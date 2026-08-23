@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 上下文压缩 Compaction — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 上下文压缩 Compaction</div>
+    <h1>上下文压缩 Compaction：把历史「压成摘要」</h1>
+    <div class="subtitle">第 5 章我们看到「最近一次 compaction 会被调到最前」。本章展开压缩的全过程：何时触发、如何选切割点、如何让模型生成结构化摘要、以及上一个 <code class="inline">compaction</code> 条目如何被新摘要<strong>增量更新</strong>。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>一句话版本</h2>
+    <p>Compaction = <strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。这样模型永远只看到「摘要 + 最近细节」，而不是无限增长的完整转写。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t6 d6">
+        <title id="t6">Compaction 流程</title>
+        <desc id="d6">触发 → 切点 → 摘要 → 新 entry</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="20" y="120" width="150" height="60" rx="8"></rect>
+        <text class="lbl" x="95" y="144" text-anchor="middle">1. 触发判定</text>
+        <text class="lbl sm" x="95" y="162" text-anchor="middle">shouldCompact</text>
+
+        <rect class="node core" x="220" y="120" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="305" y="144" text-anchor="middle">2. 找切割点</text>
+        <text class="lbl sm" x="305" y="162" text-anchor="middle">findCutPoint(keepRecentTokens)</text>
+
+        <rect class="node core" x="440" y="120" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="525" y="144" text-anchor="middle">3. 模型生成摘要</text>
+        <text class="lbl sm" x="525" y="162" text-anchor="middle">generateSummary</text>
+
+        <rect class="node" x="660" y="120" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="760" y="144" text-anchor="middle">4. 写入 compaction entry</text>
+        <text class="lbl sm" x="760" y="162" text-anchor="middle">summary + retainedTail + details</text>
+
+        <line class="edge" x1="170" y1="150" x2="218" y2="150"></line>
+        <line class="edge" x1="390" y1="150" x2="438" y2="150"></line>
+        <line class="edge" x1="610" y1="150" x2="658" y2="150"></line>
+
+        <text class="lbl sm" x="20" y="30" fill="#556674">切割点前 = 要摘要的部分；切割点后 = 保留的尾巴</text>
+        <rect class="node acc" x="60" y="40" width="300" height="40" rx="6"></rect>
+        <text class="lbl sm" x="210" y="60" text-anchor="middle">要摘要（messagesToSummarize）→ 变 summary</text>
+        <rect class="node acc" x="560" y="40" width="280" height="40" rx="6"></rect>
+        <text class="lbl sm" x="700" y="60" text-anchor="middle">保留的尾巴（retainedTail）</text>
+        <line class="st" x1="455" y1="120" x2="455" y2="96"></line>
+      </svg>
+      <div class="fig-cap">图 6.1：压缩的四步。切割点由「保留最近约 keepRecentTokens」反推。</div>
+    </div>
+
+    <style>
+      .cp-demo{margin-top:18px}
+      .cp-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 10px}
+      .cp-btn{font-family:var(--font-sans);font-size:13.5px;font-weight:600;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);cursor:pointer;transition:transform .1s,box-shadow .1s}
+      .cp-btn:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(16,34,51,.10)}
+      .cp-btn:disabled{opacity:.4;cursor:not-allowed;transform:none}
+      .cp-btn.add{border-color:var(--brand-2);color:var(--brand)}
+      .cp-btn.go{border-color:var(--accent);color:var(--accent)}
+      .cp-btn.rst{color:var(--fg-muted)}
+      .cp-bar-wrap{background:#0d1a24;border:1px solid var(--code-border);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+      .cp-bar-label{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:11.5px;color:var(--code-comment);margin-bottom:6px}
+      .cp-bar-label .cp-tk{color:var(--code-fg);font-weight:700}
+      .cp-bar-label .cp-tk.over{color:#f08080}
+      .cp-bar{height:22px;border-radius:6px;background:#1d2c3a;overflow:hidden;position:relative}
+      .cp-bar-fill{height:100%;background:linear-gradient(90deg,var(--brand-2),var(--brand));transition:width .4s,background .3s;border-radius:6px}
+      .cp-bar-fill.over{background:linear-gradient(90deg,var(--accent-2),#d33)}
+      .cp-bar-mark{position:absolute;top:0;bottom:0;width:2px;background:#f08080}
+      .cp-bar-mark .cp-mk-l{position:absolute;top:-16px;left:-30px;font-family:var(--font-mono);font-size:10px;color:#f08080;white-space:nowrap}
+      .cp-stage{display:grid;grid-template-columns:1fr 240px;gap:16px}
+      .cp-list{background:#fbfdfe;border:1px solid var(--border);border-radius:10px;padding:12px;min-height:200px;overflow-x:auto}
+      .cp-msgs{display:flex;flex-direction:column;gap:5px}
+      .cp-msg{display:flex;align-items:center;gap:8px;font-family:var(--font-mono);font-size:11.5px;padding:5px 9px;border-radius:6px;border:1px solid var(--border);background:var(--bg-card);transition:opacity .3s,background .3s,border-color .3s}
+      .cp-msg .cp-role{font-weight:700;flex:0 0 70px}
+      .cp-msg .cp-tk{color:var(--fg-muted);margin-left:auto;flex:0 0 auto}
+      .cp-msg.tail{border-color:var(--brand-2);background:#f3faf9}
+      .cp-msg.summarize{opacity:.4;border-style:dashed}
+      .cp-msg.summary{border-color:var(--accent);background:#fdf4e3;border-width:2px}
+      .cp-msg.scan{box-shadow:0 0 0 3px rgba(245,158,11,.25);border-color:var(--accent)}
+      .cp-msg .cp-tag{font-size:9.5px;padding:1px 5px;border-radius:4px;background:var(--accent);color:#fff;font-weight:700;flex:0 0 auto}
+      .cp-side{background:#0d1a24;border:1px solid var(--code-border);border-radius:10px;padding:12px;font-family:var(--font-mono);font-size:11.5px;color:var(--code-fg);min-height:200px}
+      .cp-side .cp-h{color:var(--code-comment);font-size:11px;margin-bottom:8px;letter-spacing:.4px}
+      .cp-side .cp-st{padding:2px 0;animation:cp-slide .25s ease}
+      @keyframes cp-slide{from{opacity:0;transform:translateX(6px)}to{opacity:1}}
+      .cp-side .cp-st b{color:#86e0a3}
+      .cp-side .cp-st.warn b{color:#f08080}
+      .cp-side .cp-st.acc b{color:#f59e0b}
+      .cp-note{font-size:13px;color:var(--fg-muted);margin-left:6px}
+      @media (max-width:720px){.cp-stage{grid-template-columns:1fr}}
+    </style>
+
+    <div class="cp-demo">
+      <div class="cp-controls">
+        <button class="cp-btn add" id="cp-add">＋ 追加对话（涨 token）</button>
+        <button class="cp-btn go" id="cp-compact">▶ 执行压缩</button>
+        <button class="cp-btn rst" id="cp-rst">重置</button>
+        <span class="cp-note">窗口=<b>200</b>，reserve=50，keepRecent=60。token 涨过 150（窗口−预留）即触发 <code class="inline">shouldCompact</code></span>
+      </div>
+      <div class="cp-bar-wrap">
+        <div class="cp-bar-label">
+          <span>上下文 token 用量</span>
+          <span class="cp-tk" id="cp-tk-l">0 / 200</span>
+        </div>
+        <div class="cp-bar"><div class="cp-bar-fill" id="cp-fill" style="width:0%"></div>
+          <div class="cp-bar-mark" style="left:75%"><span class="cp-mk-l">触发线 150</span></div>
+        </div>
+      </div>
+      <div class="cp-stage">
+        <div class="cp-list"><div class="cp-msgs" id="cp-msgs"></div></div>
+        <div class="cp-side">
+          <div class="cp-h">压缩过程日志</div>
+          <div id="cp-out"></div>
+        </div>
+      </div>
+      <div class="fig-cap" style="margin-top:8px">虚化=将被摘要的部分，绿框=保留的尾巴（retainedTail），橙框=新写入的 compaction 条目。<code class="inline">findCutPoint</code> 从新到旧累加到 keepRecentTokens 再回退到安全切点。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>何时触发：阈值与两笔预算</h2>
+    <p>是否压缩取决于「当前上下文 token 数」是否超过「模型窗口 - 预留」。有两个配置项：</p>
+    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — 设置与触发</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">CompactionSettings</span> {
+  enabled: <span class="cl">boolean</span>;      <span class="cmt">// 是否自动压缩</span>
+  reserveTokens: <span class="cl">number</span>;   <span class="cmt">// 给摘要 prompt 与输出预留多少 token</span>
+  keepRecentTokens: <span class="cl">number</span>; <span class="cmt">// 压缩后想保留「最近」多少 token</span>
+}
+<span class="kw">export const</span> <span class="cl">DEFAULT_COMPACTION_SETTINGS</span>: <span class="cl">CompactionSettings</span> = {
+  enabled: <span class="kw">true</span>,
+  reserveTokens: <span class="nu">16384</span>,   <span class="cmt">// 预留 ~16K</span>
+  keepRecentTokens: <span class="nu">20000</span>, <span class="cmt">// 保留最近 ~20K</span>
+};
+
+<span class="cmt">// 触发条件：现状 token &gt; (窗口 - 预留)</span>
+<span class="kw">export function</span> <span class="fn">shouldCompact</span>(contextTokens, contextWindow, settings): <span class="cl">boolean</span> {
+  <span class="kw">if</span> (!settings.enabled) <span class="kw">return false</span>;
+  <span class="kw">return</span> contextTokens &gt; contextWindow - settings.reserveTokens;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 思路是「别等到窗口满才动，留出 <code class="inline">reserveTokens</code> 给这次摘要本身」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>切割点：该压掉多少</h2>
+    <p><code class="inline">findCutPoint</code> 从新到旧累加每条消息的估计 token，直到凑足 <code class="inline">keepRecentTokens</code>，再回退到一个「安全切点」（合法切点包括 user/assistant/bashExecution/custom 消息、branchSummary/compactionSummary 消息，以及独立的 <code class="inline">branch_summary</code> 条目），避免从一条工具结果（toolResult）中间切开。</p>
+    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — findCutPoint 要点</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">findCutPoint</span>(entries, startIndex, endIndex, keepRecentTokens): <span class="cl">CutPointResult</span> {
+  <span class="kw">const</span> cutPoints = <span class="fn">findValidCutPoints</span>(entries, startIndex, endIndex);
+  <span class="cmt">// findValidCutPoints：合法切点 = message 的若干角色（user/assistant/bashExecution/custom/</span>
+  <span class="cmt">//   branchSummary/compactionSummary）+ 独立的 branch_summary 条目；</span>
+  <span class="cmt">//   toolResult 不行（不能从"工具结果"切断对话）。</span>
+  <span class="kw">let</span> accumulatedTokens = <span class="nu">0</span>, cutIndex = cutPoints[<span class="nu">0</span>];
+  <span class="kw">for</span> (<span class="kw">let</span> i = endIndex - <span class="nu">1</span>; i &gt;= startIndex; i--) {   <span class="cmt">// 从新到旧累加</span>
+    <span class="cmt">// ...累加 estimateTokens，一旦 ≥ keepRecentTokens 就选中当前最近的合法切点</span>
+  }
+  <span class="kw">return</span> { firstKeptEntryIndex: cutIndex, turnStartIndex, isSplitTurn };
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 一个<strong>精细的细节</strong>——切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>。此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的回合也有上下文。这是「压掉一半对话」时仍不丢语义的关键。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>token 估算：先靠 provider usage，后靠字符启发</h2>
+    <p>估算「现在用了多少 token」是触发与切点的前提。Pi 的聪明之处：<strong>优先用最近一次 assistant 消息里 provider 报告的 usage（精确）</strong>，只对它之后的尾巴用字符启发式估算：</p>
+    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — 估算与启发式</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">estimateContextTokens</span>(messages): <span class="cl">ContextUsageEstimate</span> {
+  <span class="kw">const</span> usageInfo = <span class="fn">getLastAssistantUsageInfo</span>(messages);  <span class="cmt">// 最近一次有 usage 的 assistant</span>
+  <span class="kw">if</span> (!usageInfo) {
+    <span class="cmt">// 没有任何 usage → 全部用字符启发式估算</span>
+  }
+  <span class="kw">const</span> usageTokens = <span class="fn">calculateContextTokens</span>(usageInfo.usage);   <span class="cmt">// 精确：provider 报的</span>
+  <span class="cmt">// 之后每一条消息用 estimateTokens（约 4 字符 ≈ 1 token，图片算 ~4800 字符）</span>
+  <span class="kw">return</span> { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, ... };
+}
+<span class="cmt">// 触发判定的 contextTokens 就来自这里</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 用 provider 的真实 usage <strong>而不是</strong>整段重算，省时又准（provider 会报告 prompt/eval 的精确 token，含 cache）。只有「usage 之后新增的部分」才走 <code class="inline">chars/4</code> 的启发式。这是工程上的务实取舍。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.5</span>让模型生成「结构化摘要」</h2>
+    <p>摘要不是自由文本，而是用小号 prompt 让模型按固定格式输出。关键：<strong>若已有前一次摘要，则用「增量更新」prompt</strong>，把新消息并入旧摘要——避免每次全量重写。</p>
+    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — 摘要 prompt 选择 + 调用</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// 首次压缩：完整格式；已有摘要：UPDATE_ 增量合并</span>
+<span class="kw">let</span> basePrompt = previousSummary ? <span class="cl">UPDATE_SUMMARIZATION_PROMPT</span> : <span class="cl">SUMMARIZATION_PROMPT</span>;
+<span class="kw">if</span> (customInstructions) basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+
+<span class="cmt">// 拼出"对话 + 旧摘要"放进 user 消息，用独立 system prompt + retry 调用</span>
+<span class="kw">const</span> response = <span class="kw">await</span> <span class="fn">completeSimpleWithRetries</span>(models, model,
+  { systemPrompt: <span class="cl">SUMMARIZATION_SYSTEM_PROMPT</span>, messages: summarizationMessages },
+  completionOptions, retry, callbacks);</pre>
+    <div class="annotation"><b>读懂这段：</b> 摘要 prompt 的格式（<code class="inline">SUMMARIZATION_PROMPT</code>）很讲究：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context</code>——这几乎就是「让我能无缝接手」的充分信息集。它把「压缩」变成了「结构化交接班」。<strong>每次摘要 <code class="inline">cacheRetention: 'none'</code>，sessionId 走 <code class="inline">options.sessionId ?? uuidv7()</code>——有调用方就复用其路由 ID、没有才生成新 uuid</strong>，避免污染主对话的缓存；同时强制 <code class="inline">toolChoice: "none"</code>，摘要请求不得调用工具，若响应里出现 <code class="inline">toolCall</code> 即抛错。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.6</span>写入 compaction 条目</h2>
+    <p>摘要生成后，连同保留的尾巴与「文件操作」细节一起，作为一条 <code class="inline">compaction</code> 条目追加进会话：</p>
+    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — compact 的产出</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">CompactResult</span> {
+  summary: <span class="cl">string</span>;            <span class="cmt">// 摘要文本（含文件操作清单）</span>
+  tokensBefore: <span class="cl">number</span>;        <span class="cmt">// 压缩前估计 token（记档用）</span>
+  usage?: <span class="cl">Usage</span>;               <span class="cmt">// 生成摘要的 LLM 用量</span>
+  retainedTail: <span class="cl">AgentMessage</span>[]; <span class="cmt">// 保留的最近消息</span>
+  details?: <span class="cl">T</span>;                 <span class="cmt">// 例如 readFiles / modifiedFiles</span>
+}
+<span class="cmt">// compact() 最后：</span>
+<span class="kw">const</span> { readFiles, modifiedFiles } = <span class="fn">computeFileLists</span>(fileOps);
+summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles);  <span class="cmt">// 把碰过哪些文件写进摘要</span>
+<span class="kw">return</span> ok({ summary, tokensBefore, usage: summaryUsage, retainedTail,
+             details: { readFiles, modifiedFiles } });</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">retainedTail</code> 直接存在 compaction 条目上——所以第 5 章的 <code class="inline">sessionEntryToContextMessages</code> 能「<code class="inline">[摘要假消息, ...retainedTail]</code>」地展开它。而 <code class="inline">details</code> 记录了「这段历史读过/改过哪些文件」，让后续上下文（或你自研时）能推断文件依赖而无需重扫。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.7</span>在上下文里呈现：摘要假消息</h2>
+    <p>落到 LLM 面前，摘要被包成一段 user 消息（来自 <code class="inline">messages.ts</code>）：</p>
+    <div class="code-title">packages/agent/src/harness/messages.ts — 摘要消息的包装</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">COMPACTION_SUMMARY_PREFIX</span> =
+  <span class="st">`The conversation history before this point was compacted into the following summary:`</span> +
+  <span class="st">`\n\n&lt;summary&gt;\n`</span>;
+<span class="kw">export const</span> <span class="cl">COMPACTION_SUMMARY_SUFFIX</span> = <span class="st">`\n&lt;/summary&gt;`</span>;
+
+<span class="cmt">// convertToLlm 里，compactionSummary 角色 → user 消息，包上 &lt;summary&gt; 标签</span>
+<span class="kw">case</span> <span class="st">"compactionSummary"</span>:
+  <span class="kw">return</span> { role: <span class="st">"user"</span>,
+           content: [{ type: <span class="st">"text"</span>, text: <span class="cl">COMPACTION_SUMMARY_PREFIX</span> + m.summary + <span class="cl">COMPACTION_SUMMARY_SUFFIX</span> }],
+           timestamp: m.timestamp };</pre>
+    <div class="annotation"><b>读懂这段：</b> 摘要对模型来说是「一个来自系统的大量历史说明」，塞进显式的 <code class="inline">&lt;summary&gt;</code> 标签，让模型明确区分「这是历史压缩」与「这是本轮对话」。<code class="inline">branchSummary</code>（第 7 章 navigation）用同样的手法。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.8</span>摘要内部结构：分支概览 + 文件操作清单</h2>
+    <p>6.1–6.7 讲的是「压缩流程怎么跑」，但没展开<strong>摘要文本本身长什么样</strong>。摘要不是纯文本块，而是由 <code class="inline">branch-summarization.ts</code> 拼出的<strong>结构化文档</strong>，两部分：</p>
+    <div class="code-title">harness/compaction/branch-summarization.ts — 摘要的两段式拼装</div>
+    <pre class="code"><code><span class="cmt">// 第 1 段：分支概览（谁说了什么、谁 fork 了什么）</span>
+<span class="kw">function</span> <span class="fn">summarizeBranch</span>(branch: LaneBranch[]): string {
+  <span class="kw">const</span> overview = branch.<span class="fn">map</span>(b =&gt; <span class="st">`- `</span> + <span class="fn">formatBranchLine</span>(b)).<span class="fn">join</span>(<span class="st">"\n"</span>);
+  <span class="kw">return</span> <span class="st">`## Branches\n`</span> + overview;
+}
+
+<span class="cmt">// 第 2 段：被压缩区间内的文件写操作清单（追加在概览之后）</span>
+<span class="kw">function</span> <span class="fn">collectFileMutations</span>(ops: ToolOp[]): FileEntry[] {
+  <span class="kw">return</span> ops
+    .<span class="fn">filter</span>(op =&gt; op.name === <span class="st">"write"</span> || op.name === <span class="st">"edit"</span>)
+    .<span class="fn">map</span>(op =&gt; ({ path: op.input.path, verb: op.name }));
+}</code></pre>
+    <p><strong>分支概览</strong>保留了"对话结构"——哪些轮次、有没有分叉、分叉在哪。这对 navigation（第 7 章切分支）至关重要：摘要后模型还能"记起"这条线上发生过哪些结构性事件。<strong>文件操作清单</strong>则是一份"元上下文"——不保留文件具体内容，只保留"动过哪些文件、动词是什么（write/edit）"，让模型压缩后仍知道项目里哪些文件是自己碰过的。6.7 的「摘要假消息」装的就是这两段的拼接结果。</p>
+    <div class="annotation"><b>设计取舍：</b> 不保留文件内容、只留清单，是 token 预算的精算——内容大概率会在后续轮次被重新读，而"动过哪些文件"这种元信息一旦丢失就要重头猜。压缩的本质不是"少说话"，而是"留下以后还能用的索引"。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.9</span>对自研与使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① token 预算两笔账</strong>：reserveTokens（给这次摘要留空间）+ keepRecentTokens（保留多少细节）。<strong>② 切割要尊重对话边界</strong>：别从工具结果中间切。<strong>③ 增量更新旧摘要</strong>，别每次全量重写（省 token 且更连贯）。<strong>④ 摘要里带上文件清单等"元上下文"</strong>，比纯文本可控得多。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="05-context.html">← 上一页：上下文构建</a>
+    <a href="07-harness.html">下一步：Harness 运行时骨架 →</a>
+  </div>
+</div>
+
+<footer>
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.84.2-6-g086c32e74 · 所有引用代码路径以仓库最新为准
+</footer>
+
+<script>
+/* ============================================================
+ * 压缩四步动画 — §6.1
+ * 复刻 compaction.ts 的语义：
+ *   shouldCompact: contextTokens > contextWindow - reserveTokens
+ *   findCutPoint:  从新到旧累加 token 直到 keepRecentTokens，回退到安全切点
+ *                  （不能从 toolResult 中间切；这里简化为「回退到最近的 user」）
+ *   压缩产出：messagesToSummarize → summary；retainedTail 保留
+ * ============================================================ */
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+
+  const WINDOW = 200, RESERVE = 50, KEEP_RECENT = 60;
+  const THRESHOLD = WINDOW - RESERVE; // 150
+
+  // 对话历史：role + token。toolResult 不可作切点。
+  let msgs = [];
+  let seq = 0;
+  let compacted = false; // 是否已压缩（避免重复）
+  let scanIdx = -1; // findCutPoint 扫描高亮（-1=无）
+
+  const roles = [
+    { role: "user", tk: 22 },
+    { role: "assistant", tk: 28 },
+    { role: "toolResult", tk: 18 },
+    { role: "user", tk: 16 },
+    { role: "assistant", tk: 30 },
+  ];
+
+  function totalTokens() {
+    return msgs.reduce((s, m) => s + m.tk, 0);
+  }
+  function shouldCompact() {
+    return totalTokens() > THRESHOLD;
+  }
+
+  // findCutPoint：从新到旧累加，直到 >= keepRecent，记录该位置，
+  // 再回退到「安全切点」（这里：该位置之前最近的 user/assistant，且不能是 toolResult）。
+  // 返回 { cutIndex, tail } —— cutIndex 之前的(含)被摘要，之后是 retainedTail。
+  function findCutPoint() {
+    let acc = 0, i = msgs.length - 1, stopAt = msgs.length; // stopAt = 第一个属于 tail 的 index
+    for (; i >= 0; i--) {
+      acc += msgs[i].tk;
+      if (acc >= KEEP_RECENT) { stopAt = i; break; }
+      stopAt = i;
+    }
+    // 回退到安全切点：tail 的起点必须是合法切点（不能是 toolResult）
+    while (stopAt < msgs.length && msgs[stopAt].role === "toolResult") stopAt++;
+    return { cutIndex: stopAt - 1, tailStart: stopAt };
+  }
+
+  function addMsg() {
+    if (compacted) return; // 压缩完成后锁定，请重置后再演示
+    const r = roles[(seq) % roles.length];
+    msgs.push({ ...r, id: "m" + ++seq });
+    scanIdx = -1;
+    render();
+    if (shouldCompact()) {
+      log(`<b>shouldCompact()</b> → true（${totalTokens()} > ${THRESHOLD}）`, "warn");
+    }
+  }
+
+  function doCompact() {
+    if (compacted) { log("已压缩过，重置后再试"); return; }
+    if (!shouldCompact()) { log(`<b>shouldCompact()</b> → false（${totalTokens()} ≤ ${THRESHOLD}），无需压缩`, "warn"); return; }
+    const out = $("cp-out");
+    out.innerHTML = "";
+    log(`<b>① 触发</b>：${totalTokens()} tokens > ${THRESHOLD}（窗口${WINDOW}−预留${RESERVE}）`);
+
+    // ② findCutPoint 动画：从新到旧逐条累加
+    const { cutIndex, tailStart } = findCutPoint();
+    let acc = 0;
+    const tkList = [];
+    for (let i = msgs.length - 1; i >= tailStart; i--) { acc += msgs[i].tk; tkList.unshift({ i, acc }); }
+
+    let k = 0;
+    const animateScan = () => {
+      if (k < tkList.length) {
+        scanIdx = tkList[k].i;
+        render();
+        log(`② findCutPoint：累加到 ${msgs[scanIdx].role} m${msgs[scanIdx].id.slice(1)}，累计 ${tkList[k].acc} ≥ ${KEEP_RECENT}`, "acc");
+        k++; setTimeout(animateScan, 420);
+      } else {
+        scanIdx = -1;
+        finishCompact(cutIndex, tailStart);
+      }
+    };
+    animateScan();
+  }
+
+  function finishCompact(cutIndex, tailStart) {
+    const summarized = msgs.slice(0, tailStart);
+    const tail = msgs.slice(tailStart);
+    log(`② 切点确定：m${summarized[summarized.length - 1].id.slice(1)} 及之前 → 摘要；其后 ${tail.length} 条保留为 retainedTail`, "acc");
+    log(`<b>③ 生成摘要</b>：把 ${summarized.length} 条（${summarized.reduce((s,m)=>s+m.tk,0)} tokens）交给 LLM 生成结构化摘要`);
+    // ④ 写入 compaction entry：替换 summarized 为一条 summary
+    const summaryTk = 12;
+    msgs = [{ role: "compaction", tk: summaryTk, id: "cmp", summary: true }].concat(tail);
+    compacted = true;
+    render();
+    log(`<b>④ 写入 compaction entry</b>（~${summaryTk} tokens）+ 保留尾巴 ${tail.length} 条。压缩后 ${totalTokens()} tokens`, "");
+  }
+
+  function render() {
+    // token bar
+    const tot = totalTokens();
+    const pct = Math.min(100, (tot / WINDOW) * 100);
+    const over = tot > THRESHOLD;
+    $("cp-fill").style.width = pct + "%";
+    $("cp-fill").classList.toggle("over", over);
+    const tkL = $("cp-tk-l");
+    tkL.textContent = `${tot} / ${WINDOW}` + (over ? `  ⚠ 超过触发线 ${THRESHOLD}` : "");
+    tkL.classList.toggle("over", over);
+
+    // 消息列表
+    const wrap = $("cp-msgs");
+    wrap.innerHTML = "";
+    let cutIndex = -1, tailStart = msgs.length;
+    if (compacted) { /* 已压缩，无高亮分组 */ }
+    else if (shouldCompact()) { const cp = findCutPoint(); cutIndex = cp.cutIndex; tailStart = cp.tailStart; }
+
+    msgs.forEach((m, i) => {
+      const div = document.createElement("div");
+      let cls = "cp-msg";
+      if (m.summary) cls += " summary";
+      else if (!compacted && i < tailStart) cls += " summarize";
+      else if (!compacted && i >= tailStart) cls += " tail";
+      if (i === scanIdx) cls += " scan";
+      div.className = cls;
+      const role = m.summary ? "compaction" : m.role;
+      let inner = `<span class="cp-role">${role}</span>`;
+      if (m.summary) inner += `<span class="cp-tag">summary+tail</span>`;
+      else inner += `<span style="color:var(--fg-muted)">m${m.id.slice(1)}</span>`;
+      inner += `<span class="cp-tk">${m.tk}tk</span>`;
+      div.innerHTML = inner;
+      wrap.appendChild(div);
+    });
+    if (msgs.length === 0) {
+      wrap.innerHTML = '<div style="color:var(--fg-muted);font-size:13px;padding:8px">空对话 — 点「＋ 追加对话」开始累积 token</div>';
+    }
+    // 压缩完成后锁定追加（一次完整压缩流程演示完毕，重置后可再来）
+    $("cp-add").disabled = compacted;
+    $("cp-compact").disabled = compacted;
+  }
+
+  let logLocked = false;
+  function log(html, kind = "") {
+    const out = $("cp-out");
+    const div = document.createElement("div");
+    div.className = "cp-st " + kind;
+    div.innerHTML = html;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+  }
+  function resetLog() { $("cp-out").innerHTML = ""; }
+
+  function reset() {
+    msgs = []; seq = 0; compacted = false; scanIdx = -1;
+    resetLog(); log("就绪。追加对话让 token 增长到触发线。");
+    render();
+  }
+
+  $("cp-add").addEventListener("click", addMsg);
+  $("cp-compact").addEventListener("click", doCompact);
+  $("cp-rst").addEventListener("click", reset);
+
+  reset();
+})();
+</script>
+
+</body>
+</html>

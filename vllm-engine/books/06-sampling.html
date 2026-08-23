@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 采样 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 采样</div>
+    <h1>采样：logits 如何变成 token</h1>
+    <div class="subtitle">模型前向的终点是一个 vocab 大小的 logits 向量,但它还不是答案。采样层负责把它「翻译」成一个（或多个）具体的 token id，再交给 detokenizer 变成文本。这一章我们把 logits → token → 文本的整条链路拆开。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>为什么需要采样</h2>
+    <p>Transformer 输出层（LM Head）给每个位置吐出一个形状为 <strong>[vocab_size]</strong> 的向量，叫 <strong>logits</strong>。它只是「分数」：分数越高的 token 越像合理的下一个词，但<strong>它本身不是 token</strong>。要拿到一个可读的 token id，必须经过<strong>采样</strong>。</p>
+    <ul>
+      <li><strong>贪心（greedy）</strong>：直接取 logits 最大的下标，即 <code class="inline">argmax</code>。确定性高，但容易重复、呆板。</li>
+      <li><strong>随机（random）</strong>：先把 logits 转成概率分布，再按概率随机抽。温度越高分布越平、越随机。</li>
+    </ul>
+    <p>在 vLLM 里，这两种行为由 <code class="inline">temperature</code> 决定：<strong>temperature=0（严格来说 &lt; 1e-5）走贪心，否则走随机</strong>。这正是下一节看到的字段与采样代码的分水岭。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 170" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <rect class="node core" x="20" y="30" width="150" height="52" rx="8"></rect>
+        <text class="lbl sm" x="95" y="52" text-anchor="middle">LM Head logits</text>
+        <text class="lbl sm" x="95" y="70" text-anchor="middle">[batch, vocab]</text>
+        <line class="edge" x1="170" y1="56" x2="250" y2="56"></line>
+        <rect class="node" x="255" y="20" width="180" height="72" rx="8"></rect>
+        <text class="lbl sm" x="345" y="48" text-anchor="middle">温度 / top-k / top-p</text>
+        <text class="lbl sm" x="345" y="66" text-anchor="middle">+ penalty 后处理</text>
+        <line class="edge" x1="435" y1="56" x2="505" y2="56"></line>
+        <rect class="node" x="510" y="20" width="120" height="72" rx="8"></rect>
+        <text class="lbl sm" x="570" y="48" text-anchor="middle">softmax</text>
+        <text class="lbl sm" x="570" y="66" text-anchor="middle">概率分布</text>
+        <line class="edge" x1="630" y1="56" x2="700" y2="56"></line>
+        <rect class="node acc" x="705" y="30" width="150" height="52" rx="8"></rect>
+        <text class="lbl sm" x="780" y="52" text-anchor="middle">采样 → token id</text>
+        <text class="lbl sm" x="780" y="70" text-anchor="middle">argmax / random</text>
+        <text class="lbl sm" x="20" y="130">注意：softmax 并不改变 argmax 的相对顺序。所以贪心路径可以跳过它直接 argmax；只有随机路径才需要真正的分布。</text>
+      </svg>
+      <div class="fig-cap">图 6.1：采样即「把 logits 变成 token id」。贪心可跳过 softmax，随机才需要完整概率分布。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>SamplingParams：请求怎么描述「我要怎么采样」</h2>
+    <p>每个请求都要带上一组采样参数。vLLM 用 <code class="inline">vllm/sampling_params.py</code> 里的 <code class="inline">SamplingParams</code> 描述。下面只摘和我们本章相关的字段（原文件字段顺序如此）：</p>
+    <div class="code-title">vllm/sampling_params.py — SamplingParams（字段摘录，含默认值与官方注释）</div>
+    <pre class="code"><span class="lang-tag">python</span>temperature: <span class="cl">float</span> = <span class="nu">1.0</span>
+<span class="cmt"># 控制随机性。低值更确定，零值即贪心采样。</span>
+top_p: <span class="cl">float</span> = <span class="nu">1.0</span>
+<span class="cmt"># 累积概率截断：只考虑累积概率到 top_p 的最优 token。=1 表示考虑全部。</span>
+top_k: <span class="cl">int</span> = <span class="nu">0</span>
+<span class="cmt"># 只考虑概率最高的 top_k 个 token。0（或 -1）表示全部。</span>
+max_tokens: <span class="cl">int</span> | <span class="kw">None</span> = <span class="nu">16</span>
+<span class="cmt"># 每个输出序列最多生成的 token 数。</span>
+stop: <span class="cl">str</span> | <span class="cl">list[str]</span> | <span class="kw">None</span> = <span class="kw">None</span>
+<span class="cmt"># 生成到这些字符串时停止。返回内容不含 stop 串。</span>
+stop_token_ids: <span class="cl">list[int]</span> | <span class="kw">None</span> = <span class="kw">None</span>
+<span class="cmt"># 生成到这些 token id 时停止。</span>
+ignore_eos: <span class="cl">bool</span> = <span class="kw">False</span>
+<span class="cmt"># 是否忽略 EOS 继续生成。</span>
+n: <span class="cl">int</span> = <span class="nu">1</span>
+<span class="cmt"># 为同一个 prompt 返回几个输出（即旧版 best_of 的继承者）。</span></pre>
+    <div class="annotation"><b>读懂默认值：</b>默认 <code class="inline">temperature=1.0</code>、<code class="inline">top_p=1.0</code>、<code class="inline">top_k=0</code> 表示「全开」——不截断、按原始分布随机。而一旦你设置 <code class="inline">temperature=0</code>（贪心），<code class="inline">SamplingParams.__post_init__</code> 会把 <code class="inline">top_p</code>、<code class="inline">top_k</code>、<code class="inline">min_p</code> 一并重置为「禁用」，并校验必须用贪心。</div>
+    <p>值得一提：V0 时代的 <code class="inline">best_of</code> 在 V1 里被语义拆开了。<code class="inline">n</code> 对应「一个 prompt 出几条独立输出」，而真正的<strong>束搜索</strong>则是一个单独的 <code class="inline">BeamSearchParams</code>（见 6.6），字段是 <code class="inline">beam_width</code>、<code class="inline">max_tokens</code>、<code class="inline">length_penalty</code>、<code class="inline">temperature=0.0</code>。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>logits 后处理链：顺序很重要</h2>
+    <p>vLLM 的 <code class="inline">Sampler</code>（<code class="inline">vllm/v1/sample/sampler.py</code>）把整条链路写得很直白。类 docstring 列出了严格顺序：先做 allowed-token-ids 白名单、bad-words 排除、可影响贪心的 logits processor，再施加各类 penalty，然后才进 <code class="inline">sample()</code> 做温度缩放、top-k/top-p、softmax 与采样。</p>
+    <div class="code-title">vllm/v1/sample/sampler.py — Sampler.forward（主干摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, logits, sampling_metadata, ...):
+    <span class="cmt"># 1) 用原始 logits（未惩罚、未缩放）算 top-k logprobs</span>
+    raw_logprobs = self.<span class="fn">compute_logprobs</span>(logits)   <span class="cmt"># log_softmax</span>
+    logits = logits.to(torch.float32)
+    <span class="cmt"># 2) 白名单 / bad words / penalties</span>
+    logits = self.<span class="fn">apply_logits_processors</span>(logits, sampling_metadata, ...)
+    <span class="cmt"># 3) 温度 / top-k / top-p / softmax / 采样</span>
+    sampled, processed_logprobs = self.<span class="fn">sample</span>(logits, sampling_metadata)
+    ...
+    <span class="kw">return</span> <span class="cl">SamplerOutput</span>(
+        sampled_token_ids=sampled.unsqueeze(-<span class="nu">1</span>),  <span class="cmt"># [num_requests, 1]</span>
+        logprobs_tensors=logprobs_tensors,
+    )</pre>
+    <p>核心的 <code class="inline">sample()</code> 方法：先看是否全贪心（<code class="inline">all_greedy</code>）——是就直接 <code class="inline">greedy_sample</code>（即 <code class="inline">logits.argmax(dim=-1)</code>）返回；否则先 <code class="inline">apply_temperature</code> 做 <code class="inline">logits.div_(temp.unsqueeze(1))</code>，再跑 argmax 不变的 logits processor，最后交给 <code class="inline">topk_topp_sampler</code>。而温度内部对贪心请求把分母换成 1（避免除零）。</p>
+    <div class="code-title">vllm/v1/sample/sampler.py — sample 中温度与 topk/topp</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 温度：logits /= temperature（贪心请求分母换 1）</span>
+logits = self.<span class="fn">apply_temperature</span>(logits, sampling_metadata.temperature,
+                                sampling_metadata.all_random)
+<span class="cmt"># 只作用于随机采样的 logits processor（argmax 不变）</span>
+<span class="kw">for</span> processor <span class="kw">in</span> sampling_metadata.logitsprocs.argmax_invariant:
+    logits = processor.<span class="fn">apply</span>(logits)
+<span class="cmt"># top-k 与 top-p 截断 + softmax + 采样</span>
+random_sampled, _ = self.topk_topp_sampler(
+    logits, sampling_metadata.generators,
+    sampling_metadata.top_k, sampling_metadata.top_p)</pre>
+    <div class="annotation"><b>注意一个细节：</b>vLLM 的随机采样并没有显式调用 <code class="inline">torch.multinomial</code>，而是用「指数噪声技巧」——定义在 <code class="inline">vllm/v1/sample/ops/topk_topp_sampler.py</code>，先把 top-k/top-p 之外的 logits 打成 <code class="inline">-inf</code>，<code class="inline">softmax</code> 后 <code class="inline">probs.div_(q).argmax()</code> 得到采样结果。之所以绕开 <code class="inline">multinomial</code>，是为了避免它带来的 CPU-GPU 同步开销。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>Sampler 与采样元数据：一整个 batch 一次算完</h2>
+    <p>采样层的关键设计是<strong>把所有请求并成一个 batch 向量化算</strong>。为此需要一个描述「这个 batch 各自怎么采样」的结构——<code class="inline">SamplingMetadata</code>（<code class="inline">vllm/v1/sample/metadata.py</code>）：</p>
+    <div class="code-title">vllm/v1/sample/metadata.py — SamplingMetadata（字段摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>temperature: <span class="cl">torch.Tensor</span> | <span class="kw">None</span>   <span class="cmt"># 每请求一个温度（batch 向量）</span>
+all_greedy: <span class="cl">bool</span>                       <span class="cmt"># 整批都是贪心？可跳过整段随机逻辑</span>
+all_random: <span class="cl">bool</span>
+top_p: <span class="cl">torch.Tensor</span> | <span class="kw">None</span>
+top_k: <span class="cl">torch.Tensor</span> | <span class="kw">None</span>
+generators: <span class="cl">dict[int, torch.Generator]</span> <span class="cmt"># 有 seed 的请求的 PRNG</span>
+no_penalties: <span class="cl">bool</span>                     <span class="cmt"># 无 penalty → 跳过惩罚分支</span>
+frequency_penalties: <span class="cl">torch.Tensor</span>
+presence_penalties: <span class="cl">torch.Tensor</span>
+repetition_penalties: <span class="cl">torch.Tensor</span>
+output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cmt"># 已生成的 token，供 penalty 参考</span></pre>
+    <p>这些字段几乎全是<strong>对齐 batch 的 tensor</strong>：temperature、top_k、top_p、各类 penalty 都是每请求一个值。于是 <code class="inline">Sampler.forward</code> 一次就能对整个 batch 的 logits 做后处理并采样，返回 <code class="inline">SamplerOutput</code>（形状 <code class="inline">[num_requests, 1]</code> 的 <code class="inline">sampled_token_ids</code>）。性能优化点：<code class="inline">no_penalties</code>、<code class="inline">all_greedy</code> 这类「整批布尔」让常见简单场景直接走快捷路径，不动 penalty 分支。</p>
+    <div class="annotation"><b>读懂采样元数据：</b>它是「逐请求采样参数 → 对齐 batch 的 tensor」这一转换的产物。自研引擎哪怕只做单请求，也从一开始就按 batch 向量的形状组织采样参数，为后续并发铺路。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.5</span>解码与停止：token 怎么变成文本、请求怎么结束</h2>
+    <p>采样给出的是 token id 序列，要让用户看到文本，得<strong>解码（detokenize）</strong>。vLLM 的 <code class="inline">vllm/v1/engine/detokenizer.py</code> 提供 <code class="inline">IncrementalDetokenizer</code> —— <strong>增量</strong>解码：每来一个新 token 只解这段、拼进已有的文本，而不是每次都重解整条序列。它分两类：快路径 <code class="inline">FastIncrementalDetokenizer</code>（走 tokenizers 库的 <code class="inline">DecodeStream</code>）和慢路径 <code class="inline">SlowIncrementalDetokenizer</code>。</p>
+    <div class="code-title">vllm/v1/engine/detokenizer.py — IncrementalDetokenizer.update（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">update</span>(self, new_token_ids, stop_terminated):
+    <span class="cmt"># 1) 增量解码新 token，拼进 output_text</span>
+    <span class="kw">for</span> new_token_id <span class="kw">in</span> new_token_ids:
+        self.token_ids.<span class="fn">append</span>(new_token_id)
+        self.output_text += self.<span class="fn">decode_next</span>(new_token_id)
+    <span class="cmt"># 2) 在此之后还要对 stop 字符串做匹配（见 update 返回的 stop 串）</span></pre>
+    <p><strong>请求怎么结束？</strong>有三道闸门，任一命中即终止本次生成：</p>
+    <ul>
+      <li><strong>EOS / stop_token_ids</strong>：采到了 EOS 或 <code class="inline">stop_token_ids</code> 里的 id。引擎会把这些 id 合并进 <code class="inline">SamplingParams.all_stop_token_ids</code>（见 <code class="inline">update_from_generation_config</code>）。</li>
+      <li><strong>stop 字符串</strong>：需要<strong>先解码</strong>才能判断「文本里出现 stop 串」。这也是为什么 stop 只在 <code class="inline">detokenize=True</code> 时被允许。<code class="inline">__post_init__</code> 里还专门算了个 <code class="inline">output_text_buffer_length</code>，把末尾可能构成 stop 前缀的那几个字符「扣住」不吐给用户。</li>
+      <li><strong>max_tokens</strong>：达到上限强制结束（兜底保证不无限生成）。</li>
+    </ul>
+    <p><code class="inline">ignore_eos=True</code> 则忽略 EOS 继续生成（但仍受 max_tokens 约束）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.6</span>束搜索与多路采样 | n / best_of</h2>
+    <p>除了单路随机/贪心，还有两类「一次出多条候选」的能力：</p>
+    <ul>
+      <li><strong>多条独立采样（n）</strong>：同一个 prompt 独立跑 <code class="inline">n</code> 条序列，各自随机，互相不共享信息。用于多次采样取最佳、或做诸如「多次尝试」的对比。</li>
+      <li><strong>束搜索（beam search）</strong>：真正的启发式搜索——每一步保留概率最高的 <code class="inline">beam_width</code> 条序列，权衡「长度惩罚」后择优。vLLM 用独立的 <code class="inline">BeamSearchParams</code>（<code class="inline">vllm/sampling_params.py</code>），字段为 <code class="inline">beam_width</code>、<code class="inline">max_tokens</code>、<code class="inline">length_penalty</code>、<code class="inline">temperature=0.0</code>。</li>
+    </ul>
+    <div class="code-title">vllm/sampling_params.py — BeamSearchParams（字段摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">BeamSearchParams</span>(msgspec.Struct, ...):
+    beam_width: <span class="cl">int</span>          <span class="cmt"># 每步保留几条序列</span>
+    max_tokens: <span class="cl">int</span>
+    ignore_eos: <span class="cl">bool</span> = <span class="kw">False</span>
+    temperature: <span class="cl">float</span> = <span class="nu">0.0</span>   <span class="cmt"># 束搜索通常是贪心的扩展</span>
+    length_penalty: <span class="cl">float</span> = <span class="nu">1.0</span></pre>
+    <div class="annotation"><b>辨析：</b>n 是「独立并行」，beam 是「共享搜索树」——两者要的显存/算力都随路数成倍上涨。绝大多数在线服务用 <code class="inline">n=1</code> 单路就够，beam 更适合离线评测。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.7</span>小结与自研启示</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
+      <tr><td>贪心</td><td><code class="inline">greedy_sample</code> → argmax</td><td>先做这个，最简单、最好 debug</td></tr>
+      <tr><td>温度</td><td><code class="inline">apply_temperature</code>（logits/temp）</td><td>第二版加温度，复用同一份 logits 路径</td></tr>
+      <tr><td>top-k / top-p</td><td><code class="inline">apply_top_k_top_p</code> → -inf 掩码</td><td>top-k 最便宜（一次 topk），top-p 要排序，后加</td></tr>
+      <tr><td>penalty / bad words</td><td><code class="inline">apply_all_penalties</code> 等</td><td>明确不需要就先跳过，靠 <code class="inline">all_greedy</code> 快路径</td></tr>
+      <tr><td>多路 / beam</td><td><code class="inline">n</code> / <code class="inline">BeamSearchParams</code></td><td>最后再加；fallback 到跑 n 次即可</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      最小引擎只需要：<strong>argmax + 温度采样 + top_k</strong> 三个足矣跑通一条对话链路。penalty、bad-words、beam 全是增量优化——把采样参数、采样元数据从一开始就按「batch 向量」的形状设计，未来加功能才不会返工。
+    </div>
+    <div class="callout info">
+      <b class="tag">下一步</b>
+      采样这么「贵」的运算为什么还快？因为 vLLM 把 top-k/top-p、softmax 都下沉成了高度优化的 kernel。采样加速正是<a href="07-kernels.html">第 7 章：Kernel</a> 的内容。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="05-model-runner.html">← 上一步：Model Runner</a>
+    <a href="07-kernels.html">下一步：Kernel →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 06 采样 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

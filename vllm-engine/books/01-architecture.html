@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <h1>整体架构：vLLM 的「机器」由哪些部件组成</h1>
+    <div class="subtitle">理解 vLLM（尤其新版 v1 引擎）如何分层，是读懂后续每一章的前提。这一页我们把整台机器拆开，并讲清每个部件只负责什么。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <p>现代 LLM 推理引擎要解决的核心矛盾是：<strong>「内存有限，但每步都要保留每个请求的 KV 状态」</strong>。为了让多个请求共享一张 GPU、交错推进，vLLM 把系统拆成两个并发跑的大块：</p>
+    <ul>
+      <li><strong>引擎层（Engine / Core，常驻 CPU）</strong>：管「一批请求现在该跑什么」—— 调度（Scheduler）、KV Cache 分配（KVCacheManager）、输入输出处理（tokenize / detokenize / 结构化输出）。</li>
+      <li><strong>执行层（Worker / Model Runner / Sampler，跑在 GPU）</strong>：管「把这一批请求真正喂给模型算出 token」—— 组装张量、跑 transformer、采样。</li>
+    </ul>
+    <p>两者之间通过一个 <strong>「步进（step）」同步点</strong>协作：CPU 决定 batch → 发给 GPU → GPU 跑一次模型前向 → 返回新 token → CPU 决定下一步。这个循环就是 Continuous Batching 的心脏。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>分层图</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
+        <title id="t12">vLLM v1 架构分层</title>
+        <desc id="d12">从用户 API 到 GPU kernel 的四层结构</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <!-- Layer 1: API -->
+        <rect class="node" x="20" y="20" width="900" height="86" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#165a7b">L1 · 用户 API</text>
+        <rect class="node acc" x="40" y="52" width="200" height="40" rx="6"></rect>
+        <text class="lbl" x="140" y="76" text-anchor="middle">LLM.generate()</text>
+        <rect class="node acc" x="260" y="52" width="200" height="40" rx="6"></rect>
+        <text class="lbl" x="360" y="76" text-anchor="middle">OpenAI API Server</text>
+        <rect class="node acc" x="480" y="52" width="200" height="40" rx="6"></rect>
+        <text class="lbl" x="580" y="76" text-anchor="middle">AsyncLLMEngine</text>
+        <text class="lbl sm" x="720" y="76">调 entrypoints</text>
+
+        <!-- Layer 2: Engine / Core -->
+        <rect class="node" x="20" y="126" width="900" height="150" rx="10"></rect>
+        <text class="lbl" x="40" y="152" font-weight="bold" fill="#165a7b">L2 · 引擎层（CPU）— engine / core</text>
+        <rect class="node core" x="40" y="160" width="150" height="46" rx="6"></rect>
+        <text class="lbl" x="115" y="184" text-anchor="middle">LLMEngine (v1)</text>
+        <rect class="node core" x="204" y="160" width="150" height="46" rx="6"></rect>
+        <text class="lbl" x="279" y="184" text-anchor="middle">EngineCore</text>
+        <rect class="node" x="368" y="160" width="170" height="46" rx="6"></rect>
+        <text class="lbl" x="453" y="178" text-anchor="middle">Scheduler(AsyncScheduler)</text>
+        <text class="lbl sm" x="453" y="194" text-anchor="middle">决定每步 batch</text>
+        <rect class="node" x="552" y="160" width="170" height="46" rx="6"></rect>
+        <text class="lbl" x="637" y="178" text-anchor="middle">KVCacheManager + BlockPool</text>
+        <text class="lbl sm" x="637" y="194" text-anchor="middle">分页分配 KV</text>
+        <rect class="node" x="736" y="160" width="164" height="46" rx="6"></rect>
+        <text class="lbl" x="818" y="184" text-anchor="middle">detokenizer /…</text>
+        <line class="edge" x1="190" y1="183" x2="202" y2="183"></line>
+        <line class="edge" x1="354" y1="183" x2="366" y2="183"></line>
+        <text class="lbl sm" x="40" y="256" fill="#5c6b7a">职责：不需要碰 GPU——只算“哪些请求、哪些 token、占哪些 KV 块”</text>
+
+        <!-- Layer 3: Execution -->
+        <rect class="node" x="20" y="296" width="900" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="322" font-weight="bold" fill="#165a7b">L3 · 执行层（GPU worker / executor 进程）</text>
+        <rect class="node" x="60" y="330" width="150" height="46" rx="6"></rect>
+        <text class="lbl" x="135" y="354" text-anchor="middle">Executor</text>
+        <rect class="node" x="230" y="330" width="150" height="46" rx="6"></rect>
+        <text class="lbl" x="305" y="354" text-anchor="middle">Worker</text>
+        <rect class="node" x="400" y="330" width="180" height="46" rx="6"></rect>
+        <text class="lbl" x="490" y="348" text-anchor="middle">GPU Model Runner</text>
+        <text class="lbl sm" x="490" y="364" text-anchor="middle">组装输入/模型</text>
+        <rect class="node" x="600" y="330" width="140" height="46" rx="6"></rect>
+        <text class="lbl" x="670" y="354" text-anchor="middle">Sampler</text>
+        <line class="edge" x1="210" y1="353" x2="228" y2="353"></line>
+        <line class="edge" x1="380" y1="353" x2="398" y2="353"></line>
+        <line class="edge" x1="580" y1="353" x2="598" y2="353"></line>
+
+        <!-- Layer 4: kernels -->
+        <rect class="node" x="20" y="426" width="900" height="74" rx="10"></rect>
+        <text class="lbl" x="40" y="452" font-weight="bold" fill="#165a7b">L4 · Kernel（GPU 底层算子）</text>
+        <text class="lbl sm" x="40" y="472">FlashAttention / FlashInfer · CUTLASS / cuBLAS GEMM · fused MoE · _custom_ops.py · 自定义 CUDA/Triton</text>
+        <line class="edge" x1="420" y1="440" x2="420" y2="424"></line>
+
+        <!-- vertical flow arrows -->
+        <line class="edge" x1="30" y1="106" x2="30" y2="124"></line>
+        <line class="edge" x1="850" y1="276" x2="850" y2="294"></line>
+      </svg>
+      <div class="fig-cap">图 1.2：四层架构。关键规律：状态越往下越靠近 GPU，越往上越「无状态、可放缩」。Engine 可和 Worker 分离进程甚至分离机器（disaggregated）。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">vllm/entrypoints/</code> → L1；<code class="inline">vllm/v1/engine/</code>（LLMEngine、Core）、<code class="inline">vllm/v1/core/</code>（scheduler、kv_cache_manager）→ L2；
+      <code class="inline">vllm/v1/executor/</code>、<code class="inline">vllm/v1/worker/</code>（worker_base、gpu/model_runner）→ L3；
+      <code class="inline">vllm/v1/attention/</code>、<code class="inline">vllm/_custom_ops.py</code>、<code class="inline">csrc/</code> → L4。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>用代码看｜引擎如何被构造</h2>
+    <p>从入口 <code class="inline">LLM</code> 出发，一步步创建引擎。核心事实：<strong>vLLM 现在默认跑 v1 引擎</strong>。</p>
+    <div class="code-title">vllm/entrypoints/llm.py — LLM.__init__ 里创建引擎</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.v1.engine.llm_engine <span class="kw">import</span> <span class="cl">LLMEngine</span>   <span class="cmt"># 用的是 v1 引擎</span>
+
+<span class="kw">class</span> <span class="cl">LLM</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model=<span class="st">"facebook/opt-125m"</span>, ...):
+        self.llm_engine = <span class="cl">LLMEngine</span>.<span class="fn">from_engine_args</span>(engine_args)  <span class="cmt"># L2 引擎</span>
+
+    <span class="kw">def</span> <span class="fn">generate</span>(self, prompts, sampling_params=<span class="kw">None</span>, ...):
+        <span class="kw">return</span> self._run_completion(prompts=prompts, params=sampling_params, ...)</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">LLMEngine</code>（在 <code class="inline">vllm/v1/engine/llm_engine.py</code>）是「同步、阻塞」的简单封装；而在线服务用的是它的异步表亲 <code class="inline">vllm/engine/async_llm_engine.py</code> 与 <code class="inline">v1/engine/async_llm.py</code>。它们背后都通向同一个 <code class="inline">EngineCore</code>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>为什么「引擎」和「Core」要分开</h2>
+    <p>v1 里，真正干活的核心是一个独立进程 <code class="inline">EngineCoreProc</code>（可由子进程或 Ray actor 承载），它内部持有 Scheduler 与 KVCacheManager，通过 <strong>ZMQ 套接字</strong>与调用方通信。</p>
+    <div class="code-title">vllm/v1/engine/core.py — EngineCore 的骨架</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EngineCore</span>:
+    <span class="cmt"># 持有 CPU 侧核心状态</span>
+    <span class="kw">def</span> <span class="fn">add_request</span>(self, request: <span class="cl">Request</span>, request_wave=<span class="nu">0</span>): ...
+    <span class="kw">def</span> <span class="fn">step</span>(self) <span class="kw">-&gt;</span> <span class="cl">tuple</span>[<span class="cl">dict</span>[<span class="cl">int</span>, <span class="cl">EngineCoreOutputs</span>], <span class="cl">bool</span>]:
+        <span class="cmt"># 1) scheduler 决定 batch  2) 交给 worker 前向  3) 采样  4) 回传输出</span>
+        ...</pre>
+    <div class="annotation"><b>为什么这么设计：</b> 把 Core 变成独立可寻址的进程，才能在多卡/多机部署里「一个调度者协调多个执行者」，也为未来分离式 prefill/decode 铺路。做自己的引擎时不需要这么重——单进程足够起步（见第 11 章）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>一张表记牢每个部件</h2>
+    <table class="tbl">
+      <tr><th>部件</th><th>目录</th><th>一句话职责</th><th>跑在</th></tr>
+      <tr><td>LLM / LLMEngine</td><td>entrypoints/llm.py · v1/engine/llm_engine.py</td><td>用户面入口：tokenize、组装 Request、收集输出</td><td>CPU</td></tr>
+      <tr><td>AsyncLLMEngine</td><td>engine/async_llm_engine.py</td><td>异步版本，服务端用</td><td>CPU</td></tr>
+      <tr><td>EngineCore</td><td>v1/engine/core.py</td><td>核心事件循环：add_request + step</td><td>CPU（独立进程）</td></tr>
+      <tr><td>Scheduler</td><td>v1/core/sched/</td><td>连续批处理：决定每一步跑哪个 batch</td><td>CPU</td></tr>
+      <tr><td>KVCacheManager</td><td>v1/core/kv_cache_manager.py</td><td>分页分配/复用/释放 KV 块</td><td>CPU</td></tr>
+      <tr><td>Executor</td><td>v1/executor/</td><td>把 EngineCore 的意图分发到各 Worker（单进程/Ray/多进程）</td><td>CPU</td></tr>
+      <tr><td>Worker</td><td>v1/worker/</td><td>持有模型与 KV cache 的实际 GPU 执行者</td><td>GPU</td></tr>
+      <tr><td>Model Runner</td><td>v1/worker/gpu/model_runner.py</td><td>把 batch 转成 GPU 张量、跑模型、管理 CUDA Graph</td><td>GPU</td></tr>
+      <tr><td>Sampler</td><td>v1/sample/</td><td>logits → token（及 logprobs）</td><td>GPU</td></tr>
+      <tr><td>Attention backends</td><td>v1/attention/</td><td>PagedAttention 的具体 kernel 选择</td><td>GPU</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.6</span>对「自研引擎」的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      别急着堆并行和分布式。自研引擎的 MVP 只需两块：<strong>① 一个能跑「单请求 prefill + decode」的循环；② 一个最朴素的连续批处理循环。</strong>
+      分层（Engine / Core / Worker）是 vLLM 为「可扩展性」付出的复杂度，你可以在理解之后再决定要不要这么切。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-request-lifecycle.html">下一步：请求全生命周期 →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 01 整体架构 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

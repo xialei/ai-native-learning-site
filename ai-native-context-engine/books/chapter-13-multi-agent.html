@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 13 章 · Multi-Agent Context — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 13 章 · Multi-Agent Context</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 13 章 · Multi-Agent Context</div>
+      <h1 class="title">Context 才是共享资产</h1>
+      <p class="lede">
+        多 Agent 协作，最常见的做法是让 Agent 之间互相发消息。但消息越传越长，Token 越烧越多，信息还容易对不上。Context Engine 换了个思路：多个 Agent 基于统一的 Context Package 协同工作，而不是通过 Prompt 或 Message 传递信息。本章聚焦多 Agent 如何共享、引用和演化 Context。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Multi-Agent Context 是 Context Engine 在多 Agent 协作场景下的上下文共享机制。它的职责是让多个 Agent 基于统一的 Context Package 协同工作，而不是通过 Prompt 或 Message 传递信息。</p>
+
+      <p>核心观念转换：Context 是共享资源，Agent 是 Context 的消费者（Consumer）和生产者（Producer）。Agent 不是自治的孤岛，而是围绕同一份 Context 协作的角色。</p>
+
+      <h2 id="why">为什么需要 Multi-Agent Context</h2>
+
+      <p>看传统 Multi-Agent 怎么工作：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  A["Agent A"] -->|Message| B["Agent B"]
+  B -->|Message| C["Agent C"]
+  style A fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>传统 Multi-Agent：靠 Message 传递。Prompt 越来越长，信息不断重复。</figcaption>
+      </figure>
+
+      <p>问题一堆：Prompt 越来越长、信息不断重复、Token 成本持续增加、Context 不一致、无法追踪来源。每经过一个 Agent，消息就胖一圈，最后那个 Agent 收到的可能是一坨冗余信息。</p>
+
+      <p>Context Engine 的做法是共享：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  CR["Context Runtime"]
+  CR --> RA["Research Agent"]
+  CR --> BA["Business Agent"]
+  CR --> CA["Coding Agent"]
+  RA --> SCP["Shared Context Package"]
+  BA --> SCP
+  CA --> SCP
+  style CR fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style SCP fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>所有 Agent 共享统一 Context。Runtime 在中间协调。</figcaption>
+      </figure>
+
+      <p>所有 Agent 共享统一 Context。Agent 之间不直接通信，而是通过读写共享的 Context Package 协作。这把"消息传递"变成了"共享状态"——就像多个线程操作同一块内存，而不是互相发邮件。</p>
+
+      <p>但共享是有代价的，得讲清楚边界。把上下文在 agent 之间完整共享，会产生更大的 prefill，还会<em>消除跨不同系统提示的 KV-cache 复用</em>——这正是第 9 章把"缓存命中"看得那么重的原因。生产实践给出的折中是：简单子任务可以不共享上下文，让子 agent 用独立窗口只回传一个 1,000–2,000 token 的精炼摘要；只有真正需要共享状态的复杂子任务，才把完整上下文传过去。换句话说，"共享 Context"不是无脑全量共享，而是按任务类型在共享与隔离之间显式取舍。<span class="src">来源：Li et al., 2026, §5.6 引 Anthropic</span></p>
+
+      <h2 id="package">Context Package</h2>
+
+      <p>所有 Agent 统一输入：</p>
+
+      <pre><code>ContextPackage
+├── Objects
+├── Relations
+├── Events
+├── Metrics
+├── Actions
+├── Memory
+├── Metadata
+└── Trace</code></pre>
+
+      <p>Agent 不关心数据来源，只消费 Context。注意这里比第 2 章多了 Memory——多 Agent 场景需要共享记忆，这是协作的基础。</p>
+
+      <h2 id="responsibility">Agent 职责</h2>
+
+      <p>每个 Agent 的职责统一抽象成五步：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  R["读取 Context"] --> I["推理"]
+  I --> T["执行 Tool"]
+  T --> U["更新 Context"]
+  U --> S["提交 Runtime"]
+  style R fill:#eef4ee,stroke:#2f6b3a
+  style S fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption>Agent 的统一职责链。最后一步是提交 Runtime，而不是直接调用别的 Agent。</figcaption>
+      </figure>
+
+      <p>读取 Context → 推理 → 执行 Tool → 更新 Context → 提交 Runtime。而不是直接调用其他 Agent。这个"提交 Runtime"很关键——Agent 不把结果发给另一个 Agent，而是写回共享 Context，由 Runtime 决定谁接下来读。</p>
+
+      <h2 id="collaboration">Agent Collaboration</h2>
+
+      <p>一个典型的协作场景：Research Agent 训练模型，生成 Checkpoint 和 Evaluation。Business Agent 自动读取最新的 Checkpoint，无需重新 Retrieval。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  RA["Research Agent"] -->|训练模型| CK["Checkpoint + Evaluation"]
+  CK -->|写入共享 Context| CR["Context Runtime"]
+  CR -->|自动可见| BA["Business Agent"]
+  style CR fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Research Agent 产出的 Checkpoint 写入共享 Context，Business Agent 自动可见。</figcaption>
+      </figure>
+
+      <p>这就是共享 Context 的威力——一个 Agent 的产出，自动成为其他 Agent 的输入，不需要任何显式的消息传递。</p>
+
+      <p>这套"共享而非传递"的思路，再往外推一步就是跨组织协作。Palantir Foundry 的 Shared Ontology 机制解决的就是这个场景：它让多个组织在同一套共享工作流下协作，本体放在专门的 shared space 里，自动继承组织标记（organization markings）和角色授权（role grants）——典型用途是和客户、合作方在同一套本体上联合建模、联合数据交换。本章的"Context 才是共享资产，Agent 只是执行者"和后续的 Context Federation，可以借鉴这种"独立共享空间 + 标记与授权继承"的模式：跨组织共享的不是某一方的私库，而是一块带好权限标记的共享领地，各方按既有授权读写。<span class="src">来源：Foundry Ontology 文档，Shared ontologies</span></p>
+
+      <p>把这种协作方式放回更大的图景里看。学术界把多 agent 编排归纳成五种模式：层级编排（上层控制器分发任务）、团队编排（一组带名字的专职 agent 协同）、工作流编排（按显式阶段组织）、扇出（并行探索多种方案）、图组合（用交互图表达多种协调模式）。本书的"共享 Context"属于团队编排这一类，并且天然支持 planner-generator-evaluator 这种把规划、执行、验证拆成独立角色的结构——因为角色之间靠读写同一份 Context 协作，比靠消息传递更容易做到职责分离又状态一致。<span class="src">来源：Li et al., 2026, §6.3</span></p>
+
+      <h2 id="subagent-lifecycle">Sub-agent 生命周期：从共享到可调度</h2>
+
+      <p>五种编排模式回答了"agent 之间怎么协作"，但还有一个更底层的问题没回答：主 agent 启动一个子 agent 之后，这个子 agent 的<em>生命周期</em>怎么管——怎么启动、怎么等它、怎么查它的进度、出了问题怎么取消、跑完怎么把结果收回来。harness 工程把这一层叫"子代理与后台任务"，并给出一组标准的生命周期原语：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>原语</th><th>语义</th></tr></thead>
+          <tbody>
+            <tr><td>spawn</td><td>启动一个子 agent 任务</td></tr>
+            <tr><td>resume</td><td>从中断点恢复一个已暂停的子 agent</td></tr>
+            <tr><td>wait</td><td>阻塞等待子 agent 完成</td></tr>
+            <tr><td>list</td><td>列出当前所有子 agent 及其状态</td></tr>
+            <tr><td>close</td><td>正常结束并回收一个子 agent</td></tr>
+            <tr><td>interrupt</td><td>强制中止一个失控或超时的子 agent</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>这组原语补上了本书从"共享 Context"到"可调度执行"之间缺的一环：前面讲的 Ownership、Version、Lock 解决的是"多个 agent 读写同一份 Context 时不打架"，但这组原语解决的是"主 agent 怎么把活派出去、又怎么把结果收回来"。它和第 8 章的 Context Event（ContextCreated / ContextUpdated …）是配合关系——spawn/close 对应子 agent 生命周期事件，wait/list 让主 agent 能对自己的执行历史做推理，而不是 fire-and-forget 之后什么都看不见。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §1 Pattern 3</span></p>
+
+      <p>这里有一条容易踩漏的纪律：<strong>并行必须是显式且可检查的</strong>。如果子 agent 的输出只存在于临时的会话上下文里，它很快就会过时，而且一旦主 agent 中断就再也看不见——主 agent 无法对自己的执行历史做推理，也无法在中断后恢复。所以子 agent 的中间状态必须结构化落盘（日志、状态记录、产出物），而不是只活在 chat context 里。这和第 8 章"Context 状态落盘而非只存快照"、第 10 章"Trace 每条存一个文件"是同一条原则在不同层的体现：能落盘的不要留在内存里，能结构化的不要留在自由文本里。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §1 Pattern 3</span></p>
+
+      <h2 id="update">Context Update：Delta 而非全量</h2>
+
+      <p>Agent 完成任务后，提交 Context Delta：</p>
+
+      <pre><code>新增: Checkpoint
+新增: Evaluation
+更新: Metric</code></pre>
+
+      <p>Runtime 自动 Merge。Delta 是增量的——Agent 只提交自己改动的部分，而不是把整个 Context 重发一遍。这和第 8 章的 Incremental Update、第 7 章的 Progressive Context 一脉相承。</p>
+
+      <h2 id="ownership-version">Ownership 与 Version</h2>
+
+      <p><strong>Context 不是 Agent 私有，而是 Runtime 的</strong>。所有修改统一提交。这意味着没有哪个 Agent "拥有"Context——它们都是租户，Runtime 才是房东。</p>
+
+      <p>每次 Context 变化生成 Version：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  V1["v1"] -->|Research Agent| V2["v2"]
+  V2 -->|Business Agent| V3["v3"]
+  style V1 fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>每个 Agent 的修改生成新版本。支持 Rollback 和 Replay。</figcaption>
+      </figure>
+
+      <p>支持 Rollback、Replay。如果某个 Agent 改坏了，可以回滚到上一个版本。</p>
+
+      <h2 id="lock">Context Lock：并发安全</h2>
+
+      <p>多个 Agent 同时修改同一对象时，Runtime 负责 Object Lock、Version Check、Merge Conflict，保证一致性。没有锁的并发修改会互相覆盖——这是共享状态系统必须解决的问题，和数据库的乐观锁/悲观锁是一回事。</p>
+
+      <h2 id="subscription">Context Subscription</h2>
+
+      <p>Agent 可以订阅 Context。Research Agent 订阅 Experiment，Business Agent 订阅 Forecast，Operation Agent 订阅 Alarm。对象变化自动通知。这让 Agent 不需要轮询——它关心的对象一变，就被推送到。</p>
+
+      <h2 id="event-bus">Context Event Bus</h2>
+
+      <p>所有 Context 变化进入 Event Bus：</p>
+
+      <pre><code>Create / Update / Delete / Merge / Snapshot</code></pre>
+
+      <p>支持异步协作。Event Bus 是订阅机制的底层——变化先入 Bus，再分发给订阅者。</p>
+
+      <h2 id="permission">Context Permission：共享但权限不同</h2>
+
+      <p>所有 Agent 共享 Context，但权限不同：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Agent</th><th>权限</th></tr></thead>
+          <tbody>
+            <tr><td>Research Agent</td><td>可以访问 Checkpoint</td></tr>
+            <tr><td>Business Agent</td><td>不能访问 Checkpoint</td></tr>
+            <tr><td>Operation Agent</td><td>只能访问 Deployment</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>Runtime 统一 ACL。共享不等于无差别可见——每个 Agent 只能看到它有权看的部分。这是第 0 章原则 2（Agent 只消费经过授权的 Context）在多 Agent 场景的落实。</p>
+
+      <h2 id="api">Context API</h2>
+
+      <pre><code>type ContextRuntime interface {
+    // 基础生命周期，见第 8 章 §15
+    Create()
+    Load()
+    Update()
+    Merge()
+    Snapshot()
+    Archive()
+    // 多 Agent 扩展
+    Subscribe()   // 订阅 Context 变化
+    Publish()     // 发布 Context 变化
+}</code></pre>
+
+      <p>所有 Agent 统一协议。基础生命周期接口以第 8 章 §15 为准（Create / Load / Update / Merge / Snapshot / Archive），多 Agent 场景在此之上扩展 Subscribe 和 Publish——这是多 Agent 协作需要的，让 Agent 能订阅彼此产生的 Context 变化。</p>
+
+      <h2 id="example">多 Agent 示例</h2>
+
+      <p>用户："为什么今天预测误差变大？"</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  Q["为什么预测误差变大？"]
+  Q --> RA["Research Agent<br/>模型 / 训练 / Checkpoint"]
+  Q --> BA["Business Agent<br/>天气 / 风场 / 设备"]
+  Q --> OA["Operation Agent<br/>GPU / Deployment / Runtime"]
+  RA --> SC["共享 Context"]
+  BA --> SC
+  OA --> SC
+  SC --> ANS["共同生成最终答案"]
+  style SC fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style ANS fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>三个 Agent 各管一摊，共享同一 Context，共同生成最终答案。</figcaption>
+      </figure>
+
+      <p>Research Agent 负责模型、训练、Checkpoint；Business Agent 负责天气、风场、设备；Operation Agent 负责 GPU、Deployment、Runtime。三个 Agent 共享同一 Context，共同生成最终答案。每个 Agent 不需要知道另外两个在干什么——它们通过共享 Context 隐式协作。</p>
+
+      <h2 id="protocol">Context Protocol：像 HTTP 一样的协议</h2>
+
+      <p>更进一步，多 Agent 协作需要一套标准协议，就像：</p>
+      <ul>
+        <li>HTTP——页面通信；</li>
+        <li>SQL——数据查询；</li>
+        <li>Kubernetes API——容器编排。</li>
+      </ul>
+
+      <p>Context Protocol 的消息类型：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  CR["ContextRequest"] --> CP["ContextPackage"]
+  CP --> CD["ContextDelta"]
+  CD --> CS["ContextSnapshot"]
+  CS --> CR2["ContextReference"]
+  CR2 --> CE["ContextEvent"]
+  CE --> CO["ContextResponse"]
+  style CP fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Context Protocol 的消息流。</figcaption>
+      </figure>
+
+      <blockquote class="callout">
+        <p><strong>协议约束：</strong>协议消息必须携带 <code>schema_version</code>、<code>context_id</code>、<code>tenant</code>、<code>provenance</code> 和权限声明；发生版本冲突时优先返回可合并的 ContextDelta，而不是静默覆盖。</p>
+      </blockquote>
+
+      <p>这条约束很重要——静默覆盖是多 Agent 系统最危险的故障模式。两个 Agent 同时改同一对象，如果一个静默覆盖另一个，数据就丢了。优先返回可合并的 Delta，让冲突显式化，才能保证一致性。</p>
+
+      <p>学术侧把这条思路推得更远：当 planner 把工作交给 executor、agent 调用工具、subagent 交还控制权、或系统升级到人时，这个交接不应该只传一段文本摘要，而应该一并携带意图、约束、权限、artifact、溯源、预算状态、风险等级、trace 历史和未决决策。本书的 Context Package 已经天然承载了其中大半——objects/relations/provenance/trace/policy 字段都在。缺口主要在预算状态和风险等级，可以作为后续协议版本的补充。<span class="src">来源：Li et al., 2026, §12.4</span></p>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Shared Context、Context Version、Context Merge、Context Lock；</li>
+        <li><strong>第二阶段</strong>：Context Event、Context Subscription、Context Permission；</li>
+        <li><strong>第三阶段</strong>：Distributed Runtime、Cross-Agent Context、Context Federation。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Multi-Agent 的核心不是 Message Passing，而是多个 Agent 基于统一 Context Package 协同推理、协同执行、协同更新。Context 才是共享资产，Agent 只是不同角色的执行者。</p>
+        <blockquote>
+          <p>多个 Agent 基于统一 Context Package 协同推理、协同执行、协同更新。</p>
+        </blockquote>
+        <p>模块关系：Hybrid Retrieval 生成初始 Context，Runtime 管理 Context，Cache 缓存 Context，Research Context 定义研发对象，Business Context 定义业务对象，Multi-Agent Context 定义 Agent 如何共享 Context。最后一章，看这一切怎么演进。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-12-business-context.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 12 章 · Business Context</span>
+        </a>
+        <a class="next" href="chapter-14-roadmap.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 14 章 · Evolution Roadmap</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

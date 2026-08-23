@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 分布式 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 分布式</div>
+    <h1>分布式推理：一张卡装不下时怎么办</h1>
+    <div class="subtitle">模型太大、一张 GPU 放不下或跑不动时，就要把它「切开」分到多张卡。切法不同，通信量、实现难度、适用场景天差地别。这一章从 vLLM 的 Executor 层看它如何把「一次推理」分发到多个 worker 进程。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>为什么需要并行：单卡放不下 / 算不动</h2>
+    <p><strong>放不下</strong>：模型权重 + KV cache + 激活，加起来超过单卡显存。比如 671B 参数的 MoE 模型，光权重就几百 GB，任何一张消费级卡都装不下。</p>
+    <p><strong>算不动</strong>：即使塞得进一张卡，单卡算力也有上限。吞吐（每秒处理多少 token）上不去，尤其面对高并发请求时，需要多张卡分摊计算。</p>
+    <p>于是有了四种「切法」。它们切的对象不同，通信的频率和量也完全不同：</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+
+        <!-- ===== TP ===== -->
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#d33">TP 张量并行</text>
+        <text class="lbl sm" x="20" y="40">同一层权重切到多卡</text>
+        <rect class="node" x="30" y="52" width="170" height="30" rx="5"></rect>
+        <text class="lbl sm" x="115" y="71" text-anchor="middle">某一层（权重 W）</text>
+        <line class="edge" x1="85" y1="82" x2="75" y2="110"></line>
+        <line class="edge" x1="145" y1="82" x2="160" y2="110"></line>
+        <rect class="node core" x="30" y="110" width="90" height="52" rx="6"></rect>
+        <text class="lbl sm" x="75" y="133" text-anchor="middle">GPU 0</text>
+        <text class="lbl sm" x="75" y="149" text-anchor="middle">W 左半</text>
+        <rect class="node core" x="125" y="110" width="90" height="52" rx="6"></rect>
+        <text class="lbl sm" x="170" y="133" text-anchor="middle">GPU 1</text>
+        <text class="lbl sm" x="170" y="149" text-anchor="middle">W 右半</text>
+        <line class="edge" x1="120" y1="136" x2="125" y2="136" marker-start="url(#arrow)" marker-end="url(#arrow)"></line>
+        <text class="lbl sm" x="20" y="182">每层算完都要 all-reduce 同步 → 层多、通信频繁</text>
+        <text class="lbl sm" x="20" y="197">适合「能塞进一张卡但想更快」</text>
+
+        <!-- ===== PP ===== -->
+        <text class="lbl" x="265" y="24" font-weight="bold" fill="#d33">PP 流水线并行</text>
+        <text class="lbl sm" x="265" y="40">不同层放在不同卡</text>
+        <rect class="node core" x="265" y="56" width="150" height="74" rx="6"></rect>
+        <text class="lbl sm" x="340" y="80" text-anchor="middle">GPU A</text>
+        <text class="lbl sm" x="340" y="97" text-anchor="middle">层 0-2（前半）</text>
+        <line class="edge" x1="340" y1="130" x2="340" y2="150"></line>
+        <line class="edge" x1="340" y1="150" x2="340" y2="168"></line>
+        <rect class="node core" x="265" y="168" width="150" height="74" rx="6"></rect>
+        <text class="lbl sm" x="340" y="192" text-anchor="middle">GPU B</text>
+        <text class="lbl sm" x="340" y="209" text-anchor="middle">层 3-5（后半）</text>
+        <text class="lbl sm" x="265" y="262">只在阶段之间传一次激活 → 通信少、延迟略高</text>
+
+        <!-- ===== DP ===== -->
+        <text class="lbl" x="500" y="24" font-weight="bold" fill="#165a7b">DP 数据并行</text>
+        <text class="lbl sm" x="500" y="40">每卡一份完整模型</text>
+        <line class="edge" x1="500" y1="70" x2="530" y2="92"></line>
+        <line class="edge" x1="508" y1="70" x2="540" y2="92"></line>
+        <rect class="node" x="535" y="92" width="92" height="58" rx="6"></rect>
+        <text class="lbl sm" x="581" y="125" text-anchor="middle">模型副本 0（全量）</text>
+        <rect class="node" x="645" y="92" width="92" height="58" rx="6"></rect>
+        <text class="lbl sm" x="691" y="125" text-anchor="middle">模型副本 1（全量）</text>
+        <text class="lbl sm" x="500" y="170">处理不同的请求，训练时互不同步</text>
+        <text class="lbl sm" x="500" y="185">推理里主要负责「扩容 / 分摊负载」</text>
+
+        <!-- ===== EP ===== -->
+        <text class="lbl" x="735" y="24" font-weight="bold" fill="#d33">EP 专家并行</text>
+        <text class="lbl sm" x="735" y="40">只切 MoE 的 expert 层</text>
+        <rect class="node acc" x="735" y="60" width="70" height="70" rx="6"></rect>
+        <text class="lbl sm" x="770" y="90" text-anchor="middle">Router</text>
+        <text class="lbl sm" x="770" y="106" text-anchor="middle">把 token</text>
+        <text class="lbl sm" x="770" y="120" text-anchor="middle">分给专家</text>
+        <line class="edge" x1="805" y1="85" x2="830" y2="85"></line>
+        <line class="edge" x1="805" y1="95" x2="830" y2="125"></line>
+        <line class="edge" x1="805" y1="115" x2="830" y2="165"></line>
+        <rect class="node core" x="830" y="62" width="70" height="46" rx="5"></rect>
+        <text class="lbl sm" x="865" y="85" text-anchor="middle">Expert 0</text>
+        <rect class="node core" x="830" y="116" width="70" height="46" rx="5"></rect>
+        <text class="lbl sm" x="865" y="139" text-anchor="middle">Expert 1</text>
+        <rect class="node core" x="830" y="170" width="70" height="46" rx="5"></rect>
+        <text class="lbl sm" x="865" y="193" text-anchor="middle">Expert 2</text>
+        <text class="lbl sm" x="735" y="236">MoE 的 FFN 层按 expert 切开，</text>
+        <text class="lbl sm" x="735" y="251">非常省：不增 KV、只搬激活</text>
+      </svg>
+      <div class="fig-cap">图 10.1：四种并行的直观区分。TP/PP 切模型，DP 复制模型，EP 只切 MoE 的 expert 层。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>Executor 层职责：把「意图」分发给 worker</h2>
+    <p>在 <code class="inline">vllm/v1/executor/abstract.py</code> 里，Executor 是抽象基类，注释写得很直白：<em>“An executor is responsible for executing the model on one device, or it can be a distributed executor that can execute the model on multiple devices.”</em> 它位于 <strong>EngineCore 的调度意图</strong> 和 <strong>每个 worker 进程</strong> 之间：引擎拿到调度输出后，把它交给 Executor，由 Executor 决定如何落到一个个 worker 上。</p>
+    <p>关键接口是 <code class="inline">collective_rpc(method, ...)</code>——「把同一个方法名广播给所有 worker 执行」，以及 <code class="inline">execute_model(scheduler_output)</code>。抽象基类还声明了两个类级标志位，用于描述实现的能力：</p>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">Executor</span>(ABC):
+    uses_ray: <span class="cl">bool</span> = <span class="kw">False</span>   <span class="cmt"># 是否用 Ray 来编排进程</span>
+    supports_pp: <span class="cl">bool</span> = <span class="kw">False</span>  <span class="cmt"># 是否支持流水线并行(PP)</span>
+    <span class="cmt"># 下面都是统一入口，交给 subclass 实现：</span>
+    ...</pre>
+    <p><code class="inline">get_class(vllm_config)</code> 根据 <code class="inline">parallel_config.distributed_executor_backend</code> 选出具体实现。vLLM 提供三种主流后端：</p>
+    <ul>
+      <li><strong>uni（UniProcExecutor）</strong>：<span class="mono">单进程</span>。worker 和一个 driver worker 跑在<strong>同一个进程</strong>里，没有任何跨进程调度。适用于单卡、不需要分布式的场景，最简单也最快。</li>
+      <li><strong>mp（MultiprocExecutor）</strong>：<span class="mono">多进程</span>。每个 worker 是 <code class="inline">context.Process(target=WorkerProc.worker_main, name=f"VllmWorker-{rank}")</code> 拉起的独立进程，进程间用<strong>共享内存消息队列 MessageQueue</strong> 通信。vLLM 默认的多卡后端，<strong>不依赖 Ray</strong>，只需标准库多进程，适合单机多卡。</li>
+      <li><strong>ray（RayDistributedExecutor / RayExecutorV2）</strong>：<span class="mono">Ray 编排</span>。每个 worker 是一个 Ray actor（<code class="inline">ray.remote(RayWorkerProc)</code>，远端对象），能跨节点、跨机调度，支持 PP 的编译 DAG。适合大规模、多机集群。注意 <code class="inline">RayExecutorV2</code> 继承自 <code class="inline">MultiprocExecutor</code>，复用了后者的基于消息队列（MQ）的控制平面，但 worker 进程由 Ray 管理、是 Ray actor 而非裸多进程。</li>
+    </ul>
+    <div class="annotation"><b>一句话：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把蓝图（并行配置）给它，它负责拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>用代码看：三种 Executor 的差异 & 并行配置</h2>
+    <p>先看后端是怎么被选出来的。下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
+    <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">elif</span> distributed_executor_backend == <span class="st">"ray"</span>:
+    executor_class = RayDistributedExecutor
+<span class="kw">elif</span> distributed_executor_backend == <span class="st">"mp"</span>:
+    executor_class = <span class="fn">MultiprocExecutor</span>
+<span class="kw">elif</span> distributed_executor_backend == <span class="st">"uni"</span>:
+    executor_class = <span class="fn">UniProcExecutor</span></pre>
+
+    <p>单进程的 <code class="inline">collective_rpc</code> 最朴素——根本没有网络，直接在同进程内调用 worker 方法：</p>
+    <div class="code-title">vllm/v1/executor/uniproc_executor.py — UniProcExecutor.collective_rpc（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># driver_worker 就在当前进程里，调用等同于直接执行</span>
+result = <span class="fn">run_method</span>(self.driver_worker, method, args, kwargs)
+<span class="kw">return</span> result <span class="kw">if</span> single_value <span class="kw">else</span> [result]</pre>
+
+    <p>而 Ray 版每个 worker 是一个远端 actor，于是 <code class="inline">collective_rpc</code> 变成「把方法序列化后 <code class="inline">.remote()</code> 发出去，再 <code class="inline">ray.get()</code> 收结果」：</p>
+    <div class="code-title">vllm/v1/executor/ray_executor.py — RayDistributedExecutor.collective_rpc（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>ray_worker_outputs = [
+    worker.<span class="fn">execute_method</span>.remote(sent_method, *args, **kwargs)
+    <span class="kw">for</span> worker <span class="kw">in</span> self.workers
+]
+<span class="kw">return</span> ray.<span class="fn">get</span>(ray_worker_outputs, timeout=timeout)</pre>
+
+    <p>并行规模最终由配置决定，而 worker 总数 <code class="inline">world_size</code> 是这样来的（vLLM 里它被定义为 TP×PP，CP/DP 再在此基础上扩展）：</p>
+    <div class="code-title">vllm/config/parallel.py — world_size（摘录，注释为官方）</div>
+    <pre class="code"><span class="lang-tag">python</span>world_size: <span class="cl">int</span> = <span class="cl">Field</span>(init=<span class="kw">False</span>)
+<span class="cmt">"""world_size is TPxPP, it affects the number of workers we create."""</span>
+
+<span class="kw">@property</span>
+<span class="kw">def</span> <span class="fn">world_size_across_dp</span>(self) <span class="kw">-&gt;</span> <span class="cl">int</span>:
+    <span class="cmt">"""Process world size across TP, PCP, PP, and DP."""</span>
+    <span class="kw">return</span> self.world_size * self.data_parallel_size</pre>
+    <div class="annotation"><b>逐行读：</b>vLLM 里 <code class="inline">world_size</code> 的本质是 <strong>TP × PP</strong>（决定 worker 数量）；<code class="inline">world_size_across_dp</code> 在它基础上再乘 <code class="inline">data_parallel_size</code>，把 DP 的复制份也算进来。注意官方 docstring 写的是“TPxPP”，但代码里实际计算是 <code class="inline">PP × TP × PCP</code>（<code class="inline">prefill_context_parallel_size</code>，默认 1，所以多数情况等价于 TP×PP）；DCP（decode context parallel）则复用 TP 的 rank 来切序列。另外 vLLM <strong>没有独立的 <code class="inline">expert_parallel_size</code> 字段</strong>——MoE 的 expert 切分直接复用 TP/DP 的世界大小（<code class="inline">enable_expert_parallel</code> 只是开关）。</div>
+
+    <p>多卡之间的「对话」最终落到设备通信。TP 组里每层都要做一次 all-reduce，走在 <code class="inline">GroupCoordinator</code> 上：</p>
+    <div class="code-title">vllm/distributed/parallel_state.py — GroupCoordinator.all_reduce（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">all_reduce</span>(self, input_: torch.Tensor) -&gt; torch.Tensor:
+    <span class="kw">if</span> self.world_size == <span class="nu">1</span>:        <span class="cmt"># 单卡直接跳过</span>
+        <span class="kw">return</span> input_
+    <span class="kw">if</span> self.use_custom_op_call:
+        <span class="kw">return</span> torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+    <span class="kw">else</span>:
+        <span class="kw">return</span> self._all_reduce_out_place(input_)  <span class="cmt"># 最终调 device_communicator</span></pre>
+    <p>底层设备通信在 <code class="inline">vllm/distributed/device_communicators/</code> 里（如 <code class="inline">pynccl.py</code> 的 <code class="inline">PyNcclCommunicator</code>、<code class="inline">custom_all_reduce.py</code>）。而各个并行组的句柄由 <code class="inline">parallel_state</code> 提供，例如 <code class="inline">get_tp_group()</code>、<code class="inline">get_pp_group()</code>、<code class="inline">get_dp_group()</code>、<code class="inline">get_ep_group()</code>、<code class="inline">get_pcp_group()</code>、<code class="inline">get_world_group()</code>。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>通信的成本：TP 与 PP 的取舍</h2>
+    <p>分布式的悖论在于：<strong>切开的多卡必须互相说话</strong>，而跨卡通信（甚至跨机走网卡）比显存内带宽慢得多。两种主要切法通信模式截然不同：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 190" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="22" font-weight="bold" fill="#165a7b">TP：每层都要通信（all-reduce）</text>
+        <rect class="node" x="20" y="34" width="60" height="24" rx="4"></rect><text class="lbl sm" x="50" y="49" text-anchor="middle">层1</text>
+        <rect class="node" x="20" y="66" width="60" height="24" rx="4"></rect><text class="lbl sm" x="50" y="81" text-anchor="middle">层2</text>
+        <rect class="node" x="20" y="98" width="60" height="24" rx="4"></rect><text class="lbl sm" x="50" y="113" text-anchor="middle">层3</text>
+        <rect class="node" x="20" y="130" width="60" height="24" rx="4" fill="#fff3f3"></rect><text class="lbl sm" x="50" y="145" text-anchor="middle">…</text>
+        <line class="edge core" x1="80" y1="46" x2="210" y2="46"></line>
+        <line class="edge core" x1="80" y1="78" x2="210" y2="78"></line>
+        <line class="edge core" x1="80" y1="110" x2="210" y2="110"></line>
+        <line class="edge" x1="80" y1="142" x2="210" y2="142"></line>
+        <text class="lbl sm" x="145" y="176" text-anchor="middle">每层都 all-reduce → 通信量 ∝ 层数 × 张量大小</text>
+
+        <text class="lbl" x="480" y="22" font-weight="bold" fill="#165a7b">PP：只在阶段间传一次激活</text>
+        <rect class="node core" x="480" y="50" width="120" height="54" rx="6"></rect>
+        <text class="lbl sm" x="540" y="80" text-anchor="middle">Stage 0（层 0-3）</text>
+        <line class="edge" x1="600" y1="77" x2="660" y2="77"></line>
+        <rect class="node core" x="660" y="50" width="120" height="54" rx="6"></rect>
+        <text class="lbl sm" x="720" y="80" text-anchor="middle">Stage 1（层 4-7）</text>
+        <line class="edge" x1="780" y1="77" x2="840" y2="77"></line>
+        <rect class="node acc" x="840" y="50" width="60" height="54" rx="6"></rect>
+        <text class="lbl sm" x="870" y="80" text-anchor="middle">出口</text>
+        <text class="lbl sm" x="540" y="150" text-anchor="middle">几十层里只传 1~2 次激活 → 通信量小</text>
+        <text class="lbl sm" x="540" y="168" text-anchor="middle">但阶段间串行，延迟略高、显存不均衡</text>
+      </svg>
+      <div class="fig-cap">图 10.4：TP 通信频繁但单次小、卡间算力均衡；PP 通信少但引入串行 bubble。</div>
+    </div>
+    <ul>
+      <li><strong>TP（张量并行）</strong>：通信发生在<strong>每一层</strong>。同一层切开后，前向和后向都要 all-reduce / all-gather，通信量大致正比于 <code class="inline">层数 × 张量大小</code>。带宽要求高（最好在同一节点、走 NVLink），但每张卡算的工作量均衡。适用：单卡放得下、只想更快。</li>
+      <li><strong>PP（流水线并行）</strong>：通信只发生在<strong>流水线阶段之间</strong>——上游把整段激活传给下游。几十上百层只传一两次，通信少、对带宽不敏感（可跨机）。代价是 phase 串行会引入「流水线气泡」（bubble），且不同阶段间显存占用不均衡。</li>
+      <li><strong>小结取舍</strong>：能塞进一张卡 → 优先 TP；模型大到必须分阶段（且带宽紧张/跨机）→ 才上 PP。这也是 vLLM 默认优先用 TP、把 PP 留给超大模型的原因。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>并行</th><th>切的对象</th><th>通信</th><th>什么时候用</th></tr>
+      <tr><td>TP</td><td>同一层权重</td><td>每层 all-reduce（多）</td><td>单卡放得下、想更快，带宽好</td></tr>
+      <tr><td>PP</td><td>不同层分段</td><td>阶段间传激活（少）</td><td>模型大到必须分段、可跨机</td></tr>
+      <tr><td>DP</td><td>复制完整模型</td><td>训练时同步梯度</td><td>推理=人多力量大，扩容负载</td></tr>
+      <tr><td>EP</td><td>MoE 的 expert 层</td><td>token 路由 + all-to-all</td><td>超大 MoE，最省显存</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      先跑通<strong>单卡</strong>（等价 vLLM 的 <code class="inline">UniProcExecutor</code>），把正确性搞对。等需要更大模型时，再上 <strong>TP</strong>——它最容易且通信模型清晰，是「单卡放不下」时的第一选择；PP/DP 是更晚的优化，别一开始就为多机并行分心。纪律是：<strong>正确性优先，并行度后置</strong>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="09-serving-entry.html">← 上一步：服务入口</a>
+    <a href="11-build-own-engine.html">下一步：自制引擎 →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 10 分布式 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

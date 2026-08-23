@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · 编码 Agent（组装成产品）— Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 编码 Agent</div>
+    <h1>编码 Agent：把前面所有碎片拼成一个「能跑的产品」</h1>
+    <div class="subtitle">前面十章分别讲了循环、会话、上下文、压缩、harness、工具、AI 层。这一页回答最后一个组装问题：<strong>所有这些碎片是怎么被 <code class="inline">@earendil-works/pi-coding-agent</code> 拼成一个真正可运行、可交互、可持续的 Agent 产品的</strong>——从 <code class="inline">createAgentSession</code> 这条「一调就成」的工厂，到 TUI / 打印 / RPC 三种运行形态。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">产品视角</span>
+    <span class="ep-quote">「改 harness，不改你的工作流。Pi 不是封箱产品。」</span>
+    要一条命令、一个工具、一个供应商、一个工作流或 UI 微调？<strong>直接让 Pi 自己造</strong>——它会即时改写自己，<code class="inline">/reload</code> 后继续。Pi 自带强力默认却<strong>跳过</strong>子 Agent、计划模式这类「功能」，转而把它们拆成原语：扩展（拿工具/命令/快捷键/事件/TUI）、技能（按需载入）、提示模板、主题，<span class="ep-arrow">→</span> 还能打包成 Pi 包经 npm 或 git 分享。本章看这层「可改的外壳」在源码里怎么被装配出来。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>一调就成的工厂：createAgentSession</h2>
+    <p>生产侧的心脏是 <code class="inline">packages/coding-agent/src/core/sdk.ts</code> 的 <code class="inline">createAgentSession()</code>。它是所有碎片的「总装配线」，短短几十行里完成了：模型运行时初始化 → 会话发现 → 模型恢复 → 载体选择 → 工具装配。先看它的文档签名：</p>
+    <div class="code-title">sdk.ts · CreateAgentSessionOptions（节选）</div>
+    <pre class="code"><code><span class="kw">export interface</span> CreateAgentSessionOptions {
+  cwd?: <span class="kw">string</span>;        <span class="cmt">// 工作目录（项目级发现的基准）</span>
+  agentDir?: <span class="kw">string</span>;    <span class="cmt">// 全局配置目录，默认 ~/.pi/agent</span>
+  modelRuntime?: ModelRuntime; <span class="cmt">// 模型/鉴权运行时（可注入）</span>
+  model?: Model&lt;<span class="kw">any</span>&gt;;       <span class="cmt">// 显式指定模型</span>
+  thinkingLevel?: ThinkingLevel; <span class="cmt">// 思考级别，按模型能力钳制</span>
+  scopedModels?: ...;          <span class="cmt">// Ctrl+P 可循环的模型列表</span>
+}</code></pre>
+    <p>模型是「显式给，还是自动找」？Pi 做了一套清晰的三级回退。看真实的装配逻辑：</p>
+    <div class="code-title">sdk.ts · 模型的三级回退</div>
+    <pre class="code"><code><span class="cmt">// 1. 调用者显式给了 → 就用它</span>
+<span class="kw">let</span> model = options.model;
+
+<span class="cmt">// 2. 有既有会话数据 → 尝试从会话里恢复上次用的模型</span>
+<span class="kw">if</span> (!model &amp;&amp; hasExistingSession &amp;&amp; existingSession.model) {
+  <span class="kw">const</span> restoredModel = modelRuntime.<span class="fn">getModel</span>(existingSession.model.provider, existingSession.model.modelId);
+  <span class="kw">if</span> (restoredModel &amp;&amp; modelRuntime.<span class="fn">hasConfiguredAuth</span>(restoredModel.provider)) {
+    model = restoredModel;
+  }
+  <span class="kw">if</span> (!model) {
+    modelFallbackMessage = <span class="st">`Could not restore model ${provider}/${modelId}`</span>;
+  }
+}
+
+<span class="cmt">// 3. 都没有 → 用 findInitialModel（settings 默认值 → 供应商默认）</span>
+<span class="kw">if</span> (!model) {
+  <span class="kw">const</span> result = <span class="fn">findInitialModel</span>(...);
+  model = result.model;
+  <span class="kw">if</span> (!model) modelFallbackMessage = formatNoModelsAvailableMessage();
+}
+
+<span class="cmt">// 4. 思考级别按模型能力钳制（别让不支持的模型背不动）</span>
+thinkingLevel = <span class="fn">clampThinkingLevel</span>(model, thinkingLevel) <span class="kw">as</span> ThinkingLevel;</code></pre>
+    <div class="callout">
+      <strong>「会话即状态」的再一次体现：</strong>模型选择不是每次从零猜，而是<strong>优先记住上次用的</strong>。恢复失败（比如换了供应商、key 没了）则给出 <code class="inline">modelFallbackMessage</code> 提示，再优雅降级到默认。这把「连续性」和「可诊断性」同时给了用户——你不会不明不白地换个模型，也不会被卡死。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>模型运行时：鉴权与服务注入</h2>
+    <p>装配线下一个关键件是 <code class="inline">ModelRuntime</code>。它持有一份「配置目录位置的鉴权存储」（<code class="inline">auth.json</code>）和模型目录（<code class="inline">models.json</code>）：</p>
+    <div class="code-title">sdk.ts · ModelRuntime 初始化</div>
+    <pre class="code"><code><span class="kw">const</span> modelsPath = options.agentDir ? <span class="fn">join</span>(agentDir, <span class="st">"models.json"</span>) : <span class="kw">undefined</span>;
+<span class="kw">const</span> modelRuntime = options.modelRuntime ?? <span class="kw">await</span> <span class="fn">ModelRuntime</span>.<span class="fn">create</span>({
+  authPath,        <span class="cmt">// ~/.pi/agent/auth.json —— 各家 key / token</span>
+  modelsPath,      <span class="cmt">// ~/.pi/agent/models.json —— 可用模型清单</span>
+});</code></pre>
+    <p>ModelRuntime 回答三个运行态问题：</p>
+    <ul>
+      <li><strong>这个供应商配过 key 吗</strong>：<code class="inline">hasConfiguredAuth(provider)</code>——第 8、10 章里 <code class="inline">prompt()</code> 跑前都靠它拦一次。</li>
+      <li><strong>这个 key 还有效吗</strong>：<code class="inline">checkAuth(provider)</code> 去验证，OAuth 与普通 key 走不同分支。</li>
+      <li><strong>这个模型的协议/鉴权怎么搭</strong>：把认证信息装进每次请求的 headers。它封装了「怎么安全地带着你的凭据去和厂商说话」。</li>
+    </ul>
+    <p>注意注入式设计——调用方可传自定义 <code class="inline">modelRuntime</code>，默认是 <code class="inline">ModelRuntime.create</code>。这让测试与自定义厂商集成可以不碰主装配线。</p>
+    <div class="callout">
+      <strong>可注入 = 可测、可换：</strong>医疗诊断的模型、私有部署的网关、临时 mock——都能通过传入自己的 ModelRuntime 接入，而 <code class="inline">createAgentSession</code> 一行不改。这是「依赖注入」在组装层的直接收益。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>工具装配：按运行形态差异化</h2>
+    <p>工具不是全都一股脑塞给 Agent。前面第 9 章的分类法在这里落地——装配时决定「这次会话能动手到什么程度」。sdk 构造 AgentSession 时传入工具集：</p>
+    <div class="code-title">tools/index.ts · 三套工具集</div>
+    <pre class="code"><code><span class="cmt">// 只读形态（如预览/审查）：read · grep · find · ls</span>
+createReadOnlyTools(cwd, options)
+<span class="cmt">// 编码形态（默认）：read · bash · edit · write</span>
+createCodingTools(cwd, options)
+<span class="cmt">// 全量：七件全给</span>
+createAllToolDefinitions(cwd, options)</code></pre>
+    <p>还有更细的工具「开关」：<code class="inline">noTools</code>（默认抑制模式）——可选「<code class="inline">"all"</code>：一开始完全不给工具」或「<code class="inline">"builtin"</code>：禁用内置只读/编码工具但保留扩展工具」。这把「工作区安全」从全局配置下放到了会话级策略。</p>
+    <p>工具还经过了 <code class="inline">withFileMutationQueue</code> 这类包装——把对文件的写操作（edit/write）排进一个跨工具队列，避免并发写冲突（第 9 章提过的文件变更队列）。这属于「工具层的协作约束」：多个工具共享同一份工作区时，写操作必须串行化。</p>
+    <div class="callout">
+      <strong>工具是「能力边界」，不是「功能清单」：</strong>Pi 把「给哪些工具、抑制哪些工具」当作会话装配时的一次性决策，而不是运行中到处临时开关。这让权限边界在启动时即确定，行为更可预测，也更安全。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>运行形态：同一个核心，三种外壳</h2>
+    <p>装配好的 <code class="inline">AgentSession</code>（含 SessionManager、工具、模型）是「无头」的——它不发声音、不画界面。真正呈现给用户的是几种「外壳」，都在 <code class="inline">packages/coding-agent/src/modes/</code> 与 <code class="inline">client|server</code> 里：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t11 d11">
+        <title id="t11">同一核心，多种外壳</title>
+        <desc id="d11">core 与 interactive / print / rpc 外壳</desc>
+        <defs>
+          <marker id="arrow11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="330" y="30" width="240" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="450" y="55" font-size="14" fill="#0f7d7a" text-anchor="middle">agent-session (core)</text>
+        <text class="lbl" x="450" y="78" font-size="12" fill="#1f2937" text-anchor="middle">无头运行时：事件总线</text>
+        <text class="lbl" x="450" y="95" font-size="11" fill="#556674" text-anchor="middle">queue_update / agent_settled…</text>
+
+        <rect class="node" x="60" y="175" width="220" height="80" rx="10" fill="#f0faf7" stroke="#0f7d7a"/>
+        <text class="lbl" x="170" y="200" font-size="13" fill="#1f2937" text-anchor="middle">interactive（TUI）</text>
+        <text class="lbl" x="170" y="220" font-size="11" fill="#556674" text-anchor="middle">实时渲染 · 中断 · 分叉</text>
+
+        <rect class="node" x="330" y="175" width="220" height="80" rx="10" fill="#f0faf7" stroke="#0f7d7a"/>
+        <text class="lbl" x="440" y="200" font-size="13" fill="#1f2937" text-anchor="middle">print-mode</text>
+        <text class="lbl" x="440" y="220" font-size="11" fill="#556674" text-anchor="middle">流式打印 · <span>&lt;/dev/null</span> 脚本</text>
+
+        <rect class="node" x="600" y="175" width="220" height="80" rx="10" fill="#f0faf7" stroke="#0f7d7a"/>
+        <text class="lbl" x="710" y="200" font-size="13" fill="#1f2937" text-anchor="middle">rpc / json-event / server</text>
+        <text class="lbl" x="710" y="220" font-size="11" fill="#556674" text-anchor="middle">给外部工具/客户端接入</text>
+
+        <!-- 核心向三种外壳分发：共用一段竖线到 y=150，再分别水平+下垂到各外壳顶部 -->
+        <path d="M450 120 v30" fill="none" stroke="#0f7d7a" stroke-width="2"/>
+        <path d="M450 150 H170 V175" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow11)"/>
+        <path d="M450 150 V175" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow11)"/>
+        <path d="M450 150 H710 V175" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow11)"/>
+      </svg>
+    </div>
+    <p>三种外壳都只订阅 AgentSession 抛出的<strong>事件流</strong>，并调用它的方法（<code class="inline">prompt / steer / followUp / fork / abort</code>）：</p>
+    <ul>
+      <li><strong>interactive（TUI）</strong>：最丰富的形态。渲染思考/工具/消息流，支持 Ctrl+P 循环模型、Esc 打断（steer）、分叉（fork）。它把第 8 章的队列、第 9 章的流式更新事件全部变成可见交互。</li>
+      <li><strong>print-mode</strong>：无交互，流式把输出打到 stdout。<code class="inline">echo prompt | pi --print</code> 这类脚本化用法，或在 CI 里跑 Agent。</li>
+      <li><strong>rpc / json-event / server</strong>：把 Agent 暴露成可编程接口（结构化事件协议），外部工具/编辑器/客户端通过它接入——这是「Agent 即服务」的形态。</li>
+    </ul>
+    <div class="callout">
+      <strong>架构红利：</strong>因为核心是「无头 + 事件总线 + 方法」，外壳可以随便换而核心一行不改。这就是分层带来的最终回报——第 3 章的循环、第 5 章的上下文、第 8 章的生产 harness，被 <code class="inline">createAgentSession</code> 拼成可复用的内核，再被三种外壳包装成三种产品。你的 Runtime 若也这样切「内核/外壳」，就能同时服务 CLI、服务端、IDE 插件。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>产品外壳的演进：几个值得注意的交互特性</h2>
+    <p>三种外壳里，interactive（TUI）迭代最快，因为它离用户最近。这里挑几个最近加入的特性——它们都不改内核契约，而是<strong>在 AgentSession 的事件流上做更聪明的呈现与会话级策略</strong>，正好说明「外壳如何在不碰内核的前提下长能力」。</p>
+    <ul>
+      <li><strong><code class="inline">/thinking</code> 命令</strong>：slash 命令表里新增 <code class="inline">{ name: "thinking", argumentHint: "&lt;level&gt;" }</code>，让用户直接切思考级别（档位 <code class="inline">off/minimal/low/medium/high/xhigh/max</code>，即 <code class="inline">THINKING_LEVEL_OPTIONS</code>）。它最终调用第 8 章的 <code class="inline">setThinkingLevel()</code>。</li>
+      <li><strong>模型 / 思考级别改默认「会话级」</strong>：切模型或调思考级别时，<code class="inline">setModel</code> / <code class="inline">setThinkingLevel</code> 现在带一个 <code class="inline">{ persist?: boolean }</code> 选项。默认 <strong>只写进当前会话的 transcript</strong>、不动全局默认；只有显式持久化（如 <kbd>Ctrl+S</kbd>）才写回 <code class="inline">settings</code>。这把「我这次想用别的模型」与「以后都用这个模型」分开了——临时实验不再污染全局配置。</li>
+      <li><strong>压缩用量提示（compaction cost）</strong>：压缩和分支摘要会消耗 token，TUI 现在把这条用量从 transcript 里抽出来，渲染成 <code class="inline">compaction_cost</code> 提示行，让用户看见「这次压缩花了多少」。这是第 6 章那条「压缩有 usage」在交互层上的可见化。</li>
+      <li><strong>会话共享改走 Radius</strong>：<code class="inline">/share</code> 不再只靠 gist，而是优先通过 Radius provider 上传成 artifact、拿回 <code class="inline">canonical_url</code>。未登录 Radius 时退回 gist。共享链路与鉴权也收敛进 AI 层的 provider 体系，而不是另起一套。</li>
+    </ul>
+    <div class="callout">
+      <strong>共同模式：</strong>这几项都遵循「<strong>内核不动，外壳做策略</strong>」——<code class="inline">/thinking</code> 只是 <code class="inline">setThinkingLevel</code> 的入口；会话级持久化靠 <code class="inline">persist</code> 选项分流；压缩提示复用 transcript 里已有的 <code class="inline">usage</code>；共享复用 Radius provider。这正是分层架构的红利：产品迭代可以很快，因为不必每次都下沉到内核。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.6</span>把「生产 Agent」拆给你看</h2>
+    <p>这一章其实是「第 1 章架构图的完成态」。用一个倒序清单收尾——从产品到地基，你能在源码里逐层找到你已学过的每一个概念：</p>
+    <table class="tbl">
+      <thead><tr><th>层次</th><th>你在哪见过</th><th>在本章/源码的位置</th></tr></thead>
+      <tbody>
+        <tr><td>产品外壳</td><td>—</td><td><code class="inline">modes/interactive</code> · <code class="inline">print-mode.ts`</code> · <code class="inline">server</code></td></tr>
+        <tr><td>生产 harness</td><td>第 8 章</td><td><code class="inline">core/agent-session.ts` · `agent-session-runtime.ts</code></td></tr>
+        <tr><td>工具</td><td>第 9 章</td><td><code class="inline">core/tools/*` · `tools/index.ts</code></td></tr>
+        <tr><td>AI 层</td><td>第 10 章</td><td><code class="inline">core/model-runtime.ts` · pi-ai</code></td></tr>
+        <tr><td>会话存储</td><td>第 4 章</td><td><code class="inline">core/session-manager.ts</code></td></tr>
+        <tr><td>会话上下文/压缩</td><td>第 5、6 章</td><td><code class="inline">core/session-manager.ts` · `core/compaction</code></td></tr>
+        <tr><td>基础循环</td><td>第 3 章</td><td><code class="inline">@agent 的 runAgentLoop` · `Agent</code></td></tr>
+        <tr><td>消息类型</td><td>第 2 章</td><td><code class="inline">@agent 的 types.ts</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>发现没有？</strong>你在第 1 章看到的「分层」，在本章的 <code class="inline">createAgentSession</code> 里被<strong>一条装配线</strong>串了起来。理解 Pi 的全部 = 理解这条装配线每一层「为什么」存在。下一章，我们把整条线翻译成「你自己造一个 Runtime」的施工图。
+    </div>
+    <div class="arrow-nav">
+      <a class="prev" href="10-ai-layer.html">← 上一章 · AI 层</a>
+      <a class="next" href="12-build-own-runtime.html">下一章 · 自制 Runtime →</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 会话与存储模型 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 会话与存储模型</div>
+    <h1>会话与存储模型：一颗 append-only 的会话树</h1>
+    <div class="subtitle">Pi 的 Session 不是简单的「消息数组」，而是一片由 <code class="inline">Lane / Entry / Record / Fact</code> 构成的、可分叉、可恢复的树。下面展开这套模型的词汇表与不可变追加的纪律，是第 5～7 章的基石。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">产品视角</span>
+    <span class="ep-quote">「树形结构、可分享的会话历史。」</span>
+    会话被存成<strong>树</strong>而非线性数组：用 <code class="inline">/tree</code> 跳回任意历史节点继续，所有分支住在<strong>同一个文件</strong>里；按消息类型过滤、给条目打书签；<span class="ep-arrow">→</span> <code class="inline">/export</code> 导出 HTML，<code class="inline">/share</code> 上传 GitHub gist 拿可渲染的分享链接。本章就是这套「树」在源码里的实现。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>为什么不是「一个数组」</h2>
+    <p>普通 Agent 用一个 <code class="inline">AgentMessage[]</code> 当历史。Pi 把它升级成一片<strong>追加式（append-only）有向树</strong>，原因是它要满足三个硬需求：</p>
+    <ul>
+      <li><strong>分叉（fork）与多分支</strong>：一次「转向」（navigation）可能开出新分支，旧分支仍完整保留。</li>
+      <li><strong>崩溃恢复</strong>：每一步都落盘，进程死了能从最后一条 <code class="inline">Record</code> 精确恢复。</li>
+      <li><strong>元数据与消息解耦</strong>：模型换了、思考级别改了、操作开始了——这些不是「消息」，但要可查询、可审计。</li>
+    </ul>
+    <p>所以它把「会话里发生的一切」分成两个名字空间：<strong>Entries（可进 LLM 的内容）</strong>与 <strong>Records（不可进 LLM 的运行簿记）</strong>，外加<strong>Lanes（车道指针）</strong>与<strong>Facts（全局事实）</strong>。</p>
+  </section>
+
+  <style>
+    /* —— 会话树生长沙盘（前缀 sd-，复用全局 CSS 变量）—— */
+    .sd-demo .sd-intro{font-size:14.5px;color:var(--fg-muted);margin:6px 0 4px}
+    .sd-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:14px 0 10px}
+    .sd-btn{font-family:var(--font-sans);font-size:13.5px;font-weight:600;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);cursor:pointer;transition:transform .1s,box-shadow .1s,border-color .1s}
+    .sd-btn:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(16,34,51,.10)}
+    .sd-btn:active{transform:translateY(0)}
+    .sd-b-msg{border-color:var(--brand-2);color:var(--brand)}
+    .sd-b-rec{border-color:var(--brand-3);color:var(--brand-3)}
+    .sd-b-mdl{border-color:var(--accent);color:var(--accent)}
+    .sd-b-move{background:linear-gradient(135deg,#f3faf9,#eef4fb);border-color:var(--brand-2)}
+    .sd-b-fork{background:linear-gradient(135deg,#fdf4e3,#fbf3e0);border-color:var(--accent);color:var(--accent)}
+    .sd-b-rst{color:var(--fg-muted)}
+    .sd-sep{width:1px;height:24px;background:var(--border);margin:0 4px}
+    .sd-select{font-family:var(--font-mono);font-size:12.5px;padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);max-width:210px}
+    .sd-status{font-size:14px;background:#f0f4f9;border-left:3px solid var(--brand-2);padding:10px 14px;border-radius:0 8px 8px 0;margin:10px 0;min-height:24px;transition:background .5s}
+    .sd-status.sd-flash{background:#e2f2ec}
+    .sd-status b{color:var(--brand)}
+    .sd-status .sd-err{color:#c0392b}
+    .sd-stage{display:grid;grid-template-columns:1fr 280px;gap:16px;margin-top:6px}
+    .sd-tree-wrap{background:#fbfdfe;border:1px solid var(--border);border-radius:10px;padding:8px;overflow-x:auto;min-height:340px}
+    .sd-tree-wrap svg{display:block;min-width:560px}
+    .sd-log-wrap{background:#0d1a24;border:1px solid var(--code-border);border-radius:10px;padding:0;overflow:hidden;display:flex;flex-direction:column;min-height:340px}
+    .sd-log-head{color:var(--code-comment);font-family:var(--font-mono);font-size:11.5px;padding:8px 12px;border-bottom:1px solid var(--code-border);letter-spacing:.4px;flex:0 0 auto}
+    .sd-log{list-style:none;margin:0;padding:4px 0;overflow-y:auto;max-height:300px;font-family:var(--font-mono);font-size:11.5px}
+    .sd-log li{padding:3px 12px;color:var(--code-fg);display:flex;gap:8px;align-items:baseline;animation:sd-slide .3s ease}
+    @keyframes sd-slide{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:translateX(0)}}
+    .sd-log .sd-lseq{color:var(--code-num);flex:0 0 26px;text-align:right}
+    .sd-log .sd-lk{flex:0 0 52px;font-weight:700}
+    .sd-log .k-entry{color:#86e0a3}
+    .sd-log .k-record{color:#7cc4ff}
+    .sd-log .k-lane{color:#f59e0b}
+    .sd-log .k-fact{color:#ffbb7a}
+    .sd-log .sd-ld{color:var(--code-comment)}
+    .sd-log li.sd-active{background:rgba(124,196,255,.12)}
+    /* 树节点 */
+    .sd-rect{stroke-width:1.6;rx:7;ry:7;transition:fill .25s}
+    .sd-rect.msg{fill:#eaf6f4;stroke:var(--brand-2)}
+    .sd-rect.mdl{fill:#fdf2e3;stroke:var(--accent)}
+    .sd-rect.leaf{stroke-width:3;stroke:var(--brand)}
+    .sd-rect.sel{stroke:#d33;stroke-width:3}
+    .sd-rect.rec{fill:#dbe9f7;stroke:var(--brand-3)}
+    .sd-rect.new{animation:sd-pop .45s ease}
+    @keyframes sd-pop{0%{opacity:0;transform:scale(.4)}60%{opacity:1;transform:scale(1.12)}100%{transform:scale(1)}}
+    .sd-rect{transform-box:fill-box;transform-origin:center}
+    .sd-tx{font-family:var(--font-mono);font-size:10.5px;fill:var(--fg);pointer-events:none}
+    .sd-tx.id{fill:var(--fg-muted);font-size:9.5px}
+    .sd-edge{stroke:var(--fg-muted);stroke-width:1.6;fill:none}
+    .sd-edge.fork{stroke:var(--accent);stroke-dasharray:4 3}
+    .sd-lptr{stroke:var(--brand);stroke-width:2.2;fill:none;marker-end:url(#sd-arr)}
+    .sd-lptr.hidden{display:none}
+    .sd-rail{fill:none;stroke:var(--brand-3);stroke-width:1.2;stroke-dasharray:3 4;opacity:.5}
+    .sd-cap{font-family:var(--font-sans);font-size:11px;fill:var(--fg-muted)}
+    .sd-empty{font-family:var(--font-sans);font-size:13px;fill:var(--fg-muted)}
+    @media (max-width:720px){.sd-stage{grid-template-columns:1fr}}
+  </style>
+
+  <section class="block sd-demo">
+    <h2><span class="num">4.1b</span>交互沙盘：让会话树长起来</h2>
+    <p class="sd-intro">下面是一颗<strong>真实的最小 Session</strong>（复刻了 <code class="inline">state.ts</code> 的 seq / lane / parentId / log / walkToRoot / fork 语义）。按钮触发的每一步都是真实的 mutation——<strong>追加消息</strong>让节点挂在 <code class="inline">main</code> 车道的叶子上、<strong>追加 record</strong>只进簿记轨道不进树、<strong>回溯</strong>把叶子指针拨回历史节点（再追加即长出新分支）、<strong>fork</strong>复制一条路径长出第二棵树且 seq 从 1 重排。右侧 <code class="inline">LogItem[]</code> 是四种 kind 混排的同一本账本。</p>
+
+    <div class="sd-controls">
+      <button class="sd-btn sd-b-msg" id="sd-msg">＋ 追加 message</button>
+      <button class="sd-btn sd-b-rec" id="sd-rec">＋ 追加 record</button>
+      <button class="sd-btn sd-b-mdl" id="sd-mdl">＋ 切换模型</button>
+      <span class="sd-sep"></span>
+      <select class="sd-select" id="sd-target"><option value="">— 选回溯目标 —</option></select>
+      <button class="sd-btn sd-b-move" id="sd-move">↩ moveLane 回溯</button>
+      <button class="sd-btn sd-b-fork" id="sd-fork">⎇ fork(branch)</button>
+      <span class="sd-sep"></span>
+      <button class="sd-btn sd-b-rst" id="sd-rst">重置</button>
+    </div>
+    <div class="sd-status" id="sd-status">空会话。点「＋ 追加 message」开始。</div>
+
+    <div class="sd-stage">
+      <div class="sd-tree-wrap">
+        <svg id="sd-tree" viewBox="0 0 640 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="sdt sdd">
+          <title id="sdt">会话树生长沙盘</title>
+          <desc id="sdd">可交互的 append-only 会话树</desc>
+          <defs>
+            <marker id="sd-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--brand)"></path></marker>
+          </defs>
+          <g id="sd-canvas"></g>
+        </svg>
+      </div>
+      <div class="sd-log-wrap">
+        <div class="sd-log-head">this.log&nbsp;·&nbsp;LogItem[]&nbsp;（seq↑）</div>
+        <ol class="sd-log" id="sd-log"></ol>
+      </div>
+    </div>
+    <div class="fig-cap" style="margin-top:8px">绿框=message、橙框=model_change、蓝框=record（簿记轨道，无 parentId）、粗框=当前 main 叶子。fork 出的新树序号从 1 重排、不带 record。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>四个词汇 + 一条纪律</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t4 d4">
+        <title id="t4">Session 四类对象</title>
+        <desc id="d4">Entry / Record / Lane / Fact</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="30" width="400" height="170" rx="10"></rect>
+        <text class="lbl" x="45" y="58" font-weight="bold" fill="#0f7d7a">Entries（内容，进得了 LLM）</text>
+        <text class="lbl sm" x="45" y="80">type: message / compaction / branch_summary</text>
+        <text class="lbl sm" x="45" y="98">      / model_change / thinking_level_change</text>
+        <text class="lbl sm" x="45" y="116">      / active_tools_change / custom</text>
+        <text class="lbl sm" x="45" y="140">共同字段：id · seq · parentId · timestamp</text>
+        <text class="lbl sm" x="45" y="162">parentId 串成树；seq 全局单调</text>
+        <text class="lbl sm" x="45" y="184">（压缩/分支摘要见第 6 章）</text>
+
+        <rect class="node core" x="480" y="30" width="400" height="170" rx="10"></rect>
+        <text class="lbl" x="505" y="58" font-weight="bold" fill="#2563eb">Records（簿记，不进 LLM）</text>
+        <text class="lbl sm" x="505" y="80">operation_started / operation_finished</text>
+        <text class="lbl sm" x="505" y="98">step_attempt / tool_started / usage</text>
+        <text class="lbl sm" x="505" y="116">queue_enqueued / abort_requested / ...</text>
+        <text class="lbl sm" x="505" y="140">共同字段：lane · seq · timestamp</text>
+        <text class="lbl sm" x="505" y="162">同样 append-only，供恢复与审计</text>
+        <text class="lbl sm" x="505" y="184">（详见第 7 章 harness）</text>
+
+        <rect class="node acc" x="20" y="215" width="190" height="40" rx="8"></rect>
+        <text class="lbl" x="115" y="238" text-anchor="middle">Lane：命名的分支指针</text>
+        <rect class="node acc" x="230" y="215" width="190" height="40" rx="8"></rect>
+        <text class="lbl" x="325" y="238" text-anchor="middle">Fact：name / label 全局事实</text>
+      </svg>
+      <div class="fig-cap">图 4.2：Session 的四类对象。核心纪律——一切都是追加写入，靠 <code class="inline">seq</code> 严格递增保证顺序与可恢复性。</div>
+    </div>
+    <div class="code-title">packages/agent/src/harness/session/types.ts — Entry 的基类与种类</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">EntryBase</span> {
+  type: <span class="cl">string</span>;
+  id: <span class="cl">string</span>;
+  seq: <span class="cl">number</span>;        <span class="cmt">// 共享单调递增序号（由存储分配）</span>
+  parentId: <span class="cl">string</span> | <span class="kw">null</span>; <span class="cmt">// 追加那条 lane 的叶子 id（存储分配）</span>
+  timestamp: <span class="cl">number</span>;  <span class="cmt">// Unix 毫秒（存储分配）</span>
+}
+<span class="kw">export type</span> <span class="cl">Entry</span> =
+  | <span class="cl">MessageEntry</span>        <span class="cmt">// type: "message"   —— 真正的对话消息</span>
+  | <span class="cl">ModelChangeEntry</span>   <span class="cmt">// type: "model_change"</span>
+  | <span class="cl">ThinkingLevelEntry</span> <span class="cmt">// type: "thinking_level_change"</span>
+  | <span class="cl">ActiveToolsEntry</span>   <span class="cmt">// type: "active_tools_change"</span>
+  | <span class="cl">CompactionEntry</span>    <span class="cmt">// type: "compaction"</span>
+  | <span class="cl">BranchSummaryEntry</span> <span class="cmt">// type: "branch_summary"</span>
+  | <span class="cl">CustomEntry</span>;        <span class="cmt">// type: "custom" + customType</span></pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">seq</code> 是全局共享的（不是 per-type），由存储分配，保证「事件的先后」唯一可判定。<code class="inline">parentId</code> 指向「追加那条 lane 当时的叶子」，从而把一个个 entry 串成树的分支。模型切换、思考级别切换都被记成 <code class="inline">Entry</code>——这样第 5 章的上下文构建才能「读到当前模型/思考级别」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>Lane：命名分支 + 叶子指针</h2>
+    <p>Lane 是一个「分支怎么长」的指针。默认只有 <code class="inline">main</code>。每个 lane 指向当前叶子 <code class="inline">leafId</code>；追加新 entry 时，<code class="inline">parentId</code> 自动取该 lane 的叶子。</p>
+    <div class="code-title">packages/agent/src/harness/session/state.ts — lane 的初始化与追加校验</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private readonly</span> lanes = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="cl">string</span>, <span class="cl">string</span> | <span class="kw">null</span>&gt;([[<span class="st">"main"</span>, <span class="kw">null</span>]]);
+
+<span class="cmt">// applyMutation 对 "entry" 的校验：必须链到 lane 的叶子</span>
+<span class="kw">case</span> <span class="st">"entry"</span>: {
+  <span class="kw">if</span> (mutation.lane !== <span class="kw">undefined</span>) {
+    <span class="kw">const</span> leafId = <span class="kw">this</span>.lanes.get(mutation.lane);
+    <span class="kw">if</span> (mutation.entry.parentId !== leafId)
+      invalid(<span class="st">"does not chain to the lane leaf"</span>);   <span class="cmt">// 必须接到叶子</span>
+  }
+  <span class="cmt">// 通过后：推进 lane 叶子 + 写入全局 log</span>
+  <span class="kw">if</span> (mutation.lane !== <span class="kw">undefined</span>) <span class="kw">this</span>.lanes.set(mutation.lane, mutation.entry.id);
+  <span class="kw">this</span>.log.push({ kind: <span class="st">"entry"</span>, seq, entry: mutation.entry });
+  <span class="kw">break</span>;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 「追加 = 更新 lane 叶子」是一体的。<code class="inline">moveLane(lane, to)</code> 可以把一个 lane 的叶子<strong>移到已有 entry</strong>（等价于把「指针」拨回历史某点）——这是实现「回溯/分叉」的原语，而不是把历史删掉。第 7 章的 navigation 就靠它。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>不可变追加的纪律与日志</h2>
+    <p>所有写入都必须满足 <code class="inline">seq === sequence + 1</code>（严格连续），这是恢复时「我到底写到哪了」的唯一依据。同时每个 mutation 都会 <code class="inline">log.push(...)</code>，形成一条可审计的 <code class="inline">LogItem[]</code>。</p>
+    <div class="code-title">packages/agent/src/harness/session/state.ts — 追加纪律 + log</div>
+    <pre class="code"><span class="lang-tag">typescript</span>applyMutation(mutation: <span class="cl">SessionMutation</span>): <span class="kw">void</span> {
+  <span class="kw">const</span> seq = <span class="cmt">/* 从 mutation 里取 seq */</span>;
+  <span class="kw">if</span> (seq !== <span class="kw">this</span>.sequence + <span class="nu">1</span>)
+    invalid(<span class="st">`has non-consecutive seq ${seq}</span>`);   <span class="cmt">// 必须严格 +1</span>
+  <span class="cmt">// ...按 kind 应用，并 this.log.push(...)</span>
+}
+<span class="cmt">// log 的条目种类：entry / record / lane / fact（名册），全部有序</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 这套「严格递增 seq + 全量 log」把 Session 变成了一本<strong>只增不改的账本</strong>。崩溃后重放 log 就能重建任意时刻的状态，也能算出每个操作的 usage 与 token 统计（<code class="inline">SessionStats</code>）。你自研时若需要「可恢复、可审计」，这套基调值得直接照抄。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>Fork：从一棵树长出另一棵</h2>
+    <p>fork 有两种 scope：<code class="inline">tree</code>（整树克隆，适合「保存副本」）与 <code class="inline">branch</code>（只复制到某个 entry 为止的路径，开一条新主线）。它通过「产出该状态的全部 mutation 序列」再在副本里重放来实现。</p>
+    <div class="code-title">packages/agent/src/harness/session/state.ts — fork 时产出 mutations</div>
+    <pre class="code"><span class="lang-tag">typescript</span>createForkMutations(options: <span class="cl">ForkOptions</span>): <span class="cl">SessionMutation</span>[] {
+  <span class="kw">let</span> copiedEntries, forkLanes;
+  <span class="kw">if</span> (options.scope === <span class="st">"tree"</span>) {
+    copiedEntries = <span class="kw">this</span>.findEntries({ order: <span class="st">"oldestFirst"</span> });  <span class="cmt">// 全树</span>
+  } <span class="kw">else</span> {
+    <span class="cmt">// branch：找到起点 entry，沿 parentId 一路往上收集路径</span>
+    copiedEntries = <span class="kw">this</span>.findEntriesOnBranch({ start: targetId, order: <span class="st">"oldestFirst"</span> });
+  }
+  <span class="cmt">// 依次产出：entry mutations（重排 seq）→ lane mutations → name → labels</span>
+  <span class="kw">return</span> mutations;   <span class="cmt">// 新存储用同样的 applyMutation 重放，得到一棵独立树</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> fork 的关键技巧是<strong>「把状态编码成 mutation 序列」，而不是复制内部字段</strong>——这保证了「任何存储后端都能用同一套 mutation 语义来 fork」。新副本的 seq 从 1 重新排，parentId 重新连锁。<strong>会话从父会话继承 parentSessionId</strong>，形成家谱。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>存储后端：内存 vs SQLite</h2>
+    <p><code class="inline">Session</code> 只是一个门面，真正读写靠 <code class="inline">SessionStorage</code>。核心包自带 <code class="inline">InMemorySessionStorage</code>（测试/示范用）；生产用 SQLite 后端（独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>，避免核心包硬依赖 node:sqlite）。</p>
+    <div class="code-title">packages/agent/src/harness/session/memory.ts — in-memory 追加</div>
+    <pre class="code"><span class="lang-tag">typescript</span>async appendEntry(newEntry: <span class="cl">ProvisionedEntry</span>, lane: <span class="cl">string</span>): Promise&lt;TEntry&gt; {
+  <span class="kw">const</span> parentId = <span class="kw">this</span>.state.requireLane(lane);   <span class="cmt">// 取 lane 叶子当父</span>
+  <span class="kw">const</span> entry = {
+    ...structuredClone(newEntry),
+    parentId,
+    seq: <span class="kw">this</span>.state.nextSequence,
+    timestamp: <span class="cl">Date</span>.now(),
+  };
+  <span class="kw">this</span>.state.applyMutation({ kind: <span class="st">"entry"</span>, lane, entry });
+  <span class="kw">return</span> structuredClone(entry);
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 注意「<code class="inline">ProvisionedEntry</code>」——调用方只提供「内容」（<code class="inline">type/id/内容字段</code>），而 <code class="inline">seq/parentId/timestamp</code> 这三个关键字段<strong>一律由存储分配</strong>，杜绝了「谁改了 seq」的作弊可能。SQLite 后端实现同一个 <code class="inline">SessionStorage</code> 接口，于是核心逻辑与后端解耦。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>查询：分支视角 vs 全局视角</h2>
+    <p><code class="inline">Session</code> 提供两类查询：全局 <code class="inline">findEntries</code>（整片树，按 seq）与分支 <code class="inline">findEntriesOnBranch</code>（从某个叶子沿 <code class="inline">parentId</code> 一路走到根）。</p>
+    <div class="code-title">packages/agent/src/harness/session/state.ts — 分支行走</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private</span> *walkToRoot(start, bounds) {   <span class="cmt">// 生成器：叶子 → 根</span>
+  <span class="kw">const</span> visited = <span class="kw">new</span> <span class="cl">Set</span>&lt;<span class="cl">string</span>&gt;();
+  <span class="kw">let</span> current = <span class="kw">this</span>.entriesById.get(start);
+  <span class="kw">while</span> (current) {
+    <span class="kw">if</span> (visited.has(current.id)) <span class="kw">throw new</span> <span class="cl">SessionError</span>(<span class="st">"..."</span>, <span class="st">"Session branch contains a cycle"</span>);
+    visited.add(current.id);
+    <span class="kw">yield</span> current;
+    <span class="kw">if</span> (current.id === bounds?.stopAtId || current.type === bounds?.stopAtType) <span class="kw">break</span>;
+    current = <span class="kw">this</span>.entriesById.get(current.parentId);  <span class="cmt">// 沿 parent 上溯</span>
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 有环检测、可停在指定 <code class="inline">id</code> 或 <code class="inline">type</code>（例如「停在最近的 compaction」）。这个「分支行走」正是 <strong>第 5 章上下文构建的输入</strong>——它先拿到<strong>当前分支的全部 entries</strong>，再转换成发往 LLM 的消息。</div>
+
+    <style>
+      .wr-demo{margin-top:18px}
+      .wr-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0 10px}
+      .wr-btn{font-family:var(--font-sans);font-size:13.5px;font-weight:600;padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg-card);color:var(--fg);cursor:pointer;transition:transform .1s,box-shadow .1s}
+      .wr-btn:hover{transform:translateY(-1px);box-shadow:0 3px 10px rgba(16,34,51,.10)}
+      .wr-btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+      .wr-btn.go{border-color:var(--brand-2);color:var(--brand)}
+      .wr-stage{display:grid;grid-template-columns:1fr 240px;gap:16px}
+      .wr-tree{background:#fbfdfe;border:1px solid var(--border);border-radius:10px;padding:10px;overflow-x:auto;min-height:230px}
+      .wr-tree svg{display:block;min-width:540px}
+      .wr-side{background:#0d1a24;border:1px solid var(--code-border);border-radius:10px;padding:10px 12px;font-family:var(--font-mono);font-size:11.5px;color:var(--code-fg);min-height:230px}
+      .wr-side .wr-h{color:var(--code-comment);font-family:var(--font-mono);font-size:11px;margin-bottom:6px;letter-spacing:.4px}
+      .wr-side .wr-step{padding:3px 0;color:var(--code-fg);animation:wr-slide .25s ease}
+      @keyframes wr-slide{from{opacity:0;transform:translateX(6px)}to{opacity:1}}
+      .wr-side .wr-cur{color:#86e0a3;font-weight:700}
+      .wr-side .wr-bound{color:#f59e0b}
+      .wr-side .wr-done{color:#7cc4ff}
+      .wr-rect{stroke-width:1.6;transition:fill .25s,stroke .25s;transform-box:fill-box;transform-origin:center}
+      .wr-rect.msg{fill:#eaf6f4;stroke:var(--brand-2)}
+      .wr-rect.cmp{fill:#fdecec;stroke:#d33}
+      .wr-rect.walk{fill:#d6f5e8;stroke:var(--brand)}
+      .wr-rect.at{stroke:#d33;stroke-width:3}
+      .wr-rect.bound{stroke:#f59e0b;stroke-width:3}
+      .wr-edge{stroke:var(--fg-muted);stroke-width:1.6;fill:none}
+      .wr-edge.walk{stroke:var(--brand);stroke-width:2.6}
+      .wr-tx{font-family:var(--font-mono);font-size:10.5px;fill:var(--fg);pointer-events:none}
+      .wr-tx.id{fill:var(--fg-muted);font-size:9.5px}
+      .wr-cap{font-family:var(--font-sans);font-size:11px;fill:var(--fg-muted)}
+      @media (max-width:720px){.wr-stage{grid-template-columns:1fr}}
+    </style>
+
+    <div class="wr-demo">
+      <div class="wr-controls">
+        <button class="wr-btn go" id="wr-play">▶ 播放 walkToRoot</button>
+        <button class="wr-btn" id="wr-step">单步 →</button>
+        <button class="wr-btn" id="wr-rst">重置</button>
+        <span style="font-size:13px;color:var(--fg-muted);margin-left:6px">起点=叶子 e07，沿 <code class="inline">parentId</code> 上溯到根；遇到 compaction 即 <code class="inline">stopAtType</code> 停下</span>
+      </div>
+      <div class="wr-stage">
+        <div class="wr-tree">
+          <svg id="wr-svg" viewBox="0 0 560 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="wrt wrd">
+            <title id="wrt">walkToRoot 分支行走动画</title>
+            <desc id="wrd">从叶子沿 parentId 走到根或 stopAtType</desc>
+            <g id="wr-canvas"></g>
+          </svg>
+        </div>
+        <div class="wr-side" id="wr-side">
+          <div class="wr-h">yield 顺序（叶子→根）</div>
+          <div id="wr-out" style="min-height:60px"></div>
+        </div>
+      </div>
+      <div class="fig-cap" style="margin-top:8px">绿高亮=已 yield 的节点；橙框=<code class="inline">stopAtType:"compaction"</code> 命中后停下（inclusive：命中节点本身也被 yield）。这是第 5 章构建上下文时真正读到的分支子集。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.8</span>为耐久而设的深度 JSON 校验</h2>
+    <p>4.4 讲了「追加式会话」保证数据一致，但没讲<strong>「写入前它凭什么敢保证你写的东西将来一定读得回来」</strong>。答案是 <code class="inline">session.ts</code> 里的 <code class="inline">assertJsonSerializable</code>——每次 commit 一个 entry/record 前，一个显式栈式遍历器会<strong>逐节点严查 JSON 可持久性</strong>：</p>
+    <div class="code-title">harness/session/session.ts · assertJsonSerializable（节选）</div>
+    <pre class="code"><code><span class="kw">export function</span> <span class="fn">assertJsonSerializable</span>(value: unknown): <span class="kw">void</span> {
+  <span class="kw">const</span> active = <span class="kw">new</span> WeakSet&lt;object&gt;();          <span class="cmt">// 记已访问，用于环检测</span>
+  <span class="kw">const</span> stack: JsonValidationFrame[] = [{ value }];
+  <span class="kw">while</span> (stack.length &gt; <span class="nu">0</span>) {
+    <span class="kw">const</span> frame = stack.pop()!;
+    <span class="kw">if</span> (<span class="st">"exit"</span> in frame) { active.<span class="fn">delete</span>(frame.exit); <span class="kw">continue</span>; }
+    <span class="kw">const</span> candidate = frame.value;
+    <span class="kw">if</span> (candidate === <span class="kw">null</span> || <span class="kw">typeof</span> candidate === <span class="st">"string"</span> || <span class="kw">typeof</span> candidate === <span class="st">"boolean"</span>) <span class="kw">continue</span>;
+    <span class="kw">if</span> (<span class="kw">typeof</span> candidate === <span class="st">"number"</span>) {
+      <span class="kw">if</span> (!Number.isFinite(candidate)) invalidPayload(<span class="st">"contains a non-finite number"</span>);
+      <span class="kw">continue</span>;
+    }
+    <span class="kw">if</span> (active.has(candidate)) invalidPayload(<span class="st">"contains a cycle"</span>);  <span class="cmt">// 环检测</span>
+    active.<span class="fn">add</span>(candidate);
+    stack.push({ exit: candidate });
+    <span class="cmt">// 对数组：拒绝稀疏数组、访问器、额外属性、符号键</span>
+    <span class="cmt">// 对对象：拒绝非平面对象、symbol 键、非可枚举/访问器属性、非有限数</span>
+  }
+}</code></pre>
+    <p>它防的坑都很「阴」——只靠 <code class="inline">JSON.stringify</code> 是无法发现的：稀疏数组、访问器（getter）、携带符号键或额外属性的数组、非平面原型对象、<code class="inline">NaN</code>/<code class="inline">Infinity</code>、循环引用。这些一旦混进 JSONL，轻则污染读出结果，重则让整个会话文件读不回来。它用的是<strong>显式栈</strong>而非递归——深对象不会爆栈。</p>
+    <div class="callout">
+      <strong>为什么这值得抄？</strong>你的 Runtime 一旦要持久化到磁盘（本章 JSONL），「写前校验」就是第一道防线。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。一道显式校验器 + 引入即失败，成本极低、收益极高。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.9</span>对自研与使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 别把历史当数组，把它当一棵可分叉树</strong>——代价是多一点抽象，收益是「回溯」「分支」「恢复」全部免费。<strong>② 内容（Entry）与簿记（Record）分离</strong>，让你的「模型记录」不被运行噪音污染。<strong>③ 存储分配 seq/parentId/timestamp</strong>，保证单一事实来源。<strong>④ 后端走统一接口</strong>，内存/SQLite 随便换。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="03-agent-loop.html">← 上一页：Agent 循环</a>
+    <a href="05-context.html">下一步：上下文构建 →</a>
+  </div>
+</div>
+
+<footer>
+  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.84.2-6-g086c32e74 · 所有引用代码路径以仓库最新为准
+</footer>
+
+<script>
+/* ============================================================
+ * 会话树生长沙盘 — 最小 Session 状态机
+ * 忠实复刻 packages/agent/src/harness/session/state.ts 的语义：
+ *   - 单一共享 seq（1 起，严格 +1），entry/record/lane/fact 共用
+ *   - lane = Map<name, leafId|null>，默认 "main" 起始 null
+ *   - entry 经 lane 追加时 parentId 必须 === 该 lane 当前叶子；追加后推进叶子
+ *   - record 只有 lane/seq/timestamp，无 parentId，不进树
+ *   - log = LogItem[]，四种 kind 混排，append-only
+ *   - moveLane: 把 lane 叶子指针拨回历史 entry（不删数据）→ 实现回溯/分叉
+ *   - fork(branch): 沿 parentId 走到根复制路径，seq 从 1 重排，不复制 record
+ * ============================================================ */
+(function () {
+  "use strict";
+
+  // —— DOM ——
+  const $ = (id) => document.getElementById(id);
+  const canvas = $("sd-canvas");
+  const logEl = $("sd-log");
+  const statusEl = $("sd-status");
+  const targetSel = $("sd-target");
+
+  // —— 状态机（镜像 state.ts）——
+  const state = {
+    sequence: 0,                 // nextSequence = sequence + 1
+    entriesById: new Map(),      // id -> entry
+    entryOrder: [],              // id[]，插入序（用于布局）
+    lanes: new Map([["main", null]]),
+    log: [],                     // LogItem[]
+    forkRoots: [],               // [{rootId, entries:Set}] 分叉出的独立子树
+    // 布局：每个节点记录 {id, x, y, lane, kind, isNew, isLeaf}
+    layout: new Map(),
+  };
+
+  const KIND = { MESSAGE: "message", MODEL_CHANGE: "model_change", RECORD: "record" };
+  let nodeCounter = 0;
+  const newId = (p) => `${p}${String(++nodeCounter).padStart(2, "0")}`;
+  const nextSeq = () => state.sequence + 1;
+
+  // 当前 fork 上下文：null=主树，否则是 forkRoots 的索引
+  let activeFork = null;
+
+  // —— 布局常量 ——
+  const NODE_W = 78, NODE_H = 40, GX = 104, GY = 66;
+  const TREE_X0 = 30, TREE_Y0 = 30;
+
+  // ============ mutation 核心 ============
+  function applyEntry(entry, lane) {
+    // seq 严格 +1（storage 分配）
+    if (entry.seq !== state.sequence + 1)
+      throw `non-consecutive seq ${entry.seq}`;
+    // id 唯一
+    if (state.entriesById.has(entry.id))
+      throw `duplicate id ${entry.id}`;
+    // 经 lane 追加：parentId 必须 === lane 叶子
+    if (lane !== undefined) {
+      const leaf = state.lanes.get(lane);
+      if (leaf === undefined) throw `missing lane ${lane}`;
+      if (entry.parentId !== leaf) throw "does not chain to the lane leaf";
+    }
+    // parent 必须存在
+    if (entry.parentId !== null && !state.entriesById.has(entry.parentId))
+      throw `missing parent ${entry.parentId}`;
+    // —— commit ——
+    state.entriesById.set(entry.id, entry);
+    state.entryOrder.push(entry.id);
+    state.sequence = entry.seq;
+    if (lane !== undefined) state.lanes.set(lane, entry.id); // 推进叶子
+    state.log.push({ kind: "entry", seq: entry.seq, entry });
+  }
+
+  function applyRecord(record) {
+    if (record.seq !== state.sequence + 1)
+      throw `non-consecutive seq ${record.seq}`;
+    if (!state.lanes.has(record.lane)) throw `missing lane ${record.lane}`;
+    state.sequence = record.seq;
+    state.log.push({ kind: "record", seq: record.seq, record });
+    // record 不进 entriesById，不进树，只挂 lane 记账
+  }
+
+  function moveLane(lane, to) {
+    if (!state.lanes.has(lane)) throw `missing lane ${lane}`;
+    if (to !== null && !state.entriesById.has(to)) throw `missing target ${to}`;
+    const seq = nextSeq();
+    state.sequence = seq;
+    state.lanes.set(lane, to);
+    state.log.push({ kind: "lane", seq, lane, leafId: to });
+  }
+
+  function createForkBranch(targetId) {
+    // 沿 parentId 走到根（镜像 walkToRoot / createForkMutations.branch）
+    const target = state.entriesById.get(targetId);
+    if (!target || target.type !== KIND.MESSAGE)
+      throw "fork target is not a message entry";
+    const path = [];
+    const visited = new Set();
+    let cur = target;
+    while (cur) {
+      if (visited.has(cur.id)) throw `cycle at ${cur.id}`;
+      visited.add(cur.id);
+      path.push(cur);
+      if (cur.parentId === null) break;
+      cur = state.entriesById.get(cur.parentId);
+      if (!cur) throw `missing parent`;
+    }
+    path.reverse(); // oldest first
+    // 在新 lane 上重放：seq 从 1 重排、不复制 record。
+    // 真实代码里副本落进「新 session」，id 不冲突；本沙盘是单 session，
+    // 故给副本分配新 id，并用 idMap 把原 parentId 翻译到副本 id，保持树形。
+    const forkLane = "fork" + (state.forkRoots.length + 1);
+    const oldSeq = state.sequence;
+    state.lanes.set(forkLane, null);
+    state.sequence = 0; // 临时切到 fork 的序号空间
+    const copiedIds = new Set();
+    const idMap = new Map(); // 原id -> 副本id
+    let forkLeaf = null; // 路径末尾（=fork 目标）的副本 id
+    for (const src of path) {
+      const newEid = newId("f");
+      idMap.set(src.id, newEid);
+      const clone = { ...src, id: newEid, seq: nextSeq(), parentId: src.parentId ? idMap.get(src.parentId) : null };
+      applyEntry(clone, undefined); // 不带 lane → 跳过 parentId 校验，重放
+      copiedIds.add(newEid);
+      forkLeaf = newEid; // 不断覆盖，最后留下的就是路径末尾
+    }
+    // 设置 fork lane 叶子 = 路径末尾（fork 目标）的副本
+    const leafSeq = nextSeq();
+    state.sequence = leafSeq;
+    state.lanes.set(forkLane, forkLeaf);
+    state.log.push({ kind: "lane", seq: leafSeq, lane: forkLane, leafId: forkLeaf });
+    // 恢复主树序号空间（fork 的 log 项已记录，序号自洽于其子树）
+    state.sequence = oldSeq;
+    state.forkRoots.push({ lane: forkLane, rootId: idMap.get(targetId), ids: copiedIds });
+    activeFork = state.forkRoots.length - 1;
+    return forkLane;
+  }
+
+  // ============ 用户动作 ============
+  function actMessage() {
+    const lane = "main";
+    const leaf = state.lanes.get(lane);
+    const entry = {
+      type: KIND.MESSAGE,
+      id: newId("e"),
+      seq: nextSeq(),
+      parentId: leaf,
+      timestamp: Date.now(),
+      label: pick(["你好", "继续", "修个 bug", "再想想", "跑测试", "总结一下"]),
+    };
+    applyEntry(entry, lane);
+    flash(`追加 <b>message</b> #${entry.seq}（parentId = ${leaf ?? "null"}）→ main 叶子推进到 <b>${entry.id}</b>`);
+  }
+
+  function actRecord() {
+    const record = {
+      type: "tool_started",
+      id: newId("r"),
+      seq: nextSeq(),
+      lane: "main",
+      timestamp: Date.now(),
+      toolName: pick(["read", "edit", "bash", "grep"]),
+    };
+    applyRecord(record);
+    flash(`追加 <b>record</b> #${record.seq}（tool_started）→ 只进簿记轨道，<b>无 parentId、不进树</b>`);
+  }
+
+  function actModel() {
+    const lane = "main";
+    const leaf = state.lanes.get(lane);
+    const entry = {
+      type: KIND.MODEL_CHANGE,
+      id: newId("m"),
+      seq: nextSeq(),
+      parentId: leaf,
+      timestamp: Date.now(),
+      modelId: pick(["opus-5", "sonnet-5", "haiku-4"]),
+    };
+    applyEntry(entry, lane);
+    flash(`追加 <b>model_change</b> #${entry.seq}（→ ${entry.modelId}）→ 仍是 Entry、进树`);
+  }
+
+  function actMove() {
+    const t = targetSel.value;
+    if (!t) { flash(`<span class="sd-err">先在左侧选一个回溯目标节点</span>`); return; }
+    const leaf = state.lanes.get("main");
+    if (t === leaf) { flash(`main 叶子已在 <b>${t}</b>，无需回溯`); return; }
+    moveLane("main", t);
+    flash(`moveLane(main, <b>${t}</b>) → 叶子指针拨回历史节点。<b>数据未删</b>，再追加 message 即长出新分支`);
+  }
+
+  function actFork() {
+    const t = targetSel.value;
+    const target = t || state.lanes.get("main");
+    if (!target) { flash(`<span class="sd-err">main 为空，无可 fork 的分支</span>`); return; }
+    try {
+      const lane = createForkBranch(target);
+      flash(`fork(branch) → 从 <b>${target}</b> 沿 parentId 复制路径到新车道 <b>${lane}</b>，seq 从 1 重排、<b>不带 record</b>`);
+    } catch (e) { flash(`<span class="sd-err">${e}</span>`); }
+  }
+
+  function reset() {
+    state.sequence = 0;
+    state.entriesById.clear();
+    state.entryOrder.length = 0;
+    state.lanes = new Map([["main", null]]);
+    state.log.length = 0;
+    state.forkRoots.length = 0;
+    state.layout.clear();
+    activeFork = null;
+    nodeCounter = 0;
+    flash("已重置为空会话");
+  }
+
+  // ============ 渲染 ============
+  function computeLayout() {
+    state.layout.clear();
+    // 主树：从根(main 起点侧)按 parentId 构建层级。entryOrder 是插入序 ≈ 拓扑序。
+    // 给每个 entry 分配 (col, row)。col = 距根深度，row = 该深度内序号。
+    // 简化：用插入序排成从左到右的链；分叉节点（多个子）下沉。
+    // —— 实际用「父子链 + 分叉检测」布局 ——
+    const childrenOf = new Map(); // parentId -> [id]
+    for (const id of state.entryOrder) {
+      const e = state.entriesById.get(id);
+      const k = e.parentId ?? "__root__";
+      if (!childrenOf.has(k)) childrenOf.set(k, []);
+      childrenOf.get(k).push(id);
+    }
+    // 深度
+    const depth = new Map();
+    const roots = childrenOf.get("__root__") || [];
+    const stack = roots.map((r) => [r, 0]);
+    while (stack.length) {
+      const [id, d] = stack.shift();
+      depth.set(id, d);
+      for (const c of childrenOf.get(id) || []) stack.push([c, d + 1]);
+    }
+    // 列 = 深度，行 = 同深度内按插入序
+    const byDepth = new Map();
+    for (const id of state.entryOrder) {
+      if (!depth.has(id)) continue;
+      const d = depth.get(id);
+      if (!byDepth.has(d)) byDepth.set(d, []);
+      byDepth.get(d).push(id);
+    }
+    for (const [d, ids] of byDepth) {
+      ids.forEach((id, i) => {
+        state.layout.set(id, {
+          x: TREE_X0 + d * GX,
+          y: TREE_Y0 + i * GY,
+          kind: kindOf(id),
+        });
+      });
+    }
+    // record：挂在同 lane 的最近 entry 下方（簿记轨道）
+    let recIdx = 0;
+    for (const item of state.log) {
+      if (item.kind !== "record") continue;
+      const lane = item.record.lane;
+      const leaf = state.lanes.get(lane);
+      // 找该 record 时刻的 lane 叶子（近似：当前叶子）
+      const anchor = leaf && state.layout.has(leaf) ? state.layout.get(leaf) : null;
+      const y = anchor ? anchor.y + NODE_H + 8 : 240 + recIdx * 16;
+      const x = anchor ? anchor.x + 6 : 30;
+      state.layout.set(item.record.id, { x, y: y + recIdx * 0, kind: "record", rail: true });
+      recIdx++;
+    }
+  }
+
+  function kindOf(id) {
+    const e = state.entriesById.get(id);
+    if (!e) return "record";
+    if (e.type === KIND.MODEL_CHANGE) return "mdl";
+    return "msg";
+  }
+
+  function render() {
+    computeLayout();
+    const svgNs = "http://www.w3.org/2000/svg";
+    canvas.innerHTML = "";
+    const mainLeaf = state.lanes.get("main");
+
+    // 簿记轨道虚线（如果存在 record）
+    const hasRecord = state.log.some((i) => i.kind === "record");
+    if (hasRecord) {
+      const rail = document.createElementNS(svgNs, "path");
+      rail.setAttribute("class", "sd-rail");
+      rail.setAttribute("d", `M 18 250 H 620`);
+      rail.setAttribute("stroke", "var(--brand-3)");
+      canvas.appendChild(rail);
+      const cap = document.createElementNS(svgNs, "text");
+      cap.setAttribute("class", "sd-cap");
+      cap.setAttribute("x", 18); cap.setAttribute("y", 244);
+      cap.textContent = "簿记轨道（Records · 无 parentId · 不进树）";
+      canvas.appendChild(cap);
+    }
+
+    // 边（parentId）
+    for (const id of state.entryOrder) {
+      const e = state.entriesById.get(id);
+      if (e.parentId === null) continue;
+      const a = state.layout.get(e.parentId), b = state.layout.get(id);
+      if (!a || !b) continue;
+      const path = document.createElementNS(svgNs, "path");
+      path.setAttribute("class", "sd-edge" + (state.forkRoots.some((f) => f.ids.has(id)) ? " fork" : ""));
+      path.setAttribute("d", `M ${a.x + NODE_W} ${a.y + NODE_H / 2} C ${a.x + NODE_W + 40} ${a.y + NODE_H / 2}, ${b.x - 40} ${b.y + NODE_H / 2}, ${b.x} ${b.y + NODE_H / 2}`);
+      canvas.appendChild(path);
+    }
+
+    // 节点
+    const newIds = new Set(state.log.filter((i) => i.kind === "entry").slice(-1).map((i) => i.entry.id));
+    for (const id of state.entryOrder) {
+      const e = state.entriesById.get(id);
+      const lay = state.layout.get(id);
+      if (!lay) continue;
+      const g = document.createElementNS(svgNs, "g");
+      const r = document.createElementNS(svgNs, "rect");
+      let cls = "sd-rect " + (e.type === KIND.MODEL_CHANGE ? "mdl" : "msg");
+      if (id === mainLeaf) cls += " leaf";
+      if (newIds.has(id)) cls += " new";
+      r.setAttribute("class", cls);
+      r.setAttribute("x", lay.x); r.setAttribute("y", lay.y);
+      r.setAttribute("width", NODE_W); r.setAttribute("height", NODE_H);
+      g.appendChild(r);
+      const t1 = document.createElementNS(svgNs, "text");
+      t1.setAttribute("class", "sd-tx"); t1.setAttribute("x", lay.x + 6); t1.setAttribute("y", lay.y + 16);
+      t1.textContent = e.type === KIND.MODEL_CHANGE ? `mdl→${e.modelId}` : (e.label || "msg");
+      g.appendChild(t1);
+      const t2 = document.createElementNS(svgNs, "text");
+      t2.setAttribute("class", "sd-tx id"); t2.setAttribute("x", lay.x + 6); t2.setAttribute("y", lay.y + 31);
+      t2.textContent = `${id}·s${e.seq}`;
+      g.appendChild(t2);
+      // 点击选中作回溯目标
+      g.style.cursor = "pointer";
+      g.addEventListener("click", () => { targetSel.value = id; render(); });
+      canvas.appendChild(g);
+    }
+
+    // record 节点
+    for (const item of state.log) {
+      if (item.kind !== "record") continue;
+      const lay = state.layout.get(item.record.id);
+      if (!lay) continue;
+      const g = document.createElementNS(svgNs, "g");
+      const r = document.createElementNS(svgNs, "rect");
+      r.setAttribute("class", "sd-rect rec new");
+      r.setAttribute("x", lay.x); r.setAttribute("y", lay.y + 4);
+      r.setAttribute("width", 70); r.setAttribute("height", 26);
+      r.setAttribute("rx", 5);
+      g.appendChild(r);
+      const t = document.createElementNS(svgNs, "text");
+      t.setAttribute("class", "sd-tx"); t.setAttribute("x", lay.x + 5); t.setAttribute("y", lay.y + 21);
+      t.textContent = `${item.record.toolName}·s${item.record.seq}`;
+      g.appendChild(t);
+      canvas.appendChild(g);
+    }
+
+    // main 叶子指针标签
+    if (mainLeaf) {
+      const lay = state.layout.get(mainLeaf);
+      if (lay) {
+        const t = document.createElementNS(svgNs, "text");
+        t.setAttribute("class", "sd-cap"); t.setAttribute("x", lay.x); t.setAttribute("y", lay.y - 6);
+        t.setAttribute("fill", "var(--brand)"); t.setAttribute("font-weight", "700");
+        t.textContent = "▼ main 叶子";
+        canvas.appendChild(t);
+      }
+    }
+
+    if (state.entryOrder.length === 0) {
+      const t = document.createElementNS(svgNs, "text");
+      t.setAttribute("class", "sd-empty"); t.setAttribute("x", 30); t.setAttribute("y", 160);
+      t.textContent = "空会话 — 点上面的按钮追加第一条 entry";
+      canvas.appendChild(t);
+    }
+
+    renderLog();
+    renderTargetSelect();
+  }
+
+  function renderLog() {
+    logEl.innerHTML = "";
+    if (state.log.length === 0) {
+      const li = document.createElement("li");
+      li.style.color = "var(--code-comment)";
+      li.textContent = "（账本为空）";
+      logEl.appendChild(li);
+      return;
+    }
+    for (const item of state.log) {
+      const li = document.createElement("li");
+      const seq = document.createElement("span"); seq.className = "sd-lseq"; seq.textContent = item.seq;
+      const k = document.createElement("span"); k.className = "sd-lk k-" + item.kind; k.textContent = item.kind;
+      const d = document.createElement("span"); d.className = "sd-ld";
+      if (item.kind === "entry") {
+        const e = item.entry;
+        d.textContent = `${e.id} · ${e.type}` + (e.type === KIND.MODEL_CHANGE ? `→${e.modelId}` : "") + ` · parent=${e.parentId ?? "null"}`;
+      } else if (item.kind === "record") {
+        d.textContent = `${item.record.id} · ${item.record.type}(${item.record.toolName}) · lane=${item.record.lane}`;
+      } else if (item.kind === "lane") {
+        d.textContent = `${item.lane} → leaf=${item.leafId ?? "null"}`;
+      } else if (item.kind === "fact") {
+        d.textContent = `${item.fact}`;
+      }
+      li.append(seq, k, d);
+      logEl.appendChild(li);
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function renderTargetSelect() {
+    const cur = targetSel.value;
+    const opts = ['<option value="">— 选回溯目标 —</option>'];
+    for (const id of state.entryOrder) {
+      const e = state.entriesById.get(id);
+      if (e.type === KIND.MESSAGE) opts.push(`<option value="${id}">${id} (s${e.seq})</option>`);
+    }
+    targetSel.innerHTML = opts.join("");
+    if (cur && state.entriesById.has(cur)) targetSel.value = cur;
+  }
+
+  // —— 辅助 ——
+  let flashTimer;
+  function flash(html) {
+    statusEl.innerHTML = html;
+    statusEl.classList.add("sd-flash");
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => statusEl.classList.remove("sd-flash"), 550);
+  }
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+  function safe(fn) {
+    return () => { try { fn(); render(); } catch (e) { flash(`<span class="sd-err">mutation 被拒：${e}</span>`); } };
+  }
+
+  // —— 绑定 ——
+  $("sd-msg").addEventListener("click", safe(actMessage));
+  $("sd-rec").addEventListener("click", safe(actRecord));
+  $("sd-mdl").addEventListener("click", safe(actModel));
+  $("sd-move").addEventListener("click", safe(actMove));
+  $("sd-fork").addEventListener("click", safe(actFork));
+  $("sd-rst").addEventListener("click", safe(reset));
+
+  // —— 初始演示：预置一条小链，让读者一进来就看到「树」 ——
+  function seed() {
+    applyEntry({ type: KIND.MESSAGE, id: "e01", seq: nextSeq(), parentId: null, timestamp: 0, label: "你好" }, "main");
+    applyEntry({ type: KIND.MESSAGE, id: "e02", seq: nextSeq(), parentId: "e01", timestamp: 0, label: "修个 bug" }, "main");
+    applyRecord({ type: "tool_started", id: "r03", seq: nextSeq(), lane: "main", timestamp: 0, toolName: "read" });
+    applyEntry({ type: KIND.MODEL_CHANGE, id: "m04", seq: nextSeq(), parentId: "e02", timestamp: 0, modelId: "sonnet-5" }, "main");
+    applyEntry({ type: KIND.MESSAGE, id: "e05", seq: nextSeq(), parentId: "m04", timestamp: 0, label: "跑测试" }, "main");
+    flash("已预置一段会话。试试：选 e02 回溯 → 追加 message 看新分支；或 fork(branch)。");
+  }
+  seed();
+  render();
+})();
+</script>
+
+<script>
+/* ============================================================
+ * walkToRoot 动画 — §4.7
+ * 复刻 state.ts 的 walkToRoot 生成器：从 start 沿 parentId 上溯，
+ * 有环检测、inclusive 的 stopAtId / stopAtType 边界。
+ * ============================================================ */
+(function () {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const SVGNS = "http://www.w3.org/2000/svg";
+
+  // 预置一棵带 compaction 的分支（供动画遍历）
+  // e01(user) -> c02(compaction) -> e03(user) -> e04(assistant) -> e05(user) -> e06(assistant) -> e07(user=叶子)
+  const nodes = [
+    { id: "e01", type: "msg", label: "user", parentId: null, x: 30, y: 100 },
+    { id: "c02", type: "cmp", label: "compaction", parentId: "e01", x: 130, y: 100 },
+    { id: "e03", type: "msg", label: "user", parentId: "c02", x: 230, y: 100 },
+    { id: "e04", type: "msg", label: "assistant", parentId: "e03", x: 330, y: 60 },
+    { id: "e05", type: "msg", label: "user", parentId: "e04", x: 430, y: 100 },
+    { id: "e07", type: "msg", label: "user", parentId: "e05", x: 530, y: 100 },
+  ];
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const NW = 70, NH = 38;
+  const START = "e07";
+  const STOP_TYPE = "compaction"; // 模拟 stopAtType
+
+  // walkToRoot 生成器（语义同 state.ts）
+  function* walkToRoot(start, stopAtType) {
+    const visited = new Set();
+    let current = byId.get(start);
+    if (!current) throw `Entry not found: ${start}`;
+    while (current) {
+      if (visited.has(current.id)) throw `cycle at ${current.id}`;
+      visited.add(current.id);
+      yield current;
+      if (current.type === "cmp" && stopAtType === "compaction") break; // stopAtType: inclusive
+      if (current.parentId === null) break;
+      current = byId.get(current.parentId);
+      if (!current) throw `Entry not found: ${current}`;
+    }
+  }
+
+  // 预计算完整路径
+  const fullPath = [...walkToRoot(START, STOP_TYPE)];
+  let stepIdx = 0; // 已 yield 到第几个（含）
+  let playing = false;
+
+  const canvas = $("wr-canvas");
+  const out = $("wr-out");
+
+  function render() {
+    canvas.innerHTML = "";
+    const yielded = new Set(fullPath.slice(0, stepIdx).map((n) => n.id));
+    const curNode = stepIdx > 0 ? fullPath[stepIdx - 1] : null;
+
+    // 边
+    for (const n of nodes) {
+      if (!n.parentId) continue;
+      const p = byId.get(n.parentId);
+      const path = document.createElementNS(SVGNS, "path");
+      const walked = yielded.has(n.id) && yielded.has(p.id);
+      path.setAttribute("class", "wr-edge" + (walked ? " walk" : ""));
+      path.setAttribute("d", `M ${p.x + NW} ${p.y + NH / 2} L ${n.x} ${n.y + NH / 2}`);
+      canvas.appendChild(path);
+    }
+    // 节点
+    for (const n of nodes) {
+      const g = document.createElementNS(SVGNS, "g");
+      const r = document.createElementNS(SVGNS, "rect");
+      let cls = "wr-rect " + (n.type === "cmp" ? "cmp" : "msg");
+      if (yielded.has(n.id)) cls += " walk";
+      if (curNode && n.id === curNode.id) cls += " at";
+      if (n.type === "cmp") cls += " bound";
+      r.setAttribute("class", cls);
+      r.setAttribute("x", n.x); r.setAttribute("y", n.y);
+      r.setAttribute("width", NW); r.setAttribute("height", NH);
+      r.setAttribute("rx", 7);
+      g.appendChild(r);
+      const t1 = document.createElementNS(SVGNS, "text");
+      t1.setAttribute("class", "wr-tx"); t1.setAttribute("x", n.x + 6); t1.setAttribute("y", n.y + 16);
+      t1.textContent = n.label;
+      g.appendChild(t1);
+      const t2 = document.createElementNS(SVGNS, "text");
+      t2.setAttribute("class", "wr-tx id"); t2.setAttribute("x", n.x + 6); t2.setAttribute("y", n.y + 30);
+      t2.textContent = n.id;
+      g.appendChild(t2);
+      canvas.appendChild(g);
+    }
+    // 叶子标记
+    const sl = byId.get(START);
+    const cap = document.createElementNS(SVGNS, "text");
+    cap.setAttribute("class", "wr-cap"); cap.setAttribute("x", sl.x); cap.setAttribute("y", sl.y - 6);
+    cap.setAttribute("fill", "var(--brand)"); cap.setAttribute("font-weight", "700");
+    cap.textContent = "▼ start (叶子)";
+    canvas.appendChild(cap);
+
+    // 侧栏输出
+    out.innerHTML = "";
+    fullPath.slice(0, stepIdx).forEach((n, i) => {
+      const last = i === stepIdx - 1;
+      const div = document.createElement("div");
+      div.className = "wr-step " + (last ? "wr-cur" : "wr-done");
+      div.textContent = `yield ${n.id} (${n.label})` + (n.type === "cmp" ? "  ← stopAtType 命中，停下" : "");
+      out.appendChild(div);
+    });
+    if (stepIdx === 0) {
+      const d = document.createElement("div");
+      d.style.color = "var(--code-comment)";
+      d.textContent = "（点击播放或单步开始）";
+      out.appendChild(d);
+    }
+    if (stepIdx >= fullPath.length) {
+      const d = document.createElement("div");
+      d.className = "wr-step";
+      d.style.color = "var(--code-comment)";
+      d.style.marginTop = "6px";
+      d.textContent = `✓ 完成，共 yield ${fullPath.length} 条 → 这就是构建上下文的输入`;
+      out.appendChild(d);
+    }
+    $("wr-step").disabled = stepIdx >= fullPath.length;
+  }
+
+  function step() {
+    if (stepIdx < fullPath.length) { stepIdx++; render(); }
+  }
+  function play() {
+    if (playing || stepIdx >= fullPath.length) {
+      if (stepIdx >= fullPath.length) reset();
+    }
+    playing = true;
+    $("wr-play").textContent = "⏸ 暂停";
+    const tick = () => {
+      if (!playing) return;
+      if (stepIdx >= fullPath.length) { playing = false; $("wr-play").textContent = "▶ 重新播放"; return; }
+      step();
+      setTimeout(tick, 650);
+    };
+    tick();
+  }
+  function pause() { playing = false; $("wr-play").textContent = "▶ 继续"; }
+  function reset() { playing = false; stepIdx = 0; $("wr-play").textContent = "▶ 播放 walkToRoot"; render(); }
+
+  $("wr-play").addEventListener("click", () => { if (playing) pause(); else play(); });
+  $("wr-step").addEventListener("click", step);
+  $("wr-rst").addEventListener("click", reset);
+
+  render();
+})();
+</script>
+
+</body>
+</html>

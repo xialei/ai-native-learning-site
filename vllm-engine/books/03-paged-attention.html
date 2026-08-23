@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · PagedAttention &amp; KV Cache — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 PagedAttention &amp; KV Cache</div>
+    <h1>PagedAttention &amp; KV Cache：vLLM 吞吐量高的根源</h1>
+    <div class="subtitle">这是 vLLM 的灵魂。它借鉴操作系统「分页」思想来管理注意力缓存，解决了「显存浪费 + 内存碎片」两大痛点，是自研引擎最值得抄的一个设计。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>问题：KV Cache 为什么会“爆炸”</h2>
+    <p>Transformer 自回归每算一个新 token，都要把每个历史 token 的 <strong>K（key）和 V（value）</strong> 存起来，供后续注意力使用。这个缓存叫 <strong>KV Cache</strong>，它随序列长度线性增长。</p>
+    <p>对每个请求、每层、每个注意力头，KV cache 都要占一块显存。并发 N 个请求、序列都较长时，KV cache 会吃下大部分显存。旧版 naive 方案给每个请求<strong>一次性预留最大长度</strong>的连续显存，导致：</p>
+    <ul>
+      <li><strong>预留浪费</strong>：多数请求根本不会生成满 max_tokens，预留的尾部一直空着。</li>
+      <li><strong>碎片化</strong>：不同长度的请求占用不同大小的连续块，删掉一个中间的请求就留下无法合并的洞。</li>
+    </ul>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 210" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#d33">朴素方案（每个请求预留一段连续显存）</text>
+        <rect class="node" x="20" y="36" width="240" height="46" rx="6"></rect>
+        <text class="lbl sm" x="140" y="63" text-anchor="middle">请求A 预留（含大片空白）</text>
+        <rect class="node" x="280" y="36" width="70" height="46" rx="6" fill="#fff3f3" ></rect>
+        <text class="lbl sm" x="315" y="63" text-anchor="middle">B</text>
+        <rect class="node warn" x="370" y="36" width="60" height="46" rx="6"></rect>
+        <text class="lbl sm" x="400" y="63" text-anchor="middle">洞</text>
+        <rect class="node" x="450" y="36" width="220" height="46" rx="6"></rect>
+        <text class="lbl sm" x="560" y="63" text-anchor="middle">请求C 预留（开头很浪费）</text>
+        <text class="lbl sm" x="20" y="110">空白 = 预留但没用到 ｜ 洞 = 中间请求结束留下的碎片</text>
+
+        <text class="lbl" x="20" y="150" font-weight="bold" fill="#165a7b">vLLM：按固定小块（如 16 token/块）分页分配</text>
+        <rect class="node core" x="20" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node core" x="90" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node core" x="160" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node" x="230" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node" x="300" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node" x="370" y="162" width="60" height="34" rx="4"></rect>
+        <rect class="node" x="440" y="162" width="60" height="34" rx="4" fill="#e8f3fb"></rect>
+        <rect class="node" x="510" y="162" width="60" height="34" rx="4" fill="#e8f3fb"></rect>
+        <rect class="node" x="580" y="162" width="60" height="34" rx="4" fill="#e8f3fb"></rect>
+        <text class="lbl sm" x="20" y="214">固定 size 的块，按需分配、跨请求紧凑排列、可复用 → 消除内部浪费与外部碎片</text>
+      </svg>
+      <div class="fig-cap">图 3.1：PagedAttention 的核心动机——像操作系统管理内存页一样管理 KV cache。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>核心思想：逻辑块 vs 物理块</h2>
+    <p>关键是<strong>把「连续性」和「存储」解耦</strong>：</p>
+    <ul>
+      <li><strong>逻辑视图（序列自己看）</strong>：一个请求的 KV 是一串连续的 token，逻辑块编号 0,1,2,…。</li>
+      <li><strong>物理视图（显存实际）</strong>：这些逻辑块被映射到物理内存里<strong>不连续</strong>的固定小块（block）。由 <code class="inline">BlockPool</code> 统一分配。</li>
+    </ul>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="22" font-weight="bold" fill="#165a7b">逻辑块（请求 A 的视角）</text>
+        <rect class="node core" x="20" y="32" width="84" height="40" rx="5"></rect><text class="lbl sm" x="62" y="55" text-anchor="middle">逻辑块 0</text>
+        <rect class="node core" x="116" y="32" width="84" height="40" rx="5"></rect><text class="lbl sm" x="158" y="55" text-anchor="middle">逻辑块 1</text>
+        <rect class="node core" x="212" y="32" width="84" height="40" rx="5"></rect><text class="lbl sm" x="254" y="55" text-anchor="middle">逻辑块 2</text>
+        <rect class="node" x="308" y="32" width="84" height="40" rx="5"></rect><text class="lbl sm" x="350" y="55" text-anchor="middle">…</text>
+
+        <line class="edge core" x1="62" y1="72" x2="150" y2="150"></line>
+        <line class="edge core" x1="158" y1="72" x2="356" y2="150"></line>
+        <line class="edge core" x1="254" y1="72" x2="268" y2="150"></line>
+
+        <text class="lbl" x="20" y="120" font-weight="bold" fill="#165a7b">物理块（显存里实际摆放，不必连续）</text>
+        <rect class="node" x="20" y="150" width="96" height="40" rx="5"></rect><text class="lbl sm" x="68" y="175" text-anchor="middle">物理块 #7</text>
+        <rect class="node" x="140" y="150" width="96" height="40" rx="5"></rect><text class="lbl sm" x="188" y="175" text-anchor="middle">物理块 #13</text>
+        <rect class="node" x="260" y="150" width="96" height="40" rx="5"></rect><text class="lbl sm" x="308" y="175" text-anchor="middle">物理块 #2</text>
+        <rect class="node" x="380" y="150" width="96" height="40" rx="5"></rect><text class="lbl sm" x="428" y="175" text-anchor="middle">(空闲)</text>
+
+        <text class="lbl sm" x="20" y="220">每块固定承载 block_size 个 token（如 16）。block 表把「逻辑 0→物理 7」的映射记在 Worker 端，按请求一份</text>
+      </svg>
+      <div class="fig-cap">图 3.2：逻辑连续、物理离散。映射关系由每请求的 block table 记录（Worker 端持有，调度器分配后下发）。</div>
+    </div>
+    <div class="annotation"><b>为什么能省显存：</b>因为块——不管是请求 A 用了 3 块还差半块，还是请求 B 只用了 1 块——都从同一个块的池子里按需拿。满了就再拿一块，而不是一次性预留整条序列。这样内存利用率大幅提升，能同时塞进更多请求，吞吐自然更高。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>用代码看｜块从哪里来：BlockPool</h2>
+    <p><code class="inline">vllm/v1/core/block_pool.py</code> 的 <code class="inline">BlockPool</code> 就是「显存页分配器」：预分配一批物理块，谁要就给谁，并对 <strong>已缓存（prefix cache）的整块</strong>做复用登记。</p>
+    <div class="code-title">vllm/v1/core/kv_cache_utils.py — KVCacheBlock（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">make_block_hash_with_group_id</span>(block_hash, group_id): ...
+<span class="cmt"># BlockHashAndGroupId: 一个 KV 块的“内容哈希 + 所属 KV 组”，</span>
+<span class="cmt"># 用于前缀缓存（prefix caching）：相同的块内容只存一份，跨请求复用</span></pre>
+    <div class="annotation"><b>读懂字段：</b>块的「内容哈希」是前缀缓存的关键——两个请求开头 token 一样，块的哈希就一样，第二个请求能直接复用第一个请求已算好的 KV，省掉重复 prefill。详见第 8 章。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>用代码看｜KVCacheManager 如何分配插槽</h2>
+    <p>调度器决定「这个请求这步要追加多少新 token」后，会调用 <code class="inline">KVCacheManager.allocate_slots</code> 给请求腾出 KV 空间。签名很长，因为要兼顾前缀命中、投机采样 lookahead、跨 attention 组等；抓主干：<strong>为请求的这批新 token 找出可写的物理块</strong>。</p>
+    <div class="code-title">vllm/v1/core/kv_cache_manager.py — allocate_slots（签名摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">allocate_slots</span>(self, request: <span class="cl">Request</span>,
+    num_new_tokens: <span class="cl">int</span>,                     <span class="cmt"># 这步要算的新 token 数</span>
+    num_new_computed_tokens: <span class="cl">int</span> = <span class="nu">0</span>,       <span class="cmt"># 其中命中前缀缓存的</span>
+    new_computed_blocks: ... = <span class="kw">None</span>,           <span class="cmt"># 命中的已缓存块</span>
+    num_lookahead_tokens: <span class="cl">int</span> = <span class="nu">0</span>,           <span class="cmt"># 投机采样预留</span>
+    ... ) <span class="kw">-&gt;</span> <span class="cl">KVCacheBlocks</span> | <span class="kw">None</span>:
+    <span class="cmt"># 若返回 None：本轮 KV 不够，该请求先不调度（等别人释放）</span>
+    <span class="cmt"># 若成功：为请求追加物理块引用，并把新块内容登记进前缀缓存</span>
+    ...</pre>
+    <div class="annotation"><b>读懂这段：</b>返回值 <code class="inline">None</code> 是个重要的「背压」信号——KV cache 满了新块拿不到，调度器就把这个请求挪到下一轮，而不是硬塞导致 OOM。这是引擎稳健性的关键设计，自研时务必保留。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>Attention 侧：kernel 需要知道 block table</h2>
+    <p>因为 KV 在物理上不连续，标准的 FlashAttention 不能直接用。vLLM 的注意力 kernel 接收 <strong>block table</strong>，在 kernel 内通过索引拿到每个逻辑块对应的物理偏移。这个「分页的 flash attention」就是 <strong>PagedAttention</strong> 名字的来源。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 180" xmlns="http://www.w3.org/2000/svg">
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">PagedAttention：kernel 内按 block table 取 KV</text>
+        <rect class="node core" x="20" y="40" width="120" height="40" rx="6"></rect><text class="lbl sm" x="80" y="63" text-anchor="middle">block table</text>
+        <line class="edge" x1="140" y1="60" x2="230" y2="60"></line>
+        <g>
+          <rect class="node" x="240" y="34" width="120" height="52" rx="6"></rect>
+          <text class="lbl sm" x="300" y="58" text-anchor="middle">物理块 #7</text>
+          <rect class="node" x="240" y="94" width="120" height="52" rx="6"></rect>
+          <text class="lbl sm" x="300" y="120" text-anchor="middle">物理块 #13</text>
+        </g>
+        <line class="edge core" x1="300" y1="86" x2="300" y2="94"></line>
+        <line class="edge" x1="360" y1="120" x2="470" y2="120"></line>
+        <rect class="node acc" x="480" y="80" width="180" height="80" rx="8"></rect>
+        <text class="lbl" x="570" y="110" text-anchor="middle">注意力 kernel</text>
+        <text class="lbl sm" x="570" y="130" text-anchor="middle">按表索引取 K/V</text>
+        <text class="lbl sm" x="570" y="146" text-anchor="middle">计算注意力</text>
+        <text class="lbl sm" x="20" y="176">kernel 入口见 vllm/v1/attention/backends（如 FlashAttentionMetadata 存 block table）</text>
+      </svg>
+      <div class="fig-cap">图 3.5：PagedAttention 就是「能理解 block table 的 FlashAttention」。kernel 层细节见第 7 章。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>小结与自研启示</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
+      <tr><td>分页 KV</td><td>BlockPool + block table</td><td>先做固定连续 KV，理解了再用分页（第二版）</td></tr>
+      <tr><td>按需分配</td><td>allocate_slots 返回 None 即背压</td><td>KV 不足时不调度，宁可等待不 OOM</td></tr>
+      <tr><td>前缀缓存</td><td>块内容哈希 + BlockHashToBlockMap</td><td>先跳过；这是吞吐优化，不是正确性要求</td></tr>
+      <tr><td>kernel</td><td>v1/attention/backends</td><td>先用 torch 原生 attention 跑通，再换优化 kernel</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      KV 只回答「块从哪来」。谁决定「这批 KV 该属于哪些请求、每步跑哪些请求」？这就是<a href="04-scheduler.html">第 4 章：调度器</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="02-request-lifecycle.html">← 上一步：请求生命周期</a>
+    <a href="04-scheduler.html">下一步：调度器 →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 03 PagedAttention &amp; KV Cache · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

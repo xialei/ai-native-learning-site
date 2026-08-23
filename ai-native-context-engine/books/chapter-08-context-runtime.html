@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 8 章 · Context Runtime — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 8 章 · Context Runtime</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 8 章 · Context Runtime</div>
+      <h1 class="title">让上下文活起来</h1>
+      <p class="lede">
+        传统 RAG 里，Context 的生命只有一次：拼一次 Prompt，喂给模型，结束。但 Agent 不是这么工作的——它会调工具、看结果、再推理、再调工具。整个过程里 Context 一直在变。这一章讲怎么管理这个持续演化的运行时状态。本章聚焦单 Agent / Session；多 Agent 共享见第 13 章。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Context Runtime 是整个 AI Knowledge Runtime 的运行时核心。它的职责是负责 Context 的创建、更新、演化、共享和生命周期管理。</p>
+
+      <p>核心转变：Context 不再只是 Prompt，而是 <strong>Agent Runtime 的状态</strong>。这一句话是本章的全部要旨。Prompt 是一次性的输入，状态是持续维护的对象——这两者的工程含义完全不同。</p>
+
+      <p>这里要把三种"状态"分清楚，否则很容易混。第一类是<em>喂给模型推理的信息</em>（检索结果、记忆、对话历史）——那是第 4–7 章的上下文。第二类是<em>系统自己用来继续和协调执行的状态</em>（待办子任务、检查点、重试、共享 artifact）——那是本章 Runtime 管的运营状态。第三类是<em>观测记录</em>（Trace、日志、监控）——那是第 10 章的事。学术界也特意把这三类分开，避免"状态"这个词被笼统使用而搅在一起。<span class="src">来源：Li et al., 2026, §6.1</span></p>
+
+      <h2 id="why">为什么需要 Runtime</h2>
+
+      <p>看传统 RAG 的流程：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  Q["Question"] --> P["Prompt"] --> L["LLM"] --> E["结束"]
+  style E fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>传统 RAG：Context 生命周期只有一次。</figcaption>
+      </figure>
+
+      <p>Context 的生命周期只有一次。但是 Agent 的真实工作方式是这样的：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  Q["Question"] --> C["Context"]
+  C --> T["Tool"]
+  T --> O["Observation"]
+  O --> NC["New Context"]
+  NC --> R["Reasoning"]
+  R --> T2["Tool"]
+  T2 --> O2["Observation"]
+  O2 --> A["Answer"]
+  style A fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Agent 的真实流程：Context 在整个推理过程中一直变化。</figcaption>
+      </figure>
+
+      <p>整个过程 Context 一直变化——每次调工具拿到 Observation，都要更新进 Context。如果每次都重新走一遍 Retrieval，既慢又贵，还会丢失前几轮的推理上下文。因此必须有 Runtime 来管理这个持续演化的状态。</p>
+
+      <p>上面这张图不是本书自创的循环，而是 harness 工程文献总结的三个基础设计模式之一——<strong>工作流自动化</strong>：plan → execute → observe/test → improve → execute，直到目标达成。它的关键不是静态 prompt 模板，而是让 agent 通过 runtime 分析自己的历史轨迹和失败案例，在循环中迭代改进。本书把这条循环落地成 Create → Expand → Optimize → Consume → Update → Snapshot 的生命周期（见下节），并允许在任务规范不清晰时主动向用户澄清。另外两个模式也和本章直接相关：<strong>文件系统作为持久记忆</strong>——长程任务的实验日志、代码 diff、错误轨迹、历史 rollout 都应该落盘为文件，而不是塞进 context 或依赖专门的记忆数据库（这正是本章 Context Store 分 hot/warm/cold 落盘的方向）；以及<strong>子代理与后台任务</strong>——主 agent 需要一个轻量进程管理器来启动、查日志、取消、合并结果（这在第 13 章展开）。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §1</span></p>
+
+      <h2 id="architecture">Runtime 架构</h2>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  U["User"] --> A["Agent"]
+  A --> CR["Context Runtime"]
+  CR --> CS["Context Store"]
+  CR --> CE["Context Engine"]
+  CE --> TR["Tool Runtime"]
+  TR --> M["Memory"]
+  M --> RC["Realtime Context"]
+  style CR fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Context Runtime 统一管理所有 Context。它在 Agent 和底层存储之间。</figcaption>
+      </figure>
+
+      <p>Context Runtime 统一管理所有 Context。Agent 不直接碰存储，也不直接碰 Context Engine——它只和 Runtime 对话。Runtime 负责协调 Store、Engine、Tool、Memory、Realtime 这些数据来源。</p>
+
+      <h2 id="lifecycle">Context 生命周期</h2>
+
+      <p>建议的生命周期是这样一个完整链路：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  C["Create"] --> L["Load"]
+  L --> E["Expand"]
+  E --> O["Optimize"]
+  O --> CO["Consume"]
+  CO --> U["Update"]
+  U --> S["Snapshot"]
+  S --> A["Archive"]
+  style C fill:#eef4ee,stroke:#2f6b3a
+  style A fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>Context 生命周期。不再是"生成一次 Prompt 就结束"，而是有完整的出生到归档。</figcaption>
+      </figure>
+
+      <p>而不是 Prompt 生成一次就结束。这条链路里，Update 和 Snapshot 是关键——Update 让 Context 反映最新状态，Snapshot 让每一步都可回放。</p>
+
+      <p>这条抽象链路在真实运行时里长什么样？开源运行时 Pi 把 Expand→Optimize→Consume 实现成一个纯函数三段管线：先把会话分支上的全部条目（Entry）过一遍 <em>transform</em>——决定哪些留下、哪些被压缩替换（第 7 章的 Optimizer 在这步介入）；再对每个条目 <em>project</em>——投影成 0 到 N 条喂给模型的消息（一次压缩条目会展开成"摘要 + 被保留的近期消息"两条以上）；最后<em>派生状态</em>从原始分支只读地推出"当前用什么模型、开哪些工具"。三段职责分离，而且状态派生读的是压缩前的完整分支——也就是说，远期对话被压成摘要了，但"当前模型配置"仍能从历史里重放重建。这套管线在每次调用模型前重跑一次，所以 Context 不是被存下来的快照，而是会话树的<em>派生视图</em>，模型永远拿不到陈旧上下文。<span class="src">来源：Pi Agent Harness 源码，packages/agent/src/harness/session/context.ts</span></p>
+
+      <h2 id="session">Context Session</h2>
+
+      <p>每次 Agent 拥有一个 Context Session。它就是 Agent 的工作空间：</p>
+
+      <pre><code>Session
+  ID
+  Owner
+  Goal
+  Context
+  History
+  Memory
+  Snapshot</code></pre>
+
+      <p>Session 把一次 Agent 任务的所有状态打包在一起：谁在用、目标是什么、当前 Context、历史、记忆、快照。这让一次 Agent 会话成为一个可管理、可恢复的单元。</p>
+
+      <h2 id="snapshot">Context Snapshot</h2>
+
+      <p>支持 Snapshot——在关键节点打快照：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  BT["Before Tool"] --> S1["Snapshot"]
+  S1 --> T["Tool"]
+  T --> S2["Snapshot"]
+  S2 --> R["Reasoning"]
+  R --> S3["Snapshot"]
+  style S1 fill:#f4e6e4,stroke:#b4332a
+  style S2 fill:#f4e6e4,stroke:#b4332a
+  style S3 fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption>在调用工具前后、推理前后打快照。方便 Replay、Debug、Checkpoint。</figcaption>
+      </figure>
+
+      <p>方便 Replay、Debug、Checkpoint。如果 Agent 推理出了问题，你可以回到上一个 Snapshot 重新来过，而不是从头开始。这是生产环境调试的刚需。</p>
+
+      <p>快照还承担一个治理含义。安全研究正在形成一个新共识：上下文不该被当成"被动的提示素材"，而该被当成<em>受治理的状态</em>——和数据库里的记录一样，它要可审计、可校验、在输出前重新过权限。Snapshot 和 Version 就是把这条原则落地的基础设施：每一次状态变更都被记录、可回溯、可在事后校验是否越权。<span class="src">来源：Li et al., 2026, §9.6 引 Kim et al., 2026</span></p>
+
+      <h2 id="update">Context Update：增量，不是重算</h2>
+
+      <p>Tool 执行后，Context 更新。比如：</p>
+
+      <pre><code>Deploy() → Deployment Status → Context Update</code></pre>
+
+      <p>不是重新 Retrieval，而是 <strong>Incremental Update</strong>。这是 Runtime 存在的核心价值——如果每次工具调用都要重新检索一遍，Agent 就退化成了"每次都从零开始"的 RAG。增量更新只把新的 Observation 合并进现有 Context，快且省。</p>
+
+      <p>这背后是个经典的取舍：无状态重放（从交互历史重建执行，利于可复现、可审计，但轨迹变长后很贵）还是有状态执行（把状态持久化到文件、库、任务图，利于连续和恢复，但带来一致性难题）。业界主流做法是<em>混合</em>——既保留可回放的交互历史，又依赖持久 artifact。本章的 Snapshot + 增量 Update，正是这种混合模式的落地：快照保证可回放，增量更新保证连续性。<span class="src">来源：Li et al., 2026, §6.1–6.2</span></p>
+
+      <h2 id="merge">Context Merge</h2>
+
+      <p>多个来源的更新要统一 Merge：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  T["Tool"] --> M["Merge"]
+  ME["Memory"] --> M
+  RT["Realtime"] --> M
+  RE["Retrieval"] --> M
+  M --> NC["最新 Context"]
+  style M fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Tool、Memory、Realtime、Retrieval 四路来源统一 Merge，形成最新 Context。</figcaption>
+      </figure>
+
+      <p>Tool 的结果、记忆、实时数据、检索结果，统一 Merge 形成最新 Context。Runtime 是这个 Merge 的协调者——它知道哪个来源优先级高、哪个该覆盖哪个。</p>
+
+      <p>"该覆盖哪个"这件事不能含糊，必须有显式的冲突解决策略。Palantir Foundry 的对象实例就是一个典型：它既能被输入数据源更新，也能被用户 Action 编辑更新，当同一个对象（同一主键）同时收到两边的数据时，平台需要一套冲突解决策略决定最终值以谁为准。本书的 Merge 也一样——Tool 结果、记忆、实时数据、检索结果可能指向同一个对象的不同值，Runtime 不能默认"后到的覆盖先到的"，而要按来源优先级和业务规则明确裁决，否则上下文会出现自相矛盾的字段。<span class="src">来源：Foundry Ontology 文档，Action types</span></p>
+
+      <h2 id="version-diff">Version 与 Diff</h2>
+
+      <p>Context 支持 Version。v1 → v2 → v3，方便 Rollback、Audit、Replay。</p>
+
+      <p>更实用的是 <strong>Context Diff</strong>：两个 Context 比较。比如：</p>
+
+      <pre><code>GPU
+  90% → 95%</code></pre>
+
+      <p>Diff 自动生成，Agent 无需全部重新读取。它只需要知道"什么变了"——这和第 7 章的 Progressive Context 理念一致，只传递增量。</p>
+
+      <p>Version 和 Snapshot 让上下文演化有了沙箱保护。这个思路工业上有成熟对应物。Palantir Foundry 的 Scenario 机制就是对 Ontology 的一次"分支"——所有假设分析的编辑都只存在于隔离沙箱，不影响主 Ontology；只有当结论被采纳时，"Apply scenario"才把所有暂存编辑作为<em>单一事务</em>原子提交回去。它一旦创建就不可变，要改得新建或复制一个；单个场景最多 30000 次编辑；合并还得在 Action 的安全策略里配足权限，因为合并相当于一次性批量改生产数据。本书第 8 章的 Snapshot（Tool 执行前后打点）和 Version（v1→v2→v3 支持 Rollback/Replay）可以借鉴这套"fork-验证-原子合并"模型——尤其是"采纳时才作为单次事务提交"这点，能避免半截更新污染主线。<span class="src">来源：Foundry Ontology 文档，Ontology scenarios</span></p>
+
+      <h2 id="share-lock">Share 与 Lock</h2>
+
+      <p><strong>Context Share</strong>：多个 Agent 共享同一 Context。Research Agent、Business Agent、Coding Agent 共享同一个 Experiment，无需重复 Retrieval。这避免了每个 Agent 各自检索一遍的浪费。多 Agent 的细节见第 13 章。</p>
+
+      <p><strong>Context Lock</strong>：多个 Agent 同时修改同一 Object 时，Runtime 负责加锁，避免冲突。没有锁的并发修改会互相覆盖，导致数据丢失。</p>
+
+      <h2 id="event-bus">Context Event Bus</h2>
+
+      <p>所有变化产生 Event：</p>
+
+      <pre><code>ContextCreated
+ContextExpanded
+ContextUpdated
+ContextMerged
+ContextArchived</code></pre>
+
+      <p>统一进 Event Bus。这让 Context 的变化可以被订阅——别的 Agent 或监控系统可以感知到"这个 Context 更新了"。这是异步协作的基础。</p>
+
+      <p>Event Bus 最小该怎么落地？参考实现里有一个干净的切法：把"内容流"和"操作账本"物理拆成两条。Pi 就这么做——会话树上只存 <em>内容条目</em>（消息、压缩检查点、分支摘要、模型/工具变更），另起一条<em>操作记录</em>（operation_started / operation_finished / step_attempt / tool_started / usage）专门记运行时元数据：谁启动了这次操作、哪一步在哪重试、这次调用花了多少 token、为什么触发压缩。内容条目是 Agent 看到的对话，操作记录是 Runtime 的账本，两者分开存储、独立查询。这么做还有一个意外收益：恢复时只查"未完成的 operation_started"——零条说明空闲、一条说明挂起需续跑、两条以上就是损坏要报错。本书的 Event Bus 可以借鉴这条"内容与账本分离"的纪律：ContextCreated 这类事件不该混进 Context Package 本身，而要落在一条可独立审计的侧带上。<span class="src">来源：Pi Agent Harness 源码，packages/agent/src/harness/session/types.ts</span></p>
+
+      <h2 id="store">Context Store：分层存储</h2>
+
+      <p>建议分层：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>层级</th><th>存储</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td>Hot Context</td><td>Redis</td><td>当前活跃会话，最快</td></tr>
+            <tr><td>Warm Context</td><td>Paimon</td><td>近期会话，可恢复</td></tr>
+            <tr><td>Cold Context</td><td>Object Storage</td><td>历史归档，长期保存</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>分层让存储成本和访问速度匹配——热数据放 Redis，冷数据放对象存储。这和第 9 章的 Cache 分层是配套的。</p>
+
+      <h2 id="api">Runtime API</h2>
+
+      <pre><code>type ContextRuntime interface {
+    Create()
+    Load()
+    Update()
+    Merge()
+    Snapshot()
+    Archive()
+}</code></pre>
+
+      <p>所有 Agent 统一接口。Agent 不需要知道 Context 存在哪、怎么合并——它只调用这几个方法。</p>
+
+      <h2 id="trace">Runtime Trace</h2>
+
+      <p>记录完整生命周期：Create → Expand → Tool → Merge → Answer。方便 Debug。和第 10 章的 Observability 是一体的——Runtime 是 Trace 数据的主要生产者。</p>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Session、Update、Snapshot、Merge、Trace；</li>
+        <li><strong>第二阶段</strong>：Version、Share、Replay、Diff；</li>
+        <li><strong>第三阶段</strong>：Distributed Runtime、Multi Agent、Streaming Context。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Context Runtime 不是 Prompt 生命周期，而是 Agent 在整个推理过程中对 Context 的持续管理与演化能力。Context 从"一次性输入"升级为"持续演化的运行时状态"。</p>
+        <blockquote>
+          <p>Agent 在整个推理过程中，对 Context 的持续管理与演化能力。</p>
+        </blockquote>
+        <p>模块分工回顾：Hybrid Retrieval 生成初始 Context，Graph Expansion 扩展，Ranking 选择，Optimizer 压缩，Runtime 让 Context 活起来。下一章讲怎么加速它——Cache。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-07-context-optimizer.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 7 章 · Context Optimizer</span>
+        </a>
+        <a class="next" href="chapter-09-context-cache.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 9 章 · Context Cache</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Kernels 与注意力后端 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 Kernels &amp; 注意力后端</div>
+    <h1>Kernels：引擎「为什么快」的最后一公里</h1>
+    <div class="subtitle">模型跑多快，最终由 kernel 决定。vLLM 用「架构无关的注意力后端接口」把 FlashAttention、FlashInfer、TRTLLM 等各家 kernel 统一起来，再用自定义算子把 C++/CUDA 性能调到位。这一章讲清楚它的分层设计，以及你自研时不必从零写 kernel。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>为什么 kernel 决定性能：计算强度分类</h2>
+    <p>GPU 上「快不快」取决于算子属于哪种类型。一个简单判断标准是<strong>计算强度（arithmetic intensity）</strong> = 每秒浮点运算 / 每秒访存字节。它决定了瓶颈在哪：</p>
+    <ul>
+      <li><strong>prefill（算力密集，compute-bound）</strong>：序列很长，一次要算整段 K/V 与 Q 的注意力。矩阵乘法充足，把 SM 的 FMA 运算喂满就能提升——瓶颈是每个 SM 每秒能做多少次乘加。</li>
+      <li><strong>decode（访存密集，memory-bound）</strong>：每个请求一次只为一个 token 算注意力，但要把整条历史 K/V 读一遍。FLOPs 很小、读显存很大——瓶颈是显存带宽（GB/s），而不是算力。</li>
+    </ul>
+    <p>这两类在之前 PagedAttention 一章已经反复出现：prefill 一次算一大段，decode 一个 token 一个 token 挤出来。所以 vLLM 会对同一份注意力逻辑提供<strong>不同的 kernel 路径</strong>（prefill 用 batch-gemm 类实现、decode 用专为「每行单独小任务」优化的实现）。</p>
+    <p>具体到 kernel 层，两个关键优化方向：</p>
+    <ul>
+      <li><strong>FlashAttention 的 IO 优化</strong>：Naive 注意力要把完整的 S×S 分数矩阵 + softmax 中间结果写回显存（HBM）再读回。FlashAttention 把<strong>整个 Q/K/V 分块（tiling）</strong>，把当前分块读进片上 SRAM，在 SRAM 里算分数、做在线 softmax、累加输出，<strong>绝不让整个 K/V 或中间分数矩阵落回 HBM</strong>。它把显存往返次数从 O(N) 降到 O(N²/M)，本质是「以多算一点为代价，少搬大量数据」。</li>
+      <li><strong>GEMM 用 CUTLASS / cuBLAS</strong>：注意力里的矩阵乘（QK^T、PV）本质是 GEMM，直接调 NVIDIA 已有高度调优的库，而不是自己写一个平庸的矩阵乘核。</li>
+    </ul>
+    <div class="annotation"><b>一句话：</b>prefill 拼算力、decode 拼带宽——kernel 层就是针对这两种瓶颈分别做极致优化的地方。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>注意力后端抽象：接口与多实现</h2>
+    <p>vLLM 并不自己闷头写死一套注意力 kernel，而是定义了一组<strong>架构无关的接口</strong>，然后让 FlashAttention、FlashInfer、TRT-LLM、Triton 等实现都去实现它。模型层代码只依赖接口，不需要知道底层是哪个 kernel。</p>
+    <p>核心是两个抽象基类，都在 <code class="inline">vllm/v1/attention/backend.py</code>：</p>
+    <div class="code-title">vllm/v1/attention/backend.py — AttentionBackend（接口）与 AttentionImpl.forward（契约）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">AttentionBackend</span>(ABC):
+    <span class="cmt"># 声明这个后端支持哪些 dtype / kv_cache_dtype / block_size</span>
+    <span class="cmt"># 前后端选择器（selector）靠这些 supports_* 判断是否可用</span>
+    <span class="kw">@staticmethod</span>
+    <span class="kw">def</span> <span class="fn">get_name</span>() <span class="kw">-&gt;</span> <span class="cl">str</span>: ...
+
+    <span class="kw">@staticmethod</span>
+    <span class="kw">def</span> <span class="fn">get_impl_cls</span>() <span class="kw">-&gt;</span> <span class="cl">type</span>[<span class="cl">AttentionImplBase</span>]: ...
+
+    <span class="kw">@staticmethod</span>
+    <span class="kw">def</span> <span class="fn">get_builder_cls</span>(): <span class="cmt"># -&gt; AttentionMetadataBuilder</span>
+        ...
+
+<span class="kw">class</span> <span class="cl">AttentionImpl</span>(AttentionImplBase[T]):
+    <span class="kw">def</span> <span class="fn">forward</span>(self, layer, query, key, value,
+        kv_cache, attn_metadata, ...) <span class="kw">-&gt;</span> <span class="cl">torch</span>.Tensor: ...</pre>
+    <p>每个后端要回答三件事：</p>
+    <ul>
+      <li><code class="inline">get_impl_cls()</code> —— 返回真正算注意力的实现类（如 <code class="inline">FlashAttentionImpl</code>）；</li>
+      <li><code class="inline">get_name()</code> —— 后端名字，如 <code class="inline">"FLASH_ATTN"</code> / <code class="inline">"FLASHINFER"</code>；</li>
+      <li><code class="inline">get_builder_cls()</code> —— 返回一个「元数据构建器」，负责把调度器给出的 block table、seq_lens 等整理成后端 kernel 需要的形式（见下边 metadata）。</li>
+    </ul>
+    <p><code class="inline">forward</code> 的签名非常统一：输入 query/key/value、<code class="inline">kv_cache</code>、<code class="inline">attn_metadata</code>，输出 attention 结果。模型层每层注意力都按这个签名调用，到底执行哪个实现由上层选择器决定。这就是「<strong>架构无关接口 + 多后端实现</strong>」——同一份模型代码能同时跑在 FlashAttention、FlashInfer、TRTLLM 上，而 vLLM 几乎是全平台支持的。</p>
+    <p>后端的「账单」在 <code class="inline">vllm/v1/attention/backends/registry.py</code> 里：一个 <code class="inline">AttentionBackendEnum</code> 枚举，每一项的值是类的完整限定名。例如：</p>
+    <div class="code-title">vllm/v1/attention/backends/registry.py — 后端枚举（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">AttentionBackendEnum</span>(Enum, ...):
+    FLASH_ATTN  = <span class="st">"vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"</span>
+    FLASHINFER  = <span class="st">"vllm.v1.attention.backends.flashinfer.FlashInferBackend"</span>
+    TRITON_ATTN = <span class="st">"vllm.v1.attention.backends.triton_attn.TritonAttentionBackend"</span>
+    CUTLASS_MLA = <span class="st">"vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"</span>
+    ...
+    <span class="kw">def</span> <span class="fn">get_class</span>(self) <span class="kw">-&gt;</span> <span class="cl">type</span>[<span class="cl">AttentionBackend</span>]:
+        <span class="kw">return</span> resolve_obj_by_qualname(self.get_path())</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="22" font-weight="bold" fill="#165a7b">模型层注意力调用（架构无关）：forward(query, key, value, kv_cache, attn_metadata)</text>
+
+        <rect class="node core" x="330" y="34" width="240" height="44" rx="6"></rect>
+        <text class="lbl" x="450" y="53" text-anchor="middle">AttentionBackend（接口）</text>
+        <text class="lbl sm" x="450" y="68" text-anchor="middle">get_impl_cls / get_name / get_builder_cls</text>
+
+        <line class="edge" x1="380" y1="78" x2="250" y2="122" marker-end="url(#arrow)"></line>
+        <line class="edge" x1="450" y1="78" x2="450" y2="122" marker-end="url(#arrow)"></line>
+        <line class="edge" x1="520" y1="78" x2="650" y2="122" marker-end="url(#arrow)"></line>
+
+        <rect class="node" x="140" y="122" width="220" height="44" rx="6"></rect>
+        <text class="lbl" x="250" y="141" text-anchor="middle">FlashAttentionImpl</text>
+        <text class="lbl sm" x="250" y="157" text-anchor="middle">get_name = "FLASH_ATTN"</text>
+
+        <rect class="node" x="380" y="122" width="140" height="44" rx="6"></rect>
+        <text class="lbl" x="450" y="141" text-anchor="middle">FlashInferImpl</text>
+        <text class="lbl sm" x="450" y="157" text-anchor="middle">get_name = "FLASHINFER"</text>
+
+        <rect class="node" x="540" y="122" width="220" height="44" rx="6"></rect>
+        <text class="lbl" x="650" y="141" text-anchor="middle">CutlassMLABackend</text>
+        <text class="lbl sm" x="650" y="157" text-anchor="middle">TRTLLM · Triton · Mamba …</text>
+
+        <line class="edge" x1="250" y1="166" x2="230" y2="210" marker-end="url(#arrow)"></line>
+        <line class="edge" x1="450" y1="166" x2="450" y2="210" marker-end="url(#arrow)"></line>
+        <line class="edge" x1="650" y1="166" x2="660" y2="210" marker-end="url(#arrow)"></line>
+
+        <rect class="node acc" x="150" y="210" width="620" height="52" rx="8"></rect>
+        <text class="lbl" x="460" y="233" text-anchor="middle">csrc/ 里的 CUDA / Triton kernel</text>
+        <text class="lbl sm" x="460" y="251" text-anchor="middle">csrc/attention/*.cu · FlashAttention / FlashInfer / Triton 库</text>
+
+        <line class="edge core" x1="700" y1="78" x2="820" y2="120" marker-end="url(#arrow)"></line>
+        <rect class="node" x="760" y="120" width="120" height="52" rx="6"></rect>
+        <text class="lbl sm" x="820" y="139" text-anchor="middle">metadata</text>
+        <text class="lbl sm" x="820" y="155" text-anchor="middle">block_table</text>
+        <text class="lbl sm" x="820" y="166" text-anchor="middle">/ seq_lens</text>
+        <line class="edge core" x1="820" y1="172" x2="820" y2="210" marker-end="url(#arrow)"></line>
+      </svg>
+      <div class="fig-cap">图 7.1：接口在中间，多个实现各连各的 kernel，metadata（block table 等）从侧边流入提供给所有后端。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>后端选择：selector 怎么挑</h2>
+    <p>模型初始化时调 <code class="inline">get_attn_backend</code>，它把「模型配置 + 设备信息」打包成一个 <code class="inline">AttentionSelectorConfig</code>，再层层下发给平台层去挑后端。关键逻辑在 <code class="inline">vllm/v1/attention/selector.py</code>：</p>
+    <div class="code-title">vllm/v1/attention/selector.py — 根据配置与平台选择后端类</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_attn_backend</span>(...) <span class="kw">-&gt;</span> <span class="cl">type</span>[<span class="cl">AttentionBackend</span>]:
+    config = <span class="cl">AttentionSelectorConfig</span>(head_size=..., dtype=...,
+        kv_cache_dtype=..., block_size=..., use_mla=...,
+        has_sliding_window=..., use_non_causal=..., ...)
+    backend = attention_config.backend          <span class="cmt"># 用户可用 --attention-backend 指定</span>
+    <span class="kw">return</span> _cached_get_attn_backend(backend, config, ...)
+
+<span class="kw">def</span> <span class="fn">_cached_get_attn_backend</span>(backend, config, num_heads):
+    attention_cls = current_platform.get_attn_backend_cls(   <span class="cmt"># 平台决定</span>
+        backend, attn_selector_config=config, num_heads=num_heads)
+    backend_cls = resolve_obj_by_qualname(attention_cls)      <span class="cmt"># 类名字符串 -&gt; 类</span>
+    ...</pre>
+    <p>最终决策落在平台的 <code class="inline">get_attn_backend_cls</code>（如 <code class="inline">vllm/platforms/cuda.py</code>），逻辑是：</p>
+    <ul>
+      <li>如果用户显式指定了 <code class="inline">--attention-backend</code>，就校验它是否满足当前配置（<code class="inline">validate_configuration</code> 跑一遍所有 <code class="inline">supports_*</code> 检查），满足就用，不满足直接报错；</li>
+      <li>否则按一个<strong>优先级列表</strong>逐个试：<code class="inline">get_valid_backends</code> 返回「可用后端 + 优先级」，取优先级最高的（<code class="inline">min(valid_backends_priorities, key=lambda c: c.priority)</code>）。</li>
+      <li>不同硬件/场景给不同列表，例如 SM100f 的非因果注意力优先 FlashAttention，普通 CUDA 平台一般默认 <code class="inline">FLASH_ATTN</code> → <code class="inline">FLASHINFER</code> → <code class="inline">TRITON_ATTN</code> → <code class="inline">FLEX_ATTENTION</code>。</li>
+    </ul>
+    <p>所以「是否 enable_flashinfer」这类开关并不是硬编码一个 if，而是：<strong>每个后端声明自己的 <code class="inline">supports_*</code> 能力（dtype、head_size、block_size、是否是 MLA、是否支持 sliding window、GPU 算力…），选择器用这些能力把所有候选过滤一遍，再在剩下的里挑优先级最高的</strong>。这样新增一个后端只需要注册到枚举并实现能力检查，选择器零改动。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>自定义算子入口：ops 那层皮</h2>
+    <p>模型里大量直接调用的是 <code class="inline">vllm/_custom_ops.py</code>。它是「Python 壳」：把 <code class="inline">torch.ops._C.*</code> / <code class="inline">_vllm</code> 这些 C++/CUDA 算子包成好读、带类型注解的 Python 函数，同时用 <code class="inline">@register_fake</code> 给自定义算子在 torch 里登记 shape 规则（供 torch.compile / fake tensor 用）。</p>
+    <div class="code-title">vllm/_custom_ops.py — 几个真实自定义算子入口</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">rms_norm</span>(out, input, weight, epsilon) <span class="kw">-&gt;</span> <span class="kw">None</span>:
+    <span class="cl">torch</span>.ops._C.rms_norm(out, input, weight, epsilon)
+
+<span class="kw">def</span> <span class="fn">rotary_embedding</span>(positions, query, key, head_size, cos_sin_cache, ...):
+    <span class="cl">torch</span>.ops._C.rotary_embedding(...)
+
+<span class="kw">def</span> <span class="fn">paged_attention_rocm</span>(out, exp_sum, max_logits, tmp_out, query,
+    key_cache, value_cache, ..., block_tables, seq_lens, ...) <span class="kw">-&gt;</span> <span class="kw">None</span>:
+    <span class="cl">torch</span>.ops._rocm_C.paged_attention(...)
+
+<span class="kw">def</span> <span class="fn">merge_attn_states</span>(states, lse, resolve_global_lse, ...) -&gt; ...:
+    <span class="cl">torch</span>.ops._C.merge_attn_states(...)   <span class="cmt"># prefill 分块后合并各块状态</span></pre>
+    <p>看 <code class="inline">rms_norm</code> 就够了：Python 里唯一干的事就是把五个参数原样传给 <code class="inline">torch.ops._C.rms_norm</code>。真正的实现是 C++ 侧编译进 <code class="inline">_C</code> 库的 kernel（源在 <code class="inline">csrc/</code>），Python 只是入口/适配层。优点：模型代码不用碰 C++，写出来像普通 PyTorch 函数；<code class="inline">ops.rms_norm(out, input, weight, 1e-6)</code> 一行就完成一次融合的 RMSNorm。</p>
+    <p>除了 C++ 算子，vLLM 还用 <strong>Triton</strong> 写了一批「Python 写、照样能跑在 GPU」的算子，集中在 <code class="inline">vllm/v1/attention/ops/</code>（如 <code class="inline">triton_attention_helpers.py</code>、<code class="inline">triton_prefill_attention.py</code>、<code class="inline">triton_decode_attention.py</code>），配合 <code class="inline">vllm/triton_utils/</code> 做一些缓存与自动调参。Triton 的好处是无需手写 CUDA 也能做 kernel 级优化，常用来实现那些没有现成库覆盖的注意力变体。</p>
+    <p>注意：注意力这类 hot loop 并不走 <code class="inline">_custom_ops.py</code> 的 Python 壳，而是后端实现里直接调动静库（如 <code class="inline">flash_attn_varlen_func</code>）或 <code class="inline">torch.ops</code>。Python 壳更多用于 <strong>RMSNorm、RoPE、KV cache 写入、量化 GEMM</strong> 这类模型层直接用的小算子。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>用代码看：一个后端到底怎么 forward</h2>
+    <p>以默认的 <code class="inline">FlashAttentionImpl.forward</code> 为例（<code class="inline">vllm/v1/attention/backends/flash_attn.py</code>）。签名告诉你它拿什么、给什么：</p>
+    <div class="code-title">vllm/v1/attention/backends/flash_attn.py — FlashAttentionImpl.forward（签名）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, layer, query, key, value, kv_cache, attn_metadata,
+    output, output_scale=<span class="kw">None</span>, output_block_scale=<span class="kw">None</span>) <span class="kw">-&gt;</span> <span class="cl">torch</span>.Tensor:
+    <span class="cmt"># query:  [num_tokens, num_heads,     head_size]        # 本次所有 token 的 Q</span>
+    <span class="cmt"># key:    [num_tokens, num_kv_heads,  head_size]        # 新算的 K</span>
+    <span class="cmt"># value:  [num_tokens, num_kv_heads,  head_size]</span>
+    <span class="cmt"># kv_cache: [num_blocks, num_kv_heads, block_size, 2*head_size]  # 分页缓存</span>
+    <span class="cmt"># attn_metadata: FlashAttentionMetadata —— 装着 block table、seq_lens 等</span>
+    <span class="cmt"># returns: [num_tokens, num_heads * head_size]         # 注意力输出</span>
+
+    <span class="kw">if</span> attn_metadata <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> output.fill_(<span class="nu">0</span>)          <span class="cmt"># profiling 时直接填 0 跳过</span>
+    ...
+    <span class="cmt"># 内部按 attn_type 分流：decode 走一次一 token 路径，</span>
+    <span class="cmt"># prefill 走 varlen 向量化路径，最终都落到 flash_attn_varlen_func 等</span></pre>
+    <div class="annotation"><b>读懂这段：</b>这是「分页」与「后端」接缝处——它拿到的是物理上分页的 <code class="inline">kv_cache</code> 和 <code class="inline">block table</code>（metadata），而底层 FlashAttention kernel 恰好知道怎么按 block table 去读不连续的 KV。这也正是第 3 章「PagedAttention 就是懂 block table 的 FlashAttention」在代码里的落点。</div>
+
+    <p>再看看一个 MLA 后端如何把 KV 写进缓存——这里直接调用 <code class="inline">_custom_ops</code> 里的算子（<code class="inline">vllm/v1/attention/backend.py</code> 的 <code class="inline">do_kv_cache_update</code>）：</p>
+    <div class="code-title">vllm/v1/attention/backend.py — MLAAttentionImpl.do_kv_cache_update（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">do_kv_cache_update</span>(self, kv_c_normed, k_pe, kv_cache,
+    slot_mapping, kv_cache_dtype, k_scale) <span class="kw">-&gt;</span> <span class="kw">None</span>:
+    <span class="kw">if</span> kv_cache.numel() == <span class="nu">0</span>:
+        <span class="kw">return</span>
+    <span class="kw">from</span> vllm <span class="kw">import</span> _custom_ops <span class="kw">as</span> ops
+    ops.concat_and_cache_mla(                     <span class="cmt"># 把 MLA 的 K/V 写进分页缓存</span>
+        kv_c_normed, k_pe.squeeze(<span class="nu">1</span>), kv_cache,
+        slot_mapping.flatten(), kv_cache_dtype=kv_cache_dtype, scale=k_scale)</pre>
+    <div class="annotation"><b>看懂这条链路：</b>模型层算出的新 K/V → 后端实现（这里是 MLA）把<strong>新算的 KV 写进每请求的 slot</strong>（slot 是 block table 展开后的一个具体位置）→ 真正干活的是 <code class="inline">ops.concat_and_cache_mla</code> 这个自定义算子。于是「内存管理（第 3/8 章）+ 后端抽象（本章）+ 算子入口」三者在这里汇合。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.6</span>小结与自研启示</h2>
+    <table class="tbl">
+      <tr><th>环节</th><th>vLLM 的做法</th><th>你的引擎可以</th></tr>
+      <tr><td>注意力 kernel</td><td>backend 抽象 + FlashAttention / FlashInfer 等多实现</td><td>先用 <code class="inline">torch.nn.functional.scaled_dot_product_attention</code> 或现成 <code class="inline">flash-attn</code> 库，别自己写</td></tr>
+      <tr><td>后端选择</td><td>各后端 <code class="inline">supports_*</code> + 平台优先级列表</td><td>第一版直接写死 <code class="inline">sdpa</code>，跑通了再加选择</td></tr>
+      <tr><td>小算子</td><td><code class="inline">_custom_ops.py</code> 包 <code class="inline">torch.ops._C.*</code></td><td>RMSNorm 等先用 torch 组合代替，后续再考虑 kernel</td></tr>
+      <tr><td>GEMM</td><td>CUTLASS / cuBLAS</td><td>调 torch 的 <code class="inline">matmul</code> 就已走 cuBLAS，够用</td></tr>
+      <tr><td>Triton 变体</td><td><code class="inline">vllm/v1/attention/ops/</code></td><td>需要特殊注意力时再学 Triton，属于进阶</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      kernel 是「懂了再优化」的事，不是「起步就自己写」。你的第一个版本用 <code class="inline">torch.nn.functional.scaled_dot_product_attention</code>（SDPA，内部会自动选 FlashAttention/Memory-Efficient）和 <code class="inline">flash-attn</code> 现成库就能获得几乎 SOTA 的注意力性能。vLLM 最值得借鉴的是它的<strong>抽象分层</strong>——后端接口 + 注册表 + 按能力选择——让你换 kernel 如换插件，而不是跟 kernel 死磕。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="06-sampling.html">← 上一步：采样</a>
+    <a href="08-memory.html">下一步：内存 →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 07 Kernel · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

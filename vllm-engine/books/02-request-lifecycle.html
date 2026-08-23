@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 请求全生命周期 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 请求全生命周期</div>
+    <h1>一条请求的旅程：从 generate() 到输出 token</h1>
+    <div class="subtitle">把第 1 章的静态分层「跑起来」：一次调用如何穿过全部层级，每一步谁在处理、传了什么。看懂这条链，你的引擎主循环就有雏形了。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>生命周期总览（泳道图）</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t2 d2">
+        <title id="t2">请求全生命周期泳道图</title>
+        <desc id="d2">用户/入口、Engine、Core、Worker、GPU 五条泳道的时间线</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <!-- lane labels -->
+        <text class="lbl sm" x="10" y="40">入口</text>
+        <text class="lbl sm" x="10" y="120">Engine</text>
+        <text class="lbl sm" x="10" y="200">Core/Sched</text>
+        <text class="lbl sm" x="10" y="280">Worker</text>
+        <text class="lbl sm" x="10" y="360">GPU 前向</text>
+        <rect x="14" y="24" width="1" height="360" class="st"></rect>
+
+        <!-- Entry -->
+        <rect class="node acc" x="40" y="24" width="180" height="34" rx="6"></rect>
+        <text class="lbl sm" x="130" y="45" text-anchor="middle">LLM.generate(prompts)</text>
+        <line class="edge" x1="130" y1="120" x2="130" y2="84" ></line>
+        <line class="edge" x1="130" y1="84" x2="130" y2="62"></line>
+        <rect class="node acc" x="40" y="64" width="180" height="34" rx="6"></rect>
+        <text class="lbl sm" x="130" y="85" text-anchor="middle">_run_completion()</text>
+
+        <!-- Engine lane -->
+        <rect class="node core" x="230" y="100" width="230" height="38" rx="6"></rect>
+        <text class="lbl" x="345" y="123" text-anchor="middle">tokenize prompt</text>
+        <text class="lbl sm" x="345" y="138" text-anchor="middle" >→ prompt_token_ids</text>
+        <line class="edge" x1="130" y1="58" x2="230" y2="119"></line>
+        <line class="edge" x1="233" y1="138" x2="360" y2="180"></line>
+
+        <!-- Core lane -->
+        <rect class="node core" x="230" y="182" width="230" height="52" rx="6"></rect>
+        <text class="lbl" x="345" y="203" text-anchor="middle">构造 Request</text>
+        <text class="lbl sm" x="345" y="220" text-anchor="middle">add_request()</text>
+        <line class="edge" x1="463" y1="208" x2="540" y2="208"></line>
+
+        <!-- Core -> wait
+        <rect class="node" x="560" y="182" width="160" height="52" rx="6"></rect>
+        <text class="lbl" x="640" y="215" text-anchor="middle">排队/等待</text> -->
+
+        <rect class="node" x="560" y="182" width="170" height="52" rx="6"></rect>
+        <text class="lbl" x="645" y="203" text-anchor="middle">Scheduler 选中</text>
+        <text class="lbl sm" x="645" y="220" text-anchor="middle">→ 分配 KV 块</text>
+        <line class="edge" x1="733" y1="208" x2="790" y2="208"></line>
+
+        <!-- Worker lane -->
+        <rect class="node" x="812" y="240" width="110" height="320" rx="8" fill="#f1f6fb" stroke-dasharray="4 3"></rect>
+        <text class="lbl sm" x="867" y="264" text-anchor="middle">Worker</text>
+        <line class="edge" x1="645" y1="234" x2="645" y2="308"></line>
+        <line class="edge" x1="645" y1="308" x2="812" y2="308"></line>
+        <rect class="node" x="410" y="290" width="230" height="40" rx="6"></rect>
+        <text class="lbl" x="525" y="315" text-anchor="middle">executor.execute_model(batch)</text>
+        <line class="edge" x1="645" y1="270" x2="525" y2="290"></line>
+
+        <!-- GPU forward -->
+        <rect class="node core" x="300" y="352" width="240" height="40" rx="6"></rect>
+        <text class="lbl" x="420" y="376" text-anchor="middle">ModelRunner: 组装 tensor</text>
+        <line class="edge" x1="525" y1="330" x2="420" y2="352"></line>
+        <rect class="node core" x="300" y="400" width="240" height="40" rx="6"></rect>
+        <text class="lbl" x="420" y="424" text-anchor="middle">GPU 前向 → logits</text>
+        <line class="edge" x1="420" y1="392" x2="420" y2="400"></line>
+        <rect class="node acc" x="300" y="448" width="240" height="40" rx="6"></rect>
+        <text class="lbl" x="420" y="472" text-anchor="middle">Sampler → 新 token</text>
+        <line class="edge" x1="420" y1="440" x2="420" y2="448"></line>
+
+        <!-- return up -->
+        <line class="edge core" x1="300" y1="468" x2="200" y2="468"></line>
+        <line class="edge" x1="200" y1="468" x2="200" y2="180"></line>
+        <line class="edge" x1="200" y1="180" x2="434" y2="180"></line> <!-- back to engine -->
+        <text class="lbl sm" x="150" y="462">新 token 回传 Engine，写入该请求输出</text>
+        <text class="lbl sm" x="60" y="160">循环：直到 stop / max_tokens</text>
+      </svg>
+      <div class="fig-cap">图 2.1：一次生成调用的关键路径（单 worker、单步视角）。真实实现里 <code class="inline">step()</code> 会并行处理一整个 batch 的请求，而不是一条。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>第 1 步：入口把「文本」变「token」</h2>
+    <p>调用 <code class="inline">generate()</code> 后，<code class="inline">_run_completion()</code>（定义在 <code class="inline">vllm/entrypoints/offline_utils.py</code>）负责把用户给出的 prompt 处理成引擎能用的形式：<strong>文本 → prompt_token_ids</strong>。</p>
+    <div class="code-title">vllm/entrypoints/offline_utils.py — 摘录</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_run_completion</span>(self, prompts, params, output_type, ...):
+    <span class="cmt"># 1) 把每个 prompt 解析、tokenize，生成 Request（含 prompt_token_ids）</span>
+    self._add_completion_requests(prompts=prompts, params=params, ...)
+    <span class="cmt"># 2) 跑引擎主循环，返回所有输出</span>
+    <span class="kw">return</span> self._run_engine(use_tqdm=use_tqdm, output_type=output_type)</pre>
+    <div class="annotation"><b>读懂这段：</b>两个阶段分工清晰——「<em>准备</em>（_add_*，把外部输入变成内部 Request）」和「<em>执行</em>（_run_engine，阻塞直到所有请求完成）」。做引擎时建议就采用这种「准备/执行」两阶段 API。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>第 2 步：Request 是引擎的「工作单元」</h2>
+    <p>v1 取消了旧版的 <code class="inline">Sequence</code>，改用统一的 <code class="inline">Request</code>（<code class="inline">vllm/v1/request.py</code>）。它是贯穿引擎、调度器、KV cache 的身份证。</p>
+    <div class="code-title">vllm/v1/request.py — 关键字段（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Request</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, request_id, prompt_token_ids, ...):
+        self.request_id = request_id            <span class="cmt"># 唯一 id</span>
+        self.prompt_token_ids = prompt_token_ids <span class="cmt"># 已 tokenize 的输入</span>
+        self.num_computed_tokens = <span class="nu">0</span>          <span class="cmt"># 已计算过多少个 token（KV 已存）</span>
+        self.sampling_params = sampling_params  <span class="cmt"># 采样参数（温度、max_tokens…）</span>
+        ...
+        self.kv_transfer_params = <span class="kw">None</span>        <span class="cmt"># PD 分离时 KV 跨节点传输参数（非 None 才走）</span>
+        self.kv_cache_report_mode = <span class="st">"incremental"</span>  <span class="cmt"># KV 块占用上报模式（块本身由 KVCacheManager 持有）</span></pre>
+    <div class="annotation"><b>核心概念 <code class="inline">num_computed_tokens</code>：</b>这是连续批处理的关键计数器。它记录「这个请求的 KV cache 已经算到第几个 token」。新到的请求为 0（还没算过，要做 prefill）；已算过的则从这之后继续算（decode）。调度器正是靠它决定 prefill 还是 decode。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>第 3 步：引擎主循环 step()</h2>
+    <p>所有请求被 add 进引擎后，进入核心循环。vLLM 的魔法在于：<strong>它不是一条一条请求跑，而是每步把一个 batch 的请求合并成一次模型前向。</strong></p>
+    <div class="code-title">vllm/v1/engine/llm_engine.py — step（概念化）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">step</span>(self) <span class="kw">-&gt;</span> <span class="cl">list</span>[<span class="cl">RequestOutput</span>]:
+    <span class="cmt"># 1) 把所有待处理的请求交给 EngineCore（内部是 Scheduler + Worker）</span>
+    <span class="cmt"># 2) Core 选出本步 batch → 分配/复用 KV 块 → 交给 Worker</span>
+    <span class="cmt"># 3) Worker 前向 + 采样，返回每个请求的新 token</span>
+    <span class="cmt"># 4) Engine 侧 detokenize、判断是否结束（stop/max_tokens），</span>
+    <span class="cmt">#    生成 RequestOutput 返回给调用者</span>
+    outputs = self.engine_core.<span class="fn">get_output</span>()   <span class="cmt"># 见 core.py：取回 EngineCore 的输出</span>
+    processed = self.output_processor.<span class="fn">process_outputs</span>(outputs.outputs, ...)
+    <span class="kw">return</span> processed</pre>
+    <div class="annotation"><b>读懂这段：</b>「有人负责批处理的前端（Engine），有人负责批处理的决策（Core/Scheduler），有人负责批处理的执行（Worker）」。这三段的职责分离，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>第 4 步：prefill vs decode</h2>
+    <p>一个请求的一生只有两种「模式」：</p>
+    <ul>
+      <li><strong>prefill（预填充/首 token）</strong>：一次前向算出 <em>整个 prompt</em> 的 KV cache，并产出第一个 token。计算量大但只发生一次。</li>
+      <li><strong>decode（解码）</strong>：每步只算「上一个新 token」对 KV cache 的增量，产出下一个 token。计算量小但反复多次。</li>
+    </ul>
+    <table class="tbl">
+      <tr><th></th><th>prefill</th><th>decode</th></tr>
+      <tr><td>输入长度</td><td>整个 prompt（可能很长）</td><td>1 个新 token</td></tr>
+      <tr><td>计算强度</td><td>计算密集（算力瓶颈）</td><td>访存密集（受 KV 读取带宽限制）</td></tr>
+      <tr><td>KV 增长</td><td>一次写入多块</td><td>每次写一块</td></tr>
+      <tr><td>vLLM 处理</td><td>chunked prefill（可分块）</td><td>与其它 decode 请求合并成一大 batch</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">自研启示</b>
+      两种模式计算特征不同，是后续所有优化的根源：chunked prefill（把长 prompt 切片喂入避免饿死 decode）、连续批处理（动态加入/移除请求）、以及 speculative decoding（用更小的模型猜 token 减少 decode 步数）。先把「prefill 一次 + decode 循环」跑通，你已经有一个可用的单请求引擎。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>从生命周期反向看你的引擎</h2>
+    <p>把这条链「减到最小」就是自研引擎的骨架（这会是第 11 章的起点）：</p>
+    <div class="code-title">一个最小引擎的主循环（伪代码）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 伪代码：单请求、无批处理的最小引擎</span>
+<span class="kw">def</span> <span class="fn">generate</span>(prompt: <span class="cl">str</span>, max_tokens=<span class="nu">16</span>) -&gt; <span class="cl">str</span>:
+    tokens = tokenizer.encode(prompt)          <span class="cmt"># 1. 文本→token</span>
+    kv_cache = alloc_kv_cache(len(tokens))     <span class="cmt"># 2. 给 prompt 预留 KV</span>
+    out_ids = []
+    <span class="kw">while</span> len(out_ids) &lt; max_tokens:
+        logits = model_forward(tokens[-<span class="nu">1</span>:], kv_cache)  <span class="cmt"># 3. 前向（首步是整个 prompt）</span>
+        tok = sample(logits)                    <span class="cmt"># 4. 采样</span>
+        out_ids.append(tok); tokens.append(tok)
+    <span class="kw">return</span> tokenizer.decode(out_ids)          <span class="cmt"># 5. token→文本</span></pre>
+    <div class="annotation"><b>下一步：</b>上面的 <code class="inline">kv_cache</code> 是「整个序列一次性分配」，浪费且限制了并发。第 3 章的 PagedAttention 教你把它改成分页、按需分配——这正是 vLLM 每秒吞吐量高的关键，也让你理解为什么它能同时服务几千个请求。</div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="01-architecture.html">← 上一步：整体架构</a>
+    <a href="03-paged-attention.html">下一步：PagedAttention &amp; KV Cache →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 02 请求全生命周期 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

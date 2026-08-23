@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 5 章 · 图扩展 — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 5 章 · 图扩展</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 5 章 · Graph Expansion</div>
+      <h1 class="title">检索找到入口，扩展找到上下文</h1>
+      <p class="lede">
+        Hybrid Retrieval 把"Experiment A"带回来了。但 Agent 要回答的下一个问题是"这个实验用了什么数据、跑在哪台 GPU 上、代码是谁提交的"——这些信息检索不会给你。Graph Expansion 的活儿，就是沿着对象之间的关系，把这些上下文补全。它不搜数据，它补上下文。
+      </p>
+
+      <h2 id="positioning">模块定位：不是更好的检索</h2>
+
+      <p>先说清楚 Graph Expansion 不是什么。它不是"再搜一遍"。</p>
+
+      <p>很多人一看到"图扩展"三个字，脑子里马上浮现的是：在向量检索后面再接一个知识图谱查询，多捞几跳邻居出来。这个理解是错的。Graph Expansion 压根不关心 Query，它不看问题，它只看当前 Context 里已经有哪些对象。</p>
+
+      <p>它的职责一句话能说完：</p>
+
+      <blockquote>
+        <p><strong>围绕当前 Context 里的业务对象，自动扩展出 Agent 真正需要的业务上下文。</strong></p>
+      </blockquote>
+
+      <p>这是 Context Engine 和传统 RAG 最根本的区别。传统 RAG 的流水线短得可怜：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  Q["Question"] --> V["Vector Search"] --> C["Chunk"] --> P["Prompt"] --> L["LLM"]
+  style Q fill:#fff,stroke:#9a978f
+  style L fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption><strong>传统 RAG</strong>：问题进来，向量搜出去，文档拼进 Prompt，结束。中间没有"补全上下文"这一步。</figcaption>
+      </figure>
+
+      <p>Context Engine 的流水线长这样：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  Q["Question"] --> H["Hybrid Retrieval"] --> S["Seed Context"] --> G["Graph Expansion"] --> E["Expanded Context"] --> L["LLM"]
+  style Q fill:#fff,stroke:#9a978f
+  style G fill:#eef4ee,stroke:#2f6b3a
+  style E fill:#f4e6e4,stroke:#b4332a
+  style L fill:#fff,stroke:#b4332a
+        </div>
+        <figcaption><strong>Context Engine</strong>：检索产出 Seed Context，Graph Expansion 把它扩展成完整的业务上下文，再交给 LLM。</figcaption>
+      </figure>
+
+      <p>注意中间多出来的那一站。检索负责找入口，扩展负责找上下文。两件事，两个阶段，别揉在一起。</p>
+
+      <p>还有一个关键点：Graph Expansion 的输出不是更多的 Document，而是 <strong>Context Object Graph</strong>——一个由业务对象和它们之间的关系组成的图。文档在这里只是对象的证据载体，不是主角。</p>
+
+      <h2 id="why-needed">为什么需要扩展</h2>
+
+      <p>举个例子。用户问："Experiment A 的训练为什么这么慢？"</p>
+
+      <p>Hybrid Retrieval 会把"Experiment A"这个对象捞回来。很好，入口找到了。但 Agent 要回答"为什么慢"，光有一个 Experiment 对象是不够的。它还需要知道：</p>
+
+      <ul>
+        <li>这个实验用了哪个 Dataset？数据量多大？</li>
+        <li>跑了哪些 Feature？有没有数据倾斜？</li>
+        <li>Notebook 里的代码长什么样？</li>
+        <li>Git Commit 是谁提交的？改了什么？</li>
+        <li>跑在哪台 GPU 上？这台机器最近有没有报过警？</li>
+        <li>有没有 Checkpoint 可以对比？</li>
+        <li>Evaluation 结果是多少？和历史实验比怎么样？</li>
+        <li>Owner 是谁？我得知道该找谁确认。</li>
+      </ul>
+
+      <p>这些信息散落在七八个系统里。Hybrid Retrieval 不会一次性把它们全捞回来——它根本不知道该捞什么，因为它只看 Query 和对象的相似度。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  EXP["Experiment A<br/><small>Seed Object</small>"]
+  EXP --> DS["Dataset"]
+  EXP --> FT["Feature"]
+  EXP --> NB["Notebook"]
+  EXP --> CM["Git Commit"]
+  EXP --> GPU["GPU"]
+  EXP --> CK["Checkpoint"]
+  EXP --> EV["Evaluation"]
+  EXP --> OW["Owner"]
+  style EXP fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style DS fill:#eef4ee,stroke:#2f6b3a
+  style FT fill:#eef4ee,stroke:#2f6b3a
+  style NB fill:#eef4ee,stroke:#2f6b3a
+  style CM fill:#eef4ee,stroke:#2f6b3a
+  style GPU fill:#eef4ee,stroke:#2f6b3a
+  style CK fill:#eef4ee,stroke:#2f6b3a
+  style EV fill:#eef4ee,stroke:#2f6b3a
+  style OW fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>检索找到的是 Experiment A 这个入口；扩展找到的是它周围这一整片业务上下文。</figcaption>
+      </figure>
+
+      <p>如果没有 Expansion，LLM 对着孤零零一个 Experiment 对象，什么都答不出来。它不知道用了什么数据，不知道谁提交了代码，不知道 GPU 是否异常，不知道有没有历史实验可以对比。</p>
+
+      <p>所以记住这句话：</p>
+
+      <blockquote class="callout">
+        <p><strong>Retrieval 找到的是入口。Expansion 找到的是上下文。</strong></p>
+      </blockquote>
+
+      <h2 id="graph-role">Graph 的定位：导航层，不是数据库</h2>
+
+      <p>这里有一个特别容易踩的坑：一提到"图扩展"，马上开始建知识图谱，把所有数据往图里塞。Experiment 是节点，Dataset 是节点，Feature 是节点，连 Git Commit 也塞进去。最后图越来越大，查询越来越慢，维护成本爆炸。</p>
+
+      <p>别这么干。</p>
+
+      <p>在本设计中，Graph <strong>不是数据库</strong>。它的定位是：</p>
+
+      <blockquote>
+        <p><strong>Object Navigation Layer</strong>——对象导航层。</p>
+      </blockquote>
+
+      <p>它的作用只有三个：</p>
+      <ul>
+        <li><strong>找关系</strong>：Experiment 和 Dataset 之间是什么关系？</li>
+        <li><strong>找上下文</strong>：这个对象周围有哪些相关的业务对象？</li>
+        <li><strong>找依赖</strong>：这个 Notebook 依赖哪个 Docker Image？那个 Image 又依赖哪个 Dataset？</li>
+      </ul>
+
+      <p>它<em>不</em>存储所有数据。数据在 Object Store 里——关系数据库、对象存储、文档库，该在哪在哪。Graph 只是这些对象的导航索引，记录谁和谁有关系、是什么关系。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  OS["Object Store<br/><small>真实数据存储</small>"]
+  GI["Graph Index<br/><small>关系导航索引</small>"]
+  EE["Expansion Engine<br/><small>上下文扩展引擎</small>"]
+  OS --> GI
+  GI --> EE
+  style OS fill:#f3f1ea,stroke:#9a978f
+  style GI fill:#eef4ee,stroke:#2f6b3a
+  style EE fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption>三层架构：Object Store 存数据，Graph Index 存关系，Expansion Engine 沿着关系扩展上下文。Graph 只是中间那层索引。</figcaption>
+      </figure>
+
+      <p>这个分工很重要。Object Store 是数据的"家"，Graph Index 是"路牌"，Expansion Engine 是"导航员"。你不把所有东西搬到路牌上，你只是用路牌找到该去哪。</p>
+
+      <p>这个分工背后有一条更硬的原则：<strong>每个事实只存一份</strong>。一个属性如果可以从关联对象算出来，就不要在本地冗余存储——一旦源头变了，所有副本都得同步更新，漏掉一个就是脏数据。Palantir Foundry 的 Ontology 结构指南把它讲得很透：用 derived property（运行时按 link 关联动态计算、只读）换取"看起来像冗余展开"的访问便利，但底层数据规范化、只存一份。它甚至支持最多三层关联遍历来计算派生值。这正是本书把 Graph 定位为"导航索引而非存储层"的依据——关系在运行时展开，而不是冗余落盘；第 7 章的 Relation Compression 也是同一个原则的延伸。<span class="src">来源：Foundry Ontology 文档，Derived properties / 结构指南</span></p>
+
+      <h2 id="input-output">输入输出：不关心 Query，只关心已有对象</h2>
+
+      <p>Graph Expansion 的输入统一是 <code>ContextPackage</code>——就是前几章定义的那个。</p>
+
+      <p>比如 Hybrid Retrieval 返回了这么个东西：</p>
+
+      <pre><code>{
+  "objects": [
+    { "type": "Experiment", "id": "exp_001" }
+  ]
+}</code></pre>
+
+      <p>就这么简单。一个 Experiment 对象，这是 Seed Context。</p>
+
+      <p>注意一个关键设计决策：<strong>Graph Expansion 不关心 Query</strong>。它不看问题是什么，它只看当前 Context 里有哪些对象。你给它什么对象，它就沿着这些对象的关系去扩展。</p>
+
+      <p>这是有意为之。把 Query 关在门外，让 Expansion 的逻辑保持纯粹——"围绕已有对象补全上下文"，而不是"根据问题猜测该捞什么"。猜测是 Intent Planner 的活儿，不是 Expansion 的。</p>
+
+      <p>输出也是 <code>ContextPackage</code>，只是对象变多了：</p>
+
+      <pre><code>{
+  "objects": [
+    { "type": "Experiment",  "id": "exp_001" },
+    { "type": "Dataset",     "id": "ds_042" },
+    { "type": "Feature",     "id": "ft_017" },
+    { "type": "Notebook",    "id": "nb_008" },
+    { "type": "GitCommit",   "id": "commit_a3f2" },
+    { "type": "GPU",         "id": "gpu_node_7" },
+    { "type": "Checkpoint",  "id": "ckpt_v3" },
+    { "type": "Evaluation",  "id": "eval_005" },
+    { "type": "Owner",       "id": "user_zhang" }
+  ]
+}</code></pre>
+
+      <p>Seed Object 还在，新扩展出来的对象和它一起组成 Expanded Context。整个过程是"加法"，不是"替换"。</p>
+
+      <h2 id="strategies">六种扩展策略</h2>
+
+      <p>Graph Expansion 不是只会一种"无脑遍历"。它支持六种策略，每种解决不同的问题。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  subgraph Strategies ["六种扩展策略"]
+    D["Direct<br/><small>一跳</small>"]
+    M["Multi-Hop<br/><small>多跳</small>"]
+    T["Type<br/><small>按类型</small>"]
+    TP["Temporal<br/><small>按时间</small>"]
+    DP["Dependency<br/><small>依赖链</small>"]
+    P["Policy<br/><small>权限</small>"]
+  end
+  style D fill:#eef4ee,stroke:#2f6b3a
+  style M fill:#eef4ee,stroke:#2f6b3a
+  style T fill:#eef4ee,stroke:#2f6b3a
+  style TP fill:#eef4ee,stroke:#2f6b3a
+  style DP fill:#eef4ee,stroke:#2f6b3a
+  style P fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>六种策略不是互斥的，Pipeline 里可以组合使用。</figcaption>
+      </figure>
+
+      <h3>1. Direct Expansion（一跳扩展）</h3>
+
+      <p>最简单：只扩展直接关联的对象，一跳就停。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  E["Experiment"] --> D["Dataset"]
+  E --> N["Notebook"]
+  style E fill:#f4e6e4,stroke:#b4332a
+  style D fill:#eef4ee,stroke:#2f6b3a
+  style N fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Direct Expansion：一跳邻居，快、省、够用。</figcaption>
+      </figure>
+
+      <p>Experiment 的直接邻居是什么？Dataset、Notebook，就这两个。适合快速问答场景——用户就想知道"这个实验用了什么数据"，一跳就够，不用再往下挖。</p>
+
+      <h3>2. Multi-Hop Expansion（多跳扩展）</h3>
+
+      <p>继续往下走。不只是直接邻居，还要扩展邻居的邻居。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  E["Experiment"] --> D["Dataset"] --> F["Feature"] --> S["Statistics"] --> Q["Quality Report"]
+  style E fill:#f4e6e4,stroke:#b4332a
+  style D fill:#eef4ee,stroke:#2f6b3a
+  style F fill:#eef4ee,stroke:#2f6b3a
+  style S fill:#eef4ee,stroke:#2f6b3a
+  style Q fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Multi-Hop Expansion：从 Experiment 一路走到 Quality Report。每多一跳，上下文更完整，但成本也更高。</figcaption>
+      </figure>
+
+      <p>从 Experiment 走到 Dataset，再走到 Feature，再到 Statistics，再到 Quality Report。适合复杂分析——用户问的是"这个实验的数据质量有没有问题"，你得追到 Quality Report 才能答。</p>
+
+      <p>但多跳必须有 <strong>Hop Limit</strong>。不限制的话，四跳之后图就炸了，一个 Experiment 能扩展出几千个对象。默认两跳，最多四跳，足够了。</p>
+
+      <h3>3. Type Expansion（按类型扩展）</h3>
+
+      <p>不按关系走，按对象类型走。给定一个 Experiment，把和它关联的<em>所有</em> Metric、所有 Event、所有 Checkpoint 全捞回来。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  E["Experiment"] --> M["全部 Metrics"]
+  E --> V["全部 Events"]
+  E --> C["全部 Checkpoints"]
+  style E fill:#f4e6e4,stroke:#b4332a
+  style M fill:#eef4ee,stroke:#2f6b3a
+  style V fill:#eef4ee,stroke:#2f6b3a
+  style C fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Type Expansion：不挑关系，直接按类型全量拉取。适合需要完整指标列表的场景。</figcaption>
+      </figure>
+
+      <p>适合的场景是：Agent 需要看到这个实验的<em>全部</em>指标，不能漏。比如做性能分析时，少一个 Metric 可能就漏掉了关键线索。</p>
+
+      <h3>4. Temporal Expansion（时间扩展）</h3>
+
+      <p>沿着时间轴扩展。当前实验 → 昨天的版本 → 最近一周 → 历史版本。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  E["当前实验"] --> Y["昨天"] --> W["最近一周"] --> H["历史版本"]
+  style E fill:#f4e6e4,stroke:#b4332a
+  style Y fill:#eef4ee,stroke:#2f6b3a
+  style W fill:#eef4ee,stroke:#2f6b3a
+  style H fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Temporal Expansion：沿着时间往回走，补全历史上下文。</figcaption>
+      </figure>
+
+      <p>用户问"这个实验比上次慢了多少"，你得把上周的版本拉出来对比。Temporal Expansion 就是干这个的——把同一个对象在不同时间点的状态补进来。</p>
+
+      <h3>5. Dependency Expansion（依赖扩展）</h3>
+
+      <p>沿着依赖链走。这条链特别长，但特别有用：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  N["Notebook"] --> G["Git Commit"] --> D["Docker Image"] --> S["Dataset"] --> U["GPU"]
+  style N fill:#f4e6e4,stroke:#b4332a
+  style G fill:#eef4ee,stroke:#2f6b3a
+  style D fill:#eef4ee,stroke:#2f6b3a
+  style S fill:#eef4ee,stroke:#2f6b3a
+  style U fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Dependency Expansion：从 Notebook 一路追到 GPU，完整依赖链。</figcaption>
+      </figure>
+
+      <p>Notebook 用了哪个 Git Commit，那个 Commit 构建出哪个 Docker Image，那个 Image 绑定了哪个 Dataset，那个 Dataset 最终跑在哪台 GPU 上。一条链走到底，Agent 就能知道这个实验<em>真正</em>依赖了什么。</p>
+
+      <p>这条链在排查问题时价值极高。"为什么结果和上次不一样？"——八成是依赖链上某个环节变了。</p>
+
+      <h3>6. Policy Expansion（权限扩展）</h3>
+
+      <p>这条策略扩展的不是业务上下文，而是权限上下文。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  E["Experiment"] --> O["Owner"] --> A["ACL"] --> P["Project"] --> T["Tenant"]
+  style E fill:#f4e6e4,stroke:#b4332a
+  style O fill:#eef4ee,stroke:#2f6b3a
+  style A fill:#eef4ee,stroke:#2f6b3a
+  style P fill:#eef4ee,stroke:#2f6b3a
+  style T fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Policy Expansion：从对象追到 Owner、ACL、Project、Tenant，补全权限链路。</figcaption>
+      </figure>
+
+      <p>Experiment 属于谁？Owner 有什么权限？这些权限挂在哪个 Project 下？Project 又属于哪个 Tenant？</p>
+
+      <p>这条链确保一件事：后续的 Context Builder 不会把当前用户无权访问的对象塞进 Prompt。权限不是事后校验，是在扩展阶段就把链路补好。</p>
+
+      <blockquote class="callout">
+        <p><strong>六种策略不是互斥的。</strong>Pipeline 里可以组合使用。比如先做 Direct Expansion 补全直接邻居，再做 Policy Expansion 补全权限链，最后对关键对象做 Multi-Hop 深挖。怎么组合取决于场景。</p>
+      </blockquote>
+
+      <h2 id="rules">扩展规则：不能无限走下去</h2>
+
+      <p>六种策略说完了，但有一个问题：如果不限制，扩展会爆炸。一个 Experiment 两跳就能拉出上百个对象，三跳上千，四跳直接爆了。</p>
+
+      <p>所以 Expansion 必须有规则。四条硬限制：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>规则</th><th>默认值</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Hop Limit</td><td>2（最大 4）</td><td>扩展几跳就停。两跳够用，四跳封顶。</td></tr>
+            <tr><td>Node Limit</td><td>200</td><td>扩展出的对象总数超过 200 就停。再多 LLM 也吃不下。</td></tr>
+            <tr><td>Relation White List</td><td>见下</td><td>只允许走白名单里的关系，其他关系忽略。</td></tr>
+            <tr><td>Score Threshold</td><td>可配置</td><td>关系打分低于阈值就不继续扩展。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Relation White List</h3>
+
+      <p>不是所有关系都值得扩展。白名单允许走的关系：</p>
+      <ul>
+        <li><code>uses</code>——Experiment uses Dataset</li>
+        <li><code>belongs_to</code>——Experiment belongs_to Project</li>
+        <li><code>generated_by</code>——Checkpoint generated_by Experiment</li>
+        <li><code>trained_on</code>——Experiment trained_on GPU</li>
+      </ul>
+
+      <p>禁止走的关系：</p>
+      <ul>
+        <li><code>debug_relation</code>——调试时临时加的关系，不该进上下文。</li>
+        <li><code>temporary_relation</code>——临时关系，没有业务意义。</li>
+      </ul>
+
+      <p>这个白名单的意义在于：图里可能有大量噪音关系，全走一遍既慢又没用。白名单把扩展限制在"对 Agent 推理有真正价值"的关系上。</p>
+
+      <h2 id="ranking">扩展排序：邻居多了得挑</h2>
+
+      <p>即使有 Node Limit，扩展出来的对象也可能很多。200 个对象塞进 Prompt？LLM 吃不下。得排序，得挑。</p>
+
+      <p>Expansion Score 的公式：</p>
+
+      <pre><code>Expansion Score
+  = Relation Weight      <span class="k"># 关系权重</span>
+  + Node Importance       <span class="k"># 节点重要性</span>
+  + Freshness             <span class="k"># 时效性</span>
+  + Business Priority     <span class="k"># 业务优先级</span>
+  - Distance              <span class="k"># 距离（越远扣越多）</span></code></pre>
+
+      <p>每一项的意思：</p>
+
+      <ul>
+        <li><strong>Relation Weight</strong>：<code>trained_on</code> 的权重可能比 <code>belongs_to</code> 高，因为前者对推理更有用。</li>
+        <li><strong>Node Importance</strong>：Dataset 对实验分析很重要，Owner 次要。</li>
+        <li><strong>Freshness</strong>：今天的 Checkpoint 比上个月的更重要。</li>
+        <li><strong>Business Priority</strong>：生产环境实验的优先级高于测试环境。</li>
+        <li><strong>Distance</strong>：离 Seed Object 越远，重要性越低。一跳邻居扣 0，两跳扣分，三跳扣更多。</li>
+      </ul>
+
+      <p>这几个因子不是拍脑袋选的。记忆系统研究里有个被反复验证的模板——检索时综合三个信号：<em>recency</em>（时效）、<em>importance</em>（重要性，写入时打分）、<em>relevance</em>（与当前查询的相关度），外加一个"反思"机制周期性地把零散观察合成更高层的洞察。消融实验表明三者各自独立贡献质量，去掉任何一个都会退化。本节的 Freshness、Node Importance、Relation Weight 正是这套三元组在图扩展上的对应物。<span class="src">来源：Li et al., 2026, §5.5.1 引 Park et al., 2023</span></p>
+
+      <p>排完序大概长这样：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>对象</th><th>评分</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Dataset</td><td>★★★★★</td><td>直接邻居，高重要性，关系权重高。</td></tr>
+            <tr><td>Notebook</td><td>★★★★★</td><td>直接邻居，代码证据。</td></tr>
+            <tr><td>GPU</td><td>★★★★☆</td><td>直接邻居，排查性能问题有用。</td></tr>
+            <tr><td>Owner</td><td>★★☆☆☆</td><td>直接邻居，但推理价值有限。</td></tr>
+            <tr><td>历史实验</td><td>★☆☆☆☆</td><td>两跳以上，时效性低，距离远。</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>排序不是最终决定。排完之后还有 Context Ranking 这一章专门管"哪些留、哪些砍"。Expansion Ranking 只是给候选对象排个序，让后面的阶段有据可依。</p>
+
+      <h2 id="api">ExpansionEngine 接口</h2>
+
+      <p>所有扩展策略，不管多复杂，都实现同一个接口：</p>
+
+      <pre><code><span class="k">type</span> ExpansionEngine <span class="k">interface</span> {
+    Expand(
+        ctx context.Context,
+        pkg  ContextPackage,
+    ) (ContextPackage, error)
+}</code></pre>
+
+      <p>就这么大。输入一个 ContextPackage，输出一个扩展后的 ContextPackage。中间是黑盒——你可以用 Direct Expansion，可以用 Multi-Hop，可以组合六种策略，调用方不关心。</p>
+
+      <p>这个设计的好处是：扩展策略可以热插拔。上线时先跑 Direct Expansion，够用了。后面加 Multi-Hop、加 Temporal，接口不变，调用方代码不动。甚至第三方可以自己实现 ExpansionEngine，只要接口对上就行。</p>
+
+      <p>这种"一个对象进、一堆边出"的可编程扩展接口，工业上已有现成参照。Palantir Foundry 的 Vertex 模块提供 <em>Search Around 函数</em>：函数接收一个对象参数，返回结构化的边集合，其中分成两类——<code>directEdges</code> 是对象之间的直接连接，<code>intermediateEdges</code> 是对象经由中间对象产生的间接连接，中间对象会被"打包"合并进同一条边。这个"直接边 + 打包中间边"的分类，恰好对应本节后文的上下文合并：多条路径找到同一个对象时按 Object ID 去重，而 intermediateEdges 的打包机制本质上就是合并的一种工业实现。本书的 ExpansionEngine 接口可以借鉴这一分类——让间接连接的合并发生在扩展阶段，而不是留到后面去重。<span class="src">来源：Foundry Ontology 文档，Vertex / Search Around 函数</span></p>
+
+      <h2 id="pipeline">扩展流水线</h2>
+
+      <p>ExpansionEngine 内部不是一步到位的。它有一条完整的流水线：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  S["1. Seed Context<br/><small>输入对象</small>"]
+  R["2. Rule Match<br/><small>匹配扩展规则</small>"]
+  F["3. Relation Filter<br/><small>白名单过滤</small>"]
+  T["4. Graph Traversal<br/><small>沿关系遍历</small>"]
+  N["5. Node Ranking<br/><small>打分排序</small>"]
+  M["6. Node Merge<br/><small>去重合并</small>"]
+  L["7. Loop Detection<br/><small>环路检测</small>"]
+  P["8. Policy Filter<br/><small>权限过滤</small>"]
+  E["9. Expanded Context<br/><small>输出</small>"]
+  S --> R --> F --> T --> N --> M --> L --> P --> E
+  style S fill:#f4e6e4,stroke:#b4332a
+  style E fill:#f4e6e4,stroke:#b4332a
+  style F fill:#eef4ee,stroke:#2f6b3a
+  style L fill:#eef4ee,stroke:#2f6b3a
+  style P fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Expansion Pipeline 九个阶段。每一步都有明确的职责，出了问题能定位到具体环节。</figcaption>
+      </figure>
+
+      <p>一步步解释：</p>
+
+      <ol>
+        <li><strong>Seed Context</strong>：拿到输入的 ContextPackage，里面是检索回来的种子对象。</li>
+        <li><strong>Rule Match</strong>：根据对象类型和配置，决定用哪些扩展策略。Experiment 用 Direct + Policy，Notebook 用 Dependency。</li>
+        <li><strong>Relation Filter</strong>：用白名单过滤关系。<code>debug_relation</code> 这种直接砍掉。</li>
+        <li><strong>Graph Traversal</strong>：沿着允许的关系遍历图，拉取邻居对象。</li>
+        <li><strong>Node Ranking</strong>：对拉到的邻居打分排序，算 Expansion Score。</li>
+        <li><strong>Node Merge</strong>：多条路径可能拉到同一个对象，按 Object ID 去重。</li>
+        <li><strong>Loop Detection</strong>：检测是否有环，防止无限扩展。</li>
+        <li><strong>Policy Filter</strong>：权限过滤，无权访问的对象砍掉。</li>
+        <li><strong>Expanded Context</strong>：输出最终的 ContextPackage。</li>
+      </ol>
+
+      <p>整个流水线<strong>保持可追踪</strong>——每一步做了什么、扩展了哪些对象、为什么扩展，都要记录下来。这个 Trace 后面会讲。</p>
+
+      <h2 id="loop-detection">环路检测：别绕圈子</h2>
+
+      <p>图遍历有一个经典问题：环。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  A --> B
+  B --> C
+  C --> A
+  style A fill:#f4e6e4,stroke:#b4332a
+  style B fill:#eef4ee,stroke:#2f6b3a
+  style C fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>环路：A→B→C→A。不检测就会无限绕下去。</figcaption>
+      </figure>
+
+      <p>A 关联 B，B 关联 C，C 又关联 A。没有环路检测，扩展引擎会在 A→B→C→A→B→C→... 里无限绕，直到 Node Limit 被打满，CPU 白烧。</p>
+
+      <p>解法很朴素：<strong>Visited Set</strong>。</p>
+
+      <pre><code><span class="k">visited</span> = {}
+<span class="k">queue</span> = [seed_objects]
+
+<span class="k">while</span> queue:
+    obj = queue.pop()
+    <span class="k">if</span> obj.id <span class="k">in</span> visited:
+        <span class="k">continue</span>          <span class="k"># 已访问过，跳过</span>
+    visited.add(obj.id)
+    neighbors = traverse(obj)
+    queue.extend(neighbors)</code></pre>
+
+      <p>每访问一个对象，把它的 ID 记下来。下次再碰到同一个 ID，直接跳过。就这么简单，没有花活儿。</p>
+
+      <p>Visited Set 的代价是内存——扩展一万个对象就有一万条记录。但考虑到 Node Limit 默认 200，这个代价完全可以接受。</p>
+
+      <h2 id="context-merge">上下文合并：同一条路走两遍</h2>
+
+      <p>另一个常见问题：多条路径拉到同一个对象。</p>
+
+      <p>比如 GPU 这个对象，Experiment 通过 <code>trained_on</code> 关联到它，Training Job 也通过 <code>runs_on</code> 关联到它。两条独立路径，拉回来的是同一台 GPU。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  E["Experiment"] --> G["GPU"]
+  J["Training Job"] --> G
+  style E fill:#f4e6e4,stroke:#b4332a
+  style J fill:#f4e6e4,stroke:#b4332a
+  style G fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>两条路径指向同一个 GPU 对象。不合并就会重复。</figcaption>
+      </figure>
+
+      <p>不合并的话，Expanded Context 里会出现两个一模一样的 GPU 对象。LLM 看到"GPU node_7"出现两次，要么困惑，要么浪费 Token。</p>
+
+      <p>Merge 的规则也很朴素：<strong>按 Object ID 去重</strong>。</p>
+
+      <pre><code><span class="k">merged</span> = {}
+<span class="k">for</span> obj <span class="k">in</span> expanded_objects:
+    <span class="k">if</span> obj.id <span class="k">not in</span> merged:
+        merged[obj.id] = obj
+    <span class="k">else</span>:
+        <span class="k"># 已存在，合并关系但保留原对象</span>
+        merged[obj.id].relations.extend(obj.relations)</code></pre>
+
+      <p>同一个 Object ID 只保留一份，但来自不同路径的关系可以合并到这个对象上。这样 Agent 既不会看到重复对象，也不会丢失"这个 GPU 同时被 Experiment 和 Training Job 引用"这条信息。</p>
+
+      <h2 id="trace">可解释：为什么扩了这个对象</h2>
+
+      <p>Expansion 必须支持 Explain。不能是一个黑盒——输出一堆对象，没人知道为什么。</p>
+
+      <p>每一个被扩展进来的对象，都要能回答："你是怎么来的？"</p>
+
+      <pre><code>{
+  "object": { "type": "Dataset", "id": "ds_042" },
+  "trace": {
+    "source": { "type": "Experiment", "id": "exp_001" },
+    "relation": "uses",
+    "path": ["exp_001", "ds_042"],
+    "reason": "Experiment uses Dataset"
+  }
+}</code></pre>
+
+      <p>比如 Dataset 是从 Experiment 通过 <code>uses</code> 关系扩展来的。Trace 记录了：从哪个对象出发、走了哪条关系、路径是什么、为什么扩展。</p>
+
+      <p>更深一点的路径也行：</p>
+
+      <pre><code>{
+  "object": { "type": "QualityReport", "id": "qr_003" },
+  "trace": {
+    "source": { "type": "Experiment", "id": "exp_001" },
+    "relation": "uses→contains→has_report",
+    "path": ["exp_001", "ds_042", "ft_017", "qr_003"],
+    "reason": "Experiment uses Dataset, Dataset contains Feature, Feature has_report QualityReport"
+  }
+}</code></pre>
+
+      <blockquote>
+        <p><strong>所有 Expansion 必须可解释。</strong>这不是可选优化。上线之后出问题——"为什么 Context 里有这个对象？"——没有 Trace 你根本答不上来。审计也过不了。</p>
+      </blockquote>
+
+      <p>Trace 还有另一个用途：调优。如果发现 Expansion 经常扩出无关对象，看 Trace 就能知道是哪条关系、哪个策略出了问题，然后调白名单或 Score Threshold。</p>
+
+      <h2 id="mvp">MVP 路线图</h2>
+
+      <p>别想着一步到位。Graph Expansion 的能力可以分三期上线。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>阶段</th><th>能力</th><th>目标</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>第一期</td>
+              <td>
+                <ul>
+                  <li>Direct Expansion</li>
+                  <li>Hop Limit</li>
+                  <li>Loop Detection</li>
+                  <li>Node Merge</li>
+                </ul>
+              </td>
+              <td>能跑，不爆炸，基本可用。</td>
+            </tr>
+            <tr>
+              <td>第二期</td>
+              <td>
+                <ul>
+                  <li>Temporal Expansion</li>
+                  <li>Dependency Expansion</li>
+                  <li>Policy Expansion</li>
+                </ul>
+              </td>
+              <td>覆盖主要业务场景，权限链路完整。</td>
+            </tr>
+            <tr>
+              <td>第三期</td>
+              <td>
+                <ul>
+                  <li>Semantic Expansion（语义扩展）</li>
+                  <li>Intent-aware Expansion（意图驱动扩展）</li>
+                  <li>Agent Feedback（反馈学习）</li>
+                </ul>
+              </td>
+              <td>从固定遍历升级为上下文规划。</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>第一期四个能力是地基。没有 Hop Limit 会爆炸，没有 Loop Detection 会死循环，没有 Merge 会重复。先把这四个搞稳，再谈别的。</p>
+
+      <p>第二期加三种策略，让 Expansion 能覆盖时间维度、依赖维度和权限维度。</p>
+
+      <p>第三期是高级玩法，下一节细讲。</p>
+
+      <h2 id="semantic-expansion">高级策略一：Semantic Expansion（语义扩展）</h2>
+
+      <p>前面六种策略都有一个前提：关系在图里<em>已经存在</em>。但企业里很多关系，图里没有。</p>
+
+      <p>举几个例子：</p>
+      <ul>
+        <li>两个 Experiment 用了相同的 Feature，但图里没有记录这条关系——它们各自关联自己的 Dataset，但彼此之间没有边。</li>
+        <li>两个模型都依赖同一个基础模型，但这个"依赖"关系没被显式记录。</li>
+        <li>两份 SOP 描述的是同一种故障，但它们分属不同项目，图里没有连接。</li>
+      </ul>
+
+      <p>这些是<strong>隐式关系</strong>。图表达不了，但它们对 Agent 推理有价值。</p>
+
+      <p>Semantic Expansion 的思路是：用 embedding 找最近邻，动态创建"虚拟关系"，然后继续走 Graph Expansion。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  O["Object"] --> EM["Embedding"] --> NN["Nearest Neighbor"] --> VR["Virtual Relation"] --> GE["Graph Expansion"]
+  style O fill:#f4e6e4,stroke:#b4332a
+  style VR fill:#eef4ee,stroke:#2f6b3a,stroke-dasharray: 5 5
+  style GE fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption>Semantic Expansion：对象 → embedding → 最近邻 → 虚拟关系 → 继续图扩展。虚拟关系用虚线表示，和显式关系区分开。</figcaption>
+      </figure>
+
+      <p>流程是这样的：</p>
+      <ol>
+        <li>拿当前对象算 embedding。</li>
+        <li>在 embedding 空间里找最近邻——那些语义上最接近的对象。</li>
+        <li>在它们之间创建虚拟关系（Virtual Relation）。</li>
+        <li>把虚拟关系当作普通关系，继续走 Graph Expansion。</li>
+      </ol>
+
+      <p>这样，即使图里没有显式连接，两个语义相似的对象也能被拉进同一个上下文。</p>
+
+      <p>这背后有个更深的道理：一条关系是否相关，在它被写入时往往看不出来，要等到和后来的信息对照之后才显现。记忆系统研究里的 A-MEM 就是这么做的——每加入一条新记忆，不仅存它，还会<em>回溯更新</em>已有的相关记忆的上下文和属性，让记忆图随知识积累不断演化。Semantic Expansion 的虚拟关系是同一个思路在图扩展上的体现：关系不是一次建好就静止，而是随着推理动态补边、回溯连接。<span class="src">来源：Li et al., 2026, §5.5.2 引 A-MEM, Xu et al., 2026b</span></p>
+
+      <blockquote class="callout">
+        <p><strong>虚拟关系必须记录三样东西：</strong>来源（哪个 embedding 模型生成的）、置信度（最近邻的相似度分数）、失效时间（虚拟关系不是永久的，过期要重新计算）。而且虚拟关系和其他关系一样，必须过第 1 章定义的 Policy Filter——不能因为是"语义相似"就绕过权限校验。</p>
+      </blockquote>
+
+      <h2 id="intent-aware">高级策略二：Intent-aware Expansion（意图驱动扩展）</h2>
+
+      <p>这是最激动人心的一个升级。</p>
+
+      <p>前面所有策略——不管是 Direct 还是 Multi-Hop——都是固定规则。给一个 Experiment，不管你问什么，扩展出来的上下文都一样。但问题是：不同的问题需要不同的上下文。</p>
+
+      <p>同一个 Experiment，四种问法，四种扩展方向：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  E["Experiment"]
+  E -->|问性能| P1["GPU"]
+  E -->|问性能| P2["Metrics"]
+  E -->|问性能| P3["Profile"]
+  E -->|问数据| D1["Dataset"]
+  E -->|问数据| D2["Feature"]
+  E -->|问数据| D3["Statistics"]
+  E -->|问代码| C1["Git Commit"]
+  E -->|问代码| C2["Notebook"]
+  E -->|问成本| M1["GPU"]
+  E -->|问成本| M2["资源用量"]
+  E -->|问成本| M3["账单"]
+  style E fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style P1 fill:#eef4ee,stroke:#2f6b3a
+  style P2 fill:#eef4ee,stroke:#2f6b3a
+  style P3 fill:#eef4ee,stroke:#2f6b3a
+  style D1 fill:#f3f1ea,stroke:#9a978f
+  style D2 fill:#f3f1ea,stroke:#9a978f
+  style D3 fill:#f3f1ea,stroke:#9a978f
+  style C1 fill:#f3f1ea,stroke:#9a978f
+  style C2 fill:#f3f1ea,stroke:#9a978f
+  style M1 fill:#f3f1ea,stroke:#9a978f
+  style M2 fill:#f3f1ea,stroke:#9a978f
+  style M3 fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>同一个 Experiment，四种 Intent，四种扩展方向。问性能就扩 GPU/Metrics/Profile；问数据就扩 Dataset/Feature/Statistics；问代码就扩 Git/Notebook；问成本就扩 GPU/资源/账单。</figcaption>
+      </figure>
+
+      <p>具体来说：</p>
+      <ul>
+        <li><strong>问性能</strong>："为什么这么慢？" → 扩展 GPU、Metrics、Profile。Agent 需要的是硬件指标和性能数据。</li>
+        <li><strong>问数据</strong>："用了什么数据？" → 扩展 Dataset、Feature、Statistics。Agent 需要的是数据血缘和质量。</li>
+        <li><strong>问代码</strong>："代码改了什么？" → 扩展 Git Commit、Notebook、代码 diff。Agent 需要的是代码变更。</li>
+        <li><strong>问成本</strong>："花了多少钱？" → 扩展 GPU 用量、资源账单、计费记录。Agent 需要的是成本数据。</li>
+      </ul>
+
+      <p>如果用固定规则，四次问询都会扩出一模一样的上下文——一大堆对象，其中大部分和问题无关。LLM 要在一堆噪音里找答案，效果很差。</p>
+
+      <p>Intent-aware Expansion 让扩展策略由 <strong>Intent Planner</strong> 决定，而不是固定的 Hop 规则。Intent Planner 分析用户的问题，判断意图是什么，然后选择对应的扩展方向。</p>
+
+      <blockquote>
+        <p><strong>这会让整个 Context Engine 从"固定图遍历"升级为"上下文规划"（Context Planning）。</strong>不再是无脑遍历，而是根据意图动态规划该扩什么、不扩什么。这是 Context Engine 和 RAG 的又一个根本差异。</p>
+      </blockquote>
+
+      <p>和 Semantic Expansion 一样，Intent-aware Expansion 产生的虚拟关系也必须记录来源、置信度和失效时间，并且过 Policy Filter。规则不能因为策略变高级了就放松。</p>
+
+      <h2 id="tradeoffs">诚实地谈谈代价</h2>
+
+      <p>Graph Expansion 不是免费的。它有几个明显的代价，得提前知道。</p>
+
+      <p><strong>第一，延迟。</strong>扩展多一跳，就要多查一次 Graph Index。Direct Expansion 可能就几十毫秒，Multi-Hop 三跳四跳可能就到秒级了。在线路径上，这个延迟不能忽视。</p>
+
+      <p><strong>第二，Graph Index 的维护成本。</strong>对象之间的关系变了——Experiment 换了 Dataset、Notebook 更新了 Git Commit——Graph Index 得跟着更新。不更新就是脏数据，扩展出来的上下文是错的。更新又有成本，得权衡更新频率和新鲜度。</p>
+
+      <p><strong>第三，Semantic Expansion 和 Intent-aware Expansion 的不确定性。</strong>虚拟关系是 embedding 算出来的，不是业务系统记录的。它可能对，也可能不对。置信度低的虚拟关系如果混进上下文，会把 Agent 带偏。所以 Score Threshold 在这里特别重要——宁可少扩，不要扩错。</p>
+
+      <p><strong>第四，复杂度。</strong>六种策略 + 两个高级策略 + 流水线九个阶段 + 规则 + 排序 + Trace，这套系统的复杂度不低。调试一个"为什么扩出了不该扩的对象"的问题，可能要翻遍整条 Pipeline。好在每一步都有 Trace，能定位，但仍然需要团队对这套系统有足够深的理解。</p>
+
+      <p>这些代价不是让你别用 Graph Expansion，而是让你<em>知道自己在哪里妥协</em>。第一期 MVP 用 Direct Expansion + Hop Limit，延迟可控，维护成本低。等系统稳定了，再逐步加 Multi-Hop、加 Temporal、加 Intent-aware。别一上来就全开。</p>
+
+      <h2 id="next-chapter">和后续章节的关系</h2>
+
+      <p>Graph Expansion 输出的是 Expanded Context——一个 ContextPackage，里面可能有几十上百个对象。</p>
+
+      <p>但这么多对象，LLM 吃不下。Prompt 有 Token 上限，而且塞太多东西进去 LLM 会"注意力分散"——它分不清哪些重要。</p>
+
+      <p>所以 Expansion 之后还有两站：</p>
+
+      <ul>
+        <li><strong>Context Ranking</strong>（第 6 章）：决定哪些 Context 对象保留、哪些砍掉。基于相关性、重要性、时效性打分排序。</li>
+        <li><strong>Token Budget</strong>：决定保留的 Context 对象里，哪些最终放进 Prompt。基于 Token 预算做压缩和裁剪。</li>
+      </ul>
+
+      <p>三站的职责是递进的：Expansion 负责"补全"，Ranking 负责"筛选"，Budget 负责"压缩"。每一步都在缩小范围，最终交付给 LLM 的是一个<em>最小但充分</em>的上下文。</p>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+
+        <p>Graph Expansion 的目标不是遍历图。它的目标是：</p>
+
+        <blockquote>
+          <p><strong>围绕当前业务对象，自动补全 Agent 完成推理所需的最小业务上下文（Minimum Sufficient Context）。</strong></p>
+        </blockquote>
+
+        <p>几条核心要点：</p>
+
+        <ul>
+          <li>Graph Expansion 不搜数据，它补上下文。检索找到入口，扩展找到上下文。</li>
+          <li>Graph 不是数据库，是 Object Navigation Layer——只存关系，不存数据。</li>
+          <li>扩展不关心 Query，只关心当前有哪些对象。意图驱动是高级策略，不是基础行为。</li>
+          <li>六种扩展策略覆盖不同维度：Direct、Multi-Hop、Type、Temporal、Dependency、Policy。</li>
+          <li>四条硬限制防止爆炸：Hop Limit、Node Limit、Relation White List、Score Threshold。</li>
+          <li>环路检测用 Visited Set，上下文合并按 Object ID 去重。</li>
+          <li>所有扩展必须可解释（Trace），必须过 Policy Filter。</li>
+          <li>Semantic Expansion 和 Intent-aware Expansion 是高级玩法，让系统从固定遍历升级为上下文规划。</li>
+        </ul>
+
+        <p>Graph 只是导航结构。真正的产品价值是 Context Expansion——把散落在十几个系统里的业务上下文，沿着关系补全成一个 Agent 能直接消费的 Context Object Graph。</p>
+
+        <p>下一章，Context Ranking 会接手这个 Expanded Context，决定哪些对象值得让 LLM 看到。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-04-hybrid-retrieval.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 4 章 · Context Retrieval Framework</span>
+        </a>
+        <a class="next" href="chapter-06-context-ranking.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 6 章 · Context Ranking</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

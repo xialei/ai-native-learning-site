@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · AI 层（pi-ai）— Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 AI 层</div>
+    <h1>AI 层：摸到模型的统一手掌</h1>
+    <div class="subtitle">前几章都在「消息/循环/会话」这一侧打转。这一页把镜头转向 <code class="inline">@earendil-works/pi-ai</code>——Pi 怎么用一个 <code class="inline">Model</code> 值对象和一套 <code class="inline">stream()</code> 契约，把 Anthropic、Google、OpenAI、Groq、DeepSeek、GitHub Copilot 等数十个供应商<strong>统一成同一个手掌</strong>，让上层 Agent 循环只认一种流协议。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">产品视角</span>
+    <span class="ep-quote">「15+ 供应商，数百个模型。」</span>
+    Anthropic、OpenAI、Google、Azure、Bedrock、Mistral、Groq、Cerebras、xAI、Hugging Face、Kimi、MiniMax、NVIDIA、OpenRouter、Ollama……API key 或 OAuth 鉴权；用 <code class="inline">/model</code> 或 <code class="inline">Ctrl+L</code> <strong>会话中途切模型</strong>，<code class="inline">Ctrl+P</code> 循环收藏夹；还能经 <code class="inline">models.json</code> 或扩展加自定义供应商与模型。<span class="ep-arrow">→</span> 本章看这套「换供应商成本近乎为零」的抽象在源码里怎么落地。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>pi-ai 的定位：把「模型」从「循环」里拆出来</h2>
+    <p>回想架构分层：<code class="inline">pi-agent-core</code> 只管消息与循环，它<strong>不直接调任何厂商 API</strong>。真正跟 Anthropic / Google / OpenAI 对话的是 <code class="inline">pi-ai</code>。它的职责一句话概括：<strong>把「换供应商」的成本压到近乎为零</strong>，同时对上层暴露一个极其稳定的接口。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t10 d10">
+        <title id="t10">pi-ai 在分层中的位置</title>
+        <desc id="d10">agent-core / ai 层与各供应商的关系</desc>
+        <defs>
+          <marker id="arrow10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <!-- top: agent-core -->
+        <rect class="node" x="270" y="30" width="360" height="70" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="450" y="55" font-size="14" fill="#2563eb" text-anchor="middle">@earendil-works/pi-agent-core</text>
+        <text class="lbl" x="450" y="78" font-size="12" fill="#1f2937" text-anchor="middle">只调用 ctx.model.stream(...)，不关心厂商</text>
+
+        <!-- middle: pi-ai -->
+        <rect class="node" x="100" y="135" width="700" height="120" rx="12" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="450" y="163" font-size="15" fill="#0f7d7a" text-anchor="middle">@earendil-works/pi-ai</text>
+        <text class="lbl" x="450" y="186" font-size="12" fill="#1f2937" text-anchor="middle">Model 值对象 · Provider.stream() · AssistantMessageEventStream</text>
+        <text class="lbl" x="450" y="205" font-size="12" fill="#1f2937" text-anchor="middle">·数十个提供商模块在 src/providers/*.ts·</text>
+        <text class="lbl" x="450" y="224" font-size="12" fill="#556674" text-anchor="middle">（anthropic · google · openai · groq · deepseek · github-copilot …）</text>
+        <text class="lbl" x="450" y="243" font-size="12" fill="#556674" text-anchor="middle">统一错误/思考/流式事件协议</text>
+
+        <!-- bottom: providers -->
+        <rect class="node" x="60" y="295" width="160" height="56" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="140" y="320" font-size="12" fill="#1f2937" text-anchor="middle">Anthropic Messages</text>
+        <rect class="node" x="250" y="295" width="160" height="56" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="330" y="320" font-size="12" fill="#1f2937" text-anchor="middle">Google Gemini</text>
+        <rect class="node" x="440" y="295" width="160" height="56" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="520" y="320" font-size="12" fill="#1f2937" text-anchor="middle">OpenAI Responses</text>
+        <rect class="node" x="630" y="295" width="150" height="56" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="705" y="320" font-size="12" fill="#1f2937" text-anchor="middle">Groq / DeepSeek / …</text>
+
+        <path d="M450 100 v33" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow10)"/>
+        <path d="M140 255 v38" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow10)"/>
+        <path d="M330 255 v38" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow10)"/>
+        <path d="M520 255 v38" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow10)"/>
+        <path d="M705 255 v38" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow10)"/>
+      </svg>
+    </div>
+    <p>这套设计的三个不变量，几乎决定了整个上层怎么写：</p>
+    <ul>
+      <li><strong>模型是值对象，不是连接</strong>：<code class="inline">Model</code> 只是「描述一个可调用模型」的纯数据（名字、baseUrl、窗口大小、能力）。连接、鉴权、网络都在别处处理。它能在会话、压缩、UI 之间到处传，而不用带着一个 live socket。</li>
+      <li><strong>流式返回事件，不返回最终串</strong>：<code class="inline">stream()</code> 返回 <code class="inline">AssistantMessageEventStream</code>——一个<strong>逐事件</strong>推送的协议（消息开始/更新/结束）。这直接喂给第 3 章的 <code class="inline">streamAssistantResponse</code>，让「打字机效果」和「响应用户打断」成为天然能力。</li>
+      <li><strong>错误不会抛出，而是编码在流里</strong>：契约明确「request/model/runtime 失败应编码进流，而不是 throw」。这是为了恢复——上层能在流结束处读到 <code class="inline">stopReason: "error"</code> + <code class="inline">errorMessage</code>，进而判断该压缩还是该重试（第 8 章）。</li>
+    </ul>
+    <div class="callout">
+      <strong>为什么「错误编码在流里」如此重要？</strong>若失败以 throw 形式逃逸，上层循环要写一堆 try/catch 去猜「这次是不是该重试、该压缩」。而 Pi 的统一约定是：<strong>任何失败都变成一条带 <code class="inline">stopReason:"error"</code> 的 assistant 消息</strong>。于是第 8 章的 <code class="inline">_checkCompaction</code> / <code class="inline">_isRetryableError</code> 只需读消息字段，逻辑异常干净。这值得你写 Runtime 时抄。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>Model 值对象：一个「模型」的完整画像</h2>
+    <p><code class="inline">Model</code> 在 <code class="inline">packages/ai/src/types.ts</code>，约 30 个字段。逐个看那些上层真正依赖的：</p>
+    <div class="code-title">packages/ai/src/types.ts · Model 接口</div>
+    <pre class="code"><code><span class="kw">export interface</span> Model&lt;TApi extends Api&gt; {
+  id: <span class="kw">string</span>;                 <span class="cmt">// 唯一标识（如 "claude-opus-5"）</span>
+  name: <span class="kw">string</span>;               <span class="cmt">// 人类可读名</span>
+  api: TApi;                   <span class="cmt">// 协议族：anthropic-messages | openai-responses | google …</span>
+  provider: ProviderId;        <span class="cmt">// 供应商：anthropic / google / openai …</span>
+  baseUrl: <span class="kw">string</span>;            <span class="cmt">// 指向哪（可换端点/网关）</span>
+  reasoning: <span class="kw">boolean</span>;        <span class="cmt">// 是否支持思考</span>
+  thinkingLevelMap?: ThinkingLevelMap;  <span class="cmt">// 把 pi 的思考档位映射到各厂商的值</span>
+  input: (<span class="st">"text"</span> | <span class="st">"image"</span>)[];    <span class="cmt">// 能吃什么输入</span>
+  cost: ModelCost;            <span class="cmt">// 计价（用于精确 token 与成本估算）</span>
+  contextWindow: <span class="kw">number</span>;     <span class="cmt">// 上下文窗口 —— 压缩与溢出判断的锚点</span>
+  maxTokens: <span class="kw">number</span>;        <span class="cmt">// 最大输出 —— 长度恢复判断的锚点</span>
+  samplingParams?: ...;       <span class="cmt">// 默认采样参数（temperature 等）</span>
+  headers?: ...;              <span class="cmt">// 附加请求头</span>
+  compat?:
+    TApi extends <span class="st">"openai-responses"</span> ? OpenAIResponsesCompat      <span class="cmt">// 按协议族的</span>
+    : TApi extends <span class="st">"anthropic-messages"</span> ? AnthropicMessagesCompat <span class="cmt">// 兼容行为覆写</span>
+    : TApi extends <span class="st">"bedrock-converse-stream"</span> ? BedrockCompat : <span class="kw">never</span>;
+}</code></pre>
+    <p>几个值得展开的字段：</p>
+    <ul>
+      <li><strong><code class="inline">api</code> vs <code class="inline">provider</code></strong>:两者不是一回事。<code class="inline">api</code> 是<strong>协议族</strong>（该怎么对话，走 anthropic 还是 openai-responses 语法），<code class="inline">provider</code> 是<strong>供应商</strong>（向谁付费、谁鉴权）。一个供应商可以同时实现多种 api 兼容。</li>
+      <li><strong><code class="inline">contextWindow</code> / <code class="inline">maxTokens</code></strong>：这是「能力画像」里最要命的两条。第 6 章压缩用 <code class="inline">contextWindow</code>判断是否溢出，第 8 章的溢出恢复用 <code class="inline">maxTokens</code> 判断「输出是否提前被掐断」。</li>
+      <li><strong><code class="inline">thinkingLevelMap</code></strong>：pi 定义了自己的一套「思考级别」档位（第 4 章见过 <code class="inline">ThinkingLevelEntry</code>），但各家厂商叫法不同（有的叫 effort，有的叫 thinking budget）。这里的映射把 pi 的抽象语言翻译成各厂商的具体参数，未映射则用默认。</li>
+      <li><strong><code class="inline">compat</code>（条件类型）</strong>:同协议的不同实现常有细微差别（比如 OpenAI Responses 的老版 compat 开关）。它按 <code class="inline">api</code> 收紧类型，保证「只有该协议族才可能有对应 compat」。</li>
+    </ul>
+    <div class="callout">
+      <strong>一个模型 = 一份「画像」，这很重要：</strong>正因为 <code class="inline">Model</code> 是纯数据，你可以在 run 前、压缩前、UI 里分别读取它的窗口与能力，而无需真正建连。这是「把策略（要不要压缩）和事实（窗口多大）分离」的典范。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>Provider 契约：stream 才是宇宙的中心</h2>
+    <p>每个提供商模块（<code class="inline">src/providers/anthropic.ts</code>、<code class="inline">google.ts</code> 等）都实现同一套 <code class="inline">ProviderStreams</code> 契约。最核心的是 <code class="inline">stream</code>：</p>
+    <div class="code-title">packages/ai/src/types.ts · ProviderStreams 契约</div>
+    <pre class="code"><code><span class="kw">export interface</span> ProviderStreams {
+  <span class="cmt">// 主入口：把「模型 + 上下文」流式地吐成 assistant 消息事件</span>
+  stream(model: Model&lt;Api&gt;, context: Context, options?): AssistantMessageEventStream;
+  <span class="cmt">// 简化版：只给一条 user 消息，无工具（用于压缩摘要等轻量调用）</span>
+  streamSimple(model: Model&lt;Api&gt;, context: Context, options?): AssistantMessageEventStream;
+  <span class="cmt">// 可选：异步续跑（deferred），拿回一个 durable handle</span>
+  fetchDeferred?(model, handle, options?): AssistantMessageEventStream;
+  cancelDeferred?(model, handle, options?): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt;;
+}</code></pre>
+    <p>这里的关键是 `Context` 与流的定义。`Context`（来自 pi-ai）就是「系统提示 + 历史消息 + 工具定义」打包体——正是第 5 章 <code class="inline">buildSessionContext</code> 产出的那一坨。所以上层的数据流是：</p>
+    <div class="code-title">数据流串联</div>
+    <pre class="code"><code><span class="cmt">// agent-core 里其实只有这一句真正打到模型：</span>
+<span class="kw">const</span> stream = ctx.model.stream(ctx.model.model, context, options);
+<span class="cmt">// 上层再从 stream 里收 AssistantMessageEvent（msg_start / msg_update / msg_end）</span></code></pre>
+    <p>为什么「简化版 <code class="inline">streamSimple</code>」要单独存在？因为它服务一个特殊场景：<strong>压缩摘要</strong>（第 6 章）。压缩时你不需要工具、不需要历史里漂亮的结构，只要「给它一堆旧消息，讨一句总结」——于是用一条轻量路径，省掉工具定义与约束参数，既更快也更不容易被工具网络干扰。</p>
+    <p>带 deferred 能力的供应商，还能「异步续跑」：请求返回一个 <code class="inline">handle</code>，真正的结果后台继续生成，稍后 <code class="inline">fetchDeferred(handle)</code> 拿回。这服务于超长推理场景，避免长时间占着连接。</p>
+    <div class="callout">
+      <strong>设计品味：</strong><code class="inline">streamSimple</code> 的存在提醒我们——抽象层不该只提供一个「万能笨重接口」，而应为不同调用场景提供不同「带宽」。压缩这种内部辅助调用不该背负完整 Agent 请求的复杂度。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>流式事件协议：内容与载体分离</h2>
+    <p>流的产出不是一段最终文本，而是一串 <code class="inline">AssistantMessageEvent</code>。内容被细分为几种「分块」，这是第 2 章「消息类型学」的延续：</p>
+    <div class="code-title">packages/ai/src/types.ts · 内容分块类型</div>
+    <pre class="code"><code><span class="kw">export interface</span> TextContent {
+  type: <span class="st">"text"</span>;
+  text: <span class="kw">string</span>;
+  textSignature?: <span class="kw">string</span>;   <span class="cmt">// 端侧 token（如 OpenAI 的 msg id / 签名）</span>
+}
+<span class="kw">export interface</span> ThinkingContent {
+  type: <span class="st">"thinking"</span>;
+  thinking: <span class="kw">string</span>;
+  thinkingSignature?: <span class="kw">string</span>; <span class="cmt">// 思考的端侧 id，续轮时回传以保持连续性</span>
+  redacted?: <span class="kw">boolean</span>;          <span class="cmt">// 被安全过滤遮蔽（内容不可读，仅留签名）</span>
+}
+<span class="kw">export interface</span> ToolCall {
+  type: <span class="st">"toolCall"</span>;
+  id: <span class="kw">string</span>; name: <span class="kw">string</span>; arguments: Record&lt;<span class="kw">string</span>, <span class="kw">any</span>&gt;;
+  thoughtSignature?: <span class="kw">string</span>;  <span class="cmt">// Google 特有：复用思考上下文的密钥</span>
+  namespace?: <span class="kw">string</span>;         <span class="cmt">// OpenAI Responses 动态/命名空间工具</span>
+}</code></pre>
+    <p>这些「分块类型」与第 2 章的 <code class="inline">AgentMessage.content</code> 一脉相承——AI 层的流事件最终被 agent-core 转成 <code class="inline">AssistantMessage</code> 的 <code class="inline">content</code> 数组。注意「签名」字段体系：<code class="inline">textSignature</code>、<code class="inline">thinkingSignature</code>、<code class="inline">thoughtSignature</code> 本质都是「把端侧不透明 token 原样回传」以维持多轮连续性（尤其思考被遮蔽时，内容是空的，但签名还在，续轮还能续得上）。</p>
+    <div class="callout">
+      <strong>被遮蔽的思考仍可持续：</strong><code class="inline">redacted: true</code> 表示这轮思考被安全过滤器遮蔽，你<strong>读不到内容</strong>。但 <code class="inline">thinkingSignature</code> 保留了<strong>加密后的</strong>不透明载体，原样回传给 API 即可保持思维连续性。这是「模型侧保护隐私、应用侧保功能」的精细平衡。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>流式代理：带宽减半的 SSE 重建</h2>
+    <p>10.1–10.4 讲了 <code class="inline">stream()</code> 契约与流事件类型，但没讲 <code class="inline">packages/agent/src/proxy.ts</code>——一个把 LLM 调用<strong>路由到「只管代理」的服务端</strong>的流式客户端。它最妙的优化是<strong>服务器在增量事件里不重复携带整条消息</strong>，客户端自己逐块重建：</p>
+    <div class="code-title">proxy.ts · 增量文本事件（服务器只发 delta）</div>
+    <pre class="code"><code><span class="cmt">// 服务器发送的瘦事件：只有「哪一块 + 增量」（节选）</span>
+<span class="kw">export type</span> ProxyAssistantMessageEvent =
+  | { type: <span class="st">"start"</span> }
+  | { type: <span class="st">"text_start"</span>; contentIndex: <span class="kw">number</span> }
+  | { type: <span class="st">"text_delta"</span>; contentIndex: <span class="kw">number</span>; delta: <span class="kw">string</span> }
+  | { type: <span class="st">"text_end"</span>; contentIndex: <span class="kw">number</span>; contentSignature?: <span class="kw">string</span> }
+  | { type: <span class="st">"thinking_start"</span>; contentIndex: <span class="kw">number</span> }
+  | { type: <span class="st">"thinking_delta"</span>; contentIndex: <span class="kw">number</span>; delta: <span class="kw">string</span> }
+  | { type: <span class="st">"thinking_end"</span>; contentIndex: <span class="kw">number</span>; contentSignature?: <span class="kw">string</span> }
+  | { type: <span class="st">"toolcall_start"</span>; contentIndex: <span class="kw">number</span>; id: <span class="kw">string</span>; toolName: <span class="kw">string</span> }
+  | { type: <span class="st">"toolcall_delta"</span>; contentIndex: <span class="kw">number</span>; delta: <span class="kw">string</span> }
+  | { type: <span class="st">"toolcall_end"</span>; contentIndex: <span class="kw">number</span>; toolCall: <span class="cl">ToolCall</span> }
+  | { type: <span class="st">"done"</span>; reason: ...; usage: ... }
+  | { type: <span class="st">"error"</span>; reason: ...; errorMessage?: <span class="kw">string</span>; usage: ... }</code></pre>
+    <p>客户端维护一个 <code class="inline">partial</code> 消息对象，把增量拼进去，并对外重新产出标准事件。最精妙的是<strong>工具调用参数的增量 JSON 解析</strong>：</p>
+    <div class="code-title">proxy.ts · 流式工具调用参数重建</div>
+    <pre class="code"><code><span class="kw">case</span> <span class="st">"toolcall_start"</span>:
+  partial.content[proxyEvent.contentIndex] = {
+    type: <span class="st">"toolCall"</span>, id: proxyEvent.id, name: proxyEvent.toolName,
+    arguments: {}, partialJson: <span class="st">""</span>,
+  } satisfies ToolCall &amp; { partialJson: <span class="kw">string</span> } <span class="kw">as</span> ToolCall;
+  <span class="kw">return</span> { type: <span class="st">"toolcall_start"</span>, contentIndex, partial };
+
+<span class="kw">case</span> <span class="st">"toolcall_delta"</span>: {
+  <span class="kw">const</span> content = partial.content[proxyEvent.contentIndex];
+  <span class="kw">if</span> (content?.type === <span class="st">"toolCall"</span>) {
+    content.partialJson += proxyEvent.delta;                    <span class="cmt">// 累积残缺 JSON</span>
+    content.arguments = <span class="fn">parseStreamingJson</span>(content.partialJson) || {}; <span class="cmt">// 边到边解析</span>
+    <span class="kw">return</span> { type: <span class="st">"toolcall_delta"</span>, contentIndex, delta: proxyEvent.delta, partial };
+  }
+  <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(<span class="st">"Received toolcall_delta for non-toolCall content"</span>);
+}</code></pre>
+    <p><code class="inline">parseStreamingJson</code> 是 pi-ai 提供的「接受残缺 JSON、尽量解析」的解析器——工具参数通常还是一个不完整的对象时，就能解析出已能确定的字段，让 UI 能提前渲染「即将调用的工具」。一旦 <code class="inline">toolcall_end</code> 到达，用完整对象覆盖并清掉 <code class="inline">partialJson</code>。</p>
+    <div class="callout">
+      <strong>三个细节一次给到：</strong>
+      <ul>
+        <li><strong>带宽优化</strong>——delta 里不重复带整条消息，长对话能省大量字节；</li>
+        <li><strong>可恢复性</strong>——parseStreamingJson 让「调工具意图」能提前浮现，而非等整个 JSON 到齐；</li>
+        <li><strong>契约一致</strong>——客户端重建后仍按标准 <code class="inline">AssistantMessageEvent</code> 输出，上层完全无感知。</li>
+      </ul>
+      这跟本章前面学到的「错误进流/流协议」一脉相承。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.6</span>模型目录与生产侧封装</h2>
+    <p>模型清单集中在<strong>生成文件</strong>（<code class="inline">models.generated.ts</code> / <code class="inline">model-catalog.ts</code>），把「某供应商某型号具备什么能力」集中描述——这通常由脚本从厂商文档生成，保持最新且不手抄。生产 harness 在 <code class="inline">model-runtime.ts</code> / <code class="inline">model-registry.ts</code> 之上再加一层运行态封装：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t10b d10b">
+        <title id="t10b">模型目录 → 运行态封装</title>
+        <desc id="d10b">从生成目录到 AgentSession 的模型链路</desc>
+        <defs>
+          <marker id="arrow10b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="40" y="90" width="190" height="90" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="135" y="115" font-size="13" fill="#2563eb" text-anchor="middle">models.generated.ts</text>
+        <text class="lbl" x="135" y="135" font-size="12" fill="#1f2937" text-anchor="middle">集中描述各模型能力</text>
+        <text class="lbl" x="135" y="152" font-size="11" fill="#556674" text-anchor="middle">（脚本生成）</text>
+
+        <rect class="node" x="290" y="90" width="190" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="385" y="115" font-size="13" fill="#0f7d7a" text-anchor="middle">ModelRegistry</text>
+        <text class="lbl" x="385" y="135" font-size="12" fill="#1f2937" text-anchor="middle">按 id/provider 检索</text>
+        <text class="lbl" x="385" y="152" font-size="11" fill="#556674" text-anchor="middle">选模型的「货架」</text>
+
+        <rect class="node" x="540" y="90" width="190" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="635" y="115" font-size="13" fill="#0f7d7a" text-anchor="middle">ModelRuntime</text>
+        <text class="lbl" x="635" y="135" font-size="12" fill="#1f2937" text-anchor="middle">鉴权 · 建连 · 分发</text>
+        <text class="lbl" x="635" y="152" font-size="11" fill="#556674" text-anchor="middle">hasConfiguredAuth / checkAuth</text>
+
+        <rect class="node" x="740" y="90" width="130" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="805" y="115" font-size="13" fill="#0f7d7a" text-anchor="middle">AgentSession</text>
+        <text class="lbl" x="805" y="135" font-size="12" fill="#1f2937" text-anchor="middle">ctx.model</text>
+        <text class="lbl" x="805" y="152" font-size="11" fill="#556674" text-anchor="middle">喂给循环</text>
+
+        <line x1="230" y1="135" x2="288" y2="135" stroke="#556674" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <line x1="480" y1="135" x2="538" y2="135" stroke="#556674" stroke-width="2" marker-end="url(#arrow10b)"/>
+        <line x1="730" y1="135" x2="738" y2="135" stroke="#556674" stroke-width="2" marker-end="url(#arrow10b)"/>
+      </svg>
+    </div>
+    <p>生产侧真正跑请求前的还有鉴权闸门——第 8 章我们在 <code class="inline">prompt()</code> 里见过：</p>
+    <div class="code-title">agent-session.ts · 跑前鉴权校验（节选，第 8 章见过）</div>
+    <pre class="code"><code><span class="kw">if</span> (!<span class="fn">this</span>.model) <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(formatNoModelSelectedMessage());
+<span class="kw">const</span> hasConfiguredAuth =
+  <span class="fn">this</span>._modelRuntime.hasConfiguredAuth(<span class="fn">this</span>.model.provider) ||
+  (<span class="kw">await</span> <span class="fn">this</span>._modelRuntime.checkAuth(<span class="fn">this</span>.model.provider)) !== <span class="kw">undefined</span>;
+<span class="kw">if</span> (!hasConfiguredAuth) {
+  <span class="cmt">// 若走 OAuth 就给更贴切的提示，否则提示 /login&lt;provider&gt;</span>
+  <span class="kw">if</span> (<span class="fn">this</span>._modelRuntime.isUsingOAuth(<span class="fn">this</span>.model.provider)) { ... }
+  <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(formatNoApiKeyFoundMessage(<span class="fn">this</span>.model.provider));
+}</code></pre>
+    <p>压缩路径用的摘要请求也走 ModelRuntime 的鉴权封装（<code class="inline">_getSummarizationRequestAuth</code>），确保「压缩用的模型」同样合法可用——这不是顺手为之，而是避免「主模型有 key、摘要模型的 key 没配」导致的诡异压缩失败。</p>
+    <div class="callout">
+      <strong>分层链路收口：</strong>生成目录（静态画像）→ Registry（检索货架）→ Runtime（运行态鉴权/建连）→ AgentSession（喂循环）。四层各司其职，让「换模型」这件事在任一层次都不需要改协议。这正是把「稳定的抽象」与「易变的供应商」隔开的完整实践。
+    </div>
+    <h3>10.6.1 三个值得记住的供应商兼容细节</h3>
+    <p>抽象层的好处是「一套契约打天下」，但代价是要把厂商之间的差异收编进数据模型。pi-ai 里有三处收编很典型，值得自研时借鉴：</p>
+    <ul>
+      <li><strong>工具选择（<code class="inline">ToolChoice</code>）</strong>：pi 定义了 provider 中立的 <code class="inline">type ToolChoice = "auto" | "none"</code>，挂在 <code class="inline">SimpleStreamOptions.toolChoice</code> 上。摘要这类「不该调工具」的请求就显式传 <code class="inline">"none"</code>（见第 6 章）。各 provider 再翻译成自家术语——Anthropic 转成 <code class="inline">{ type: "none" }</code>、Google 走 <code class="inline">functionCallingMode</code>、OpenAI/Responses 透传 <code class="inline">tool_choice</code>。差异藏在适配器里，上层只说一个意图。</li>
+      <li><strong>思考预算字段（<code class="inline">thinkingTokenBudgetField</code>）</strong>：vLLM/Qwen/llama.cpp 这类 OpenAI 兼容端点上，「推理」与「答案」共享 <code class="inline">max_tokens</code>——不设预算，一轮重度推理可能吃光整个响应、一个字答案都不吐。pi 把「用哪个字段封顶」也做成可配：<code class="inline">ThinkingTokenBudgetField = "thinking_token_budget" | "thinking_budget" | "thinking_budget_tokens"</code>（分别是 vLLM / Qwen·DashScope·SGLang / llama.cpp 的字段名）。旧的布尔 <code class="inline">supportsThinkingTokenBudget</code> 保留为 <code class="inline">thinking_token_budget</code> 的别名。配合 <code class="inline">{ "$var": "thinking.budget" }</code> 这个 chat-template 变量，思考级别就能跨端点统一调控。</li>
+      <li><strong>Anthropic 拒答兜底（<code class="inline">allowedFallbackModels</code>）</strong>：Anthropic 支持<strong>服务端</strong>拒答 fallback——主模型拒答时由服务端自动切到备选模型。但不是所有模型都能写进 <code class="inline">fallbacks</code>，写错了 API 会拒。于是 <code class="inline">AnthropicMessagesCompat.allowedFallbackModels</code> 显式列出「被允许的兜底模型 + 本地定价元数据」，适配器只在列表非空时才发 <code class="inline">fallbacks</code>，并在返回里用本地价格给兜底响应算成本。把「能不能兜底」也当成模型画像的一部分，而不是运行时瞎试。</li>
+    </ul>
+    <div class="callout">
+      <strong>自研启示：</strong>抽象层的真正工作量不在「定义接口」，而在把这些「同义但不同形」的厂商参数——工具选择、思考预算、兜底策略——逐个翻译成统一意图、再把意图落回各家术语。<code class="inline">ToolChoice</code>（一个枚举）与 <code class="inline">thinkingTokenBudgetField</code>（一个字段名枚举）是两种典型收编：前者把差异吸收进抽象、后者把差异枚举成配置。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.7</span>AI 层小结</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t10c d10c">
+        <title id="t10c">AI 层心智模型</title>
+        <desc id="d10c">值对象 + 契约 + 提供商</desc>
+        <defs>
+          <marker id="arrow10c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="40" y="70" width="260" height="90" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="170" y="95" font-size="14" fill="#2563eb" text-anchor="middle">Model 值对象</text>
+        <text class="lbl" x="170" y="115" font-size="12" fill="#1f2937" text-anchor="middle">窗口/输出/能力/兼容 ——</text>
+        <text class="lbl" x="170" y="132" font-size="12" fill="#1f2937" text-anchor="middle">纯数据，可到处传</text>
+
+        <rect class="node" x="360" y="70" width="260" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="490" y="95" font-size="14" fill="#0f7d7a" text-anchor="middle">stream() 契约</text>
+        <text class="lbl" x="490" y="115" font-size="12" fill="#1f2937" text-anchor="middle">流事件 + 错误进流 +</text>
+        <text class="lbl" x="490" y="132" font-size="12" fill="#1f2937" text-anchor="middle">streamSimple / deferred</text>
+
+        <rect class="node" x="680" y="70" width="200" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="780" y="95" font-size="14" fill="#0f7d7a" text-anchor="middle">数十家提供商</text>
+        <text class="lbl" x="780" y="115" font-size="12" fill="#1f2937" text-anchor="middle">同一契约各自实现</text>
+        <text class="lbl" x="780" y="132" font-size="12" fill="#1f2937" text-anchor="middle">生成目录集中画像</text>
+      </svg>
+    </div>
+    <div class="arrow-nav">
+      <a class="prev" href="09-tools.html">← 上一章 · 工具层</a>
+      <a class="next" href="11-coding-agent.html">下一章 · 编码 Agent →</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>

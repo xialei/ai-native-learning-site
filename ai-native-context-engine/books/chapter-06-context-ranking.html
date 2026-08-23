@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 6 章 · Context Ranking — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 6 章 · Context Ranking</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 6 章 · Context Ranking</div>
+      <h1 class="title">在有限 Token 里，选什么给模型看</h1>
+      <p class="lede">
+        如果说 Hybrid Retrieval 决定找到什么，Graph Expansion 决定补充什么，那么 Context Ranking 决定最终把什么交给 LLM。检索和扩展会带回几百个对象，但模型一次只能看那么多。选谁、不选谁，是这一章的全部问题。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Context Ranking 位于 Graph Expansion 之后。它的职责是从大量 Context Candidate 中，筛选出当前任务最有价值的 Context。</p>
+
+      <p>它不是传统搜索里的排序器（Ranking），而是 <strong>Context Selection Engine（上下文选择引擎）</strong>。区别在于：搜索排序是"把最相关的排前面"，而 Context Selection 要考虑的不止相关性——还有时效、权限、Token 成本、业务优先级。它是一个多维决策，不是单一相似度。</p>
+
+      <h2 id="why">为什么需要 Ranking</h2>
+
+      <p>经过 Hybrid Retrieval 和 Graph Expansion 后，通常会得到这样一个规模的结果：</p>
+
+      <pre><code>300~500 个 Object
+1000+ Relation
+100+ Event
+几十篇 Document
+几十个 Metric</code></pre>
+
+      <p>但 LLM 一次只能接收有限 Token。因此必须选择，而不是全部发送。</p>
+
+      <p>这件事的难度在于"全发"和"全不发"之间，有一个巨大的灰色地带。发太多，Token 爆了，模型注意力被稀释；发太少，关键信息缺失，答非所问。Ranking 的价值就是在中间找到那个最优子集。</p>
+
+      <h2 id="architecture">整体架构</h2>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  HR["Hybrid Retrieval"] --> CC["Context Candidate"]
+  CC --> GE["Graph Expansion"]
+  GE --> EC["Expanded Context"]
+  EC --> CR["Context Ranking"]
+  CR --> TC["Top Context"]
+  TC --> TBO["Context Optimizer"]
+  style CR fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style TBO fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>Ranking 决定哪些对象进入 Prompt。它之后是第 7 章的 Context Optimizer。</figcaption>
+      </figure>
+
+      <h2 id="io">输入与输出</h2>
+
+      <p>统一输入是 Context Package，包含 Objects、Relations、Documents、Events、Metrics、Actions。每个对象带 ID、Type、Metadata、Source、Timestamp、Score。</p>
+
+      <p>输出是 Ranked Context Package，比输入多了四个字段：Rank、Priority、Final Score、Reason。比如：</p>
+
+      <pre><code>Experiment
+  Score: 97
+  Reason: Current Experiment
+          High Importance
+          Recent
+          Owner Match</code></pre>
+
+      <p>注意那个 Reason——Ranking 必须支持 Explain。每个对象为什么进、为什么被踢，都要能解释。这是第 10 章 Observability 的基础。</p>
+
+      <h2 id="pipeline">Ranking Pipeline</h2>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  CC["Candidate Context"] --> PF["Permission Filter"]
+  PF --> DM["Duplicate Merge"]
+  DM --> BR["Business Rule"]
+  BR --> SC["Score Calculation"]
+  SC --> TN["Top-N Selection"]
+  TN --> CP["Context Package"]
+  style PF fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Ranking Pipeline。Permission Filter 在最前面——无权限对象直接踢，不参与打分。</figcaption>
+      </figure>
+
+      <h2 id="factors">七个排序因子</h2>
+
+      <p>建议采用多维评分，而不是 Embedding Similarity。下面七个因子共同决定一个对象的最终分数。</p>
+
+      <h3>1. Relevance（相关性）</h3>
+      <p>来源是 Query、Intent、Ontology。比如 Loss 这个指标，和 Experiment 高度相关。相关性是基础分，但不是唯一分。</p>
+
+      <h3>2. Freshness（时效性）</h3>
+      <p>当前 GPU 状态、今天的告警、昨天的日志，优先级远高于三个月前的数据。实时业务场景里，时效性往往比相关性更重要——一个过时的"高相关"对象，价值不如一个新鲜的"中等相关"对象。</p>
+
+      <h3>3. Importance（业务重要性）</h3>
+      <p>来自 Ontology。Experiment 五星、GPU 四星、Owner 两星、Comment 一星。重要性是业务定义的，不是算出来的——它反映的是"这个对象对业务有多关键"。</p>
+
+      <h3>4. Authority（可信度）</h3>
+      <p>MLflow 五星、Notebook 四星、Wiki 三星、Slack 一星。来源影响最终排序——同样一个数据，来自 MLflow 比来自 Slack 可信得多。</p>
+
+      <h3>5. Permission（权限）</h3>
+      <p>用户没有权限的对象，直接过滤，而不是降分。这是硬约束，和第 0 章原则 4 一致。</p>
+      <p>权限过滤还要细到属性粒度，不只是"对象可见不可见"。Palantir Foundry 支持在 object type 上直接配 cell-level（单元格级）安全——对象实例级和属性值级两层，且独立于背后数据源权限。它比传统的 Restricted View 方案更轻：配置直接挂在类型上、策略变更近乎实时生效（旧方案改权限得重建整条管道）、还能给流式数据源加行列级权限（旧方案做不到）。本书这里的 Permission 因子可以照这个粒度深化：无权限的对象直接过滤，而对象内部无权限的属性也按 cell 级脱敏，而不是整个对象扔掉。<span class="src">来源：Foundry Ontology 文档，Object and property security policies</span></p>
+
+      <h3>6. Distance（图距离）</h3>
+      <p>Graph Distance。Experiment → Dataset 距离是 1，Experiment → Dataset → Statistics 距离是 2。距离越远，Score 越低。这控制了扩展的范围——太远的对象即使相关，也降权。</p>
+
+      <h3>7. Token Cost（Token 成本）</h3>
+      <p>不同对象占用 Token 不同：Document 1000 Token、Metric 20 Token、Event 15 Token。如果价值接近，优先选低 Token 的。这是为压缩阶段服务的——同样的信息量，用更少的 Token 表达。</p>
+
+      <h2 id="final-score">Final Score</h2>
+
+      <p>七个因子合成一个分数：</p>
+
+      <pre><code>Final Score = Relevance + Freshness + Importance
+            + Authority + Business Priority
+            - Distance - Token Cost</code></pre>
+
+      <p>两个负向因子值得注意：Distance 和 Token Cost。它们让排序不仅看"价值高不高"，还看"代价大不大"。一个距离远、Token 又大的对象，即便相关性高，也可能被踢出去。</p>
+
+      <p>"价值接近时优先低 Token"这条原则，在更上游还有一个工业对应物：按需索引。不是所有属性都值得进高成本的可搜索、可排序索引。Palantir Foundry 用 render hints 标记每个属性的用途——比如 Searchable 决定它能不能被过滤、排序、聚合；不需要被搜索的属性，取消这个提示就能显著减轻重建索引的负担、加快索引速度。这和 Token Cost 的精神是一致的：资源有限，只把"会被用到的"放进高成本通道。本书在排序层用 Token Cost 选对象，Foundry 在存储层用 render hints 选索引，本质都是按需加载。<span class="src">来源：Foundry Ontology 文档，Property metadata / Render hints</span></p>
+
+      <h2 id="explain">Explain：每个对象都能解释</h2>
+
+      <p>Ranking 必须支持 Explain。例如：</p>
+
+      <pre><code>Experiment
+  Score: 95
+  原因: Current Project
+        Recent
+        High Authority
+        Token Low</code></pre>
+
+      <p>Agent 可以据此 Debug。更重要的是，当业务人员问"为什么 Agent 没看到这个信息"，你能拿出具体原因——是 Token 太高被踢了，还是权限不够被过滤了。没有 Explain 的 Ranking，在生产环境里就是黑盒。</p>
+
+      <h2 id="diversity">Context Diversity：不能全是同一类</h2>
+
+      <p>一个常见错误：Top 10 全是 Document。但实际上 LLM 需要的是覆盖——Experiment、Dataset、Metric、GPU、Notebook、Commit 各要一点。Ranking 不是简单的 Top Score，而是要保证 Context 丰富。</p>
+
+      <p>这背后是一个经典的算法问题：Set Cover。目标不是"选分数最高的 N 个"，而是"用有限的 Token 覆盖最多的信息维度"。</p>
+
+      <p>"少而精优于多而全"是同构的另一面。生产实践反复印证：铺一个大而全的候选集，不如精选一组覆盖度高的对象——前者稀释注意力、增加 Token 成本、放大选择错误。这条经验来自工具层（工具菜单越大，选择错误和提示注入面越大），但同样适用于上下文选择：选什么、不选什么，本身就是质量的决定因素，而不只是检索之后的附庸。<span class="src">来源：Li et al., 2026, §4.2/§11.2</span></p>
+
+      <h2 id="conflict">Conflict Resolution：冲突怎么办</h2>
+
+      <p>多个 Source 可能冲突。比如 MLflow 说 Accuracy 92%，Notebook 说 91%。Ranking 优先 Authority 高的，保留 MLflow。冲突解决不能靠"取平均"——数据可信度不同，平均是在稀释真相。</p>
+
+      <h2 id="api">Ranking API</h2>
+
+      <pre><code>type Ranker interface {
+    Rank(ctx context.Context, pkg ContextPackage) (ContextPackage, error)
+}</code></pre>
+
+      <p>支持插件化——不同的业务可以有不同的排序策略。</p>
+
+      <h2 id="quality">Context Quality：不止输出分数</h2>
+
+      <p>Ranking 不仅输出 Score，还输出 Quality 指标：Coverage（覆盖率）、Freshness（新鲜度）、Authority（权威度）、Completeness（完整度）。这些供 Prompt Builder 参考——它知道这份 Context 的质量水位，能据此决定是否需要再补检索。</p>
+
+      <p>关键提醒：<strong>生产实现应同时报告相关性、覆盖率、冲突率和 Token 效率，避免把单一分数误认为 Context 质量。</strong>一个高分数的 Context 可能覆盖率很低，单一分数会掩盖这个问题。</p>
+
+      <h2 id="advanced">两个高级能力</h2>
+
+      <h3>Goal-aware Ranking（目标感知排序）</h3>
+
+      <p>传统 Ranking 只看 Query。建议增加 Goal 维度——同样问"为什么训练慢"：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  G["为什么训练慢？"] --> RA["Research Agent<br/>优先: GPU / Profile"]
+  G --> OA["Operator Agent<br/>优先: Cluster / Queue / Scheduler"]
+  G --> BA["Business Agent<br/>优先: Cost"]
+  style G fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>同一个问题，不同 Agent 关注的对象完全不同。Goal 决定 Ranking。</figcaption>
+      </figure>
+
+      <p>Research Agent 优先 GPU 和 Profile，Operator Agent 优先集群和调度器，Business Agent 优先成本。Goal 决定 Ranking——这让排序从"问题驱动"升级为"目标驱动"。</p>
+
+      <h3>Context Coverage Optimization（上下文覆盖优化）</h3>
+
+      <p>很多 RAG 的 Top 10 全是 Document，但实际上 LLM 需要 Experiment、Dataset、Metric、Action、History、Policy 的组合。因此 Ranking 不是 Top Score，而是最大 Coverage——类似 Set Cover。这是 Context Engine 的核心研究方向。</p>
+
+      <h2 id="learning">Learning Ranking：会学习的排序</h2>
+
+      <p>未来支持 Feedback。如果用户经常点击 GPU 相关的对象，GPU 的 Importance 会自动提升。Ranking 不断学习，越来越贴合实际使用。这把排序从"静态规则"变成"自适应系统"。</p>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Relevance、Freshness、Importance、Permission、Token Cost、Explain；</li>
+        <li><strong>第二阶段</strong>：Learning Ranking、Diversity、Conflict Resolution；</li>
+        <li><strong>第三阶段</strong>：Reinforcement Ranking、Adaptive Ranking、User Preference。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Context Ranking 不是搜索排序。而是在有限 Token 下，选择最值得让 LLM 看到的业务上下文。它决定了 Agent 是否真正拥有高质量 Context。</p>
+        <blockquote>
+          <p>在有限 Token 下，选择最值得让 LLM 看到的业务上下文。</p>
+        </blockquote>
+        <p>各模块在流水线中的职责与边界见第 1 章 §4。本章的定位：从 Graph Expansion 输出的候选中负责选择（Select）——找到是 Hybrid Retrieval 的事，扩展是 Graph Expansion 的事，压缩是 Context Optimizer 的事。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-05-graph-expansion.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 5 章 · Graph Expansion</span>
+        </a>
+        <a class="next" href="chapter-07-context-optimizer.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 7 章 · Context Optimizer</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 经典模式 — LangGraph 学习站</title>
+<link rel="stylesheet" href="assets/lg-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>LangGraph 学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-core-concepts.html">核心概念</a>
+      <a href="02-first-graph.html">第一个图</a>
+      <a href="03-state-reducers.html">状态·Reducer</a>
+      <a href="04-control-flow.html">控制流</a>
+      <a href="05-react-agent.html">ReAct Agent</a>
+      <a href="06-human-in-the-loop.html">人机协同</a>
+      <a href="09-checkpoint-store.html">持久化</a>
+      <a href="07-multi-agent.html">多智能体</a>
+      <a href="08-patterns.html" style="color:var(--brand);font-weight:600">经典模式</a>
+      <a href="11-streaming.html">流式输出</a>
+      <a href="10-agent-selector.html">选型指南</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 经典模式</div>
+    <h1>经典模式:在 ReAct 骨架上加反思、规划与纠错</h1>
+    <div class="subtitle">Reflection、Reflexion、Plan-and-Execute、四种 RAG 变体——这些被反复引用的 Agent 模式,本质上都是在基础 ReAct 循环(第 05 章)的基础上,再插入几个"反思 / 规划 / 纠错"节点和回边。本章基于本代码库 examples 目录的 notebook 模式,逐个拆开讲清"为什么这样设计",帮你在自建与选型时知道该套哪一套。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一个心智锚点:这些都是 ReAct 的变体</h2>
+    <div class="callout info">
+      <b class="tag">关于 examples 目录</b>
+      本代码库 <code class="inline">examples/reflection</code>、<code class="inline">examples/reflexion</code>、<code class="inline">examples/plan-and-execute</code>、<code class="inline">examples/rag/</code> 下的 notebook 现在是归档占位文件(指向已合并到 LangChain 文档的教程),但它们记录的图结构、state schema、节点职责划分是真实且稳定的。本章把这些模式用 LangGraph 1.x 的 <code class="inline">StateGraph</code> / <code class="inline">Command</code> / <code class="inline">Send</code> 重新写成可运行骨架,直接对应当前 API。
+    </div>
+    <p>阅读前请先记住一个心智锚点:第 05 章的 ReAct 是"agent 节点 ↔ tools 节点"的二人转。本章所有模式做的事,都可以概括成一句话——<strong>在这二人转里再加一个或几个节点,并在节点之间加条件边和回边,把单向循环变成带反馈的多循环</strong>。掌握了第 04 章的控制流原语,组合这些模式是自然的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>Reflection(反思):生成 → 评估 → 再生成</h2>
+    <p>Reflection 解决的问题是:LLM 第一遍写出来的东西往往不够好。与其让人来挑刺,不如再请一个"评估者"节点专门挑刺,把批评意见喂回去让生成者改,循环几轮直到评估者说"可以了"。</p>
+    <p>为什么不让同一个 LLM 调用"又写又评"?因为生成和评估是两种相反的认知方向:生成要发散,评估要收敛。把它们拆成两个节点(甚至两个不同的 prompt / 模型),各自专注一件事,效果比一个节点包揽要好——这是"分工"在图层面的体现。两个节点之间用条件边控制循环次数,这是 ReAct 之外最简单的一种"反馈循环"。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 660 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t82 d82">
+        <title id="t82">Reflection 模式</title>
+        <desc id="d82">generator 到 reflector,经判断回到 generator 或到 END</desc>
+        <defs><marker id="arr82" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="60" cy="160" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="60" y="165" text-anchor="middle">START</text>
+        <line class="edge" x1="102" y1="160" x2="168" y2="160" marker-end="url(#arr82)"></line>
+
+        <rect class="node core" x="170" y="120" width="160" height="80" rx="10"></rect>
+        <text class="lbl" x="250" y="150" text-anchor="middle" font-weight="bold" fill="var(--brand)">generator</text>
+        <text class="lbl sm" x="250" y="172" text-anchor="middle">生成初稿/改进稿</text>
+
+        <line class="edge" x1="330" y1="160" x2="398" y2="160" marker-end="url(#arr82)"></line>
+
+        <rect class="node core" x="400" y="120" width="160" height="80" rx="10"></rect>
+        <text class="lbl" x="480" y="150" text-anchor="middle" font-weight="bold" fill="var(--accent)">reflector</text>
+        <text class="lbl sm" x="480" y="172" text-anchor="middle">评估并给改进建议</text>
+
+        <path class="edge" d="M480 120 Q 480 70 250 70 Q 250 90 250 118" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr82)" stroke-dasharray="5 3"></path>
+
+        <polygon class="node" points="560,160 600,135 640,160 600,185"></polygon>
+        <text class="lbl sm" x="600" y="155" text-anchor="middle">达到</text>
+        <text class="lbl sm" x="600" y="170" text-anchor="middle">门槛?</text>
+        <line class="edge" x1="560" y1="160" x2="562" y2="160" marker-end="url(#arr82)"></line>
+
+        <text class="lbl sm code" x="365" y="100" text-anchor="middle">否→再生成</text>
+        <path class="edge" d="M640 160 Q 660 160 660 230 Q 660 280 250 280 Q 250 280 250 202" fill="none" stroke="var(--edge)" stroke-width="0" ></path>
+        <ellipse class="node acc" cx="600" cy="280" rx="42" ry="22"></ellipse>
+        <text class="lbl" x="600" y="285" text-anchor="middle">END</text>
+        <path class="edge" d="M600 187 Q 600 235 600 258" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr82)"></path>
+        <text class="lbl sm code" x="615" y="225">是</text>
+      </svg>
+      <div class="fig-cap">图 8.1:Reflection——generator 与 reflector 两节点循环,评估不过就回到 generator 再生成,直到达标或撞循环上限。</div>
+    </div>
+
+    <div class="code-title">Reflection:生成器 ↔ 评估器循环</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+
+<span class="cmt"># 生成器与评估者用两个不同 prompt 的模型实例</span>
+generator_llm = init_chat_model(<span class="st">"openai:gpt-4o"</span>).with_structured_output(
+    {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"properties"</span>: {<span class="st">"draft"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>}}}
+)
+reflector_llm = init_chat_model(<span class="st">"openai:gpt-4o"</span>).with_structured_output(
+    {<span class="st">"type"</span>: <span class="st">"object"</span>,
+     <span class="st">"properties"</span>: {<span class="st">"critique"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>},
+                    <span class="st">"satisfactory"</span>: {<span class="st">"type"</span>: <span class="st">"boolean"</span>}}}
+)
+
+<span class="kw">class</span> <span class="cl">ReflectionState</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]   <span class="cmt"># 原始问题 + 各轮草稿/批评</span>
+    iterations: <span class="cl">int</span>                            <span class="cmt"># 循环计数,用来兜底防死循环</span>
+
+MAX_ITER = <span class="nu">3</span>  <span class="cmt"># 兜底:无论评估者怎么说,最多改 3 轮</span>
+
+<span class="kw">def</span> <span class="fn">generator</span>(state: <span class="cl">ReflectionState</span>):
+    resp = generator_llm.invoke(state[<span class="st">"messages"</span>])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [(<span class="st">"assistant"</span>, resp[<span class="st">"draft"</span>])], <span class="st">"iterations"</span>: state[<span class="st">"iterations"</span>] + <span class="nu">1</span>}
+
+<span class="kw">def</span> <span class="fn">reflector</span>(state: <span class="cl">ReflectionState</span>):
+    resp = reflector_llm.invoke(state[<span class="st">"messages"</span>])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">f"改进建议: {resp['critique']}"</span>)]}
+
+<span class="kw">def</span> <span class="fn">should_continue</span>(state: <span class="cl">ReflectionState</span>):
+    <span class="kw">if</span> state[<span class="st">"iterations"</span>] &gt;= MAX_ITER:
+        <span class="kw">return</span> END
+    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 实际可从 messages 末尾解析 satisfactory 字段</span>
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">ReflectionState</span>)
+workflow.add_node(<span class="st">"generator"</span>, generator)
+workflow.add_node(<span class="st">"reflector"</span>, reflector)
+workflow.add_edge(START, <span class="st">"generator"</span>)
+workflow.add_edge(<span class="st">"generator"</span>, <span class="st">"reflector"</span>)
+workflow.add_conditional_edges(<span class="st">"reflector"</span>, should_continue, {<span class="st">"generator"</span>: <span class="st">"generator"</span>, END: END})
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 写作(文章 / 邮件 / 营销文案)、代码生成、翻译这类"有明确质量标准、且改一改能明显变好"的任务。注意 Reflection 的成本是每轮多一次 LLM 调用,若任务本身一次就能做好(比如简单事实问答),加反思纯属浪费——它只对"草稿质量离上限有距离"的任务划算。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>Reflexion:把反思沉淀成 episodic memory</h2>
+    <p>Reflection 的问题在于:每一轮的批评用完就丢,下次遇到同类问题还会犯同样的错。Reflexion 的改进点是——把反思结论存进一个长期累积的 <code class="inline">reflections</code> 列表(state 的一部分,语义上相当于"情节记忆"),生成者每次动笔前先读这个列表,把历史教训纳入考虑。</p>
+    <p>这个设计的关键在于 <code class="inline">reflections</code> 用 <code class="inline">operator.add</code> 作为 reducer(第 03 章):每次反思节点返回一条新教训,它会被<strong>追加</strong>到列表而不是覆盖。于是状态里就形成了一条不断增长的"经验流",生成者读它时看到的是全部历史教训。这正是"记忆"在图里的实现方式——一个带累加 reducer 的 state 字段。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t83 d83">
+        <title id="t83">Reflexion 模式</title>
+        <desc id="d83">generator 读 reflections 后生成,经评估到 reflector 追加教训,失败则带新教训重试</desc>
+        <defs><marker id="arr83" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="150" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="155" text-anchor="middle">START</text>
+        <line class="edge" x1="92" y1="150" x2="158" y2="150" marker-end="url(#arr83)"></line>
+
+        <rect class="node core" x="160" y="110" width="150" height="80" rx="10"></rect>
+        <text class="lbl" x="235" y="142" text-anchor="middle" font-weight="bold" fill="var(--brand)">generator</text>
+        <text class="lbl sm" x="235" y="162" text-anchor="middle">读 reflections</text>
+        <text class="lbl sm" x="235" y="178" text-anchor="middle">后再生成</text>
+
+        <rect class="node" x="350" y="110" width="140" height="80" rx="10"></rect>
+        <text class="lbl" x="420" y="142" text-anchor="middle">executor</text>
+        <text class="lbl sm" x="420" y="162" text-anchor="middle">试运行打分</text>
+        <line class="edge" x1="310" y1="150" x2="348" y2="150" marker-end="url(#arr83)"></line>
+
+        <rect class="node core" x="530" y="110" width="150" height="80" rx="10"></rect>
+        <text class="lbl" x="605" y="142" text-anchor="middle" font-weight="bold" fill="var(--accent)">reflector</text>
+        <text class="lbl sm" x="605" y="162" text-anchor="middle">追加失败教训</text>
+        <text class="lbl sm" x="605" y="178" text-anchor="middle">进 reflections</text>
+        <line class="edge" x1="490" y1="150" x2="528" y2="150" marker-end="url(#arr83)"></line>
+
+        <path class="edge" d="M605 110 Q 605 50 235 50 Q 235 80 235 108" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr83)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm code" x="400" y="42" text-anchor="middle">否,带新教训重试</text>
+
+        <rect class="node acc" x="160" y="260" width="400" height="60" rx="8" stroke-dasharray="6 4"></rect>
+        <text class="lbl" x="360" y="285" text-anchor="middle" fill="var(--accent)">reflections: list[str]</text>
+        <text class="lbl sm" x="360" y="302" text-anchor="middle">reducer = operator.add · 逐轮累加,只增不删</text>
+        <path class="edge" d="M605 192 Q 605 230 460 258" fill="none" stroke="var(--edge)" stroke-width="1.2" marker-end="url(#arr83)" stroke-dasharray="4 3"></path>
+        <text class="lbl sm code" x="555" y="232">写入</text>
+        <path class="edge" d="M235 192 Q 235 230 280 258" fill="none" stroke="var(--edge)" stroke-width="1.2" marker-end="url(#arr83)" stroke-dasharray="4 3"></path>
+        <text class="lbl sm code" x="225" y="232">读取</text>
+
+        <ellipse class="node acc" cx="660" cy="280" rx="42" ry="22"></ellipse>
+        <text class="lbl" x="660" y="285" text-anchor="middle">END</text>
+        <path class="edge" d="M605 192 Q 660 230 660 258" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr83)"></path>
+        <text class="lbl sm code" x="635" y="232">是</text>
+      </svg>
+      <div class="fig-cap">图 8.2:Reflexion——reflector 把教训写进 <code class="inline">reflections</code>(累加 reducer),generator 下次读全部历史教训再生成。</div>
+    </div>
+
+    <div class="code-title">Reflexion:reflections 用 operator.add 累加</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+
+model = init_chat_model(<span class="st">"openai:gpt-4o"</span>)
+
+<span class="kw">class</span> <span class="cl">ReflexionState</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    <span class="cmt"># 关键:reflections 用 operator.add 累加,语义上是"情节记忆"</span>
+    <span class="cmt"># 每轮 reflector 产出的教训会 append 进来,生成器下次能看到全部历史</span>
+    reflections: Annotated[<span class="cl">list</span>[<span class="cl">str</span>], operator.add]
+    attempt: <span class="cl">int</span>
+
+MAX_ATTEMPTS = <span class="nu">3</span>
+
+<span class="kw">def</span> <span class="fn">generator</span>(state: <span class="cl">ReflexionState</span>):
+    lessons = <span class="st">"\n"</span>.join(<span class="st">f"- {r}"</span> <span class="kw">for</span> r <span class="kw">in</span> state.get(<span class="st">"reflections"</span>, []))
+    sys = <span class="st">f"你是一个解题 agent。过往反思教训:\n{lessons}\n请避免重复同样的错误。"</span>
+    resp = model.invoke([(<span class="st">"system"</span>, sys), *state[<span class="st">"messages"</span>]])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp]}
+
+<span class="kw">def</span> <span class="fn">evaluate</span>(state: <span class="cl">ReflexionState</span>):
+    <span class="cmt"># 实际场景:执行代码 / 跑测试 / 用另一个 LLM 评分</span>
+    last = state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content
+    passed = <span class="st">"def "</span> <span class="kw">in</span> last <span class="kw">and</span> <span class="st">"return"</span> <span class="kw">in</span> last
+    <span class="kw">return</span> {<span class="st">"_pass"</span>: passed}  <span class="cmt"># 临时键,实际应放进 state schema</span>
+
+<span class="kw">def</span> <span class="fn">reflector</span>(state: <span class="cl">ReflexionState</span>):
+    resp = model.invoke([
+        (<span class="st">"system"</span>, <span class="st">"总结这次失败的根本原因,用一句话给出可复用的教训。"</span>),
+        (<span class="st">"user"</span>, state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content),
+    ])
+    <span class="kw">return</span> {<span class="st">"reflections"</span>: [resp.content], <span class="st">"attempt"</span>: state[<span class="st">"attempt"</span>] + <span class="nu">1</span>}
+
+<span class="kw">def</span> <span class="fn">should_continue</span>(state: <span class="cl">ReflexionState</span>):
+    <span class="kw">if</span> state[<span class="st">"attempt"</span>] &gt;= MAX_ATTEMPTS:
+        <span class="kw">return</span> END
+    <span class="kw">return</span> <span class="st">"generator"</span>
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">ReflexionState</span>)
+workflow.add_node(<span class="st">"generator"</span>, generator)
+workflow.add_node(<span class="st">"reflector"</span>, reflector)
+workflow.add_edge(START, <span class="st">"generator"</span>)
+workflow.add_edge(<span class="st">"generator"</span>, <span class="st">"reflector"</span>)
+workflow.add_conditional_edges(<span class="st">"reflector"</span>, should_continue, {<span class="st">"generator"</span>: <span class="st">"generator"</span>, END: END})
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 代码竞赛(USACO)、多步推理、智能体导航这类"会反复失败、且失败原因可复用"的任务。Reflexion 相比 Reflection 多出的价值,完全取决于"教训是否真的可复用"——如果每次失败的原因都和具体上下文强绑定、无法泛化,那 <code class="inline">reflections</code> 列表只会越长越干扰。所以它更适合<strong>同一会话内多次尝试同类问题</strong>的场景;跨会话的记忆要配合第 09 章的 Store 持久化。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>Plan-and-Execute:先规划全局,再逐步执行</h2>
+    <p>ReAct 是"想一步做一步",每一步只看眼前。问题是:没有全局视野,容易在长任务里走偏、重复劳动、或漏掉关键步骤。Plan-and-Execute 把流程拆成两段——<strong>先让 planner 节点一次性生成完整的步骤列表,再让 executor 逐条执行,执行完由 re-planner 评估要不要根据新信息调整计划</strong>。</p>
+    <p>为什么 planner 用 <code class="inline">with_structured_output</code> 返回一个 <code class="inline">Plan(steps: list[str])</code>?因为计划是结构化数据(一组步骤),不是自然语言文本。用结构化输出让 LLM 直接吐 Pydantic 对象,比让它写自由文本再去正则解析稳得多。计划存在 state 的 <code class="inline">plan</code> 字段里,executor 每次取第一条执行,执行完把它移到 <code class="inline">past_steps</code>(用 <code class="inline">operator.add</code> 累加),re-planner 看到"已完成哪些 + 还剩哪些 + 最新观察"后决定是否重排。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 720 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t84 d84">
+        <title id="t84">Plan-and-Execute 模式</title>
+        <desc id="d84">planner 生成步骤,executor 逐条执行,replanner 评估后继续或结束</desc>
+        <defs><marker id="arr84" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="140" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="145" text-anchor="middle">START</text>
+        <line class="edge" x1="92" y1="140" x2="158" y2="140" marker-end="url(#arr84)"></line>
+
+        <rect class="node core" x="160" y="100" width="150" height="80" rx="10"></rect>
+        <text class="lbl" x="235" y="132" text-anchor="middle" font-weight="bold" fill="var(--brand)">planner</text>
+        <text class="lbl sm" x="235" y="152" text-anchor="middle">生成完整</text>
+        <text class="lbl sm" x="235" y="168" text-anchor="middle">步骤列表 Plan</text>
+
+        <rect class="node" x="350" y="100" width="150" height="80" rx="10"></rect>
+        <text class="lbl" x="425" y="132" text-anchor="middle" font-weight="bold">executor</text>
+        <text class="lbl sm" x="425" y="152" text-anchor="middle">取 plan[0] 执行</text>
+        <text class="lbl sm" x="425" y="168" text-anchor="middle">产出结果</text>
+        <line class="edge" x1="310" y1="140" x2="348" y2="140" marker-end="url(#arr84)"></line>
+
+        <rect class="node core" x="540" y="100" width="160" height="80" rx="10"></rect>
+        <text class="lbl" x="620" y="128" text-anchor="middle" font-weight="bold" fill="var(--accent)">re-planner</text>
+        <text class="lbl sm" x="620" y="146" text-anchor="middle">看 past_steps +</text>
+        <text class="lbl sm" x="620" y="160" text-anchor="middle">剩余 plan + 新观察</text>
+        <text class="lbl sm" x="620" y="174" text-anchor="middle">续原计划/重排/完成</text>
+        <line class="edge" x1="500" y1="140" x2="538" y2="140" marker-end="url(#arr84)"></line>
+
+        <path class="edge" d="M620 100 Q 620 40 425 40 Q 425 70 425 98" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr84)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm code" x="520" y="32" text-anchor="middle">还有步骤→继续</text>
+
+        <ellipse class="node acc" cx="620" cy="260" rx="42" ry="22"></ellipse>
+        <text class="lbl" x="620" y="265" text-anchor="middle">END</text>
+        <path class="edge" d="M620 182 Q 620 220 620 238" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr84)"></path>
+        <text class="lbl sm code" x="635" y="215">完成</text>
+      </svg>
+      <div class="fig-cap">图 8.3:Plan-and-Execute——planner 一次性出全局计划,executor 逐条执行,re-planner 据新信息调整剩余计划。</div>
+    </div>
+
+    <div class="code-title">Plan-and-Execute:结构化计划 + 逐条执行 + 重排</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> pydantic <span class="kw">import</span> <span class="cl">BaseModel</span>, <span class="cl">Field</span>
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+
+model = init_chat_model(<span class="st">"openai:gpt-4o"</span>)
+
+<span class="cmt"># 用结构化输出让 planner 直接吐结构化计划,而不是自由文本</span>
+<span class="kw">class</span> <span class="cl">Plan</span>(<span class="cl">BaseModel</span>):
+    <span class="str">"""一组可执行步骤。"""</span>
+    steps: <span class="cl">list</span>[<span class="cl">str</span>] = <span class="cl">Field</span>(description=<span class="st">"按顺序执行的步骤列表"</span>)
+
+<span class="kw">class</span> <span class="cl">PlanExecuteState</span>(<span class="cl">TypedDict</span>):
+    input: <span class="cl">str</span>
+    plan: <span class="cl">list</span>[<span class="cl">str</span>]                            <span class="cmt"># 当前待执行步骤</span>
+    past_steps: Annotated[<span class="cl">list</span>[<span class="cl">tuple</span>], operator.add]  <span class="cmt"># 已完成累加</span>
+    response: <span class="cl">str</span>                              <span class="cmt"># 最终答案</span>
+
+<span class="kw">def</span> <span class="fn">planner</span>(state: <span class="cl">PlanExecuteState</span>):
+    planner_llm = model.with_structured_output(<span class="cl">Plan</span>)
+    plan = planner_llm.invoke([
+        (<span class="st">"system"</span>, <span class="st">"为用户目标制定一份分步执行计划,步骤要具体可执行。"</span>),
+        (<span class="st">"user"</span>, state[<span class="st">"input"</span>]),
+    ])
+    <span class="kw">return</span> {<span class="st">"plan"</span>: plan.steps}
+
+<span class="kw">def</span> <span class="fn">executor</span>(state: <span class="cl">PlanExecuteState</span>):
+    current_step = state[<span class="st">"plan"</span>][<span class="nu">0</span>]
+    result = model.invoke([
+        (<span class="st">"system"</span>, <span class="st">"执行下面这一步,给出结果。"</span>),
+        (<span class="st">"user"</span>, current_step),
+    ]).content
+    remaining = state[<span class="st">"plan"</span>][<span class="nu">1</span>:]
+    <span class="kw">return</span> {<span class="st">"past_steps"</span>: [(current_step, result)], <span class="st">"plan"</span>: remaining}
+
+<span class="kw">def</span> <span class="fn">replanner</span>(state: <span class="cl">PlanExecuteState</span>):
+    replanner_llm = model.with_structured_output(<span class="cl">Plan</span>)
+    new_plan = replanner_llm.invoke([
+        (<span class="st">"system"</span>,
+         <span class="st">"你是 re-planner。根据已完成的步骤和结果,判断剩余计划是否需要调整。"</span>
+         <span class="st">"若已能回答原始目标,返回空步骤列表;否则返回调整后的剩余步骤。"</span>),
+        (<span class="st">"user"</span>,
+         <span class="st">f"目标: {state['input']}\n已完成: {state['past_steps']}\n剩余: {state['plan']}"</span>),
+    ])
+    <span class="kw">return</span> {<span class="st">"plan"</span>: new_plan.steps}
+
+<span class="kw">def</span> <span class="fn">should_end</span>(state: <span class="cl">PlanExecuteState</span>):
+    <span class="kw">if</span> <span class="kw">not</span> state[<span class="st">"plan"</span>]:
+        <span class="kw">return</span> END
+    <span class="kw">return</span> <span class="st">"executor"</span>
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">PlanExecuteState</span>)
+workflow.add_node(<span class="st">"planner"</span>, planner)
+workflow.add_node(<span class="st">"executor"</span>, executor)
+workflow.add_node(<span class="st">"replanner"</span>, replanner)
+workflow.add_edge(START, <span class="st">"planner"</span>)
+workflow.add_edge(<span class="st">"planner"</span>, <span class="st">"executor"</span>)
+workflow.add_edge(<span class="st">"executor"</span>, <span class="st">"replanner"</span>)
+workflow.add_conditional_edges(<span class="st">"replanner"</span>, should_end, {<span class="st">"executor"</span>: <span class="st">"executor"</span>, END: END})
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 长任务(多步研究、复杂报告、多文件重构)、需要全局规划的场景、以及"前期信息不全、执行中会暴露新情况"的任务(re-planner 的价值就在这)。代价是:planner 一次生成的计划可能不准,若任务本身只需两三步,Plan-and-Execute 的开销大于 ReAct。它和 ReAct 的取舍本质是<strong>规划深度 vs 执行延迟</strong>:任务越长、步骤间耦合越紧,越值得先规划。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>RAG 变体:让检索更聪明、更会纠错</h2>
+    <p>朴素 RAG 是"用户问 → 检索 → 拼进 prompt → 生成"的单向流水线。问题是:不是每个问题都需要检索、检索回来的文档未必相关、生成的答案未必被文档支持。下面四个变体分别从"是否检索 / 检索什么 / 如何纠错"三个维度给朴素 RAG 加反馈回路。它们的共同点:都还是 <code class="inline">StateGraph</code>,只是多了几个判断节点和回边。</p>
+
+    <h3>4.1 Agentic RAG:agent 自己决定检索与否</h3>
+    <p>把 retriever 封装成一个工具,交给 ReAct agent。agent 读到问题后自己判断:需不需要检索?检索什么词?检索一次不够要不要再检索?这比朴素 RAG 的"无脑检索一次"灵活得多——简单问题直接答,复杂问题多轮检索。</p>
+    <p>为什么用工具封装而不是单独写个 retrieve 节点?因为"要不要检索、检索几次"本质是 LLM 的推理决策,用 <code class="inline">tool_calls</code> 表达最自然——这正是第 05 章 ReAct 循环擅长的事。所以 Agentic RAG 在结构上几乎就是一个标准的 ReAct agent,只是工具列表里多了一个 <code class="inline">retrieve</code>。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 680 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t85a d85a">
+        <title id="t85a">Agentic RAG</title>
+        <desc id="d85a">agent 节点决定是否调用含 retrieve 的 tools 节点</desc>
+        <defs><marker id="arr85a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="120" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="125" text-anchor="middle">START</text>
+        <line class="edge" x1="92" y1="120" x2="168" y2="120" marker-end="url(#arr85a)"></line>
+
+        <rect class="node core" x="170" y="80" width="170" height="80" rx="10"></rect>
+        <text class="lbl" x="255" y="110" text-anchor="middle" font-weight="bold" fill="var(--brand)">agent</text>
+        <text class="lbl sm" x="255" y="132" text-anchor="middle">决定是否调用</text>
+        <text class="lbl sm" x="255" y="148" text-anchor="middle">retrieve 工具</text>
+
+        <polygon class="node" points="400,120 440,90 480,120 440,150"></polygon>
+        <text class="lbl sm" x="440" y="115" text-anchor="middle">有 tool</text>
+        <text class="lbl sm" x="440" y="130" text-anchor="middle">_calls?</text>
+        <line class="edge" x1="340" y1="120" x2="400" y2="120" marker-end="url(#arr85a)"></line>
+
+        <rect class="node" x="510" y="60" width="150" height="60" rx="8"></rect>
+        <text class="lbl" x="585" y="88" text-anchor="middle">tools 节点</text>
+        <text class="lbl sm" x="585" y="106" text-anchor="middle">含 retrieve</text>
+        <line class="edge" x1="470" y1="108" x2="508" y2="88" marker-end="url(#arr85a)"></line>
+        <text class="lbl sm code" x="490" y="98">是</text>
+        <path class="edge" d="M585 120 Q 585 180 255 180 Q 255 160 255 162" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr85a)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm code" x="420" y="200" text-anchor="middle">结果回 agent</text>
+
+        <ellipse class="node acc" cx="585" cy="180" rx="42" ry="22"></ellipse>
+        <text class="lbl" x="585" y="185" text-anchor="middle">END</text>
+        <line class="edge" x1="470" y1="135" x2="543" y2="170" marker-end="url(#arr85a)"></line>
+        <text class="lbl sm code" x="495" y="145">否</text>
+      </svg>
+      <div class="fig-cap">图 8.4:Agentic RAG——结构≈标准 ReAct,只是工具列表里多了一个 <code class="inline">retrieve</code>。</div>
+    </div>
+
+    <div class="code-title">Agentic RAG:retrieve 当工具交给 ReAct agent</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+<span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent, ToolNode, tools_condition
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, MessagesState, START, END
+
+<span class="cmt"># 假设已有一个向量检索器(如 FAISS / Chroma 的 .as_retriever())</span>
+<span class="cmt"># retriever = vectorstore.as_retriever(search_kwargs={"k": 3})</span>
+
+<span class="nd">@tool</span>
+<span class="kw">def</span> <span class="fn">retrieve</span>(query: <span class="cl">str</span>) -> <span class="cl">str</span>:
+    <span class="str">"""根据查询检索知识库,返回相关文档片段。可多次调用以获取不同角度的信息。"""</span>
+    <span class="cmt"># docs = retriever.invoke(query)</span>
+    <span class="cmt"># return "\n\n".join(d.page_content for d in docs)</span>
+    <span class="kw">return</span> <span class="st">f"(检索结果: 关于 {query} 的相关文档片段)"</span>
+
+<span class="cmt"># 最简形态:直接用 create_react_agent,把 retrieve 当一个工具</span>
+<span class="cmt"># agent 自己决定何时检索、检索什么、检索几次</span>
+graph = create_react_agent(
+    <span class="st">"openai:gpt-4o"</span>,
+    tools=[retrieve],
+    prompt=<span class="st">"你是问答助手。需要时调用 retrieve 检索知识库,可多次检索。"</span>,
+)
+
+<span class="cmt"># 也可手写等价的 StateGraph,结构同第 05 章手写 ReAct:</span>
+<span class="cmt"># workflow = StateGraph(MessagesState)</span>
+<span class="cmt"># workflow.add_node("agent", call_model)</span>
+<span class="cmt"># workflow.add_node("tools", ToolNode([retrieve]))</span>
+<span class="cmt"># workflow.set_entry_point("agent")</span>
+<span class="cmt"># workflow.add_conditional_edges("agent", tools_condition)</span>
+<span class="cmt"># workflow.add_edge("tools", "agent")</span></pre>
+    <div class="annotation"><b>适用场景:</b> 问题难度参差、有时要检索有时不用、或需要多轮检索拼凑答案的开放问答。它是最轻量的 RAG 增强——基本不增加图复杂度,只是"换一种方式用 ReAct"。</div>
+
+    <h3>4.2 Adaptive RAG:先路由,再选路径</h3>
+    <p>Agentic RAG 把"是否检索"交给 LLM 临场决定,但有些场景你希望<strong>一开始就根据问题类型分流</strong>。Adaptive RAG 在入口放一个 router 节点,判断问题难度:简单的直接答、需要知识的走本地 RAG、需要时效性的走 web search。三条路径互不干扰,各自走到终点。</p>
+    <p>这个模式的核心是 <code class="inline">add_conditional_edges(START, route)</code>——在图的入口就做条件路由。为什么用结构化输出做路由?因为"简单 / RAG / web"是离散分类,让 LLM 直接输出类别比让它写自由文本再解析稳。router 本身不产生答案,只做分流,所以它是纯粹的"控制流节点"。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 720 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t85b d85b">
+        <title id="t85b">Adaptive RAG</title>
+        <desc id="d85b">START 到 router 节点,分三路:直接答/本地 RAG/web search,各自到 END</desc>
+        <defs><marker id="arr85b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="140" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="145" text-anchor="middle">START</text>
+        <line class="edge" x1="92" y1="140" x2="178" y2="140" marker-end="url(#arr85b)"></line>
+
+        <polygon class="node core" points="180,140 240,100 300,140 240,180"></polygon>
+        <text class="lbl" x="240" y="135" text-anchor="middle" font-weight="bold" fill="var(--brand)">router</text>
+        <text class="lbl sm" x="240" y="152" text-anchor="middle">判断问题类型</text>
+
+        <rect class="node" x="370" y="40" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="445" y="62" text-anchor="middle">直接 LLM 回答</text>
+        <text class="lbl sm code" x="445" y="78" text-anchor="middle">llm</text>
+        <line class="edge" x1="290" y1="125" x2="368" y2="68" marker-end="url(#arr85b)"></line>
+
+        <rect class="node" x="370" y="115" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="445" y="137" text-anchor="middle">retrieve + 生成</text>
+        <text class="lbl sm code" x="445" y="153" text-anchor="middle">rag</text>
+        <line class="edge" x1="300" y1="140" x2="368" y2="140" marker-end="url(#arr85b)"></line>
+
+        <rect class="node" x="370" y="190" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="445" y="212" text-anchor="middle">web search + 生成</text>
+        <text class="lbl sm code" x="445" y="228" text-anchor="middle">web</text>
+        <line class="edge" x1="290" y1="155" x2="368" y2="208" marker-end="url(#arr85b)"></line>
+
+        <ellipse class="node acc" cx="640" cy="140" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="640" y="145" text-anchor="middle">END</text>
+        <line class="edge" x1="520" y1="65" x2="600" y2="125" marker-end="url(#arr85b)"></line>
+        <line class="edge" x1="520" y1="140" x2="598" y2="140" marker-end="url(#arr85b)"></line>
+        <line class="edge" x1="520" y1="215" x2="600" y2="158" marker-end="url(#arr85b)"></line>
+      </svg>
+      <div class="fig-cap">图 8.5:Adaptive RAG——入口 <code class="inline">add_conditional_edges(START, route)</code> 一分多路,各路径互不干扰。</div>
+    </div>
+
+    <div class="code-title">Adaptive RAG:入口条件路由一分三路</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+<span class="kw">import</span> operator
+
+model = init_chat_model(<span class="st">"openai:gpt-4o"</span>)
+
+<span class="kw">class</span> <span class="cl">AdaptiveState</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    documents: Annotated[<span class="cl">list</span>, operator.add]   <span class="cmt"># 检索/web 结果累加</span>
+
+<span class="kw">def</span> <span class="fn">route_question</span>(state: <span class="cl">AdaptiveState</span>) -> <span class="cl">Literal</span>[<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]:
+    router_llm = model.with_structured_output(
+        {<span class="st">"type"</span>: <span class="st">"object"</span>,
+         <span class="st">"properties"</span>: {<span class="st">"datasource"</span>: {<span class="st">"type"</span>: <span class="st">"string"</span>, <span class="st">"enum"</span>: [<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]}}}
+    )
+    resp = router_llm.invoke([
+        (<span class="st">"system"</span>,
+         <span class="st">"把问题路由到: llm(常识/无需检索)、rag(需知识库)、web(需实时网络信息)。"</span>),
+        (<span class="st">"user"</span>, state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content),
+    ])
+    <span class="kw">return</span> resp[<span class="st">"datasource"</span>]
+
+<span class="kw">def</span> <span class="fn">direct_llm</span>(state: <span class="cl">AdaptiveState</span>):
+    resp = model.invoke(state[<span class="st">"messages"</span>])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp]}
+
+<span class="kw">def</span> <span class="fn">rag_path</span>(state: <span class="cl">AdaptiveState</span>):
+    docs = [<span class="st">"(知识库文档片段)"</span>]  <span class="cmt"># = retriever.invoke(query)</span>
+    resp = model.invoke([*state[<span class="st">"messages"</span>], *docs])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp], <span class="st">"documents"</span>: docs}
+
+<span class="kw">def</span> <span class="fn">web_path</span>(state: <span class="cl">AdaptiveState</span>):
+    docs = [<span class="st">"(web search 结果)"</span>]  <span class="cmt"># = search_api.run(query)</span>
+    resp = model.invoke([*state[<span class="st">"messages"</span>], *docs])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp], <span class="st">"documents"</span>: docs}
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">AdaptiveState</span>)
+workflow.add_node(<span class="st">"llm"</span>, direct_llm)
+workflow.add_node(<span class="st">"rag"</span>, rag_path)
+workflow.add_node(<span class="st">"web"</span>, web_path)
+workflow.add_conditional_edges(
+    START,
+    route_question,
+    {<span class="st">"llm"</span>: <span class="st">"llm"</span>, <span class="st">"rag"</span>: <span class="st">"rag"</span>, <span class="st">"web"</span>: <span class="st">"web"</span>},
+)
+workflow.add_edge(<span class="st">"llm"</span>, END)
+workflow.add_edge(<span class="st">"rag"</span>, END)
+workflow.add_edge(<span class="st">"web"</span>, END)
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 问题类型分布明确、且不同类型适合不同检索源的客服 / 知识问答系统。价值在于"早分流省成本"——简单问题不浪费检索,复杂问题不走错路径。代价是 router 自身可能误判,所以分类边界要设计得清晰。</div>
+
+    <h3>4.3 Corrective RAG (CRAG):检索后自我修正</h3>
+    <p>Adaptive RAG 是"检索前分流",CRAG 则是"检索后纠错"。它假设检索结果质量参差,所以在检索后加一个 <strong>grading 节点</strong>评估每篇文档与问题的相关性:相关的留下生成,不相关的丢弃并转去 web search 补救。这是一条"检索 → 评估 → 必要时换源重试"的反馈回路。</p>
+    <p>为什么要在生成前 grading?因为把不相关文档塞进 prompt 会误导 LLM(它倾向于"信任"给定的上下文)。CRAG 的设计哲学是:与其让 LLM 在一堆噪声里挣扎,不如先用一个轻量判断把噪声过滤掉,过滤不掉就换更可靠的信息源。grading 节点通常用一个便宜的小模型做二元判断,成本远低于让大模型在噪声上下文里胡编。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 760 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t85c d85c">
+        <title id="t85c">Corrective RAG</title>
+        <desc id="d85c">retrieve 到 grading,相关则 generate,都不相关则转 web search 再 generate</desc>
+        <defs><marker id="arr85c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="140" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="145" text-anchor="middle">START</text>
+        <line class="edge" x1="92" y1="140" x2="148" y2="140" marker-end="url(#arr85c)"></line>
+
+        <rect class="node core" x="150" y="110" width="130" height="60" rx="10"></rect>
+        <text class="lbl" x="215" y="135" text-anchor="middle" font-weight="bold" fill="var(--brand)">retrieve</text>
+        <text class="lbl sm" x="215" y="153" text-anchor="middle">检索候选文档</text>
+        <line class="edge" x1="280" y1="140" x2="318" y2="140" marker-end="url(#arr85c)"></line>
+
+        <rect class="node core" x="320" y="110" width="130" height="60" rx="10"></rect>
+        <text class="lbl" x="385" y="135" text-anchor="middle" font-weight="bold" fill="var(--accent)">grading</text>
+        <text class="lbl sm" x="385" y="153" text-anchor="middle">逐篇评估相关性</text>
+
+        <polygon class="node" points="490,140 530,110 570,140 530,170"></polygon>
+        <text class="lbl sm" x="530" y="135" text-anchor="middle">文档</text>
+        <text class="lbl sm" x="530" y="150" text-anchor="middle">相关?</text>
+        <line class="edge" x1="450" y1="140" x2="490" y2="140" marker-end="url(#arr85c)"></line>
+
+        <rect class="node" x="620" y="60" width="120" height="50" rx="8"></rect>
+        <text class="lbl" x="680" y="82" text-anchor="middle">基于文档生成</text>
+        <text class="lbl sm code" x="680" y="98" text-anchor="middle">generate</text>
+        <line class="edge" x1="560" y1="125" x2="618" y2="88" marker-end="url(#arr85c)"></line>
+        <text class="lbl sm code" x="580" y="120">是</text>
+
+        <rect class="node" x="620" y="180" width="120" height="50" rx="8"></rect>
+        <text class="lbl" x="680" y="202" text-anchor="middle">转 web search</text>
+        <text class="lbl sm code" x="680" y="218" text-anchor="middle">换源</text>
+        <line class="edge" x1="560" y1="155" x2="618" y2="198" marker-end="url(#arr85c)"></line>
+        <text class="lbl sm code" x="580" y="180">否</text>
+
+        <path class="edge" d="M680 230 Q 680 245 680 245 Q 700 245 700 130 Q 700 110 740 110" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr85c)"></path>
+        <ellipse class="node acc" cx="680" cy="260" rx="32" ry="18" visibility="hidden"></ellipse>
+      </svg>
+      <div class="fig-cap">图 8.6:CRAG——检索后 grading 过滤噪声,都不相关就转 web search 换源,一条"检索→评估→换源"纠错回边。</div>
+    </div>
+
+    <div class="code-title">CRAG:grading 过滤 + 换源纠错</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+
+model = init_chat_model(<span class="st">"openai:gpt-4o"</span>)
+
+<span class="kw">class</span> <span class="cl">CragState</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    documents: Annotated[<span class="cl">list</span>, operator.add]   <span class="cmt"># 过滤后的相关文档</span>
+    web_results: Annotated[<span class="cl">list</span>, operator.add]
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state: <span class="cl">CragState</span>):
+    docs = [<span class="st">f"(候选文档 {i})"</span> <span class="kw">for</span> i <span class="kw">in</span> <span class="cl">range</span>(<span class="nu">3</span>)]  <span class="cmt"># = retriever.invoke(...)</span>
+    <span class="kw">return</span> {<span class="st">"documents"</span>: docs}
+
+<span class="kw">def</span> <span class="fn">grade_documents</span>(state: <span class="cl">CragState</span>):
+    grader_llm = model.with_structured_output(
+        {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"properties"</span>: {<span class="st">"relevant"</span>: {<span class="st">"type"</span>: <span class="st">"boolean"</span>}}}
+    )
+    question = state[<span class="st">"messages"</span>][<span class="nu">0</span>].content
+    filtered = []
+    <span class="kw">for</span> doc <span class="kw">in</span> state[<span class="st">"documents"</span>]:
+        resp = grader_llm.invoke([
+            (<span class="st">"system"</span>, <span class="st">"判断文档是否与问题相关,只回 relevant 布尔值。"</span>),
+            (<span class="st">"user"</span>, <span class="st">f"问题: {question}\n文档: {doc}"</span>),
+        ])
+        <span class="kw">if</span> resp[<span class="st">"relevant"</span>]:
+            filtered.append(doc)
+    <span class="kw">return</span> {<span class="st">"documents"</span>: filtered}
+
+<span class="kw">def</span> <span class="fn">decide_to_generate</span>(state: <span class="cl">CragState</span>) -> <span class="cl">Literal</span>[<span class="st">"generate"</span>, <span class="st">"web_search"</span>]:
+    <span class="kw">if</span> <span class="kw">not</span> state[<span class="st">"documents"</span>]:
+        <span class="kw">return</span> <span class="st">"web_search"</span>
+    <span class="kw">return</span> <span class="st">"generate"</span>
+
+<span class="kw">def</span> <span class="fn">web_search</span>(state: <span class="cl">CragState</span>):
+    results = [<span class="st">"(web search 补救结果)"</span>]
+    <span class="kw">return</span> {<span class="st">"web_results"</span>: results, <span class="st">"documents"</span>: results}
+
+<span class="kw">def</span> <span class="fn">generate</span>(state: <span class="cl">CragState</span>):
+    context = <span class="st">"\n\n"</span>.join(state[<span class="st">"documents"</span>] + state.get(<span class="st">"web_results"</span>, []))
+    resp = model.invoke([
+        (<span class="st">"system"</span>, <span class="st">"仅基于以下文档回答,不要编造。\n\n文档:\n"</span> + context),
+        *state[<span class="st">"messages"</span>],
+    ])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp]}
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">CragState</span>)
+workflow.add_node(<span class="st">"retrieve"</span>, retrieve)
+workflow.add_node(<span class="st">"grade"</span>, grade_documents)
+workflow.add_node(<span class="st">"web_search"</span>, web_search)
+workflow.add_node(<span class="st">"generate"</span>, generate)
+workflow.add_edge(START, <span class="st">"retrieve"</span>)
+workflow.add_edge(<span class="st">"retrieve"</span>, <span class="st">"grade"</span>)
+workflow.add_conditional_edges(<span class="st">"grade"</span>, decide_to_generate, {<span class="st">"generate"</span>: <span class="st">"generate"</span>, <span class="st">"web_search"</span>: <span class="st">"web_search"</span>})
+workflow.add_edge(<span class="st">"web_search"</span>, <span class="st">"generate"</span>)
+workflow.add_edge(<span class="st">"generate"</span>, END)
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 知识库质量参差、检索召回不稳定、且对答案准确性要求高的场景(医疗、法律、企业内部文档问答)。CRAG 的核心收益是"用纠错换可信度",代价是 grading 多一轮 LLM 调用;若你的检索器本身召回率很高,CRAG 的纠错分支几乎不会触发,就是纯开销。</div>
+
+    <h3>4.4 Self-RAG:全流程自我反思</h3>
+    <p>Self-RAG 把"自我评估"推到极致:不仅检索后评估文档相关性,生成后还自评"回答是否被文档支持"。它内嵌了多个反思点——是否需要检索、检索结果是否相关、回答是否有据——形成多轮自我反思的闭环。</p>
+    <p>和 CRAG 的区别:CRAG 只在检索后纠错一次,Self-RAG 在<strong>多个环节</strong>都插了评估节点,且生成后还会回头检查"幻觉没有"。代价是图更复杂、LLM 调用更多;收益是幻觉率最低。它适合对事实准确性要求最高的场景。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 780 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t85d d85d">
+        <title id="t85d">Self-RAG</title>
+        <desc id="d85d">多环节自评:是否检索、文档相关、回答被支持,多回路</desc>
+        <defs><marker id="arr85d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <ellipse class="node" cx="50" cy="50" rx="42" ry="26"></ellipse>
+        <text class="lbl" x="50" y="55" text-anchor="middle">START</text>
+
+        <polygon class="node core" points="140,50 190,20 240,50 190,80"></polygon>
+        <text class="lbl sm" x="190" y="45" text-anchor="middle">需要</text>
+        <text class="lbl sm" x="190" y="60" text-anchor="middle">检索?</text>
+        <line class="edge" x1="92" y1="50" x2="140" y2="50" marker-end="url(#arr85d)"></line>
+
+        <rect class="node" x="130" y="120" width="120" height="50" rx="8"></rect>
+        <text class="lbl" x="190" y="150" text-anchor="middle">retrieve</text>
+        <line class="edge" x1="190" y1="80" x2="190" y2="118" marker-end="url(#arr85d)"></line>
+        <text class="lbl sm code" x="200" y="105">是</text>
+
+        <polygon class="node core" points="190,230 240,200 290,230 240,260"></polygon>
+        <text class="lbl sm" x="240" y="225" text-anchor="middle">文档</text>
+        <text class="lbl sm" x="240" y="240" text-anchor="middle">相关?</text>
+        <line class="edge" x1="190" y1="170" x2="220" y2="202" marker-end="url(#arr85d)"></line>
+
+        <path class="edge" d="M290 230 Q 380 230 380 145 Q 380 145 250 145" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr85d)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm code" x="340" y="225">否→重检索</text>
+
+        <rect class="node" x="430" y="120" width="130" height="50" rx="10"></rect>
+        <text class="lbl" x="495" y="150" text-anchor="middle" font-weight="bold" fill="var(--brand)">generate</text>
+        <line class="edge" x1="290" y1="230" x2="440" y2="155" marker-end="url(#arr85d)"></line>
+        <line class="edge" x1="240" y1="80" x2="430" y2="140" marker-end="url(#arr85d)"></line>
+        <text class="lbl sm code" x="330" y="95">否(直接答)</text>
+
+        <polygon class="node core" points="640,145 690,115 740,145 690,175"></polygon>
+        <text class="lbl sm" x="690" y="140" text-anchor="middle">回答被</text>
+        <text class="lbl sm" x="690" y="155" text-anchor="middle">支持?</text>
+        <text class="lbl sm" x="690" y="170" text-anchor="middle">幻觉检查</text>
+        <line class="edge" x1="560" y1="145" x2="640" y2="145" marker-end="url(#arr85d)"></line>
+
+        <ellipse class="node acc" cx="730" cy="60" rx="38" ry="22"></ellipse>
+        <text class="lbl" x="730" y="65" text-anchor="middle">END</text>
+        <line class="edge" x1="720" y1="120" x2="735" y2="84" marker-end="url(#arr85d)"></line>
+        <text class="lbl sm code" x="745" y="100">是</text>
+
+        <path class="edge" d="M640 175 Q 400 320 190 320 Q 190 320 190 172" fill="none" stroke="var(--edge)" stroke-width="1.4" marker-end="url(#arr85d)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm code" x="420" y="315" text-anchor="middle">否,有幻觉→重检索重生成</text>
+      </svg>
+      <div class="fig-cap">图 8.7:Self-RAG——多环节反思(是否检索 / 文档相关 / 答案被支持),多条回边,幻觉率最低但成本最高。</div>
+    </div>
+
+    <div class="code-title">Self-RAG:多环节自我反思闭环</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+<span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
+
+model = init_chat_model(<span class="st">"openai:gpt-4o"</span>)
+
+<span class="kw">class</span> <span class="cl">SelfRagState</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    documents: Annotated[<span class="cl">list</span>, operator.add]
+
+<span class="kw">def</span> <span class="fn">need_retrieve</span>(state: <span class="cl">SelfRagState</span>) -> <span class="cl">Literal</span>[<span class="st">"retrieve"</span>, <span class="st">"generate"</span>]:
+    llm = model.with_structured_output(
+        {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"properties"</span>: {<span class="st">"need"</span>: {<span class="st">"type"</span>: <span class="st">"boolean"</span>}}}
+    )
+    resp = llm.invoke([
+        (<span class="st">"system"</span>, <span class="st">"判断回答这个问题是否需要检索外部知识。"</span>),
+        (<span class="st">"user"</span>, state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content),
+    ])
+    <span class="kw">return</span> <span class="st">"retrieve"</span> <span class="kw">if</span> resp[<span class="st">"need"</span>] <span class="kw">else</span> <span class="st">"generate"</span>
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state: <span class="cl">SelfRagState</span>):
+    docs = [<span class="st">f"(检索文档 {i})"</span> <span class="kw">for</span> i <span class="kw">in</span> <span class="cl">range</span>(<span class="nu">2</span>)]
+    <span class="kw">return</span> {<span class="st">"documents"</span>: docs}
+
+<span class="kw">def</span> <span class="fn">grade_relevance</span>(state: <span class="cl">SelfRagState</span>) -> <span class="cl">Literal</span>[<span class="st">"generate"</span>, <span class="st">"retrieve"</span>]:
+    <span class="kw">if</span> <span class="kw">not</span> state[<span class="st">"documents"</span>]:
+        <span class="kw">return</span> <span class="st">"retrieve"</span>
+    <span class="kw">return</span> <span class="st">"generate"</span>
+
+<span class="kw">def</span> <span class="fn">generate</span>(state: <span class="cl">SelfRagState</span>):
+    context = <span class="st">"\n\n"</span>.join(state[<span class="st">"documents"</span>]) <span class="kw">or</span> <span class="st">"(无检索文档,用模型自身知识)"</span>
+    resp = model.invoke([
+        (<span class="st">"system"</span>, <span class="st">"基于以下文档回答,文档为空时谨慎使用自身知识。\n\n"</span> + context),
+        *state[<span class="st">"messages"</span>],
+    ])
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [resp]}
+
+<span class="kw">def</span> <span class="fn">hallucination_check</span>(state: <span class="cl">SelfRagState</span>) -> <span class="cl">Literal</span>[<span class="st">"__end__"</span>, <span class="st">"retrieve"</span>]:
+    llm = model.with_structured_output(
+        {<span class="st">"type"</span>: <span class="st">"object"</span>, <span class="st">"properties"</span>: {<span class="st">"grounded"</span>: {<span class="st">"type"</span>: <span class="st">"boolean"</span>}}}
+    )
+    answer = state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content
+    docs = <span class="st">"\n\n"</span>.join(state[<span class="st">"documents"</span>])
+    resp = llm.invoke([
+        (<span class="st">"system"</span>, <span class="st">"判断回答是否完全被以下文档支持。只回 grounded 布尔值。"</span>),
+        (<span class="st">"user"</span>, <span class="st">f"文档:\n{docs}\n\n回答:\n{answer}"</span>),
+    ])
+    <span class="kw">return</span> END <span class="kw">if</span> resp[<span class="st">"grounded"</span>] <span class="kw">else</span> <span class="st">"retrieve"</span>
+
+workflow = <span class="cl">StateGraph</span>(<span class="cl">SelfRagState</span>)
+workflow.add_node(<span class="st">"retrieve"</span>, retrieve)
+workflow.add_node(<span class="st">"generate"</span>, generate)
+workflow.add_conditional_edges(START, need_retrieve, {<span class="st">"retrieve"</span>: <span class="st">"retrieve"</span>, <span class="st">"generate"</span>: <span class="st">"generate"</span>})
+workflow.add_conditional_edges(<span class="st">"retrieve"</span>, grade_relevance, {<span class="st">"generate"</span>: <span class="st">"generate"</span>, <span class="st">"retrieve"</span>: <span class="st">"retrieve"</span>})
+workflow.add_conditional_edges(<span class="st">"generate"</span>, hallucination_check, {END: END, <span class="st">"retrieve"</span>: <span class="st">"retrieve"</span>})
+graph = workflow.compile()</pre>
+    <div class="annotation"><b>适用场景:</b> 对事实准确性 / 可溯源要求极高的场景(医疗、法律、合规)。Self-RAG 的多个反思节点能显著压低幻觉,但每个节点都是一次 LLM 调用,延迟和成本是朴素 RAG 的数倍——它用"慢和贵"换"准和可信"。如果你的业务对延迟敏感,Self-RAG 通常不是首选。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>RAG 变体对比:何时检索 / 检索什么 / 如何纠错</h2>
+    <p>四个变体的差异,本质上是对"检索决策"放在流程的哪个位置、以及纠错回路有几条。下面这张总表把它们沿着三个维度摆开,方便你在选型时横向对照:</p>
+    <table class="tbl">
+      <tr><th>模式</th><th>何时检索</th><th>检索什么</th><th>如何纠错</th><th>图复杂度</th></tr>
+      <tr><td><strong>Agentic RAG</strong></td><td>LLM 临场决定(工具调用)</td><td>LLM 自己构造查询,可多轮</td><td>无显式纠错,靠 agent 多轮调用自然收敛</td><td>低(≈ 标准 ReAct)</td></tr>
+      <tr><td><strong>Adaptive RAG</strong></td><td>入口 router 预先分流</td><td>按分流选源(本地 / web / 不检索)</td><td>无纠错回路,路径在入口就定死</td><td>中(一分多路)</td></tr>
+      <tr><td><strong>Corrective RAG</strong></td><td>总是先检索一次</td><td>固定查询一次</td><td>检索后 grading,不相关转 web search 换源</td><td>中(一条纠错回边)</td></tr>
+      <tr><td><strong>Self-RAG</strong></td><td>自评是否需要检索</td><td>按需检索,可重试</td><td>多环节反思:文档相关性 + 答案是否被支持,多回路</td><td>高(多条反思回边)</td></tr>
+    </table>
+    <p>选型直觉:<strong>需求越偏"灵活",选 Agentic;越偏"分流",选 Adaptive;越偏"可信",选 CRAG 或 Self-RAG</strong>。CRAG 和 Self-RAG 的区别是"纠错几次"——CRAG 只在检索后纠一次,Self-RAG 在检索和生成后都纠。准确性要求每上一个台阶,成本大约翻一倍,这不是免费的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>共同骨架:没有新原语</h2>
+    <div class="callout info">
+      <b class="tag">这些模式的共同骨架</b>
+      回头看这七个模式(Reflection、Reflexion、Plan-and-Execute、四种 RAG 变体),它们本质上都是"给基础 ReAct 加上额外的反思 / 规划 / 纠错节点和循环"。具体地说:
+      <ul>
+        <li><strong>新增节点</strong>都是普通函数节点:reflector、planner、re-planner、grader、router……每个承担一个明确的"评估 / 决策"职责。</li>
+        <li><strong>新增循环</strong>都是条件边 + 回边:评估不过就回到生成 / 检索节点,这是第 04 章 <code class="inline">add_conditional_edges</code> 的标准用法。</li>
+        <li><strong>新增记忆</strong>都是带 reducer 的 state 字段:<code class="inline">reflections</code> 用 <code class="inline">operator.add</code> 累加教训,<code class="inline">past_steps</code> 累加完成项,<code class="inline">documents</code> 累加检索结果。</li>
+      </ul>
+      换句话说,本章没有引入任何新原语——全部是 <code class="inline">StateGraph</code> + 节点 + 条件边 + 回边 + reducer 的组合。掌握第 03、04、05 章后,组合这些模式是自然的:你需要哪种反馈回路,就加哪个节点和哪条回边。这也是 LangGraph 把控制流做成显式图的好处——模式不是框架预设的"开关",而是你可以像搭积木一样拼出来的结构。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.8</span>组合与取舍:模式不是单选题</h2>
+    <p>实际工程里,这些模式常常组合使用。Plan-and-Execute 的 executor 内部可以是一个 Agentic RAG;Reflexion 的评估节点可以用 CRAG 的 grading 思路;Adaptive RAG 的 rag 路径可以再嵌一个 Self-RAG 子图。组合的边界只在于:每多一个反思节点,就多一次 LLM 调用、多一段延迟、多一份成本。</p>
+    <p>一个实用的取舍原则:<strong>从最简的模式起步,只在确实解决不了的失败模式上加节点</strong>。先跑朴素 RAG,发现"简单问题也检索"就上 Agentic;发现"检索回来一堆噪声"就加 CRAG 的 grading;发现"答案有幻觉"再加 Self-RAG 的生成后检查。不要一上来就堆 Self-RAG + Reflexion + Plan-and-Execute——那样调试困难、成本爆炸,且大多数反思节点在多数情况下不会触发,纯属浪费。</p>
+    <p>这也呼应了第 05 章末尾的判断标准:如果你发现自己在某个模式上堆了太多补丁,往往说明该把它拆成更清晰的子图,或者退一步用更简单的模式。模式的目的是解决问题,不是炫技。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.9</span>本页要点回顾</h2>
+    <ul>
+      <li><strong>Reflection</strong>:generator → reflector 循环,评估者批评、生成者改进,适合写作 / 代码生成。关键是把"生成"和"评估"拆成两个专注的节点。</li>
+      <li><strong>Reflexion</strong>:在 Reflection 基础上,把反思教训存进 <code class="inline">reflections: Annotated[list[str], operator.add]</code> 累加的"情节记忆",生成器读历史教训避免重蹈覆辙。适合会反复失败、教训可复用的任务。</li>
+      <li><strong>Plan-and-Execute</strong>:planner 用 <code class="inline">with_structured_output(Plan)</code> 一次生成全局步骤列表,executor 逐条执行,re-planner 据新信息调整。适合长任务、需全局规划的场景。</li>
+      <li><strong>Agentic RAG</strong>:retriever 封装成工具,交给 ReAct agent 自行决定是否 / 何时 / 检索几次。最轻量的 RAG 增强,结构≈标准 ReAct。</li>
+      <li><strong>Adaptive RAG</strong>:入口 router 节点用结构化输出分流(直接答 / 本地 RAG / web search),<code class="inline">add_conditional_edges(START, route)</code> 实现一分多路。</li>
+      <li><strong>Corrective RAG</strong>:检索后 grading 节点评估文档相关性,差的转 web search 换源。一条"检索 → 评估 → 换源"纠错回边。</li>
+      <li><strong>Self-RAG</strong>:多环节自我反思(是否检索 / 文档相关 / 答案被支持),多条反思回边,幻觉率最低但成本最高。</li>
+      <li><strong>共同骨架</strong>:这些模式全部是 <code class="inline">StateGraph</code> + 节点 + 条件边 + 回边 + reducer 的组合,没有新原语。掌握控制流后,组合模式是自然的;从最简模式起步,按需加节点。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.10</span>新手常犯的错误</h2>
+    <p>本章的图都能编译通过、也能跑前几步,坑集中在"循环跑飞"和"reducer 语义和直觉相反"上。下面三个都对照本仓库源码验证过。</p>
+
+    <div class="code-title">① 反馈循环忘了加循环上限 → GraphRecursionError</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ reflector 永远说"不够好", should_continue 永远回 "generator", 死循环</span>
+<span class="kw">def</span> <span class="fn">should_continue</span>(state):
+    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 没有 iterations 上限, 也没有解析 satisfactory</span>
+
+graph.<span class="fn">invoke</span>(initial_state)
+<span class="cmt"># GraphRecursionError: Recursion limit of 10007 reached without hitting a stop condition.</span>
+<span class="cmt"># 默认上限 LANGGRAPH_DEFAULT_RECURSION_LIMIT=10007 (_internal/_config.py:32), 撞到才停。</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 任何回边都要配一个"硬上限"兜底(本章所有示例都这么做的):</span>
+MAX_ITER = <span class="nu">3</span>
+<span class="kw">def</span> <span class="fn">should_continue</span>(state):
+    <span class="kw">if</span> state[<span class="st">"iterations"</span>] &gt;= MAX_ITER:   <span class="cmt"># 硬上限</span>
+        <span class="kw">return</span> END
+    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 再叠一个业务判断(解析 satisfactory)更稳</span></pre>
+    <div class="annotation"><b>踩坑点:</b> Reflection / Reflexion / Self-RAG / CRAG 都有回边,只要评估节点一直说"再来一轮",就是死循环。LangGraph 不会自动检测"你在原地打转",只靠 <code class="inline">recursion_limit</code> 兜底(默认 10007,源码 <code class="inline">_internal/_config.py:32</code> 的 <code class="inline">DEFAULT_RECURSION_LIMIT</code>,撞限抛 <code class="inline">GraphRecursionError</code>,消息见 <code class="inline">main.py:3003</code>)。10007 步的 LLM 调用代价惊人,所以<strong>每条回边都要配一个计数器上限</strong>,别指望业务判断永远收敛。</div>
+
+    <div class="code-title">② 给"过滤/替换"语义的字段用了 operator.add → 越过滤越长</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
+<span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+
+<span class="kw">class</span> <span class="cl">CragState</span>(<span class="cl">TypedDict</span>):
+    <span class="cmt"># ✗ 想用 documents 做"过滤后的相关文档", 却配了 operator.add</span>
+    documents: <span class="kw">Annotated</span>[<span class="cl">list</span>, operator.add]   <span class="cmt"># reducer 是 list + list = 拼接</span>
+
+<span class="kw">def</span> <span class="fn">retrieve</span>(state):  <span class="kw">return</span> {<span class="st">"documents"</span>: [<span class="st">"doc1"</span>, <span class="st">"doc2"</span>, <span class="st">"doc3"</span>]}   <span class="cmt"># state.documents = 3 篇</span>
+
+<span class="kw">def</span> <span class="fn">grade</span>(state):
+    filtered = [<span class="st">"doc1"</span>]   <span class="cmt"># 只剩 1 篇相关</span>
+    <span class="kw">return</span> {<span class="st">"documents"</span>: filtered}
+<span class="cmt"># 期望: documents 变成 ["doc1"](只剩相关的)</span>
+<span class="cmt"># 实际: documents = ["doc1","doc2","doc3"] + ["doc1"] = 4 篇! 过滤根本没生效</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 要"替换"语义, 就别配 reducer(默认 LastValue = 最后一次写入覆盖):</span>
+<span class="kw">class</span> <span class="cl">CragState</span>(<span class="cl">TypedDict</span>):
+    documents: <span class="cl">list</span>   <span class="cmt"># 无 Annotated reducer → LastValue, 覆盖而非累加</span></pre>
+    <div class="annotation"><b>踩坑点:</b> 这是本章最容易踩的语义陷阱。<code class="inline">operator.add</code> 是<strong>追加</strong>(list 拼接),适合"只增不减"的记忆字段(reflections、past_steps);但"过滤"是要<strong>替换</strong>掉旧值,这时不该配 reducer——源码 <code class="inline">state.py:1871</code> 里,没有 reducer 注解的字段会回落到 <code class="inline">LastValue</code>(最后一次写入覆盖),这才是过滤该用的语义。判断准则:这字段是<strong>累加历史</strong>(用 reducer)还是<strong>反映当前最新值</strong>(不配 reducer)?CRAG 的 documents 是后者。</div>
+
+    <div class="code-title">③ 路由 LLM 吐了 Literal 之外的值 → KeyError</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Literal
+
+<span class="cmt"># Adaptive RAG 的 router, 期望返回 "llm" / "rag" / "web"</span>
+<span class="kw">def</span> <span class="fn">route_question</span>(state) -> <span class="cl">Literal</span>[<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]:
+    resp = router_llm.<span class="fn">invoke</span>(...)   <span class="cmt"># LLM 偶尔会回 "LLM" / " rag " / "search"</span>
+    <span class="kw">return</span> resp[<span class="st">"datasource"</span>]
+<span class="cmt"># 假设 LLM 回了 "search"(不在 Literal / path_map 里):</span>
+<span class="cmt"># KeyError: 'search'   (_branch.py:203 的 self.ends[r] 字典查找)</span>
+<span class="cmt"># 若返回 None / START: ValueError: Branch did not return a valid destination</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 路由函数里做归一化 + 兜底, 别把 LLM 原始输出直接当路由键:</span>
+<span class="kw">def</span> <span class="fn">route_question</span>(state) -> <span class="cl">Literal</span>[<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]:
+    raw = router_llm.<span class="fn">invoke</span>(...)[<span class="st">"datasource"</span>].strip().lower()
+    <span class="kw">return</span> raw <span class="kw">if</span> raw <span class="kw">in</span> (<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>) <span class="kw">else</span> <span class="st">"llm"</span>   <span class="cmt"># 未知→走最稳的兜底路</span></pre>
+    <div class="annotation"><b>踩坑点:</b> 源码 <code class="inline">_branch.py:201-208</code> 里,带 path_map / Literal 的条件边会把返回值当字典 key 查 <code class="inline">self.ends[r]</code>,查不到就 <code class="inline">KeyError</code>。LLM 输出天然不稳定(大小写、空格、同义词),所以路由节点<strong>不能把 LLM 原始输出直接当路由键</strong>——要先归一化(strip/lower)再做白名单校验,未命中走一条兜底路径。这是 Adaptive RAG / Self-RAG 这类"LLM 当路由器"模式的通病。</div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="07-multi-agent.html">← 多智能体</a>
+    <a href="11-streaming.html">流式输出 →</a>
+  </div>
+</div>
+
+<footer>
+  LangGraph 学习站 · 08 经典模式 · 基于本代码库源码 · 所有 API 引用以仓库最新为准
+</footer>
+
+</body>
+</html>

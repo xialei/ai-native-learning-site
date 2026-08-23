@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 2 章 · Context Object Model — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 2 章 · Context Object Model</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 2 章 · Context Object Model</div>
+      <h1 class="title">一份契约，全书共用</h1>
+      <p class="lede">
+        这一章是全书的"宪法"。它定义唯一的对象模型和 Context Package 契约——后面所有章节都只实现或消费这份契约，谁都不许重新定义这些字段。把这一章读透了，后面十三章你都能知道它们在往哪栋建筑上添砖加瓦。
+      </p>
+
+      <blockquote class="callout">
+        <p><strong>本章是全书唯一的对象模型和 Context Package 契约。</strong>其他章节不得重新定义这些字段。如果你在后面的章节看到某个对象字段，它的权威定义一定在这里。</p>
+      </blockquote>
+
+      <h2 id="why-unified">为什么需要统一对象模型</h2>
+
+      <p>从最小单元说起。传统 RAG 的最小单元是 Document Chunk——一段被切开的文本。Context Engine 的最小单元是 <strong>Object（对象）</strong>。</p>
+
+      <p>这个差别看起来小，其实是整个系统设计的分水岭。Chunk 是扁平的文本片段，它没有身份、没有关系、没有状态。而 Object 是一个有 ID、有类型、有关系、能演化的实体。一个 Chunk 不能回答"这个实验用了哪个数据集"，但一个 Experiment 对象，顺着它的关系，就能找到。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  subgraph RAG["传统 RAG"]
+    direction LR
+    C1["Chunk"] --- C2["Chunk"] --- C3["Chunk"]
+  end
+  subgraph CE["Context Engine"]
+    E["Experiment"] --> D["Dataset"]
+    E --> N["Notebook"]
+    E --> G["GPU"]
+  end
+  style RAG fill:#f3f1ea,stroke:#9a978f
+  style CE fill:#f4e6e4,stroke:#b4332a
+        </div>
+        <figcaption>Chunk 之间互不关联；Object 之间靠关系连成图。前者是文本堆，后者是业务世界。</figcaption>
+      </figure>
+
+      <p>统一对象模型要服务四个下游，所以它必须同时满足四种需求：</p>
+      <ul>
+        <li>给 <strong>Knowledge Builder</strong> 提供统一抽象——不管从哪个数据源抽取，产出的都是同一种对象；</li>
+        <li>给 <strong>Hybrid Retrieval</strong> 提供统一检索对象——六种 Retriever 返回的都是同一种东西；</li>
+        <li>给 <strong>Graph Expansion</strong> 提供统一节点——图遍历的起点和终点都是对象；</li>
+        <li>给 <strong>Agent</strong> 提供统一 Context Package——Agent 不需要知道数据从哪来。</li>
+      </ul>
+
+      <h2 id="composition">Context 由七类对象组成</h2>
+
+      <p>一份 Context 不是一坨文本，而是七类对象的集合：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>类型</th><th>说明</th><th>示例</th></tr></thead>
+          <tbody>
+            <tr><td>Entity</td><td>实体对象</td><td>Experiment、Dataset、WindTurbine</td></tr>
+            <tr><td>Relation</td><td>对象关系</td><td>uses、belongs_to</td></tr>
+            <tr><td>Event</td><td>事件</td><td>TrainingStarted、AlarmRaised</td></tr>
+            <tr><td>Metric</td><td>指标</td><td>Loss、Accuracy、Latency</td></tr>
+            <tr><td>Action</td><td>可执行动作</td><td>deploy、restart</td></tr>
+            <tr><td>Document</td><td>文档</td><td>SOP、Notebook、PDF</td></tr>
+            <tr><td>Policy</td><td>权限与规则</td><td>ACL、脱敏、审计</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>注意 Document 在这个表里只是七类之一。在 RAG 里它是全部，在这里它退居为"证据载体"的一种。而 Policy 被列为独立的一类对象，这意味着权限不是事后加的标注，而是 Context 的一等组成。</p>
+
+      <p>把对象拆成"类型 + 属性 + 关系 + 动作"四件套，是工业上已被验证的成熟做法。Palantir Foundry 的 Ontology 就以这四者为核心类型，并给了一个好用的类比：对象类型≈表、对象≈行、属性≈列、链接≈join——用数据集的语言解释对象模型，门槛立刻降下来。本书的七类对象（尤其 Entity/Relation/Action）与此同构，额外把 Event、Metric、Document 单列，是因为这三类在 AI 场景下都有独立的时序、聚合和证据语义，值得一等公民待遇。<span class="src">来源：Foundry Ontology 文档，Object and link types</span></p>
+
+      <h3>通用元数据</h3>
+
+      <p>不管哪种类型，所有对象都携带下面这些通用元数据。这套字段是治理和可追溯性的基础：</p>
+
+      <pre><code>id: exp-001
+type: Experiment
+schema_version: "1.0"
+source: mlflow
+source_ref: mlflow://experiment/1
+provenance: []
+confidence: 0.98
+valid_time: {start: null, end: null}
+observed_at: 2026-07-17T10:00:00Z
+tenant: tenant-a</code></pre>
+
+      <p>几个字段值得强调：<code>provenance</code> 记录对象的来源链，让每个对象都能回答"我从哪来"；<code>confidence</code> 让 LLM 知道这条信息的可信度；<code>valid_time</code> 和 <code>observed_at</code> 区分了业务生效时间和观察时间——这对实时性强的场景至关重要；<code>tenant</code> 是多租户隔离的基础。</p>
+
+      <p>校验逻辑也应该"随类型走"，而不是散落在每个字段各写一遍。Palantir Foundry 的 Value Type 机制就是这个思路：把正则、枚举、范围、唯一性这些约束绑定到一个语义类型上（比如定义一个带正则的 <code>email</code> 类型），之后任何引用它的属性自动继承校验。校验和治理权限也是分开的——"使用"一个类型和"定义/治理"一个类型是两件事。本书第 3 章 Validation 遵循同一纪律：校验失败的对象不得进入 Ontology，而校验规则本身应该沉淀在类型层，而不是在每条抽取规则里重复实现。<span class="src">来源：Foundry Ontology 文档，Value types</span></p>
+
+      <h2 id="entity">Entity 模型</h2>
+
+      <p>Entity 是整个 Ontology 的核心。它是"名词"——业务世界里那些实实在在的东西。</p>
+
+      <pre><code>id: exp-001
+type: Experiment
+name: glm52_ablation
+properties:
+  owner: alice
+  framework: pytorch
+tags:
+  - research
+status: Running
+version: v1</code></pre>
+
+      <p>设计原则四条：</p>
+      <ul>
+        <li><strong>全局唯一 ID</strong>——不管对象从哪个系统来，ID 必须全局唯一，这是图遍历和去重的前提；</li>
+        <li><strong>类型明确</strong>——type 决定了这个对象能参与哪些关系、哪些扩展规则；</li>
+        <li><strong>属性可扩展</strong>——properties 是开放的，不同类型的 Entity 可以有不同字段；</li>
+        <li><strong>支持版本演进</strong>——对象会变，version 字段让历史可追溯。</li>
+      </ul>
+
+      <h2 id="relation">Relation 模型</h2>
+
+      <p>Relation 描述对象之间的业务关系。如果 Entity 是名词，Relation 就是把它们串起来的动词。</p>
+
+      <pre><code>source: experiment-1
+relation: uses
+target: dataset-1
+confidence: 0.98</code></pre>
+
+      <p>Relation 必须支持四种能力：<strong>双向查询</strong>（从 Dataset 反查谁在用它）、<strong>权重</strong>（关系有强弱）、<strong>来源</strong>（这条关系是怎么发现的）、<strong>生命周期</strong>（关系会失效）。</p>
+
+      <p>这四点里最容易忽略的是双向查询和生命周期。很多图系统只支持单向遍历，结果"谁在用这个数据集"这种反向问题就答不了。而生命周期意味着一条 Relation 可以有 valid_time——训练结束之后，"experiment uses dataset" 这条关系在业务上可能就不再生效了。</p>
+
+      <h2 id="event">Event 模型</h2>
+
+      <p>Event 描述对象状态的变化。它是构建 Realtime Context 的基础——没有 Event，Context 就只能反映静态快照，看不到"正在发生什么"。</p>
+
+      <pre><code>type: TrainingFinished
+time: 2026-07-17T10:00:00Z
+actor: trainer
+object: experiment-1</code></pre>
+
+      <p>每个 Event 都有时间、动作主体、作用对象。把一段时间内的 Event 串起来就是事件时间线——这对"为什么训练失败"这类时序问题几乎是必需的。</p>
+
+      <h2 id="metric">Metric 模型</h2>
+
+      <p>Metric 描述可量化的指标。它和 Entity 的区别在于：Entity 是"是什么"，Metric 是"是多少"。</p>
+
+      <pre><code>name: Loss
+value: 0.213
+timestamp: 2026-07-17T10:00:00Z</code></pre>
+
+      <p>Metric 要支持时序（一系列带时间戳的值）、聚合（min/max/avg）、趋势分析（是上升还是下降）。在后文的压缩阶段你会看到，1000 个 Loss 点不会全部塞进 Prompt，而是压缩成"当前值 + 趋势"——这套能力就是 Metric 模型提供的。</p>
+
+      <h2 id="action">Action 模型</h2>
+
+      <p>Action 定义 Agent 可以执行的能力。这是 Context Engine 超越"问答"的关键。</p>
+
+      <pre><code>name: deploy
+resource: model-service
+parameters:
+  version: latest</code></pre>
+
+      <p>Action 不只是用来回答问题的，它支持 Agent 自动执行。当 Context 里带了 <code>deploy</code> 这个 Action，Agent 就知道它不仅能告诉你"可以部署"，还能真的去调部署接口。这把 Context 从"信息"扩展到了"能力"。</p>
+
+      <p>把 Action 和 Policy 列为一等公民对象，而不是外挂在数据之上的功能，这个设计有工业先例。Palantir Foundry 把 Ontology 的内容分成两半：<em>语义元素</em>（objects/properties/links，描述"是什么"）和<em>动态元素</em>（actions/functions/动态安全策略，描述"能做什么、必须遵守什么"）。它认为只有语义元素、没有动态元素的 Ontology 是不完整的——因为企业真正运转靠的是决策和行动，不是静态描述。本书把 Action（可执行动作）和 Policy（权限规则）都建摸成对象，正是对"动态元素"的对应：上下文不只是供阅读的信息，还包括可执行的动作与必须遵守的约束。<span class="src">来源：Foundry Ontology 文档，Ontology 概览</span></p>
+
+      <h2 id="package">Context Package：最终产物</h2>
+
+      <p>前面六类对象最终都被组装进 Context Package——Context Engine 的统一输出格式。</p>
+
+      <pre><code>context:
+  objects: []
+  relations: []
+  events: []
+  metrics: []
+  actions: []
+  documents: []
+  policy: {}
+  trace: {}
+  token_budget: 24000
+  schema_version: "1.0"</code></pre>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  P["Context Package"] --> O["Objects"]
+  P --> R["Relations"]
+  P --> E["Events"]
+  P --> M["Metrics"]
+  P --> A["Actions"]
+  P --> D["Documents"]
+  P --> POL["Policy"]
+  P --> T["Trace"]
+  P --> B["token_budget"]
+  style P fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+  style POL fill:#eef4ee,stroke:#2f6b3a
+  style T fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>Context Package 的结构。Policy 和 Trace 是一等字段，不是事后补的标注。</figcaption>
+      </figure>
+
+      <p>两个设计决策要强调：</p>
+      <p>第一，<strong>Agent 只消费 Context Package，而不是直接消费 Prompt</strong>。Prompt 只是 Package 在最后一步的渲染。这意味着同一份 Package 可以渲染成不同模型的 Prompt，也可以喂给非 LLM 的消费者。</p>
+      <p>第二，<strong>Policy 是输出约束而不是普通排序特征</strong>。任何对象在进入最终 Package 前都必须经过授权、脱敏和审计检查。这条规则不是建议，是硬门——它解释了为什么 Policy 在 Package 里是独立字段，且第 1 章把 Policy Filter 放在 Ranking 之前。</p>
+
+      <p>权限要落到这一步，得先分清两件事："能不能改类型定义"和"能不能看到具体数据"。Palantir Foundry 把 Ontology 资源权限（类型定义层：名称、属性名、类型、描述）和对象实例权限（数据层：主键和属性值）分成两层独立管理——前者是治理，后者是可见性，两者不能混为一谈。它还经历过三代演进：从数据源派生权限，到 Ontology 角色，再到统一的项目权限，核心收益是把权限模型统一成一个心智、且可解释。本书的 Policy（输出约束）与第 6 章的 Permission（直接过滤而非降分），遵循的就是同一种分层思路。<span class="src">来源：Foundry Ontology 文档，Permissioning / Viewing usage</span></p>
+
+      <h2 id="schema-evolution">Schema 演进</h2>
+
+      <p>对象模型不可能一次设计完美，它会演化。Schema 演进的设计要求：</p>
+      <ul>
+        <li><strong>Schema Version</strong>——每个 Package 带版本号；</li>
+        <li><strong>向后兼容</strong>——新版本不能破坏旧消费者；</li>
+        <li><strong>属性可扩展</strong>——加字段不破坏已有字段；</li>
+        <li><strong>类型可新增</strong>——未来可以引入新的对象类型；</li>
+        <li><strong>保证历史 Context 可重放</strong>——这是最关键的一条。</li>
+      </ul>
+
+      <p>"历史可重放"为什么重要？因为如果 Schema 改了之后，三个月前的 Context Package 解析不了，你就失去了回放和审计能力。第 10 章的 Observability 依赖这一点——它要能重新跑昨天的 Context 来定位问题。</p>
+
+      <p>而"历史可重放"不只是加个版本号那么简单，它牵涉存储层。Palantir Foundry 的经验是：破坏性 Schema 变更（改属性类型、换数据源、改主键）之后，能否迁移已有的用户编辑，取决于底层存储架构。它的旧版存储（Phonograph）不支持编辑迁移——一旦破坏性变更，历史编辑要么丢失要么靠人工抢救；新版（OSv2）才从架构上解除这个限制。这给本书的提醒是：Schema 演进不能只在模型层做版本管理，存储层从一开始就得为"编辑迁移"留好能力，否则历史回放会卡在数据搬不动上。<span class="src">来源：Foundry Ontology 文档，Object edits and materializations</span></p>
+
+      <h2 id="lifecycle">Object 生命周期</h2>
+
+      <p>一个对象从被发现到被 Agent 消费，经过这条链路：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  D["Discovery"] --> N["Normalization"]
+  N --> OS["Ontology Store"]
+  OS --> R["Retrieval"]
+  R --> GE["Graph Expansion"]
+  GE --> CP["Context Package"]
+  CP --> A["Agent"]
+  style OS fill:#eef4ee,stroke:#2f6b3a
+  style CP fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>对象生命周期。从数据源发现、规范化、入库，到被检索、扩展、打包，最后到达 Agent。</figcaption>
+      </figure>
+
+      <p>Discovery 是 Knowledge Builder 的事（第 3 章），Normalization 把不同来源的数据映射成统一 Object，Ontology Store 负责持久化，Retrieval 和 Expansion 是第 4、5 章的主题。你能看到这条链路正好对应前面几章的顺序——契约之所以重要，就是因为它让这条链路上的每一段都能独立替换。</p>
+
+      <h2 id="mapping">与数据平台的映射</h2>
+
+      <p>对象不是凭空设计的，它来自具体的数据源。下面这张表是"数据源 → 对象类型"的映射，落地时照着这张表做 Connector：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>数据来源</th><th>映射对象</th></tr></thead>
+          <tbody>
+            <tr><td>MLflow</td><td>Experiment、Metric</td></tr>
+            <tr><td>Git</td><td>Commit、Repository</td></tr>
+            <tr><td>Notebook</td><td>Document</td></tr>
+            <tr><td>Paimon</td><td>Dataset</td></tr>
+            <tr><td>Kafka / Fluss</td><td>Event</td></tr>
+            <tr><td>MySQL</td><td>Entity</td></tr>
+            <tr><td>PDF</td><td>Document</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>这张表的意义不在于穷举，而在于说明：每个企业系统都对应着某几类对象，Knowledge Builder 的 Connector 只需要知道"这个系统产什么对象"。新增一个数据源，就是新增一个映射。</p>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Object 是 Context Engine 的一等公民，Document 只是对象的一种来源和证据载体。Knowledge Builder 负责生成对象，Retrieval 和 Expansion 负责发现对象，Ranking 和 Optimizer 负责选择表达方式，Agent 最终消费标准化的 Context Package。</p>
+        <p>记住这份契约：七类对象、一套通用元数据、一个 Package 结构。后面十三章都在它的基础上展开——遇到字段定义，回到这一章来查。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-01-architecture.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 1 章 · 总体架构</span>
+        </a>
+        <a class="next" href="chapter-03-knowledge-builder.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 3 章 · Knowledge Builder</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

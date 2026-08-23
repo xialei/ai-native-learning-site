@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 基础 Agent 循环 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 基础 Agent 循环</div>
+    <h1>基础 Agent 循环：一台吞吐消息的机器</h1>
+    <div class="subtitle">第 3 章拆开 <code class="inline">packages/agent</code> 的 <code class="inline">agent-loop.ts</code> 与 <code class="inline">agent.ts</code>——这是整个 Pi 的「心脏」。它不处理会话持久化，只管一件事：把消息一次次喂给 LLM，执行工具，并对外发事件。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>两个入口：新开 vs 继续</h2>
+    <p>循环有两个入口。<code class="inline">agentLoop</code> 带着一条新提示开始；<code class="inline">agentLoopContinue</code> 从当前上下文继续跑（用于重试）。</p>
+    <div class="code-title">packages/agent/src/agent-loop.ts — 两个入口 &amp; 各自的校验</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">agentLoop</span>(prompts, context, config, signal, streamFn) {
+  <span class="cmt">// 把 prompt 追加进上下文，发 message_start/message_end，然后进主循环</span>
+  <span class="kw">const</span> stream = createAgentStream();
+  <span class="kw">void</span> runAgentLoop(prompts, context, config, e =&gt; stream.push(e), signal, streamFn)
+    .then(messages =&gt; stream.end(messages));
+  <span class="kw">return</span> stream;   <span class="cmt">// 立即返回一个 EventStream，事件异步到达</span>
+}
+
+<span class="kw">export function</span> <span class="fn">agentLoopContinue</span>(context, config, signal, streamFn) {
+  <span class="cmt">// 不能从空的、或以 assistant 结尾的上下文"继续"</span>
+  <span class="kw">if</span> (context.messages.length === <span class="nu">0</span>)
+    <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">"Cannot continue: no messages in context"</span>);
+  <span class="kw">if</span> (context.messages[context.messages.length - <span class="nu">1</span>].role === <span class="st">"assistant"</span>)
+    <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">"Cannot continue from message role: assistant"</span>);
+  <span class="cmt">// 最后一条必须是 user 或 toolResult，否则 provider 会拒绝请求</span>
+  ...
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <strong>「继续」的前置条件非常严格</strong>——最后一条消息绝不能是 assistant。因为 LLM 不能「自己接自己」，必须由 user 消息或工具结果来驱动下一轮。这个约束在你的自研 Runtime 里也成立。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>主循环：内层 turn，外层 follow-up</h2>
+    <p><code class="inline">runLoop</code> 是一个<strong>双层 while</strong>：内层把「当前的回合」跑到底（含工具循环）；外层在有 follow-up 消息时再开新回合。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t3 d3">
+        <title id="t3">runLoop 双层循环结构</title>
+        <desc id="d3">内层 turn 循环 + 外层 follow-up 循环</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+
+        <!-- 外层框 -->
+        <rect class="node" x="20" y="30" width="860" height="360" rx="12"></rect>
+        <text class="lbl" x="45" y="58" font-weight="bold" fill="#0f7d7a">外层 while(true)：有 follow-up 就再来一个回合</text>
+
+        <!-- 内层框 -->
+        <rect class="node core" x="60" y="80" width="790" height="200" rx="10"></rect>
+        <text class="lbl" x="85" y="106" font-weight="bold" fill="#2563eb">内层 while(hasMoreToolCalls || pendingMessages)</text>
+
+        <rect class="node acc" x="90" y="120" width="150" height="44" rx="6"></rect>
+        <text class="lbl" x="165" y="146" text-anchor="middle">注入 pending</text>
+        <line class="edge" x1="240" y1="142" x2="278" y2="142"></line>
+
+        <rect class="node" x="280" y="120" width="170" height="44" rx="6"></rect>
+        <text class="lbl" x="365" y="146" text-anchor="middle">streamAssistant</text>
+        <line class="edge" x1="450" y1="142" x2="488" y2="142"></line>
+
+        <rect class="node" x="490" y="120" width="150" height="44" rx="6"></rect>
+        <text class="lbl" x="565" y="146" text-anchor="middle">执行工具批</text>
+        <line class="edge" x1="640" y1="142" x2="668" y2="142"></line>
+
+        <rect class="node" x="670" y="120" width="150" height="44" rx="6"></rect>
+        <text class="lbl" x="745" y="146" text-anchor="middle">turn_end</text>
+
+        <!-- 回流箭头 -->
+        <path class="edge" d="M745 164 L745 190 Q745 205 665 205 L490 205 L490 190" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="520" y="196" text-anchor="middle">hasMoreToolCalls? 回流</text>
+
+        <text class="lbl sm" x="90" y="265" fill="#556674">内层结束条件：没有工具调用 &amp;&amp; 没有 pending 消息</text>
+
+        <!-- 外层回流 -->
+        <path class="edge" d="M60 168 L30 168 L30 300 L470 300 L470 66" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="40" y="330" text-anchor="middle">follow-up?</text>
+
+        <rect class="node acc" x="500" y="300" width="200" height="44" rx="6"></rect>
+        <text class="lbl" x="600" y="326" text-anchor="middle">agent_end</text>
+      </svg>
+      <div class="fig-cap">图 3.2：内层处理「一个回合 + 它的工具」，外层处理「steering/follow-up 消息」。</div>
+    </div>
+    <div class="code-title">packages/agent/src/agent-loop.ts — 内层循环骨架（手写要点提炼）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">while</span> (true) {                       <span class="cmt">// 外层</span>
+  <span class="kw">let</span> hasMoreToolCalls = <span class="kw">true</span>;
+  <span class="kw">while</span> (hasMoreToolCalls || pendingMessages.length &gt; <span class="nu">0</span>) {  <span class="cmt">// 内层</span>
+    <span class="cmt">// 1) 注入 pendingMessages（steering 或 follow-up 的 backlog）</span>
+    <span class="cmt">// 2) 流式拿一个 assistant 回复： message = streamAssistantResponse(...)</span>
+    <span class="cmt">// 3) 若 stopReason 是 error/aborted → turn_end + agent_end，退出</span>
+    <span class="cmt">// 4) 若含 toolCall：stopReason==="length" 则全部判失败；否则 executeToolCalls</span>
+    <span class="cmt">// 5) 把 toolResult 消息推回 currentContext.messages 与 newMessages</span>
+    <span class="cmt">// 6) turn_end；prepareNextTurn 可能换 model/context；shouldStopAfterTurn?退出</span>
+    <span class="cmt">// 7) pendingMessages = getSteeringMessages()  ← 是否有新的 steering</span>
+  }
+  <span class="cmt">// 内层退出：没有工具也没有 steering。检查 follow-up</span>
+  <span class="kw">const</span> followUp = <span class="kw">await</span> config.getFollowUpMessages?.();
+  <span class="kw">if</span> (followUp?.length) { pendingMessages = followUp; <span class="kw">continue</span>; }  <span class="cmt">// 交给内层</span>
+  <span class="kw">break</span>;   <span class="cmt">// 真的停了</span>
+}</pre>
+    <div class="annotation"><b>读懂这段（自研者必看）：</b> 注意 <code class="inline">newMessages</code> 与 <code class="inline">currentContext.messages</code> 的分野——<code class="inline">currentContext</code> 是整个历史（可能含预存在的上下文），<code class="inline">newMessages</code> 只统计本次循环新增的。循环结束时返回的是 <code class="inline">newMessages</code>，调用方（如 <code class="inline">Agent</code>）再把它并入自己的状态。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>流式回复与事件</h2>
+    <p><code class="inline">streamAssistantResponse</code> 是转化的关键点：先 <code class="inline">transformContext</code>、再 <code class="inline">convertToLlm</code>、调 <code class="inline">streamFn</code>，然后把「流式事件」翻译成 <code class="inline">AgentEvent</code>：</p>
+    <div class="code-title">packages/agent/src/agent-loop.ts — 流式处理（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">for</span> <span class="kw">await</span> (event <span class="kw">of</span> response) {
+  <span class="kw">switch</span> (event.type) {
+    <span class="kw">case</span> <span class="st">"start"</span>:
+      partialMessage = event.partial;
+      context.messages.push(partialMessage);      <span class="cmt">// 先把半成品塞进上下文</span>
+      <span class="kw">await</span> emit({ type: <span class="st">"message_start"</span>, message: { ...partialMessage } });
+      <span class="kw">break</span>;
+    <span class="kw">case</span> <span class="st">"text_delta"</span>:  <span class="cmt">// 以及 thinking_*/toolcall_* 等增量事件</span>
+      partialMessage = event.partial;
+      context.messages[context.messages.length - <span class="nu">1</span>] = partialMessage; <span class="cmt">// 覆盖半成品</span>
+      <span class="kw">await</span> emit({ type: <span class="st">"message_update"</span>, assistantMessageEvent: event, message: { ...partialMessage } });
+      <span class="kw">break</span>;
+    <span class="kw">case</span> <span class="st">"done"</span>: <span class="kw">case</span> <span class="st">"error"</span>: {
+      <span class="kw">const</span> finalMessage = <span class="kw">await</span> response.result();
+      <span class="cmt">// 用最终消息替换挂在末尾的半成品</span>
+      context.messages[context.messages.length - <span class="nu">1</span>] = finalMessage;
+      <span class="kw">await</span> emit({ type: <span class="st">"message_end"</span>, message: finalMessage });
+      <span class="kw">return</span> finalMessage;
+    }
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 一个很优雅的细节——<strong>先把「半成品」放进 <code class="inline">messages</code></strong>，每次增量用新对象<strong>原位覆盖最后一项</strong>，最后用 final 替换。这样任何时刻上下文里都只有「当前位置」的正确消息，无需在结束时额外拼接。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>事件时序一图流</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t34 d34">
+        <title id="t34">一次带工具的 prompt 事件序列</title>
+        <desc id="d34">从 agent_start 到 agent_end 的事件顺序</desc>
+        <!-- 时间轴 -->
+        <line class="st" x1="120" y1="40" x2="120" y2="250"></line>
+        <text class="lbl sm" x="55" y="220">事件</text>
+        <line class="st" x1="120" y1="40" x2="810" y2="40"></line>
+        <text class="lbl sm" x="820" y="44">时间 →</text>
+
+        <g>
+          <rect class="node" x="160" y="46" width="600" height="30" rx="6"></rect>
+          <text class="lbl" x="180" y="66">agent_start · turn_start</text>
+        </g>
+        <g>
+          <rect class="node" x="160" y="82" width="180" height="30" rx="6"></rect>
+          <text class="lbl" x="180" y="102">message_start/end(user)</text>
+        </g>
+        <g>
+          <rect class="node core" x="200" y="118" width="200" height="30" rx="6"></rect>
+          <text class="lbl" x="220" y="138">message_start(assistant)</text>
+        </g>
+        <g>
+          <rect class="node core" x="200" y="154" width="560" height="30" rx="6"></rect>
+          <text class="lbl" x="220" y="174">message_update ×N（流式文本/thinking/tool call）</text>
+        </g>
+        <g>
+          <rect class="node core" x="200" y="190" width="200" height="30" rx="6"></rect>
+          <text class="lbl" x="220" y="210">message_end(assistant)</text>
+        </g>
+        <g>
+          <rect class="node acc" x="420" y="190" width="220" height="30" rx="6"></rect>
+          <text class="lbl" x="440" y="210">tool_execution_start/end</text>
+        </g>
+        <g>
+          <rect class="node" x="160" y="226" width="300" height="30" rx="6"></rect>
+          <text class="lbl" x="180" y="246">message_start/end(toolResult) · turn_end</text>
+        </g>
+        <g>
+          <rect class="node" x="560" y="226" width="200" height="30" rx="6"></rect>
+          <text class="lbl" x="580" y="246">(第二回合) … · agent_end</text>
+        </g>
+      </svg>
+      <div class="fig-cap">图 3.4：带工具调用的一次 prompt 的典型事件序列。完整的精确序列见官方 README 与第 1 章引用的文档。</div>
+    </div>
+
+    <table class="tbl">
+      <tr><th>事件</th><th>含义</th></tr>
+      <tr><td><code class="inline">agent_start / agent_end</code></td><td>整次运行开始/结束；agent_end 携带全部 newMessages</td></tr>
+      <tr><td><code class="inline">turn_start / turn_end</code></td><td>一个「回合」= 一次 assistant 回复 + 它的工具/结果</td></tr>
+      <tr><td><code class="inline">message_start / message_update / message_end</code></td><td>单条消息三种状态；update 专用于流式</td></tr>
+      <tr><td><code class="inline">tool_execution_start / update / end</code></td><td>单个工具的声明与完成（含流式 partial）</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>Agent 类：有状态的封装 + 三个队列</h2>
+    <p><code class="inline">Agent</code> 把 <code class="inline">runAgentLoop</code> 包成一个有状态对象，并引入两个队列实现「并发下往运行中的 agent 塞消息」：</p>
+    <div class="code-title">packages/agent/src/agent.ts — 属性与队列（要点）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export class</span> <span class="cl">Agent</span> {
+  <span class="kw">private</span> steeringQueue: <span class="cl">PendingMessageQueue</span>;  <span class="cmt">// run 中途注入</span>
+  <span class="kw">private</span> followUpQueue: <span class="cl">PendingMessageQueue</span>;  <span class="cmt">// 运行将停时才注入</span>
+
+  async prompt(input): Promise&lt;<span class="kw">void</span>&gt; {
+    <span class="kw">if</span> (<span class="kw">this</span>.activeRun) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">"already processing..."</span>);
+    <span class="kw">const</span> msgs = <span class="kw">this</span>.normalizePromptInput(input);
+    <span class="kw">await</span> <span class="kw">this</span>.runPromptMessages(msgs);
+  }
+  steer(message): <span class="kw">void</span> { <span class="kw">this</span>.steeringQueue.enqueue(message); }  <span class="cmt">// 非阻塞</span>
+  followUp(message): <span class="kw">void</span> { <span class="kw">this</span>.followUpQueue.enqueue(message); }
+  abort(): <span class="kw">void</span> { <span class="kw">this</span>.activeRun?.abortController.abort(); }
+}
+
+<span class="cmt">// 队列的 drain 语义受 QueueMode 控制：</span>
+<span class="cmt">//   "all"          → 一次全部放出（drain 全部）</span>
+<span class="cmt">//   "one-at-a-time" → 每次只放最旧的一条（默认）</span></pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">PendingMessageQueue.drain()</code> 在 <code class="inline">QueueMode === "one-at-a-time"</code> 时只 <code class="inline">shift</code> 出一条。这避免了「乘胜追击」——每次只多塞一条，让 agent 消化完再决定。这些队列在 <code class="inline">getSteeringMessages</code>/<code class="inline">getFollowUpMessages</code> 里被 loop 拉取——即<strong>拉模型（pull），不是模型主动注入</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>对自研与使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 双层循环（turn / follow-up）是为「中途介入」服务的</strong>——steering 在回合内插入，follow-up 等到将停时插入。<strong>② 事件流是 UI 的生命线</strong>，把「运行时决策」与「UI 呈现」解耦（事件订阅）。<strong>③ 转换点（transformContext → convertToLlm）是上下文管理的天然挂载点。</strong> 这三条几乎能原样移植进你自己的 Runtime。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="02-messages-types.html">← 上一页：消息类型</a>
+    <a href="04-session-storage.html">下一步：会话与存储模型 →</a>
+  </div>
+</div>
+
+<footer>
+  Pi Agent Harness · 03 基础 Agent 循环 · 版本 v0.84.2-6-g086c32e74 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 7 章 · Context Optimizer — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 7 章 · Context Optimizer</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 7 章 · Context Optimizer</div>
+      <h1 class="title">让每个 Token 都说点有用的</h1>
+      <p class="lede">
+        选完对象之后，还要把它们塞进有限的上下文窗口。最笨的办法是截断——砍掉尾巴。Context Optimizer 不干这种粗暴的事。它负责去重、合并、压缩、Token 分配，然后把装配好的 Context Package 交给 Prompt Builder（第 1 章 §4）做最终结构化组装，目标是单位 Token 携带最多的业务信息。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Context Optimizer 位于 Context Ranking 之后。它的职责是在有限上下文窗口内，以最低 Token 成本构建最高质量的 Prompt Context。</p>
+
+      <p>它不是简单的 Token 裁剪器，而是 <strong>Context Engineering Engine</strong>。裁剪是做减法，优化是做"信息密度"——同样的窗口，塞进更多有用信息。</p>
+
+      <h2 id="why">为什么需要 Optimizer</h2>
+
+      <p>经过 Hybrid Retrieval、Graph Expansion、Context Ranking，通常会得到这样的结果：</p>
+
+      <pre><code>200 Objects
+100 Relations
+30 Documents
+50 Events</code></pre>
+
+      <p>总计约 250K Token。但不管 GPT、Claude、GLM 还是 Qwen，上下文都有限。必须优化，而不是直接截断。</p>
+
+      <p>而且"窗口够大就不用管"是一个危险的错觉。一项评测了 18 个前沿模型的研究发现，<em>每个模型都随输入增长而退化</em>，而且退化远早于窗口填满——一个标称 200K 的模型，可能在 50K 就出现明显性能下降。研究者把这种现象叫做 context rot（上下文腐烂），并指出：对于任何会累积工具结果、中间推理和文件内容的 agent 来说，这是正常工况，不是边缘情况。<span class="src">来源：Hong et al., 2025，转引自 Li et al., 2026, §5.1</span></p>
+
+      <p>所以 Optimizer 的目标不是"把窗口塞满"，而是学术界对 context engineering 的那句核心定义——<strong>在每一步找到使正确结果概率最大化、且最小的高信号 token 集</strong>。<span class="src">来源：Li et al., 2026, §5.2 引 Anthropic</span></p>
+
+      <p>"截断"和"优化"的区别要讲清楚：截断是从末尾砍掉一截，被砍掉的可能是关键信息；优化是理解每个对象的价值和成本，决定谁保留、谁压缩、谁合并。前者是机械操作，后者需要语义理解。</p>
+
+      <h2 id="architecture">整体架构</h2>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  RC["Ranked Context"] --> DR["Duplicate Remove"]
+  DR --> OM["Object Merge"]
+  OM --> DC["Document Compression"]
+  DC --> SM["Summary"]
+  SM --> TA["Token Allocation"]
+  TA --> PB["Prompt Builder（交接）"]
+  PA --> FC["Final Context"]
+  style PA fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Optimizer Pipeline。从去重到 Token 分配，每一步都在提升信息密度；最后把装配好的 Package 交接给 Prompt Builder。</figcaption>
+      </figure>
+
+      <h2 id="objective">优化目标</h2>
+
+      <p>Context Optimizer 的目标不是最少 Token，而是最大化信息增益：</p>
+
+      <pre><code>         Information Gain
+score = ─────────────────
+          Token Cost</code></pre>
+
+      <p>即单位 Token 的信息量最高。这个目标函数很重要——它解释了为什么有时候 Optimizer 会选择<em>增加</em> Token：如果一个摘要能显著提升信息量，多花 200 Token 是值得的。优化不等于压缩，优化等于提升密度。</p>
+
+      <p>这里有个反直觉的事实：精炼不等于体积小。Palantir Foundry 明确指出，Ontology 的体积往往比原始数据集还大——因为索引不可压缩，加上额外存储开销。但它的设计初衷是作为"高度精炼数据"的快速访问后端，所以仍要主动控制规模：多少个 object type、每个类型多少对象、每个对象多少属性。本书 Optimizer 的"最大信息增益 / Token 成本"目标正需要这种规模治理意识——不是一味求少，而是在"精炼后仍可能很大"的前提下，把每一份体积都用在信息密度最高的地方。<span class="src">来源：Foundry Ontology 文档，Ontology volume</span></p>
+
+      <h2 id="duplicate">Duplicate Remove</h2>
+
+      <p>不同 Retriever 可能返回同一对象。比如 Experiment 来自 Graph、SQL、Vector 三路。Merge 统一成一个 Object，避免重复。这看似简单，但如果不做，三份重复的 Experiment 会白白吃掉三倍 Token。</p>
+
+      <h2 id="object-merge">Object Merge：信息互补</h2>
+
+      <p>多个 Object 的信息往往互补。比如 GPU 这个对象：</p>
+      <ul>
+        <li>Graph 提供：型号；</li>
+        <li>Prometheus 提供：利用率；</li>
+        <li>Kubernetes 提供：所在 Node。</li>
+      </ul>
+
+      <p>最终融合成一个 GPU Object，把三个来源的字段合并。这样 Agent 看到的是一台完整的 GPU，而不是三份碎片。</p>
+
+      <h2 id="relation-compression">Relation Compression</h2>
+
+      <p>Graph 可能是这样的长链：</p>
+
+      <pre><code>Experiment → Dataset → Feature → Statistics</code></pre>
+
+      <p>如果 Feature 对当前任务没有价值，直接压缩成：</p>
+
+      <pre><code>Experiment → Dataset → Statistics</code></pre>
+
+      <p>减少中间的 Relation 节点。这和图遍历的"跳过无关节点"是一致的——扩展时多跳是为了补全，压缩时砍掉是为了省 Token。</p>
+
+      <h2 id="document-compression">Document Compression</h2>
+
+      <p>这里的关键转变是：不是 Chunk，而是 Document Summary。一份 20 页的 SOP，压缩成 200 Token 的摘要，保留关键步骤。</p>
+
+      <p>为什么用摘要而不是 Chunk？因为 Chunk 是机械切分，可能把一个完整步骤切成两半；摘要是语义理解，能保留"这份文档到底说了什么"。当然，摘要本身要用 LLM 生成，而且要缓存（避免重复摘要）——这是第 9 章 Cache 的内容。</p>
+
+      <p>"摘要保什么、怎么保信息密度"在工程上有个可借鉴的样板。开源运行时 Pi 给对话历史做压缩时，用的不是自由文本摘要，而是一张固定六段的结构化模板——目标 / 约束与偏好 / 进度（已完成 / 进行中 / 受阻）/ 关键决策 / 下一步 / 关键上下文，并明确要求"保留精确的文件路径、函数名、报错信息"，禁止"顺着对话往下答"。结构化模板的好处是每段都有固定职责，信息密度可预期，也方便第 10 章 Explain 分别度量。更关键的是它做<em>增量更新</em>：每次压缩不是从零重写摘要，而是把上一版摘要和新消息一起喂回去，规则是"保住旧信息、并入新进展、过时的可删"——这正好是 Progressive Context 那种"摘要随推理演化而不丢信息"的工程形态。本书压缩的是知识对象而非对话，领域不同，但"固定结构 + 增量更新"这套范式通用。<span class="src">来源：Pi Agent Harness 源码，packages/agent/src/harness/compaction/compaction.ts</span></p>
+
+      <p>这里有一条容易踩反的调参纪律：压缩要先最大化召回，再优化精度——先尽量捕获一切可能相关的信息，再迭代删除多余的。不能反过来先狠删，因为"过早删掉的东西，后面需要时不可恢复"。<span class="src">来源：Li et al., 2026, §5.6 引 Anthropic</span></p>
+
+      <h2 id="event-compression">Event Compression</h2>
+
+      <p>1000 条训练日志，压缩成一条时间线：</p>
+
+      <pre><code>Training Started → OOM → Restart → Finished</code></pre>
+
+      <p>把零散事件压缩成有意义的 Timeline。Agent 不需要看 1000 条原始日志，它需要知道"发生了什么、按什么顺序"。</p>
+
+      <h2 id="metric-compression">Metric Compression</h2>
+
+      <p>Loss 有 1000 个点，保留 Min、Max、Current、Trend 即可。无需全部。Metrics 的价值在趋势，不在每一个数据点——"Loss 从 0.5 降到 0.2，最近开始回升"比 1000 个数字有用得多。</p>
+
+      <h2 id="token-allocation">Token Allocation：按类型分预算</h2>
+
+      <p>不同类型的对象，预算不同：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>类型</th><th>预算</th></tr></thead>
+          <tbody>
+            <tr><td>Objects</td><td>25%</td></tr>
+            <tr><td>Relations</td><td>10%</td></tr>
+            <tr><td>Metrics</td><td>10%</td></tr>
+            <tr><td>Events</td><td>10%</td></tr>
+            <tr><td>Documents</td><td>35%</td></tr>
+            <tr><td>Actions</td><td>10%</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>预算动态调整——不是一个固定比例走天下。Documents 占比最大，因为它们信息量最高但也最耗 Token；Metrics 和 Events 占比小，因为它们压缩后很省。</p>
+
+      <h3>Adaptive Budget：按模型调整</h3>
+
+      <p>根据模型自动调整。8K 窗口的模型，多保留 Object 少放 Document；128K 窗口的模型，可以保留更多 Document；1M 窗口的模型，甚至无需 Summary。窗口越大，压缩越宽松——但永远不要因此放弃优化，因为 Token 就是钱：生产实践中缓存命中的 token 和未命中的 token，单价可以相差 10 倍（第 9 章会展开）。</p>
+
+      <p>"按模型自适应"在工程上具体怎么落地？开源运行时 Pi 给了一个可核验的最小范式：它用一条阈值公式决定何时触发压缩——<code>当前 token &gt; 上下文窗口 − 预留量</code>，并配两个预算：<em>预留量</em>（默认 16384 token，留给摘要 prompt 本身和它的输出）与<em>保留近期量</em>（默认 20000 token，压缩后原样保留的近期上下文）。模型窗口变大，触发线自动后移，无需改代码；而"保留近期量"保证最该精确的那段上下文零损耗，只有更早的部分才进摘要。本书的 Adaptive Budget 可以把这两个数当成起点去校准：预留量反映"压缩本身要花多少 token"（见第 10 章 RCA），保留近期量反映"近期上下文的信息密度阈值"。<span class="src">来源：Pi Agent Harness 源码，packages/agent/src/harness/compaction/compaction.ts</span></p>
+
+      <h2 id="prompt-assembly">Prompt Assembly（交接 Prompt Builder）</h2>
+
+      <p>Optimizer 的终点不是自己拼 Prompt，而是把装配好的 Context Package 交给 Prompt Builder（第 1 章 §4）做最终结构化组装。最终输出走这样一条链：</p>
+
+      <pre><code>ContextPackage → Prompt Template → LLM</code></pre>
+
+      <p>Prompt 不是拼接，而是结构化。Objects、Relations、Events、Metrics、Documents、Actions 分别组织，而不是混成一坨文本。结构化的 Prompt 让模型更容易解析每个部分，也方便第 10 章做 Prompt Explain——能分别看到每部分占多少 Token。</p>
+
+      <h2 id="explain">Explain</h2>
+
+      <p>支持 Explain。例如：</p>
+
+      <pre><code>Document A
+  → Summary
+  → 200 Token
+  → 原因: Token Budget</code></pre>
+
+      <p>方便 Debug——当模型答得不好，你能查到是不是某个关键文档被压缩过度了。</p>
+
+      <h2 id="api">API</h2>
+
+      <pre><code>type ContextOptimizer interface {
+    Optimize(ctx context.Context, pkg ContextPackage,
+             budget TokenBudget) (PromptContext, error)
+}</code></pre>
+
+      <p>支持插件。不同场景可以有不同的优化策略。</p>
+
+      <h2 id="cache">Cache</h2>
+
+      <p>Summary、Graph、Object、Prompt 都要缓存，避免重复计算。尤其是 Summary——同一份文档的摘要没必要每次重算。这部分和第 9 章强相关。</p>
+
+      <h2 id="reasoning-aware">Reasoning-aware Compression：按任务压缩</h2>
+
+      <p>不同任务，压缩策略不同。压缩应该由 Intent Planner 控制：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>问题</th><th>保留</th><th>删除</th></tr></thead>
+          <tbody>
+            <tr><td>为什么训练失败？</td><td>Timeline</td><td>README</td></tr>
+            <tr><td>如何部署？</td><td>SOP</td><td>Loss</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>问"为什么训练失败"，保留 Timeline、删 README；问"如何部署"，保留 SOP、删 Loss。同样的对象集，不同的问题需要不同的压缩结果。这让压缩从"通用规则"变成"意图感知"。</p>
+
+      <h2 id="progressive">Progressive Context：像 CPU 按需调页</h2>
+
+      <p>一个更激进的想法：不要一次把 Context 全给齐，而是按需加载。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  R1["Round 1"] --> NM{"需要更多？"}
+  NM -->|是| R2["Round 2"]
+  R2 --> NM2{"需要更多？"}
+  NM2 -->|是| R3["Round 3"]
+  NM -->|否| A["Answer"]
+  NM2 -->|否| A
+  style A fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Progressive Context。Context 随 Agent 推理不断扩展，类似 CPU 的 Demand Paging。</figcaption>
+      </figure>
+
+      <p>Round 1 给基础 Context，Agent 推理后发现需要更多信息，再 Round 2、Round 3 补充。Context 随着推理不断扩展。这把 Context 从静态 Prompt 变成了一个可按需加载、可持续演化的运行时资源——类似 CPU 的 Demand Paging（按需调页）。</p>
+
+      <p>这个类比不是自说自话。学术界已经把 agent 的上下文按时间尺度明确分成三层——活动窗口、会话状态、跨会话存储，并指出它和操作系统的内存层级<em>同构</em>。最早的 MemGPT 就是把 LLM 的上下文窗口当 RAM、外部存储当磁盘，给模型显式的 page in/out 调用，让它产生"上下文更长"的幻觉——和虚拟内存的原理精确对应。<span class="src">来源：Li et al., 2026, §5.2/§5.5.1 引 Packer et al., 2023</span></p>
+
+      <p>Progressive Context 就是这个思路的运行时落地：不预加载所有东西，而是像操作系统管理内存一样，按需把高信号的内容调进窗口、把用完的调出去。它之所以成立，前提是把 Context 当成运行时状态管理——这正是第 8 章的主题。</p>
+
+      <blockquote>
+        <p>Progressive Context 把 Context 从静态 Prompt 变成了一个可按需加载、可持续演化的运行时资源。</p>
+      </blockquote>
+
+      <p>这个能力和第 8 章的 Context Runtime 紧密相关——只有把 Context 当成运行时状态管理，按需加载才有意义。</p>
+
+      <h2 id="evolving-playbook">Context 作为可演化的 Playbook</h2>
+
+      <p>前面讲的压缩都是"把当前一坨内容压小"。但还有一层更深的转变：把上下文当成一份<em>可进化的 playbook</em>——一组结构化要点，会随任务推进被增量更新，而不是每次都从零重写一个 prompt。上面 Pi 的"固定六段结构 + 增量更新"已经是这个思路的工程形态；学术界把它提炼成 ACE（Agentic Context Engineering），用三个角色把这件事说清楚：</p>
+
+      <ul>
+        <li><strong>Generator</strong>：参照现有的结构化要点生成任务轨迹；</li>
+        <li><strong>Reflector</strong>：从成功和失败轨迹中提炼洞察，找出"下次该保留什么、该改什么"；</li>
+        <li><strong>Curator</strong>：增量式更新结构化上下文——不是重写整个 prompt blob，而是输出带 id 的结构化条目，用确定性逻辑合并去重。</li>
+      </ul>
+
+      <p>这套分工和本书的对应关系是：Generator 是 Optimizer 在做的事（生成当前要进 Prompt 的内容），Reflector 是第 10 章 RCA 在做的事（从轨迹提炼失败洞察），Curator 则是 Optimizer 还缺的那一环——把洞察沉淀回一份持续维护的结构化上下文，跨轮次复用。MVP 第三阶段那个模糊的"Context Learning"，可以就用 ACE 这三角色来定义。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.1</span></p>
+
+      <p>Curator 为什么强调"增量合并去重"而不是"重写"？因为反复"总结再总结"会掉进两个坑：<strong>上下文坍塌</strong>（每一轮摘要都丢一点信息，几轮下来关键细节没了）和<strong>简洁偏差</strong>（模型倾向越写越短，把该保留的精确数值、路径、报错都省略掉）。正确的做法是维护一份持续增量合并、定期去重的结构化日志——旧信息保住、新进展并入、过时的才删——而不是把上一版摘要整个推翻重写。这和第 8 章 Snapshot 的"fork-验证-原子合并"是同一种纪律：改的是增量，底盘不动。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.1</span></p>
+
+      <p>再往前一步，可以把"上下文管理策略"本身做成可配置、可版本化、可评估的对象——MCE（Meta Context Engineering）的主张。一个策略就是一个 skill：有静态部分（策略说明）和动态部分（它维护的上下文 + 历史 rollout 数据），统一用标准的读写工具操作。这意味着 Research Context、Business Context、Coding Context 可以各自维护一套独立的压缩与编排策略，针对不同业务线独立进化，而不是一套规则写死在 Optimizer 代码里。这正好呼应第 11/12 章领域插件化的方向——不只是对象模型插件化，上下文管理策略也插件化。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.1</span></p>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Duplicate、Merge、Summary、Token Allocation、Prompt Assembly；</li>
+        <li><strong>第二阶段</strong>：Adaptive Budget、Timeline Compression、Graph Compression；</li>
+        <li><strong>第三阶段</strong>：Reinforcement Optimization、LLM Self Compression、Context Learning。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Context Optimizer 的目标不是减少 Token，而是让每一个 Token 都尽可能携带更多业务信息。它决定了 Agent 是否能在有限 Context Window 内完成复杂推理。</p>
+        <blockquote>
+          <p>让每一个 Token 都尽可能携带更多业务信息。</p>
+        </blockquote>
+        <p>各模块在流水线中的职责与边界见第 1 章 §4。本章的定位：在 Ranking 之后负责压缩与 Token 分配（Compress），然后把装配好的 Package 交给 Prompt Builder。下一章进入运行时——Context 不是一次性输入，而是持续演化的状态。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-06-context-ranking.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 6 章 · Context Ranking</span>
+        </a>
+        <a class="next" href="chapter-08-context-runtime.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 8 章 · Context Runtime</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

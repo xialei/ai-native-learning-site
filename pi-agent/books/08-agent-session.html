@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 生产 Harness（agent-session）— Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
+    <h1>生产 Harness：agent-session 里的真实运行时</h1>
+    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章看到的是<code class="inline">AgentHarness</code>接口契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 3300 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。它是你未来做 Agent Runtime 时最该抄的样板。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>从契约到实现：为什么有「两个 harness」</h2>
+    <p>你已经见过 <code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 基类——它只抛出 <code class="inline">HarnessNotImplemented</code>。真正干活的在 <code class="inline">coding-agent</code> 包里：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
+        <title id="t8">两层 harness 的关系</title>
+        <desc id="d8">基础包提供 Agent 类与循环，生产 harness 组装成 AgentSession</desc>
+        <defs>
+          <marker id="arrow8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <!-- left column: agent-core -->
+        <rect class="node" x="40" y="40" width="360" height="290" rx="12" fill="#eef4fb" stroke="#2563eb" stroke-dasharray="5 4"/>
+        <text class="lbl" x="220" y="70" font-size="15" font-weight="700" fill="#2563eb">@earendil-works/pi-agent-core</text>
+        <text class="lbl" x="60" y="95" font-size="12" fill="#556674">只懂「消息」与「循环」，不懂磁盘、账号、工具</text>
+
+        <rect class="node" x="60" y="115" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
+        <text class="lbl" x="75" y="142" font-size="13" fill="#1f2937">Agent 类 · prompt / continue / steer</text>
+        <rect class="node" x="60" y="170" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
+        <text class="lbl" x="75" y="197" font-size="13" fill="#1f2937">runAgentLoop 双循环（第 3 章）</text>
+        <rect class="node" x="60" y="225" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
+        <text class="lbl" x="75" y="252" font-size="13" fill="#1f2937">AgentMessage / AgentEvent / 转换器</text>
+        <rect class="node" x="60" y="280" width="320" height="40" rx="8" fill="#f3f6fb" stroke="#2563eb"/>
+        <text class="lbl" x="75" y="304" font-size="13" fill="#556674">docs/harness.md 的 AgentHarness 契约（基类）</text>
+
+        <!-- right column: coding-agent -->
+        <rect class="node" x="500" y="40" width="360" height="290" rx="12" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="680" y="70" font-size="15" font-weight="700" fill="#0f7d7a">@earendil-works/pi-coding-agent</text>
+        <text class="lbl" x="520" y="95" font-size="12" fill="#556674">生产 harness：持久化、鉴权、工具、恢复、扩展</text>
+
+        <rect class="node" x="520" y="115" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="535" y="142" font-size="13" fill="#1f2937">SessionManager · buildSessionContext</text>
+        <rect class="node" x="520" y="170" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="535" y="197" font-size="13" fill="#1f2937">agent-session.ts · prompt / steer / abort</text>
+        <rect class="node" x="520" y="225" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="535" y="252" font-size="13" fill="#1f2937">ExtensionRunner · 模型Runtime · 工具集</text>
+        <rect class="node" x="520" y="280" width="320" height="40" rx="8" fill="#f0faf7" stroke="#0f7d7a"/>
+        <text class="lbl" x="535" y="304" font-size="13" fill="#556674">AgentSessionRuntime · 会话切换 / 分叉</text>
+
+        <!-- arrow -->
+        <line x1="405" y1="180" x2="495" y2="180" stroke="#556674" stroke-width="2" marker-end="url(#arrow8)"/>
+        <text class="lbl" x="450" y="168" font-size="11" fill="#0f7d7a" text-anchor="middle">组装</text>
+      </svg>
+    </div>
+    <p>分工很明确：</p>
+    <ul>
+      <li><strong>基础包（右侧列之外）</strong>：纯「消息吞吐机」。它不知道消息要落盘、不知道 API key，也不知道 Bash 工具。只保证「给一串消息，正确地跑出一个 Loop」。</li>
+      <li><strong>生产 harness（右侧列）</strong>：把基础包装在壳里。它负责<strong>持久化</strong>（agent 事件 → SessionManager.appendMessage）、<strong>鉴权</strong>（模型/API key 校验）、<strong>恢复</strong>（压缩、重试、溢出恢复）、<strong>排队</strong>（steer/followUp）、以及<strong>扩展事件</strong>（ExtensionRunner 让第三方能挂进生命周期）。</li>
+    </ul>
+    <div class="callout">
+      <strong>要点：</strong>两层的分界是「<strong>可测试的纯核心 vs 带副作用的壳</strong>」。基础层不碰 IO，canonical 层才能被单测反复打。你自己做 Agent Runtime 时也值得这样切——核心循环越纯，越好验证。
+    </div>
+
+    <h3>那 Harness 到底"是"什么？怎么实现的？没有它会怎样？</h3>
+    <p>这一章后面会散落很多机制点（队列、事件桥、持久化、收敛、换会话），先在这里把它们钉在一个心智模型上，免得读着读着丢了主线。</p>
+    <table class="tbl">
+      <tr><th>问题</th><th>答案</th></tr>
+      <tr>
+        <td><strong>它是什么</strong></td>
+        <td>生产 harness = <code class="inline">AgentSession</code> 这个类，<strong>把裸的 <code class="inline">agentLoop</code> 包成一个"有记忆、能恢复、可排队、可扩展"的会话对象</strong>。它不是另一个循环，而是循环外面的一层壳。</td>
+      </tr>
+      <tr>
+        <td><strong>靠什么实现</strong></td>
+        <td>靠<strong>一段写死的顺序流程</strong>，不是声明式配置、也不是 prompt。整个 <code class="inline">prompt()</code> 就是一条按固定步骤走的方法体（命令 → 钩子 → 展开 → 校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>），每一步硬编码在前一步之后。韧性（重试 / 压缩 / 续跑）同样硬编码在 <code class="inline">_handlePostAgentRun</code> 的 while 循环里。系统提示词只决定"模型怎么想"，<strong>这段流程才决定"运行时怎么跑"</strong>。</td>
+      </tr>
+      <tr>
+        <td><strong>没有它会怎样</strong></td>
+        <td>退回第 3 章的 <code class="inline">agentLoop</code>：能跑一轮，但——<strong>不落盘</strong>（进程一退会话全没）、<strong>流式中无法安全追加/打断</strong>用户输入（没有 steer/followUp）、<strong>遇到错误或超长不会自救</strong>（没有重试/溢出压缩）、<strong>扩展挂不进去</strong>（没有 before_agent_start / input 等钩子）、<strong>运行中无法换会话</strong>（没有 teardown/apply 协议）。用户感知到的"Agent 越跑越稳、从不崩、能续上"，几乎全部来自这层壳，而不是 LLM 本身。</td>
+      </tr>
+    </table>
+    <div class="annotation"><b>一句话记住：</b> harness 用<strong>固化流程</strong>把"会跑的循环"变成"跑得稳、跑得久、跑得能被观测和介入"的运行时。下面 8.2~8.6 逐段拆这条流程的每个闸门；8.7 再把它收成一张清单。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>一次 prompt 的完整旅程</h2>
+    <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间过了十几个闸门。全程时序如下：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
+        <title id="t8b">AgentSession.prompt 完整旅程</title>
+        <desc id="d8b">从用户输入到 agent 运行，经过命令、钩子、展开、队列/校验、压缩预检、before_agent_start，最后进 _runAgentPrompt</desc>
+        <defs>
+          <marker id="arrow8b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+          <marker id="arrow8a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#d97706"></path>
+          </marker>
+          <marker id="arrow8t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#0f7d7a"></path>
+          </marker>
+          <marker id="arrow8s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#2563eb"></path>
+          </marker>
+        </defs>
+
+        <!-- ===== 顶排：1 → 2 → 3，三个等宽框 ===== -->
+        <rect class="node" x="30" y="30" width="170" height="62" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="115" y="56" font-size="12" fill="#1f2937" text-anchor="middle">1 扩展命令</text>
+        <text class="lbl sm" x="115" y="76" text-anchor="middle">/cmd 直接执行</text>
+
+        <rect class="node" x="240" y="30" width="170" height="62" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="325" y="56" font-size="12" fill="#1f2937" text-anchor="middle">2 input 钩子</text>
+        <text class="lbl sm" x="325" y="76" text-anchor="middle">可拦截 / 改写</text>
+
+        <rect class="node" x="450" y="30" width="170" height="62" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="535" y="56" font-size="12" fill="#1f2937" text-anchor="middle">3 技能 / 模板展开</text>
+        <text class="lbl sm" x="535" y="76" text-anchor="middle">/skill:、模板</text>
+
+        <!-- 1→2, 2→3 水平箭头 -->
+        <line x1="200" y1="61" x2="238" y2="61" stroke="#556674" stroke-width="2" marker-end="url(#arrow8b)"/>
+        <line x1="410" y1="61" x2="448" y2="61" stroke="#556674" stroke-width="2" marker-end="url(#arrow8b)"/>
+
+        <!-- ===== 判菱形：正在流式? ===== -->
+        <path d="M535 92 L535 112 L600 132 L535 152 L470 132 Z" fill="#fffef5" stroke="#d97706" stroke-width="1.6"/>
+        <text class="lbl sm" x="535" y="130" text-anchor="middle" fill="#b45309">正在流式?</text>
+        <line x1="535" y1="92" x2="535" y2="112" stroke="#d97706" stroke-width="2"/>
+
+        <!-- 是 → 4a 入队（右下） -->
+        <path d="M600 132 L690 132" fill="none" stroke="#d97706" stroke-width="2" marker-end="url(#arrow8a)"/>
+        <text class="lbl sm" x="645" y="125" text-anchor="middle" fill="#b45309">是</text>
+        <rect class="node acc" x="690" y="104" width="180" height="58" rx="8" fill="#fffef5" stroke="#d97706"/>
+        <text class="lbl" x="780" y="128" font-size="12" fill="#b45309" text-anchor="middle">4a 入队</text>
+        <text class="lbl sm" x="780" y="147" text-anchor="middle">steer / followUp（见 8.3）</text>
+
+        <!-- 否 → 向左下到 4b（垂直长线） -->
+        <path d="M470 132 L420 132" fill="none" stroke="#0f7d7a" stroke-width="2"/>
+        <text class="lbl sm" x="445" y="125" text-anchor="middle" fill="#0f7d7a">否</text>
+        <path d="M420 132 L420 200 L235 200 L235 218" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow8t)"/>
+
+        <!-- ===== 左列：4b → 5 → 6（垂直） ===== -->
+        <rect class="node" x="150" y="220" width="170" height="58" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="235" y="244" font-size="12" fill="#1f2937" text-anchor="middle">4b flush bash</text>
+        <text class="lbl sm" x="235" y="263" text-anchor="middle">冲刷待发 Bash</text>
+        <line x1="235" y1="278" x2="235" y2="318" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow8t)"/>
+
+        <rect class="node" x="150" y="320" width="170" height="58" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="235" y="344" font-size="12" fill="#1f2937" text-anchor="middle">5 模型 / 鉴权校验</text>
+        <text class="lbl sm" x="235" y="363" text-anchor="middle">模型已选? API key?</text>
+        <path d="M235 378 L235 400 L410 400" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow8t)"/>
+
+        <!-- 6 压缩预检（中间偏下） -->
+        <rect class="node" x="410" y="372" width="180" height="58" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="500" y="396" font-size="12" fill="#1f2937" text-anchor="middle">6 压缩预检</text>
+        <text class="lbl sm" x="500" y="415" text-anchor="middle">_checkCompaction</text>
+
+        <!-- 6 → 需要? → 先压缩 -->
+        <line x1="590" y1="401" x2="648" y2="401" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow8t)"/>
+        <text class="lbl sm" x="619" y="394" text-anchor="middle" fill="#0f7d7a">需要?</text>
+        <rect class="node core" x="650" y="372" width="170" height="58" rx="8" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="735" y="396" font-size="12" fill="#0f7d7a" text-anchor="middle">先压缩（第 6 章）</text>
+        <text class="lbl sm" x="735" y="415" text-anchor="middle">再继续</text>
+        <!-- 压缩完回流到 6（虚线，表示返回再往下） -->
+        <path d="M735 372 L735 352 L500 352 L500 372" fill="none" stroke="#0f7d7a" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrow8t)"/>
+
+        <!-- 6 → 7（向左下） -->
+        <path d="M500 430 L500 452 L325 452 L325 470" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow8t)"/>
+
+        <!-- ===== 底排：7 → 8 ===== -->
+        <rect class="node" x="150" y="472" width="190" height="58" rx="8" fill="#fff" stroke="#2563eb"/>
+        <text class="lbl" x="245" y="496" font-size="12" fill="#1f2937" text-anchor="middle">7 before_agent_start</text>
+        <text class="lbl sm" x="245" y="515" text-anchor="middle">扩展可注入 custom/systemPrompt</text>
+        <line x1="340" y1="501" x2="378" y2="501" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow8s)"/>
+
+        <rect class="node core" x="380" y="472" width="220" height="58" rx="8" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="490" y="496" font-size="12" fill="#1f2937" text-anchor="middle">8 _runAgentPrompt</text>
+        <text class="lbl sm" x="490" y="515" text-anchor="middle">agent.prompt → continue 循环</text>
+      </svg>
+      <div class="fig-cap">图 8.2：<code class="inline">prompt()</code> 是一条<strong>固定顺序</strong>的流水线（命令 → 钩子 → 展开 → 流式则入队，否则 flush/校验/压缩预检 → before_agent_start → _runAgentPrompt）。三处可短路返回：扩展命令 handled、input 钩子 handled、流式入队。</div>
+    </div>
+    <p>看真实代码。第 1 步扩展命令是最快的短路——以 <code class="inline">/</code> 开头的指令若命中注册命令，直接执行并返回，根本不进 LLM：</p>
+    <div class="code-title">agent-session.ts · prompt() 前半段（扩展命令 + input 钩子 + 技能展开）</div>
+    <pre class="code"><code><span class="cmt">// 1. 优先执行扩展命令（流式中也立即执行，命令自管 LLM 交互）</span>
+<span class="kw">if</span> (expandPromptTemplates && text.startsWith(<span class="st">"/"</span>)) {
+  <span class="kw">const</span> handled = <span class="kw">await</span> <span class="fn">this</span>._tryExecuteExtensionCommand(text);
+  <span class="kw">if</span> (handled) { preflightResult?.(<span class="nu">true</span>); <span class="kw">return</span>; }
+}
+
+<span class="kw">let</span> currentText = text;
+<span class="kw">let</span> currentImages = options?.images;
+<span class="cmt">// 2. input 事件：扩展可完全接管（handled）或改写（transform）</span>
+<span class="kw">if</span> (<span class="fn">this</span>._extensionRunner.hasHandlers(<span class="st">"input"</span>)) {
+  <span class="kw">const</span> inputResult = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.<span class="fn">emitInput</span>(
+    currentText, currentImages, options?.source ?? <span class="st">"interactive"</span>,
+    <span class="fn">this</span>.isStreaming ? options?.streamingBehavior : <span class="kw">undefined</span>,
+  );
+  <span class="kw">if</span> (inputResult.action === <span class="st">"handled"</span>) { preflightResult?.(<span class="nu">true</span>); <span class="kw">return</span>; }
+  <span class="kw">if</span> (inputResult.action === <span class="st">"transform"</span>) {
+    currentText = inputResult.text;
+    currentImages = inputResult.images ?? currentImages;
+  }
+}
+
+<span class="cmt">// 3. 技能 /skill:name 与 prompt 模板展开为完整文本</span>
+<span class="fn">this</span>._expandSkillCommand(expandedText);
+expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<span class="fn">this</span>.promptTemplates]);</code></pre>
+    <div class="callout">
+      <strong>读懂三个「短路」：</strong>扩展命令（1）、input 钩子（2）都能<strong>完全吞掉</strong>这一次输入（handled），不让它进 LLM；技能/模板（3）则把一句话<strong>展开成一大段</strong>塞进上下文。三者顺序固定——先给最高优先级、最便宜的拦截机会。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>流式时的双消息队列：steer vs followUp</h2>
+    <p>最难的地方：<strong>Agent 正在跑（流式），用户又发了一条消息，怎么办？</strong>Pi 用「双队列」解决，打破了你朴素的一声一答模型。先看关键判断——<code class="inline">prompt()</code> 检测到流式中时，强制你要么 <code class="inline">steer</code> 要么 <code class="inline">followUp</code>：</p>
+    <div class="code-title">agent-session.ts · 流式时入队</div>
+    <pre class="code"><code><span class="cmt">// 正在流式：必须显式声明是打断还是等待</span>
+<span class="kw">if</span> (<span class="fn">this</span>.isStreaming) {
+  <span class="kw">if</span> (!options?.streamingBehavior) {
+    <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(<span class="st">"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp')."</span>);
+  }
+  <span class="kw">if</span> (options.streamingBehavior === <span class="st">"followUp"</span>) {
+    <span class="kw">await</span> <span class="fn">this</span>._queueFollowUp(expandedText, currentImages);
+  } <span class="kw">else</span> {
+    <span class="kw">await</span> <span class="fn">this</span>._queueSteer(expandedText, currentImages);
+  }
+  preflightResult?.(<span class="nu">true</span>);
+  <span class="kw">return</span>;
+}</code></pre>
+    <p>两种入队的差别，看底层实现（AgentSession 维护两条数组，再转发给基础包的 Agent）：</p>
+    <div class="code-title">agent-session.ts · _queueSteer / _queueFollowUp</div>
+    <pre class="code"><code><span class="kw">private</span> <span class="kw">async</span> _queueSteer(text: string, images?: ImageContent[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
+  <span class="fn">this</span>._steeringMessages.push(text);      <span class="cmt">// 记录待投递（用于 UI 展示）</span>
+  <span class="fn">this</span>._emitQueueUpdate();
+  <span class="kw">await</span> <span class="fn">this</span>.agent.steer({ text, images }); <span class="cmt">// 打断正在进行的动作</span>
+}
+<span class="kw">private</span> <span class="kw">async</span> _queueFollowUp(text: string, images?: ImageContent[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
+  <span class="fn">this</span>._followUpMessages.push(text);
+  <span class="fn">this</span>._emitQueueUpdate();
+  <span class="kw">await</span> <span class="fn">this</span>.agent.followUp({ text, images }); <span class="cmt">// 等当前动作做完再投</span>
+}</code></pre>
+    <p>区分与投递时机：</p>
+    <table class="tbl">
+      <thead><tr><th>队列</th><th>语义</th><th>何时投给 LLM</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">steer</code>（打断）</td><td>「别干这个了，先听我的」</td><td>在 Tool 动作边界截断当前行动，立即注入下一条 user 消息</td></tr>
+        <tr><td><code class="inline">followUp</code>（跟随）</td><td>「把这个记下来，做完手上的再说」</td><td>在 Agent 没有更多 Tool 调用或无 steer 等待时才交付</td></tr>
+        <tr><td><code class="inline">nextTurn</code>（结转）</td><td>「这一轮末尾追加的上下文」</td><td>随下一条 user 消息一起作上下文注入（见 prompt 里 <code class="inline">_pendingNextTurnMessages</code>）</td></tr>
+      </tbody>
+    </table>
+    <p>基础包的 <code class="inline">Agent</code> 类实际维护着这些队列，并提供两种投递模式：</p>
+    <div class="code-title">packages/agent/src/agent.ts · 队列模式</div>
+    <pre class="code"><code><span class="cmt">// QueueMode: "all" 或 "one-at-a-time"</span>
+<span class="cmt">// agent-loop 在每个边界（tool call / 一轮结束）检查队列：</span>
+<span class="cmt">//   one-at-a-time：每次只投最新一条 steer + 最新一条 followUp</span>
+<span class="cmt">//   all：同一批次全部投给 LLM</span></code></pre>
+    <div class="callout">
+      <strong>为什么需要双队列？</strong>打断语义天然比「排队等」急迫。你在终端里按 <kbd>Esc</kbd> 想叫停 Agent 去读另一个文件，这是 <code class="inline">steer</code>；你顺手补一句「对了记得用 Vite」是 <code class="inline">followUp</code>。UI（TUI）正是靠 <code class="inline">queue_update</code> 事件把两侧队列实时画出来。你的 Runtime 若支持中断/追加，照抄这对队列即可。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>事件桥与持久化：Agent 事件 → 会话落盘</h2>
+    <p>基础包的 <code class="inline">Agent</code> 只发 <code class="inline">AgentEvent</code>。生产层要做的两件事：<strong>(a)</strong> 把它转成扩展事件喂给 ExtensionRunner；<strong>(b)</strong> 把 <code class="inline">message_end</code> 落盘到 SessionManager。这就是 <code class="inline">_handleAgentEvent</code>，一块事件枢纽：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8c d8c">
+        <title id="t8c">事件桥与持久化</title>
+        <desc id="d8c">AgentEvent 分流到扩展、监听器、会话存储</desc>
+        <defs>
+          <marker id="arrow8c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="120" width="170" height="60" rx="8" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="115" y="145" font-size="13" fill="#1f2937" text-anchor="middle">AgentEvent</text>
+        <text class="lbl" x="115" y="164" font-size="11" fill="#556674" text-anchor="middle">agent_start / turn_start / …</text>
+
+        <line x1="200" y1="142" x2="280" y2="80" stroke="#556674" stroke-width="2" marker-end="url(#arrow8c)"/>
+        <rect class="node" x="285" y="40" width="190" height="60" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="380" y="64" font-size="12" fill="#1f2937" text-anchor="middle">ExtensionRunner</text>
+        <text class="lbl" x="380" y="84" font-size="11" fill="#556674" text-anchor="middle">turn_start / message_update…</text>
+        <text class="lbl" x="380" y="96" font-size="11" fill="#b45309" text-anchor="middle">注: extend/修改/拦截</text>
+
+        <rect class="node" x="285" y="130" width="190" height="60" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="380" y="154" font-size="12" fill="#1f2937" text-anchor="middle">事件监听器（UI）</text>
+        <text class="lbl" x="380" y="174" font-size="11" fill="#556674" text-anchor="middle">agent_settled / queue_update…</text>
+
+        <rect class="node" x="285" y="222" width="190" height="60" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="380" y="246" font-size="12" fill="#1f2937" text-anchor="middle">SessionManager</text>
+        <text class="lbl" x="380" y="266" font-size="11" fill="#556674" text-anchor="middle">appendMessage / 自定义条目</text>
+
+        <line x1="200" y1="165" x2="280" y2="165" stroke="#556674" stroke-width="2" marker-end="url(#arrow8c)"/>
+        <line x1="200" y1="205" x2="280" y2="250" stroke="#556674" stroke-width="2" marker-end="url(#arrow8c)"/>
+
+        <text class="lbl" x="580" y="70" font-size="12" fill="#b45309">— 扩展可改写消息（emitMessageEnd）</text>
+        <text class="lbl" x="580" y="95" font-size="12" fill="#b45309">— 工具调用可被 block（emitToolCall）</text>
+        <text class="lbl" x="580" y="160" font-size="12" fill="#1f2937">— message_end 时按 role / customType 落盘</text>
+        <text class="lbl" x="580" y="250" font-size="12" fill="#1f2937">— 顺序: 扩展先 → 监听器后 → 存盘</text>
+      </svg>
+    </div>
+    <p>看真实的落盘分流（这是持久化的核心，读 <code class="inline">_handleAgentEvent</code>）：</p>
+    <div class="code-title">agent-session.ts · message_end 时按类型落盘</div>
+    <pre class="code"><code><span class="kw">if</span> (event.type === <span class="st">"message_end"</span>) {
+  <span class="cmt">// 自定义消息 → CustomMessageEntry（保留 customType / display / details）</span>
+  <span class="kw">if</span> (event.message.role === <span class="st">"custom"</span>) {
+    <span class="fn">this</span>.sessionManager.<span class="fn">appendCustomMessageEntry</span>(
+      event.message.customType, event.message.content,
+      event.message.display, event.message.details,
+    );
+  }
+  <span class="cmt">// 常规 LLM 消息 → SessionMessageEntry（第 4 章讲过）</span>
+  <span class="kw">else if</span> (
+    event.message.role === <span class="st">"user"</span> ||
+    event.message.role === <span class="st">"assistant"</span> ||
+    event.message.role === <span class="st">"toolResult"</span>
+  ) {
+    <span class="fn">this</span>.sessionManager.<span class="fn">appendMessage</span>(event.message);
+  }
+  <span class="cmt">// bashExecution / compactionSummary / branchSummary 在别处单独落盘</span>
+}</code></pre>
+    <p>注意事件在扩展层可以<strong>改写和拦截</strong>。工具调用先过 <code class="inline">emitToolCall</code>——扩展可以 <code class="inline">block</code> 它；助手消息结束过 <code class="inline">emitMessageEnd</code>——扩展可返回替换消息（这正是一致性/审校型扩展的挂点）。</p>
+    <div class="callout">
+      <strong>顺序很重要：</strong>先是 <code class="inline">_emitExtensionEvent(event)</code>（给扩展，允许改写），再 <code class="inline">_emit(...)</code>（给 UI 监听器，只读展示），最后 <code class="inline">appendMessage</code>（落盘）。改写在先、展示在中、存盘在后——三层各吃一份，互不阻塞。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>运行后收敛：重试 → 压缩 → 续跑的三段式</h2>
+    <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有没有消息？</strong>看 <code class="inline">_runAgentPrompt</code> 和它的收敛函数：</p>
+    <div class="code-title">agent-session.ts · prompt 后收敛循环</div>
+    <pre class="code"><code><span class="kw">private async</span> <span class="fn">_runAgentPrompt</span>(messages: AgentMessage | AgentMessage[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
+  <span class="fn">this</span>._isAgentRunActive = <span class="nu">true</span>;
+  <span class="kw">try</span> {
+    <span class="kw">await</span> <span class="fn">this</span>.agent.prompt(messages);
+    <span class="cmt">// 收敛：每次 continue 后再判断还要不要继续</span>
+    <span class="kw">while</span> (<span class="kw">await</span> <span class="fn">this</span>._handlePostAgentRun()) {
+      <span class="kw">await</span> <span class="fn">this</span>.agent.continue();
+    }
+  } <span class="kw">finally</span> {
+    <span class="fn">this</span>._systemPromptOverride = <span class="kw">undefined</span>;
+    <span class="fn">this</span>._flushPendingBashMessages();
+    <span class="kw">await</span> <span class="fn">this</span>._emitAgentSettled();
+  }
+}
+
+<span class="kw">private async</span> <span class="fn">_handlePostAgentRun</span>(): <span class="fn">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
+  <span class="kw">const</span> msg = <span class="fn">this</span>._lastAssistantMessage;
+  <span class="fn">this</span>._lastAssistantMessage = <span class="kw">undefined</span>;
+  <span class="kw">if</span> (!msg) <span class="kw">return</span> <span class="kw">false</span>;
+
+  <span class="cmt">// 1. 可重试错误? → 准备重试并续跑</span>
+  <span class="kw">if</span> (<span class="fn">this</span>._isRetryableError(msg) &amp;&amp; (<span class="kw">await</span> <span class="fn">this</span>._prepareRetry(msg))) <span class="kw">return</span> <span class="nu">true</span>;
+
+  <span class="kw">if</span> (msg.stopReason === <span class="st">"error"</span> &amp;&amp; <span class="fn">this</span>._retryAttempt &gt; <span class="nu">0</span>) { <span class="cmt">/* 收尾 auto_retry_end 事件 */</span> }
+
+  <span class="cmt">// 2. 需要压缩? → 压缩后继续</span>
+  <span class="kw">if</span> (<span class="kw">await</span> <span class="fn">this</span>._checkCompaction(msg)) <span class="kw">return</span> <span class="nu">true</span>;
+
+  <span class="cmt">// 3. 队列还有消息（agent_end 扩展又追加了）? → 继续</span>
+  <span class="kw">return</span> <span class="fn">this</span>.agent.hasQueuedMessages();
+}</code></pre>
+    <p>收敛顺序的表达力：<strong>重试优先于压缩，压缩优先于兜底续跑</strong>。判断「要不要」的逻辑堆积在三个函数里，生产版比基础 harness 契约多了「自动重试」这一维。重试的关键判断是 <code class="inline">_willRetryAfterAgentEnd</code>（回扫最后一条 assistant，看是否可重试错误且未超 <code class="inline">maxRetries</code>）：</p>
+    <div class="code-title">agent-session.ts · 是否要在 agent_end 后自动重试</div>
+    <pre class="code"><code><span class="kw">private</span> <span class="fn">_willRetryAfterAgentEnd</span>(event): <span class="kw">boolean</span> {
+  <span class="kw">const</span> settings = <span class="fn">this</span>.settingsManager.getRetrySettings();
+  <span class="kw">if</span> (!settings.enabled || <span class="fn">this</span>._retryAttempt &gt;= settings.maxRetries) <span class="kw">return</span> <span class="kw">false</span>;
+  <span class="kw">for</span> (<span class="kw">let</span> i = event.messages.length - <span class="nu">1</span>; i &gt;= <span class="nu">0</span>; i--) {
+    <span class="kw">if</span> (event.messages[i].role === <span class="st">"assistant"</span>)
+      <span class="kw">return</span> <span class="fn">this</span>._isRetryableError(event.messages[i]);
+  }
+  <span class="kw">return</span> <span class="kw">false</span>;
+}</code></pre>
+    <p>压缩分支是第 6 章的接驳处。<code class="inline">_checkCompaction</code> 是生产 harness 里最精巧的函数之一，它处理<strong>三类</strong>自动触发并带一堆「防误触发」守卫（三类都汇入同一个 <code class="inline">_runAutoCompaction()</code>）：</p>
+    <ul>
+      <li><strong>溢出 + 重试（overflow with retry）</strong>：assistant 因上下文溢出而错误或可恢复截断。此时<strong>先把被截断的 assistant 从 agent state 里剥掉</strong>（<code class="inline">messages.slice(0, -1)</code>），压缩后重试一轮；<code class="inline">_overflowRecoveryAttempted</code> 保证只试一次，避免死循环。</li>
+      <li><strong>溢出但不重试（overflow without retry）</strong>：一次<strong>成功</strong>的响应仍超出了上下文窗口。此时压缩，但<strong>保留这条已完成的响应</strong>、不重试——溢出不是错误，所以不丢工作成果。</li>
+      <li><strong>阈值（threshold without retry）</strong>：上下文用量（实际或估计）越过阈值，静默压缩，同样不重试。</li>
+      <li><strong>守卫</strong>：换模型后跳过旧模型的溢出判断；「消息比最近一次压缩还旧」就不再次触发（避免刚压完又被旧 usage 拉回）；aborted 消息默认跳过。</li>
+    </ul>
+    <div class="callout">
+      <strong>这是「自适应收敛」的精髓：</strong>基础 harness 契约只定义了「有 compaction 操作」；生产层负责<strong>自己判断何时触发、何时不触发</strong>。注意压缩前还会给扩展一个 <code class="inline">session_before_compact</code> 钩子——扩展可以拿到准备对象并 <code class="inline">cancel</code> 掉压缩。所有这些「自动驾驶」叠加起来，就是用户感知里「Agent 自己越跑越聪明、从不崩」的来源。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>会话替换：换会话、新建、分叉与优雅收尾</h2>
+    <p>生产 Agent 还能在<strong>运行中间换会话、分叉、导入 JSONL</strong>——对应到用户侧的斜杠命令是 <code class="inline">/resume</code>（恢复别的会话）、<code class="inline">/new</code>（开新会话）、<code class="inline">/fork</code>（从某条消息分叉）、<code class="inline">/import</code>（导入 JSONL）。它们背后都由 <code class="inline">AgentSessionRuntime</code> 统一管理，关键是<strong>任何替换都先完整地拆掉旧运行时</strong>。看替换公共流程（以 <code class="inline">switchSession</code> 为例，即 <code class="inline">/resume</code> 走的路径）：</p>
+    <div class="code-title">agent-session-runtime.ts · switchSession</div>
+    <pre class="code"><code><span class="kw">async</span> switchSession(sessionPath, options?) {
+  <span class="cmt">// 1. 先问扩展：允许切吗？（session_before_switch 可取消）</span>
+  <span class="kw">const</span> beforeResult = <span class="kw">await</span> <span class="fn">this</span>.emitBeforeSwitch(<span class="st">"resume"</span>, sessionPath);
+  <span class="kw">if</span> (beforeResult.cancelled) <span class="kw">return</span> beforeResult;
+
+  <span class="kw">const</span> previousSessionFile = <span class="fn">this</span>.session.sessionFile;
+  <span class="cmt">// 2. 打开目标会话，校验其 cwd 存在</span>
+  <span class="kw">const</span> sessionManager = <span class="fn">SessionManager</span>.<span class="fn">open</span>(sessionPath, <span class="kw">undefined</span>, options?.cwdOverride);
+  <span class="fn">assertSessionCwdExists</span>(sessionManager, <span class="fn">this</span>.cwd);
+
+  <span class="cmt">// 3. 拆旧：abort → session_shutdown 事件 → UI 摘除 → dispose</span>
+  <span class="kw">await</span> <span class="fn">this</span>.teardownCurrent(<span class="st">"resume"</span>, sessionManager.getSessionFile());
+
+  <span class="cmt">// 4. 建新运行时并套用</span>
+  <span class="fn">this</span>.<span class="fn">apply</span>(<span class="kw">await</span> <span class="fn">this</span>.createRuntime({ cwd, agentDir, sessionManager,
+    sessionStartEvent: { type: <span class="st">"session_start"</span>, reason: <span class="st">"resume"</span>, previousSessionFile } }));
+
+  <span class="cmt">// 5. 重绑会话引用，跑 withSession 回调</span>
+  <span class="kw">await</span> <span class="fn">this</span>.finishSessionReplacement(options?.withSession);
+  <span class="kw">return</span> { cancelled: <span class="kw">false</span> };
+}</code></pre>
+    <p>拆旧顺序是整页最值得抄的一段：</p>
+    <div class="code-title">agent-session-runtime.ts · teardownCurrent —— 优雅收尾</div>
+    <pre class="code"><code><span class="kw">private async</span> <span class="fn">teardownCurrent</span>(reason, targetSessionFile?) {
+  <span class="cmt">// 1. 先把当前响应的工具结果等落盘（abort 会妥善收尾）</span>
+  <span class="kw">await</span> <span class="fn">this</span>.session.abort();
+  <span class="cmt">// 2. 发 session_shutdown 事件，给扩展一个钩子</span>
+  <span class="kw">await</span> <span class="fn">emitSessionShutdownEvent</span>(<span class="fn">this</span>.session.extensionRunner,
+    { type: <span class="st">"session_shutdown"</span>, reason, targetSessionFile });
+  <span class="cmt">// 3. 同步回调：主机 UI 在旧扩展上下文变 stale 前摘除组件</span>
+  <span class="fn">this</span>.beforeSessionInvalidate?.();
+  <span class="cmt">// 4. dispose 释放资源</span>
+  <span class="fn">this</span>.session.dispose();
+}</code></pre>
+    <p>顺序的讲究：<strong>abort → shutdown 事件 → UI 摘除 → dispose</strong>。abort 保证「切换到新会面前，旧会话的当前回合（含工具结果）已持久化」；shutdown 事件给扩展留清理钩子；<code class="inline">beforeSessionInvalidate</code> 特意做成<strong>同步</strong>回调（注释写明「不能把控制权交还事件循环」），因为要在旧的扩展上下文失效前摘掉扩展提供的 TUI 组件。分叉（<code class="inline">fork</code>）则复用同一套拆装，只是目标会话要先用 <code class="inline">createBranchedSession(targetLeafId)</code> 造一个分支 JSONL。</p>
+    <div class="callout">
+      <strong>给你做 Runtime 的启示：</strong>「替换运行时」不是简单地<code class="inline">session = newSession()</code>。它需要一份<strong>严格的拆装协议</strong>——先持久化未决状态、再广播退场、再置换、再广播入场。顺序错了，轻则丢数据，重则扩展到旧会话的悬垂引用。Pi 在 <code class="inline">agent-session-runtime.ts</code> 里把这份协议收得很干净。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>把这一章装进你的 Runtime 清单</h2>
+    <p>这一章的信息密度很高。把它压缩成一张「生产 harness 必备件」清单，也是你第 12 章自制 Runtime 的骨架：</p>
+    <table class="tbl">
+      <thead><tr><th>能力</th><th>Pi 的做法（文件）</th><th>为什么缺它不行</th></tr></thead>
+      <tbody>
+        <tr><td>输入管道</td><td><code class="inline">prompt()</code>：命令→钩子→展开→队列/校验</td><td>没有统一入口，拦截/改写在别处无从挂</td></tr>
+        <tr><td>双队列</td><td><code class="inline">steer / followUp / nextTurn</code></td><td>流式中无法安全追加/打断用户输入</td></tr>
+        <tr><td>事件桥</td><td><code class="inline">_handleAgentEvent → _emitExtensionEvent</code></td><td>扩展与 UI 都靠它观察，三层顺序=可扩展性</td></tr>
+        <tr><td>持久化</td><td><code class="inline">message_end → appendMessage</code></td><td>不落盘则无法恢复、分叉、跨进程续跑</td></tr>
+        <tr><td>自适应收敛</td><td><code class="inline">_handlePostAgentRun</code>：重试→压缩→续跑</td><td>Agent 遇到错误/超长要自己能消化，而非干等</td></tr>
+        <tr><td>会话替换</td><td><code class="inline">teardownCurrent → createRuntime → rebind</code></td><td>换会话在最坏时机（运行中）也必须不丢数据</td></tr>
+      </tbody>
+    </table>
+    <div class="arrow-nav">
+      <a class="prev" href="07-harness.html">← 上一章 · Harness 运行时骨架</a>
+      <a class="next" href="09-tools.html">下一章 · 工具层 →</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>

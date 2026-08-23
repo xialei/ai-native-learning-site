@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 10 章 · Context Observability — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 10 章 · Context Observability</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 10 章 · Observability & Evaluation</div>
+      <h1 class="title">Agent 为什么得到这个答案</h1>
+      <p class="lede">
+        企业部署 Agent 之后，最常被问的问题不是"它能不能用"，而是"它为什么这么答"。为什么没找到这个实验？为什么用了旧版 SOP？为什么引用了错误文档？这一章讲怎么让每一份进入 Prompt 的上下文都可以被解释、回放、比较和诊断。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Context Observability 是整个 Context Engine 的可观测与评测层。它的职责是完整记录 Context 从 Query 到 Prompt 的整个生成过程，并提供调试、解释、回放、评估能力。</p>
+
+      <p>它不仅帮助研发排查问题，也帮助业务人员理解：Agent 为什么得到这个答案。这把"黑盒 AI"变成"可解释 AI"——而可解释是企业上线的硬门槛。</p>
+
+      <p>把观测和评测放在同一章，不是随意的编排。一项 2026 年的从业者调研显示：约 89% 的团队在用可观测工具，但只有约 52% 在跑离线评测——也就是说，大多数人能"看到 agent 做了什么"，却不系统判断"做得对不对"。这道观测与评测之间的鸿沟，正是本章要把两者合起来讲的原因。<span class="src">来源：Li et al., 2026, §7.5/§12.3 引 LangChain 调研</span></p>
+
+      <h2 id="why">为什么需要 Debugger</h2>
+
+      <p>企业部署 Agent 后，最常见的问题是这些：</p>
+
+      <pre><code>为什么没有找到这个实验？
+为什么没有引用最新日志？
+为什么使用了旧版本 SOP？
+为什么没有看到 GPU 信息？
+为什么引用了错误文档？</code></pre>
+
+      <p>如果没有 Debugger，只能猜。而猜在生产环境里是站不住脚的——业务方不会接受"可能是检索没捞到"这种答案。因此必须 Explain。</p>
+
+      <h2 id="architecture">整体架构</h2>
+
+      <p>Context Observability 监听整条 Pipeline，记录全部状态：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  Q["User Query"] --> HR["Hybrid Retrieval"]
+  HR --> GE["Graph Expansion"]
+  GE --> CR["Context Ranking"]
+  CR --> CO["Context Optimizer"]
+  CO --> PB["Prompt Builder"]
+  PB --> LLM["LLM"]
+  LLM --> A["Answer"]
+  OB["Context Observability"] -.->|监听| Q
+  OB -.->|监听| HR
+  OB -.->|监听| GE
+  OB -.->|监听| CR
+  OB -.->|监听| CO
+  OB -.->|监听| PB
+  OB -.->|监听| LLM
+  style OB fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Observability 监听整个 Pipeline，记录每一步状态。</figcaption>
+      </figure>
+
+      <h2 id="trace">Context Trace</h2>
+
+      <p>每一次 Context 生成形成一个 Trace：</p>
+
+      <pre><code>Trace
+  ID
+  Start Time
+  End Time
+  Latency
+  Model
+  Token
+  Context Version</code></pre>
+
+      <p>统一记录。Trace 是 Observability 的基本单元——一次请求从进来到出去，所有中间状态都挂在同一个 Trace ID 下。</p>
+
+      <p>Trace 的字段不必自己发明。业界已把 OpenTelemetry 当作事实标准，社区为生成式 AI 发布了语义约定，规定了 model name、temperature、token counts、latency 这类 span 属性。直接对齐这套约定，能让 Context Engine 的 Trace 流入团队已有的监控后端，而不是又造一套孤立的追踪格式。<span class="src">来源：Li et al., 2026, §7.1 引 OpenTelemetry/OpenLLMetry</span></p>
+
+      <h2 id="trace-pipeline">Trace Pipeline</h2>
+
+      <p>完整记录每一步：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  Q["Query"] --> RW["Rewrite"]
+  RW --> R["Retrieval"]
+  R --> E["Expansion"]
+  E --> R2["Ranking"]
+  R2 --> O["Optimizer"]
+  O --> P["Prompt"]
+  P --> L["LLM"]
+  L --> R3["Response"]
+  style Q fill:#f3f1ea,stroke:#9a978f
+  style R3 fill:#eef4ee,stroke:#2f6b3a
+        </div>
+        <figcaption>Trace Pipeline。每一步都有 Trace。</figcaption>
+      </figure>
+
+      <p>每一步都有 Trace。这意味着你能把一次请求拆成八段，分别看耗时、看输入输出、看异常。这是定位"慢在哪一步""哪一步丢了对象"的基础。</p>
+
+      <p>Trace 记到极致，行为本身就可以被建模成对象，而不只是日志行。Palantir Foundry 的 Action Log 就是这个思路：它把每一次 action 提交都建模成一个 object type，统一用 <code>[LOG]</code> 前缀标注，和对应的 action type 一一对应——这样行为记录就能用 Ontology 的感知工具去查询、展示，甚至喂给下游决策工作流，而不是沉在没人翻的日志文件里。本书的 Context Trace 也可以往这个方向走：不只记录"对象为何进入 Prompt"的日志，而是把这条决策本身建模成可查询的对象，让"为什么"也能被检索和复盘。（若要的是某个对象被编辑的全部历史，那该用对象级的 edit history，而不是 action log，两者职责不同。）<span class="src">来源：Foundry Ontology 文档，Action log</span></p>
+
+      <h2 id="explain">四个 Explain</h2>
+
+      <h3>Retrieval Explain</h3>
+      <p>展示每个 Retriever 返回了什么：</p>
+
+      <pre><code>Keyword  → 5 Objects
+Vector   → 8 Objects
+SQL      → 2 Objects
+Graph    → 12 Objects</code></pre>
+
+      <p>全部可见。你能看到是不是某个 Retriever 没被调用，或者返回太少。</p>
+
+      <h3>Expansion Explain</h3>
+      <p>展示为什么扩展。比如 Experiment → Dataset → Checkpoint → GPU，解释用的是 trained_on、uses、running_on 这些关系。支持逐跳查看——你可以一跳一跳地看扩展路径。</p>
+
+      <h3>Ranking Explain</h3>
+      <p>展示每个对象为什么保留。比如 GPU 得 92 分，原因是 Current、Importance、Authority。同时展示<em>未保留</em>的原因——比如 README 被踢是因为 Token Too High、Low Relevance。知道"为什么没进来"和"为什么进来"同样重要。</p>
+
+      <h3>Optimizer Explain</h3>
+      <p>展示 Context 如何压缩。比如 SOP 20 页 → Summary 180 Token。展示节省了多少 Token。如果模型答得不好，能查到是不是压缩过度丢了关键信息。</p>
+
+      <h2 id="prompt-explain">Prompt Explain</h2>
+
+      <p>最终 Prompt 的组成：Objects、Relations、Metrics、Events、Documents、Actions，分别占多少 Token。这让你知道 Token 都花在哪了——是文档占太多，还是关系太冗余。</p>
+
+      <h2 id="timeline">Timeline</h2>
+
+      <p>展示时间线：</p>
+
+      <pre><code>10:01      Retrieval
+10:01.2    Expansion
+10:01.3    Ranking
+10:01.5    Prompt
+10:02      LLM</code></pre>
+
+      <p>查看耗时。哪个阶段慢，一目了然。生产环境里，"慢"往往比"错"更常见，Timeline 是性能优化的抓手。</p>
+
+      <h2 id="replay-diff">Replay 与 Diff</h2>
+
+      <p><strong>Replay</strong>：昨天的 Context 重新运行。方便 Debug——线上出了问题，你可以在离线环境把那次请求的 Trace 重放，定位根因。</p>
+
+      <p><strong>Diff</strong>：两个 Context 比较。展示新增了哪些 Object、删除了哪些 Object、哪些 Relation 变了。比如对比昨天和今天的 Context，能看出数据源发生了什么变化。</p>
+
+      <h2 id="metrics">Metrics</h2>
+
+      <p>统一指标：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>指标</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td>Retrieval Latency</td><td>检索耗时</td></tr>
+            <tr><td>Ranking Latency</td><td>排序耗时</td></tr>
+            <tr><td>Expansion Latency</td><td>扩展耗时</td></tr>
+            <tr><td>Prompt Size</td><td>Prompt 大小</td></tr>
+            <tr><td>Context Size</td><td>Context 大小</td></tr>
+            <tr><td>Token Saved</td><td>节省的 Token</td></tr>
+            <tr><td>Cache Hit</td><td>缓存命中率</td></tr>
+            <tr><td>LLM Cost</td><td>LLM 成本</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>统一 Dashboard。这些指标让 Context Engine 的运行状况可视化——不只是"能不能用"，而是"用得好不好、贵不贵"。</p>
+
+      <h2 id="search">Search：找历史 Trace</h2>
+
+      <p>支持搜索历史 Trace。比如按 Experiment、Loss、GPU、User、Project 快速定位。线上排障时，你往往需要先找到"出问题的那次请求"，才能开始诊断。</p>
+
+      <p>把上面这些能力串起来，就构成了一个完整的评测闭环：任务落地 → 执行前就绪校验 → 受控执行与 Trace 捕获 → 多层级判定与失败归因 → 持续回归与反馈。学术界把它叫"任务到反馈的五阶段生命周期"，核心主张是——上报的分数应该被视为"模型 + Context Engine 这个组合"的属性，而不是模型一个人的。<span class="src">来源：Li et al., 2026, §8.1</span></p>
+
+      <p>这个主张有个很现实的理由：评测结果会被基础设施噪声污染。一项研究发现，仅仅改变基础设施配置，就能让 agent 基准分数漂移约 6 个百分点。如果 Trace 里不记录每次运行的环境、工具、上下文策略配置，你就分不清一次失败是模型不行，还是环境没配对。<span class="src">来源：Li et al., 2026, §7.3/§12.3 引 Anthropic</span></p>
+
+      <h2 id="api">API</h2>
+
+      <pre><code>type TraceService interface {
+    StartTrace()
+    Record()
+    Finish()
+    Replay()
+    Compare()
+}</code></pre>
+
+      <p>统一管理。</p>
+
+      <h2 id="rca">创新：Root Cause Analysis</h2>
+
+      <p>更进一步，系统可以自动做根因分析。常见的 Context 质量问题根因有这些：</p>
+
+      <ol>
+        <li>Retrieval Recall Too Low——检索召回太低；</li>
+        <li>Missing Dataset Relation——缺少关键关系；</li>
+        <li>Context Too Large——Context 太大；</li>
+        <li>Token Compression Too Aggressive——压缩过度；</li>
+        <li>Outdated Cache——缓存过期；</li>
+        <li>Permission Filter Removed Critical Object——权限过滤误删了关键对象。</li>
+      </ol>
+
+      <p>然后自动给出建议：增加 Graph Hop、提高 Dataset 权重、重新 Summary。这把 Observability 从"被动记录"升级为"主动诊断"——它不只告诉你出了什么问题，还告诉你怎么修。</p>
+
+      <p>这个"从观测到诊断再到修复"的闭环，业界已经把它结构化成一条六阶段流水线：观察 → 收集指标 → 检测异常 → 根因分析 → 推荐修复 → 自动修复。本章的 Trace + 四个 Explain + RCA，正是这条流水线在 Context Engine 里的具体实现。值得注意的是，一项调研显示 79% 的从业者把"非确定性执行流"列为 agent 系统最大的挑战——而 Trace 和 Diff 这类能力，正是对抗这种非确定性的武器。<span class="src">来源：Li et al., 2026, §7.2 引 Moshkovich &amp; Zeltyn, 2025</span></p>
+
+      <p>RCA 的难点在于，一次失败的根因可能藏在很多地方。学术综述列出的候选归因源就有七类：模型推理、误导性的工具 schema、陈旧或被压缩过度的上下文、沙箱不稳、编排循环、基准歧义、评测器不可靠。这意味着根因分析不是给最终分数贴个标签，而是要对着整条 Trace 做诊断——本书把 Retrieval/Expansion/Ranking/Optimizer 拆成可观测的独立阶段，正是为了让这种跨阶段归因成为可能。<span class="src">来源：Li et al., 2026, §8.5.4</span></p>
+
+      <p>但光知道"根因可能藏在七处"还不够——同一类失败表面相同，因果机制可能完全不同。两次运行都表现为"产物缺失"或"超时"，但一个是检索没召回，一个是压缩时误删，改的是完全不同的组件。要让归因真正落地，失败记录不能只存一条终态结论，而要存三层信息：<strong>终态结论</strong>（verifier 给出的失败判定）、<strong>行为因果状态</strong>（agent 在失败前实际做了什么、关键决策点在哪）、<strong>抽象机制</strong>（这条轨迹暴露出的是哪类共性问题，而非这个具体任务）。只有三层齐备，下次弱点挖掘才能找到真正的根因，而不是反复修同一个表象。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.3</span></p>
+
+      <p>这三层结构也直接服务于一个更野心的能力——让 Context Engine 把诊断结果<em>安全地</em>反哺成自身改进。做法是给每一次配置改动配一份"证据驱动编辑日志"（manifesto）：写明失败证据的名字、推断的根因、目标修复方案、预期影响（预期修复什么 + 可能引入什么回归风险）。下一轮验证时，回头检查当初的预测是否成立——成立就保留改动，不成立就回滚并记录。这套"可证伪的编辑日志"让每一次改动都变成一次可审计的小实验，而不是凭直觉调参。它和本章的 Replay、Diff 是天然搭档：Replay 重跑改动前后，Diff 看上下文变化，manifesto 记录当初的理由和预测。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.3</span></p>
+
+      <p>这个"诊断后安全地改"的闭环，还有一个上游前提：答案本身要可追溯。如果 Context 里的每个论断——引用的数值、依据的方法、得出的结论——都能回溯到具体证据来源，那么 RCA 才不是在猜，而是在审计一条证据链。这正是科研型 Agent 流派 ScientistOne 强调的"可验证性"：每个论断都要能追溯到证据，并通过 Chain-of-Evidence 审计。本书的 provenance 字段（第 2 章）已经为此留了位置；让"为什么"也能被检索和复盘，是 Observability 从"解释单次生成"走向"支撑持续改进"的关键一步。<span class="src">来源：Lilian Weng, <em>Harness Engineering for Self-Improvement</em>, 2026, §4.2 引 ScientistOne</span></p>
+
+      <p>归因要准，第一步是把"业务出错"和"系统出错"分开。Palantir Foundry 的函数监控就刻意区分两类错误：<em>user-facing errors</em>（函数代码主动抛出的、用户可见的错误，通常是业务逻辑问题）和 <em>non-user-facing errors</em>（基础设施、系统级故障）。两类错误分别告警给不同团队——业务问题归业务负责人，平台问题归平台团队，主动抛 <code>UserFacingError</code> 的失败还会被单独统计。本书的 RCA 也该有这道二分：检索逻辑判错、权限过滤误删这类是业务问题，存储超时、向量库宕机这类是系统问题。混在一起，排障就找不到对的人，告警也会失效。<span class="src">来源：Foundry Ontology 文档，Function monitoring / User-facing errors</span></p>
+
+      <p>可观测还有一层容易忽略的维度：不只看单次 Context 生成，还要看 Ontology 本身变更的影响面。Palantir Foundry 的 Viewing usage 就是干这个的——在改动 Ontology 之前，先展示近 30 天的读写统计（读按加载请求计、写按 Action/编辑计），帮你评估"这个破坏性变更会波及多少下游"。本书的 Trace 当前侧重"对象为何进入 Prompt"，可以再补一刀："某次 Ontology 变更，影响了多少份历史 Context 的可重放性"。有了这层，Schema 演进才敢放开手改，因为影响面是可见的。<span class="src">来源：Foundry Ontology 文档，Viewing usage</span></p>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Trace、Explain、Timeline、Replay、Search；</li>
+        <li><strong>第二阶段</strong>：Diff、Dashboard、Metrics、Cost；</li>
+        <li><strong>第三阶段</strong>：Root Cause Analysis、Automatic Diagnosis、Context Quality Score。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Context Observability 的目标不是记录日志，而是让每一个进入 Prompt 的 Context 都可以被解释、回放、比较和诊断。真正做到 Explainable Context。</p>
+        <blockquote>
+          <p>让每一个进入 Prompt 的 Context 都可以被解释、回放、比较和诊断。</p>
+        </blockquote>
+        <p>所有上游模块——Retrieval、Expansion、Ranking、Optimizer、Runtime——都输出 Trace，最终统一到 Context Observability。这是系统能上生产的最后一块拼图。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-09-context-cache.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 9 章 · Context Cache</span>
+        </a>
+        <a class="next" href="chapter-11-research-context.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 11 章 · Research Context</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

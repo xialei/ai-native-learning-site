@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · 安全边界·本地模型·程序化集成 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 14 安全·本地模型·程序化集成</div>
+    <h1>安全边界、本地模型与程序化集成</h1>
+    <div class="subtitle">这台「运行时」不光要跑得稳，还要<strong>敢在你不信任的地方跑、能在你没有网络时跑、能被你的代码当库调用</strong>。本章收拢三个「边界」话题：信任与沙箱（安全）、llama.cpp 本地模型接入（离线）、以及 SDK / RPC 的程序化嵌入（可编程）。它们共同回答了「一个能用的 Agent Runtime」的最后三个问题。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">产品视角</span>
+    <span class="ep-quote">「同一内核，四种形态；离线也能跑、被你的代码当库调。」</span>
+    Pi 不只有交互式 TUI：<code class="inline">pi -p</code> 走 print/JSON 给脚本与 CI，stdin/stdout 传 JSONL 的 RPC 给非 Node 集成，SDK 把 Pi 当库嵌进你的应用（见 OpenClaw 这种真实落地）。想离线 / 重隐私？把 <code class="inline">llama.cpp</code> 本地服务器「伪装」成一个 Provider 就接上了。<span class="ep-arrow">→</span> 本章看信任沙箱、本地模型适配、程序化嵌入这三条边界在源码里怎么收口。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">14.1</span>项目信任：一套可持久化、可继承的决策</h2>
+    <p>Agent 会在你的工作目录里跑 Bash——它怎么知道「这个目录可以信任」?答案是 <code class="inline">packages/coding-agent/src/core/trust-manager.ts</code>，一套小而精的信任决策系统。核心是 <code class="inline">TrustFile</code>：<strong>路径 → 决策</strong>的一张表，决策只有三态 <code class="inline">true / false / null</code>。</p>
+    <div class="code-title">trust-manager.ts · 信任表与「就近祖先」查询</div>
+    <pre class="code"><code><span class="kw">type</span> TrustFile = Record&lt;<span class="kw">string</span>, <span class="kw">boolean</span> | <span class="kw">null</span> | <span class="kw">undefined</span>&gt;;  <span class="cmt">// path → 是否可信</span>
+
+<span class="cmt">// 查一个 cwd 是否可信：从它自己开始，一路向父目录找最近的一个显式决策</span>
+<span class="kw">function</span> <span class="fn">findNearestTrustEntry</span>(data: TrustFile, cwd: <span class="kw">string</span>): ProjectTrustStoreEntry | <span class="kw">null</span> {
+  <span class="kw">let</span> currentDir = <span class="fn">normalizeCwd</span>(cwd);
+  <span class="kw">while</span> (<span class="nu">true</span>) {
+    <span class="kw">const</span> value = data[currentDir];
+    <span class="kw">if</span> (value === <span class="nu">true</span> || value === <span class="nu">false</span>) {
+      <span class="kw">return</span> { path: currentDir, decision: value };   <span class="cmt">// 命中显式决策</span>
+    }
+    <span class="kw">const</span> parentDir = <span class="fn">dirname</span>(currentDir);
+    <span class="kw">if</span> (parentDir === currentDir) <span class="kw">return</span> <span class="kw">null</span>;        <span class="cmt">// 到根都没有 → 未决</span>
+    currentDir = parentDir;
+  }
+}</code></pre>
+    <p>「<strong>就近祖先</strong>」是关键语义：你在 <code class="inline">~/work</code> 下信任了 <code class="inline">~/work</code>，那么 <code class="inline">~/work/repo-a</code>、<code class="inline">~/work/repo-b</code> 都会被继承为可信，而无需逐目录确认。若某子目录被显式设为 <code class="inline">false</code>，又会盖过祖先的信任。这是一棵向上求最近决策的「决策继承树」。</p>
+    <p>落盘时还有三个讲究——排序、锁定、严格校验：</p>
+    <div class="code-title">trust-manager.ts · 锁定 + 稳定写</div>
+    <pre class="code"><code><span class="kw">function</span> <span class="fn">acquireTrustLockSync</span>(path: <span class="kw">string</span>): () =&gt; <span class="kw">void</span> {
+  <span class="cmt">// 用 proper-lockfile 在同一目录放 .lock，串行化并发写</span>
+  <span class="cmt">//   （多个 pi 进程同时信任/取消信任同一目录时不打架）</span>
+  <span class="kw">return</span> <span class="fn">lockfile.lockSync</span>(trustDir, { realpath: <span class="kw">false</span>, lockfilePath: <span class="st">`${path}.lock`</span> });
+}
+
+<span class="kw">function</span> <span class="fn">writeTrustFile</span>(path: <span class="kw">string</span>, data: TrustFile): <span class="kw">void</span> {
+  <span class="kw">const</span> sorted: TrustFile = {};
+  <span class="kw">for</span> (<span class="kw">const</span> key of <span class="fn">Object.keys</span>(data).sort()) {        <span class="cmt">// 按键排序</span>
+    <span class="kw">...</span>                                              <span class="cmt">// 稳定输出，便于 diff 与版本管理</span>
+  }
+  <span class="fn">mkdirSync</span>(<span class="fn">dirname</span>(path), { recursive: <span class="nu">true</span> });
+  <span class="fn">writeFileSync</span>(path, <span class="st">`${JSON.stringify(sorted, null, 2)}\n`</span>, <span class="st">"utf-8"</span>);
+}</code></pre>
+    <p>配信任时的「选项推导」也很有品味——不是简单二选一，而是给你「信任 / 信任整个父目录 / 仅本次会话信任 / 不信任 / 仅本次会话不信任」等富选项。其中「信任父目录」会<strong>同时写父目录为 true、当前目录为 null</strong>（null 表示「跟随父目录」），让决策既持久又不过度扩散。</p>
+    <div class="callout">
+      <strong>为什么这值得抄？</strong>信任系统的难点不在「信任」本身，而在<strong>「决策如何继承、如何持久化、如何并发安全」</strong>。Pi 用就近祖先 + 三态值 + proper-lockfile 把这三件事都收拾干净了。你做 Runtime 时，任何「跨进程、跨会话、要落盘的安全判断」都可以套这个模板：三态值、向上继承、加锁写、排序输出。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.2</span>沙箱边界：Bash 这道闸门</h2>
+    <p>信任是「要不要问」；真正的隔离发生在 <strong>Bash 工具这条沙箱边界</strong>上。回顾第 9 章我们已经建立的图景：权限确认挂在 <code class="inline">beforeToolCall</code> 钩子上（第 8 章），stdout 由 <code class="inline">output-guard</code> 串行接管（第 9 章 §9.6）。这里补上 bash 自身的<strong>执行边界</strong>——它接住 <code class="inline">AbortSignal</code> 并<strong>杀掉整个进程树</strong>。</p>
+    <div class="code-title">tools/bash.ts · 中止即杀全树</div>
+    <pre class="code"><code>exec: <span class="kw">async</span> (command, cwd, { onData, signal, <span class="kw">...</span> }) =&gt; {
+  <span class="kw">const</span> child = spawn(..., { ... });
+  <span class="cmt">// 记下子进程；外部 abort 时，不只是 kill 一个 pid，而是整棵进程树</span>
+  <span class="kw">function</span> <span class="fn">onAbort</span>() { <span class="fn">killProcessTree</span>(child); }   <span class="cmt">// 防止孤儿进程继续跑</span>
+  <span class="kw">if</span> (signal?.aborted) <span class="fn">onAbort</span>();
+  <span class="kw">else</span> signal?.addEventListener(<span class="st">"abort"</span>, onAbort, { once: <span class="nu">true</span> });
+  <span class="cmt">// 输出经 onData 流式回传 → 上层 tool_execution_update</span>
+}</code></pre>
+    <p>这里「杀整棵进程树」不是细节，而是<strong>安全与资源的基本盘</strong>：一条 <code class="inline">sleep 100000</code> 或一个 <code class="inline">npm install</code>，若只杀父进程，它的子进程会变成孤儿继续占机器、甚至继续写文件。Pi 用 <code class="inline">exec</code> 封装把进程树治理收拢成一处，配合第 9 章的 <code class="inline">signal</code> 参数，让「用户打断」真正落到 OS 层面。</p>
+    <p>再往外一层才是「把整个 pi 隔离起来」——那是<b>容器化</b>的范畴：用 Docker、Gondolin 或 OpenShell 把 pi 装进沙箱跑。此时「Agent 能碰到的」从「当前目录」缩小到「容器的文件系统」，Bash 执行的就不是宿主机命令而是容器内命令（<code class="inline">bash-executor.ts</code> 也支持 SSH/远端容器的远程执行）。这是信任模型之外<strong>真正的强隔离</strong>——信任是「软边界」（决定放行与否），容器是「硬边界」（决定能力范围）。</p>
+    <div class="callout">
+      <strong>一句话区分：</strong>信任系统决定「<strong>要不要问</strong>」，<code class="inline">beforeToolCall</code> 钩子决定「<strong>放不放行</strong>」，AbortSignal→杀进程树决定「<strong>能不能停</strong>」，容器/Gondolin 决定「<strong>能碰到什么</strong>」。四层叠加才是完整的安全纵深。你自己做 Runtime 时，至少要把前两层（信任 + 放行）和「可中止」做扎实，容器化可以后补。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.3</span>本地模型：把 llama.cpp 变成一个 Provider</h2>
+    <p>没有网络、在意隐私时，你想在本地跑模型。Pi 用第 10 章那套「多供应商抽象」顺手就接上了 <code class="inline">llama.cpp</code>——<strong>它根本不需要为本地模型造新机制，只需要一个「把本地 llama 服务器翻译成 Model/Provider」的适配器</strong>。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t14 d14">
+        <title id="t14">llama.cpp 作为 Provider 接入</title>
+        <desc id="d14">扩展把本地 llama 服务器适配成 openai-completions Model</desc>
+        <defs>
+          <marker id="arrow14" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="40" width="240" height="120" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="150" y="65" font-size="13" fill="#2563eb" text-anchor="middle">llama.cpp extension</text>
+        <text class="lbl" x="150" y="85" font-size="11" fill="#1f2937" text-anchor="middle">LlamaClient：list/load/unload</text>
+        <text class="lbl" x="150" y="101" font-size="11" fill="#1f2937" text-anchor="middle">download + SSE watch</text>
+        <text class="lbl" x="150" y="120" font-size="11" fill="#556674" text-anchor="middle">管理本地服务器与模型</text>
+        <text class="lbl" x="150" y="138" font-size="11" fill="#556674" text-anchor="middle">→/llama 命令 + UI</text>
+
+        <rect class="node" x="330" y="40" width="240" height="120" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="450" y="65" font-size="13" fill="#0f7d7a" text-anchor="middle">toPiModel()</text>
+        <text class="lbl" x="450" y="85" font-size="11" fill="#1f2937" text-anchor="middle">把本地模型翻译成</text>
+        <text class="lbl" x="450" y="101" font-size="11" fill="#1f2937" text-anchor="middle">Model&lt;"openai-completions"&gt;</text>
+        <text class="lbl" x="450" y="121" font-size="11" fill="#b45309" text-anchor="middle">provider = "llama.cpp"</text>
+
+        <rect class="node" x="630" y="40" width="240" height="120" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="750" y="65" font-size="13" fill="#0f7d7a" text-anchor="middle">复用 stream()</text>
+        <text class="lbl" x="750" y="85" font-size="11" fill="#1f2937" text-anchor="middle">复用 OpenAI 兼容流</text>
+        <text class="lbl" x="750" y="101" font-size="11" fill="#1f2937" text-anchor="middle">上层完全无感</text>
+        <text class="lbl" x="750" y="121" font-size="11" fill="#556674" text-anchor="middle">→ 盘进模型循环(ch3/10)</text>
+
+        <line x1="270" y1="100" x2="328" y2="100" stroke="#556674" stroke-width="2" marker-end="url(#arrow14)"/>
+        <line x1="570" y1="100" x2="628" y2="100" stroke="#556674" stroke-width="2" marker-end="url(#arrow14)"/>
+        <text class="lbl" x="450" y="210" font-size="12" fill="#b45309" text-anchor="middle">llama.cpp server (http://127.0.0.1:8080)</text>
+        <path d="M150 160 v40 M450 160 v40 M750 160 v40" fill="none" stroke="#556674" stroke-width="1.5"/>
+        <rect class="node" x="330" y="250" width="240" height="34" rx="8" fill="#fffef5" stroke="#d97706"/>
+        <text class="lbl" x="450" y="271" font-size="12" fill="#b45309" text-anchor="middle">本地推理可控 · 离线 · 隐私</text>
+      </svg>
+    </div>
+    <p>看两个关键翻译。一是 <code class="inline">toPiModel</code>——把 llama 服务器的模型信息映射成 Pi 的 <code class="inline">Model</code> 值对象（上下文窗口从 <code class="inline">n_ctx</code> 取，取不到回退 128000）：</p>
+    <div class="code-title">extensions/llama/provider.ts · toPiModel</div>
+    <pre class="code"><code><span class="kw">function</span> <span class="fn">toPiModel</span>(model: LlamaModelInfo, serverUrl: <span class="kw">string</span>): Model&lt;<span class="st">"openai-completions"</span>&gt; {
+  <span class="kw">const</span> reportedContextWindow = model.meta?.n_ctx ?? model.meta?.n_ctx_train;
+  <span class="kw">const</span> contextWindow =
+    reportedContextWindow &amp;&amp; reportedContextWindow &gt; <span class="nu">0</span> ? reportedContextWindow : <span class="nu">128000</span>;
+  <span class="kw">return</span> {
+    id: model.id, name: model.id,
+    api: <span class="st">"openai-completions"</span>,      <span class="cmt">// 就借通用协议族</span>
+    provider: LLAMA_PROVIDER_ID,       <span class="cmt">// "llama.cpp"</span>
+    contextWindow, <span class="kw">...</span>
+  };
+}</code></pre>
+    <p>二是 Provider 的 <code class="inline">stream</code>/<code class="inline">streamSimple</code> <strong>直接复用 pi-ai 的 OpenAI 兼容流</strong>，<code class="inline">refreshModels</code> 里还会先恢复「上次持久化的模型清单」，并从 <code class="inline">catalog</code> 里筛出 <code class="inline">status.value === "loaded"</code>（<strong>真正加载到内存</strong>的）模型作为活跃目录：</p>
+    <div class="code-title">extensions/llama/provider.ts · 活跃模型目录</div>
+    <pre class="code"><code>models = catalog
+  .filter((model) =&gt; model.status.value === <span class="st">"loaded"</span>)   <span class="cmt">// 只暴露已加载的</span>
+  .map((model) =&gt; <span class="fn">toPiModel</span>(model, serverUrl));</code></pre>
+    <div class="callout">
+      <strong>最大的启示：</strong>接入本地模型<strong>没有造任何新机制</strong>——只是把一个本地服务器“伪装”成既有的 OpenAI 兼容 Provider。这正是第 10 章「统一协议抽象」的全部回报：一个新供应商的成本被压到「写一个适配器」。而 <code class="inline">LlamaClient</code> 负责的 list/load/unload/download/SSE watch，才是本地场景特有的「模型管理」逻辑（内存里该驻留哪几个模型、要不要先下载）。你把 <code class="inline">/llama</code> 这套「本地路由 + 按需加载」的思想用到自己 Runtime 的本地模型支持上，能省不少弯路。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.4</span>程序化集成：SDK、RPC 与 JSON 事件流</h2>
+    <p>前面几章讲的是「人跟 Agent 交互」，这一节讲「<strong>你的程序</strong>跟 Agent 交互」——三种由浅入深的嵌入方式。</p>
+
+    <h3>14.4.1 当库用：SDK</h3>
+    <p>第 11 章已见 <code class="inline">createAgentSession</code>——它同时也是程序化嵌入的总入口。你把 pi 当模块 import 进自己的 Node 应用，一次调用拿到一个可 prompt/steer/abort 的 <code class="inline">AgentSession</code>。这正是学 Runtime 的你应该密切关注的那一条「公开 API 面」。</p>
+    <div class="code-title">sdk.ts · 公开导出面</div>
+    <pre class="code"><code><span class="kw">export</span> <span class="kw">async function</span> <span class="fn">createAgentSession</span>(options): <span class="fn">Promise</span>&lt;CreateAgentSessionResult&gt;;
+<span class="cmt">// 连带导出设计要用的类型：模型、工具、模板、技能…</span>
+<span class="kw">export type</span> { PromptTemplate } <span class="kw">from</span> <span class="st">"./prompt-templates.ts"</span>;
+<span class="kw">export type</span> { Skill } <span class="kw">from</span> <span class="st">"./skills.ts"</span>;
+<span class="kw">export type</span> { Tool } <span class="kw">from</span> <span class="st">"./tools/index.ts"</span>;</code></pre>
+    <p>值得注意它把 <code class="inline">PromptTemplate</code>、<code class="inline">Skill</code>、<code class="inline">Tool</code> 这些「可注入素材」的类型也一并导出——嵌入方不仅能拿一个 session，还能复用 pi 的模板/技能/工具体系。这是「SDK 该导什么」的好示范：<strong>不只给运行时，还给素材与约定</strong>。</p>
+
+    <h3>14.4.2 当服务用：RPC over stdin/stdout JSONL</h3>
+    <p>想让外部进程驱动 pi（比如编辑器、CI、你自己的工具），最稳的通道是 <code class="inline">RPC mode</code>——<strong>通过 stdin/stdout 传 JSONL</strong>，每一行一个带 <code class="inline">id</code> 的请求或响应。看协议的命令集合：</p>
+    <div class="code-title">modes/rpc/rpc-types.ts · RpcCommand</div>
+    <pre class="code"><code><span class="kw">export type</span> RpcCommand =
+  | { id?: <span class="kw">string</span>; type: <span class="st">"prompt"</span>; message: <span class="kw">string</span>; streamingBehavior?: <span class="st">"steer"</span> | <span class="st">"followUp"</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"steer"</span>; message: <span class="kw">string</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"follow_up"</span>; message: <span class="kw">string</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"abort"</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"new_session"</span>; parentSession?: <span class="kw">string</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"set_model"</span>; provider: <span class="kw">string</span>; modelId: <span class="kw">string</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"compact"</span>; customInstructions?: <span class="kw">string</span> }
+  | { id?: <span class="kw">string</span>; type: <span class="st">"set_auto_compaction"</span>; enabled: <span class="kw">boolean</span> } <span class="kw">...</span></code></pre>
+    <p>这个命令集合几乎是「把第 8 章 AgentSession 的公开方法正面暴露了一遍」——prompt/steer/follow_up/abort 对应输入管道与队列，new_session/compact/set_model 对应会话与模型管理。它<strong>不是</strong>把内部对象丢给外部，而是精心收敛出一个“可行、可中断、可管理”的最小面。</p>
+    <p>RPC 的传输还匿名复用了第 9 章 §9.6 的 <code class="inline">output-guard</code>——响应要走 stdout，但 stdout 可能正被不知不觉地改动，于是 RPC 模式先 <code class="inline">takeOverStdout</code> 再 <code class="inline">writeRawStdout</code>，保证「协议行」干净、不被 UI 污染。这是把上一章那个「终端秩序」设计，直接复用到协议层的好例子。</p>
+
+    <h3>14.4.3 结构化事件：JSON event stream</h3>
+    <p>介于 print 与 RPC 之间还有 <code class="inline">JSON event stream</code> 模式——把原本打给人看的文本，换成<strong>结构化的 JSON 事件</strong>。它复用第 8 章那套事件语言（agent_start / turn_start / message_update…），让下游程序能按事件流式消费 Agent 的每一步进展，而不必自己去解析人类文本。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t14b d14b">
+        <title id="t14b">三种程序化嵌入方式</title>
+        <desc id="d14b">SDK / RPC / JSON event stream</desc>
+        <defs>
+          <marker id="arrow14b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="80" width="260" height="110" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="160" y="105" font-size="13" fill="#2563eb" text-anchor="middle">SDK（库）</text>
+        <text class="lbl" x="160" y="126" font-size="11" fill="#1f2937" text-anchor="middle">Node 内嵌 · createAgentSession</text>
+        <text class="lbl" x="160" y="144" font-size="11" fill="#1f2937" text-anchor="middle">同进程函数调用</text>
+        <text class="lbl" x="160" y="162" font-size="11" fill="#b45309" text-anchor="middle">最深 · 需嵌进你的代码里</text>
+
+        <rect class="node" x="330" y="80" width="260" height="110" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="460" y="105" font-size="13" fill="#0f7d7a" text-anchor="middle">RPC（服务）</text>
+        <text class="lbl" x="460" y="126" font-size="11" fill="#1f2937" text-anchor="middle">stdin/stdout JSONL</text>
+        <text class="lbl" x="460" y="144" font-size="11" fill="#1f2937" text-anchor="middle">请求/响应 · 稳 · 不依赖 UI</text>
+        <text class="lbl" x="460" y="162" font-size="11" fill="#0f7d7a" text-anchor="middle">跨进程 · 可编程</text>
+
+        <rect class="node" x="630" y="80" width="250" height="110" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="755" y="105" font-size="13" fill="#0f7d7a" text-anchor="middle">JSON event stream</text>
+        <text class="lbl" x="755" y="126" font-size="11" fill="#1f2937" text-anchor="middle">print 模式 + 结构化事件</text>
+        <text class="lbl" x="755" y="144" font-size="11" fill="#1f2937" text-anchor="middle">agent_start/turn_start/…</text>
+        <text class="lbl" x="755" y="162" font-size="11" fill="#0f7d7a" text-anchor="middle">流式消费每一步</text>
+      </svg>
+    </div>
+    <div class="callout">
+      <strong>三者的取舍：</strong>SDK 最「深」但要把 pi 嵌进你的进程；RPC 最「稳、通用」，任何会跑子进程的语言都能驱动；JSON event stream 介于两者，偏「观察」。它们共享同一内核（第 8 章 AgentSession），只是<strong>外壳不同</strong>——这正是第 11 章「同一核心、多种外壳」的再一次印证。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.5</span>这一章收进你的 Runtime 清单</h2>
+    <table class="tbl">
+      <thead><tr><th>能力</th><th>Pi 的做法（源码）</th><th>自制时的次序建议</th></tr></thead>
+      <tbody>
+        <tr><td>项目信任</td><td><code class="inline">trust-manager.ts</code> 三态 + 就近祖先 + 加锁写</td><td>第一层（软边界）</td></tr>
+        <tr><td>工具放行</td><td><code class="inline">beforeToolCall</code> 钩子（第 8 章）</td><td>第一层</td></tr>
+        <tr><td>可中止性</td><td><code class="inline">bash.ts</code> Abort→杀进程树</td><td>第一层</td></tr>
+        <tr><td>强隔离</td><td>Docker / Gondolin / OpenShell 容器化 pi</td><td>后补</td></tr>
+        <tr><td>本地模型</td><td><code class="inline">extensions/llama/</code> 适配成 Provider</td><td>有抽象后顺手接</td></tr>
+        <tr><td>程序化嵌入</td><td>SDK / RPC / JSON event stream</td><td>内核稳定后加外壳</td></tr>
+      </tbody>
+    </table>
+    <p>至此，Pi 的「运行内核 + 安全边界 + 模型生态 + 集成外壳」四块拼图都齐了——这套多层设计，就是你后续持续吸收、贴合自己场景去改造的完整参考系。</p>
+    <div class="arrow-nav">
+      <a class="prev" href="12-build-own-runtime.html">← 上一章 · 自制 Runtime</a>
+      <a class="top" href="index.html">返回首页</a>
+      <a class="next" href="15-comparison-langgraph.html">下一章 · Pi vs LangGraph →</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>

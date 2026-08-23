@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 9 章 · Context Cache — AI Native Context Engine</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#f4e6e4', primaryTextColor: '#1c1b19',
+          primaryBorderColor: '#b4332a', lineColor: '#9a978f', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">AI Native Context Engine<span class="dot">.</span></a>
+      <span class="crumb">第 9 章 · Context Cache</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 9 章 · Context Cache</div>
+      <h1 class="title">缓存的是理解，不是查询</h1>
+      <p class="lede">
+        Agent 经常连着问好几个相关问题，每次的 Context 几乎一样。如果每次都从头检索、扩展、排序、压缩，既慢又烧 Token。Context Cache 解决这个问题——但它缓存的不是数据库查询结果，而是已经理解过的上下文。本章只讨论派生 Context 的复用、失效和一致性。
+      </p>
+
+      <h2 id="positioning">模块定位</h2>
+
+      <p>Context Cache 是 Context Runtime 的加速层。它的职责是缓存可复用的 Context，而不是缓存数据库查询结果。</p>
+
+      <p>目标很直接：降低 Retrieval 成本、降低 LLM Token 消耗、降低响应延迟、提升 Agent 连续推理效率。</p>
+
+      <blockquote class="callout">
+        <p><strong>范围说明：</strong>本章只讨论派生 Context 的复用、失效和一致性。Retrieval Cache、Embedding Cache、Prompt Cache 和模型 KV Cache 不等同于 Context Package Cache——它们缓存的是中间产物，不是最终上下文。</p>
+      </blockquote>
+
+      <h2 id="why">为什么需要 Context Cache</h2>
+
+      <p>传统 RAG 每次都重新算：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  Q["Question"] --> R["Retrieval"] --> RK["Ranking"] --> P["Prompt"]
+  style R fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>传统 RAG：每次全部重新计算。</figcaption>
+      </figure>
+
+      <p>但是 Agent 通常是这样连问的：</p>
+
+      <pre><code>为什么训练慢？
+  ↓
+为什么 GPU 利用率低？
+  ↓
+为什么数据加载慢？</code></pre>
+
+      <p>三次提问，Context 几乎相同——都在围绕同一个实验、同一组 GPU、同一批数据。完全可以复用。如果每次都重新走 Retrieval → Expansion → Ranking → Optimizer，大部分计算是浪费的。</p>
+
+      <p>缓存之所以是生产 agent 成本优化绕不开的一环，是因为学术界和实践报告都把它列为两大基础构件之一——另一个是路由（把简单请求转给更便宜的处理路径）。两者配合，能在匹配表现的前提下把成本压到极低。<span class="src">来源：Li et al., 2026, §7.3 引 FrugalGPT/GPTCache</span></p>
+
+      <h2 id="architecture">整体架构</h2>
+
+      <p>Cache 的位置在 Optimizer 之后、Prompt Builder 之前：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  Q["Query"] --> HR["Hybrid Retrieval"]
+  HR --> GE["Graph Expansion"]
+  GE --> RK["Ranking"]
+  RK --> CO["Context Optimizer"]
+  CO --> CC["Context Cache"]
+  CC --> PB["Prompt Builder"]
+  PB --> LLM["LLM"]
+  style CC fill:#f4e6e4,stroke:#b4332a,stroke-width:2px
+        </div>
+        <figcaption>Cache 在流水线末端。下一次请求优先查 Cache，Cache Miss 再走完整流水线。</figcaption>
+      </figure>
+
+      <p>下一次请求优先查 Cache。Cache Miss 才重新 Retrieval。这个顺序很重要——缓存命中时跳过的是整条流水线，不只是某一步。</p>
+
+      <h2 id="object">Cache 对象：缓存单位是 Package</h2>
+
+      <p>缓存单位不是 Document，不是 SQL，而是 <strong>Context Package</strong>：</p>
+
+      <pre><code>ContextPackage
+├── Objects
+├── Relations
+├── Events
+├── Metrics
+├── Actions
+├── Documents
+└── Metadata</code></pre>
+
+      <p>统一缓存。这是 Context Cache 和传统缓存的根本区别——它缓存的是加工后的、Agent 可直接消费的上下文，而不是任何中间原料。</p>
+
+      <h2 id="key">Cache Key：不要用 Question</h2>
+
+      <p>这是最容易踩的坑。Cache Key 不要用原始 Question，因为"为什么训练慢"和"训练为什么慢"是同一个意图，但文本不同，会 Cache Miss。</p>
+
+      <p>建议用这些维度组合生成 Key：</p>
+
+      <pre><code>Tenant
+Project
+Goal
+Intent
+Seed Object
+Permission
+Model</code></pre>
+
+      <p>例如：</p>
+
+      <pre><code>tenant-a
+experiment-001
+research
+glm-5.2</code></pre>
+
+      <p>用这些生成 Context Key。这样不同措辞的同一意图能命中同一个缓存，而不同权限的用户不会误命中对方的缓存——Permission 进 Key 是安全要求。</p>
+
+      <h2 id="tiers">Cache 层级：三级缓存</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>层级</th><th>存储</th><th>特点</th></tr></thead>
+          <tbody>
+            <tr><td>L1</td><td>Memory</td><td>最快，进程内</td></tr>
+            <tr><td>L2</td><td>Redis</td><td>共享，跨进程</td></tr>
+            <tr><td>L3</td><td>Paimon / Object Storage</td><td>长期保存</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>三级缓存按访问速度和持久性分层。L1 命中延迟最低但进程重启就丢；L2 让多个 Agent 实例共享缓存；L3 用于长期复用。这和第 8 章 Context Store 的分层是配套设计。</p>
+
+      <p>L1 这层有一个被低估的好处：单次执行内共享快照，能同时提升一致性和性能。Palantir Foundry 的 function-backed action 就是这么做的——在一次运行里，所有读请求自动复用同一个 Ontology 快照，保证这次执行内多次查询看到的数据完全一致（不会中途数据变了导致前后矛盾），同时因为复用快照，读性能也跟着提升。本书的 L1 缓存可以借鉴这个"执行粒度共享快照"的机制：一次 Agent 推理内部的多次检索共用一份快照，既省了重复计算，又避免了"前一步查到的对象、后一步被改了"这种隐蔽 bug。<span class="src">来源：Foundry Ontology 文档，Manage published functions</span></p>
+
+      <h2 id="content">Cache 内容：不止 Package</h2>
+
+      <p>除了完整的 Context Package，还可以缓存这些中间产物：</p>
+
+      <h3>Graph Expansion</h3>
+      <p>Expansion 的结果。无需每次重新遍历图——同样的 Seed Object，扩展出来的邻居是一样的。</p>
+      <p>图扩展结果甚至可以持久化到对象身上，下次直接按引用加载。Palantir Foundry 的 Graph Template 就支持这一点：任何一次图探索都能存成模板，还能用一个"覆盖图谱 RID"的选项，从对象的某个属性里读出已保存的图谱 RID 来加载已有图谱，而不是每次重新生成——适合给某个业务对象持久化保存一份专属分析图谱。本书的 Graph Expansion 缓存可以借鉴这个"结果落盘 + 按引用加载"的模式：频繁被访问的种子对象，把扩展结果带个 RID 存进 L3，命中时直接取回整张子图。<span class="src">来源：Foundry Ontology 文档，Vertex / Graph template</span></p>
+
+      <h3>Document Summary</h3>
+      <p>文档摘要。避免重复 Summary——同一份 SOP 的摘要没必要每次用 LLM 重算。这是 Optimizer 的主要成本来源之一。</p>
+
+      <h3>Embedding</h3>
+      <p>Embedding 缓存。避免重复计算向量。</p>
+
+      <h3>Prompt Fragment</h3>
+      <p>固定的 SOP、固定的 Policy、固定的 System Prompt，直接缓存。这些内容每次都一样，没必要重新组装。</p>
+
+      <h2 id="lifecycle">Cache 生命周期</h2>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  C["Create"] --> W["Warm"]
+  W --> H["Hit"]
+  H --> R["Refresh"]
+  R --> E["Expire"]
+  E --> A["Archive"]
+  style H fill:#eef4ee,stroke:#2f6b3a
+  style E fill:#f3f1ea,stroke:#9a978f
+        </div>
+        <figcaption>Cache 生命周期。支持自动更新，不是简单的 TTL 过期。</figcaption>
+      </figure>
+
+      <h2 id="update-strategy">三种更新策略</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>策略</th><th>触发</th><th>适合</th></tr></thead>
+          <tbody>
+            <tr><td>Lazy Update</td><td>读取时更新</td><td>静态知识</td></tr>
+            <tr><td>Active Update</td><td>数据变化主动刷新</td><td>MLflow / Git / Experiment</td></tr>
+            <tr><td>Event Update</td><td>监听 Fluss / Kafka / CDC</td><td>实时数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>三种策略对应不同数据新鲜度要求。静态知识用 Lazy 就够；MLflow 这种变化不频繁但需要准时的用 Active；实时数据必须用 Event Update。</p>
+
+      <h2 id="invalidation">Cache 失效：什么时候必须清</h2>
+
+      <p>缓存最大的风险是脏数据。以下情况必须失效：</p>
+      <ul>
+        <li>数据更新——底层数据变了，缓存作废；</li>
+        <li>权限变化——用户权限变了，缓存的 Context 可能含越权对象；</li>
+        <li>Policy 更新——脱敏规则变了，旧缓存没脱敏；</li>
+        <li>Ontology 更新——对象 Schema 变了，旧缓存格式不对；</li>
+        <li>Prompt 模板更新——模板变了，渲染结果不同。</li>
+      </ul>
+
+      <p>避免脏 Context。这五条里，权限变化最容易被忽略——一个用户刚被撤销了某数据集的权限，但如果缓存还在，他还能通过 Agent 间接看到那个数据集。所以 Permission 进 Cache Key 的同时，权限变化必须主动失效相关缓存。</p>
+
+      <h2 id="share">Cache 共享</h2>
+
+      <p>多个 Agent 共享同一 Context。Research Agent、Coding Agent、FDE Agent 无需重复 Retrieval。这和第 8 章的 Context Share 一致——缓存是共享的物质基础。</p>
+
+      <h2 id="api">Cache API</h2>
+
+      <pre><code>type ContextCache interface {
+    Get()
+    Put()
+    Refresh()
+    Delete()
+    Exists()
+}</code></pre>
+
+      <p>支持插件化。</p>
+
+      <h2 id="metrics">Cache 指标：看省了多少 Token</h2>
+
+      <p>建议监控：Hit Rate、Miss Rate、Refresh Count、Average TTL、Average Context Size、Average Retrieval Latency Saved、Token Saved。</p>
+
+      <p>重点关注的是 <strong>节省了多少 Token</strong>，而不是缓存数量。一个从来不命中的缓存，条数再多也没意义。Token Saved 才是 Cache 的真实价值——它直接对应省下的成本。</p>
+
+      <p>这条原则在模型 KV-cache 层面体现得最极端。一个生产团队经过五轮架构迭代后认定，KV-cache 命中率是"生产级 agent 最重要的单一指标"——因为缓存命中的 token 和未命中的 token 单价相差约 10 倍（以某模型为例，缓存 $0.30/百万 token，未缓存 $3.00/百万 token）。这逼出三条上下文结构的设计硬约束：<strong>前缀必须稳定</strong>（开头差一个 token，其后全部缓存失效）；<strong>上下文当作 append-only</strong>（改写历史动作或观察会破坏复用）；<strong>序列化必须确定</strong>（JSON 键序不稳会静默击穿缓存）。<span class="src">来源：Li et al., 2026, §5.3 引 Manus</span></p>
+
+      <p>换句话说，Context Engine 输出的结构不只是给模型看的，还要对缓存友好——这正是 Optimizer 的 Prompt 组装（第 7 章）和本章的 Cache 设计必须协同的原因。</p>
+
+      <blockquote>
+        <p>重点关注节省了多少 Token，而不是缓存数量。</p>
+      </blockquote>
+
+      <h2 id="mvp">MVP</h2>
+
+      <p>分三个阶段：</p>
+      <ul>
+        <li><strong>第一阶段</strong>：Context Package Cache、Embedding Cache、Summary Cache、L1 Memory、Redis；</li>
+        <li><strong>第二阶段</strong>：Graph Cache、Prompt Cache、Event Refresh；</li>
+        <li><strong>第三阶段</strong>：Predictive Cache、Distributed Cache、Context Sharing。</li>
+      </ul>
+
+      <div class="summary">
+        <h2 id="summary">本章小结</h2>
+        <p>Semantic Context Cache 缓存的不是数据，而是 Agent 已经理解过的企业上下文。真正缓存的是 Context Package，而不是 Document 或 SQL。</p>
+        <blockquote>
+          <p>Agent 已经理解过的企业上下文。</p>
+        </blockquote>
+        <p>模块关系：Hybrid Retrieval 生成 Context，Context Runtime 管理 Context，Context Cache 加速 Context，Prompt Builder 消费 Context。下一章讲怎么让这一切可观测、可调试。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-08-context-runtime.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 8 章 · Context Runtime</span>
+        </a>
+        <a class="next" href="chapter-10-observability.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 10 章 · Context Observability</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

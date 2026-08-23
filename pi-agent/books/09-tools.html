@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 工具层 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 工具层</div>
+    <h1>工具层：Agent 如何「动手」</h1>
+    <div class="subtitle">第 3 章里工具只是循环中的一个色块；这一页把 <code class="inline">AgentTool</code> 的接口契约、<strong>prepare → execute → finalize 三阶段管线</strong>、顺序/并行两种执行模式，以及生产环境真正在用的七个核心工具讲透。工具是你 Agent 的能力边界，也是权限与安全的闸门。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>一个工具长什么样：AgentTool 契约</h2>
+    <p>顶层工具接口在 <code class="inline">packages/agent/src/types.ts</code>。核心只要求两样东西——<strong>schema（给模型看的说明书）</strong>和 <strong>execute（真正动手）</strong>：</p>
+    <div class="code-title">packages/agent/src/types.ts · AgentTool 接口（要点）</div>
+    <pre class="code"><code><span class="kw">export interface</span> AgentTool&lt;TArgs = <span class="kw">any</span>, TResult = <span class="kw">any</span>&gt; {
+  <span class="cmt">// 1. 元数据：名字 + 给模型的 JSON-schema 参数说明</span>
+  name: <span class="kw">string</span>;
+  description: <span class="kw">string</span>;
+  schema: TSchema;              <span class="cmt">// typebox schema，决定模型该传什么参数</span>
+
+  <span class="cmt">// 2. 执行入口：id + 参数 + 中止信号 + 流式更新回调</span>
+  <span class="fn">execute</span>(toolCallId: <span class="kw">string</span>, args: TArgs, signal?: AbortSignal,
+          update?: AgentToolUpdateCallback): <span class="fn">Promise</span>&lt;AgentToolResult&lt;TResult&gt;&gt;;
+
+  <span class="cmt">// 3. 可选增强</span>
+  executionMode?: <span class="st">"sequential"</span> | <span class="st">"parallel"</span>;  <span class="cmt">// 本工具是否强制串行</span>
+  prepareArguments?: (args) =&gt; args;             <span class="cmt">// 执行前改写参数（如补全路径）</span>
+  beforeToolCall?: ...;                           <span class="cmt">// 也可自带闸门（更常用的是全局 config 钩子）</span>
+}</code></pre>
+    <p>这里有几个被低估的设计点，值得逐句拆：</p>
+    <ul>
+      <li><strong><code class="inline">signal</code>（AbortSignal）</strong>：每个工具 execute 都收到中止信号。这打破了「工具一旦跑起来就不能停」的僵局——用户可以 <code class="inline">steer</code> 打断一个正在执行的 Bash。<strong>这是让中断语义（第 8 章）能落到工具层的关键。</strong></li>
+      <li><strong><code class="inline">update</code> 流式回调</strong>：长任务（如 Bash 持续输出）可以边跑边吐 <code class="inline">partialResult</code>，对应 Agent 事件 <code class="inline">tool_execution_update</code>。这样 TUI 能实时渲染进度。</li>
+      <li><strong><code class="inline">executionMode</code> 混搭</strong>：全局可设 <code class="inline">toolExecution</code>，但<strong>单个工具可以自我声明「我必须串行」</strong>——比如「编辑文件」在你预期上有依赖时。（见 9.3）</li>
+      <li><strong><code class="inline">prepareArguments</code></strong>：模型给的参数常是相对路径、带省略号；在真正执行前改写（补全 cwd、展开 ~），让模型侧更轻、执行侧更正确。</li>
+    </ul>
+    <div class="callout">
+      <strong>一句话记忆：</strong>工具的 execute 签名其实是一个「<strong>可中止、可流式、可枚举</strong>」的 IO。你在自制 Runtime 里定义工具时，这三样（signal / update / 参数校验）几乎是开箱就得有的最低配置。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>三阶段管线：prepare → execute → finalize</h2>
+    <p>生产代码把「跑一个工具」拆成三个阶段，跑在 <code class="inline">packages/agent/src/agent-loop.ts</code> 的 <code class="inline">executeToolCalls</code> 里。看管线全景：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t9 d9">
+        <title id="t9">工具调用三阶段管线</title>
+        <desc id="d9">assistant 的 toolCall 经过 prepare / execute / finalize 变成 toolResult</desc>
+        <defs>
+          <marker id="arrow9" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="150" width="150" height="70" rx="8" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="95" y="172" font-size="13" fill="#1f2937" text-anchor="middle">assistant</text>
+        <text class="lbl" x="95" y="190" font-size="12" fill="#1f2937" text-anchor="middle">toolCall</text>
+        <text class="lbl" x="95" y="207" font-size="11" fill="#556674" text-anchor="middle">{name, arguments}</text>
+
+        <rect class="node" x="210" y="60" width="180" height="96" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="300" y="82" font-size="13" fill="#0f7d7a" text-anchor="middle">1 · prepareToolCall</text>
+        <text class="lbl" x="300" y="100" font-size="11" fill="#556674" text-anchor="middle">找工具·prepArgs·校验</text>
+        <text class="lbl" x="300" y="116" font-size="11" fill="#556674" text-anchor="middle">beforeToolCall 钩子（可 block）</text>
+        <text class="lbl" x="300" y="132" font-size="11" fill="#b45309" text-anchor="middle">出错→直接给错误结果(immediate)</text>
+
+        <rect class="node" x="430" y="60" width="180" height="96" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="520" y="82" font-size="13" fill="#0f7d7a" text-anchor="middle">2 · executePrepared</text>
+        <text class="lbl" x="520" y="100" font-size="11" fill="#556674" text-anchor="middle">tool.execute(id,args,signal,update)</text>
+        <text class="lbl" x="520" y="116" font-size="11" fill="#556674" text-anchor="middle">流式 partialResult 事件</text>
+        <text class="lbl" x="520" y="132" font-size="11" fill="#b45309" text-anchor="middle">出错→catch 并打包错误</text>
+
+        <rect class="node" x="650" y="60" width="180" height="96" rx="8" fill="#fff" stroke="#0f7d7a"/>
+        <text class="lbl" x="740" y="82" font-size="13" fill="#0f7d7a" text-anchor="middle">3 · finalize</text>
+        <text class="lbl" x="740" y="100" font-size="11" fill="#556674" text-anchor="middle">afterToolCall 钩子可改写</text>
+        <text class="lbl" x="740" y="116" font-size="11" fill="#556674" text-anchor="middle">result/terminate 收尾</text>
+        <text class="lbl" x="740" y="132" font-size="11" fill="#b45309" text-anchor="middle">→ 包装成 toolResult 消息</text>
+
+        <line x1="170" y1="185" x2="228" y2="140" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
+        <line x1="390" y1="108" x2="428" y2="108" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
+        <line x1="610" y1="108" x2="648" y2="108" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
+
+        <rect class="node" x="650" y="230" width="180" height="70" rx="8" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="740" y="252" font-size="13" fill="#1f2937" text-anchor="middle">toolResult 消息</text>
+        <text class="lbl" x="740" y="270" font-size="11" fill="#556674" text-anchor="middle">回填会话 · 供下一轮模型读</text>
+        <text class="lbl" x="740" y="287" font-size="11" fill="#0f7d7a" text-anchor="middle">terminate 则提前结束 turn</text>
+        <path d="M740 156 v74" fill="none" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow9)"/>
+      </svg>
+    </div>
+    <p>看 <code class="inline">prepareToolCall</code> 里「<strong>出错了也不抛出，而是立刻返回错误结果</strong>」的哲学——错误被当作一条普通的结果走完管线，让模型自己读：</p>
+    <div class="code-title">agent-loop.ts · prepareToolCall（节选）</div>
+    <pre class="code"><code><span class="kw">async function</span> <span class="fn">prepareToolCall</span>(currentContext, assistantMessage, toolCall, config, signal) {
+  <span class="kw">const</span> tool = currentContext.tools?.find((t) =&gt; t.name === toolCall.name);
+  <span class="kw">if</span> (!tool) <span class="kw">return</span> {
+    kind: <span class="st">"immediate"</span>,
+    result: <span class="fn">createErrorToolResult</span>(<span class="st">`Tool ${toolCall.name} not found`</span>),
+    isError: <span class="nu">true</span>,
+  };
+
+  <span class="kw">try</span> {
+    <span class="kw">const</span> preparedToolCall = <span class="fn">prepareToolCallArguments</span>(tool, toolCall);
+    <span class="kw">const</span> validatedArgs = <span class="fn">validateToolArguments</span>(tool, preparedToolCall);
+    <span class="kw">if</span> (config.beforeToolCall) {
+      <span class="kw">const</span> beforeResult = <span class="kw">await</span> config.beforeToolCall(
+        { assistantMessage, toolCall, args: validatedArgs, context: currentContext }, signal);
+      <span class="cmt">// beforeToolCall 钩子可以 block！（这是权限/审校的挂点）</span>
+      <span class="kw">if</span> (beforeResult?.block) {
+        <span class="kw">const</span> result = <span class="fn">createErrorToolResult</span>(beforeResult.reason || <span class="st">"Tool execution was blocked"</span>);
+        <span class="kw">if</span> (beforeResult.<span class="fn">terminate</span> === <span class="nu">true</span>) result.terminate = <span class="nu">true</span>;
+        <span class="kw">return</span> { kind: <span class="st">"immediate"</span>, result, isError: <span class="nu">true</span> };
+      }
+    }
+    <span class="kw">if</span> (signal?.aborted) <span class="kw">return</span> { kind: <span class="st">"immediate"</span>, result: <span class="fn">createErrorToolResult</span>(<span class="st">"Operation aborted"</span>), isError: <span class="nu">true</span> };
+    <span class="kw">return</span> { kind: <span class="st">"prepared"</span>, toolCall, tool, args: validatedArgs };
+  } <span class="kw">catch</span> (error) {
+    <span class="kw">return</span> { kind: <span class="st">"immediate"</span>, result: <span class="fn">createErrorToolResult</span>(<span class="fn">String</span>(error)), isError: <span class="nu">true</span> };
+  }
+}</code></pre>
+    <div class="callout">
+      <strong>两种提前返回值得注意：</strong><code class="inline">kind: "immediate"</code> 表示「根本没真正执行」——工具未找到、参数校验失败、被 hooks block、被中止，全部归为 immediate。而归为 <code class="inline">kind: "prepared"</code> 的才真正走 <code class="inline">execute</code>。这两种结果都统一转成错误消息喂回给模型，<strong>模型从错误里学会不犯第二次</strong>。这是「让 LLM 自己纠错」的机制化表达。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>执行模式：顺序 vs 并行</h2>
+    <p>一个 assistant 消息里可以带<strong>多个</strong> toolCall。怎么跑？<code class="inline">executeToolCalls</code> 的决策很巧妙——<strong>默认看全局配置，但任何单个工具都能「强制串行」</strong>：</p>
+    <div class="code-title">agent-loop.ts · executeToolCalls 决策</div>
+    <pre class="code"><code><span class="kw">async function</span> <span class="fn">executeToolCalls</span>(currentContext, assistantMessage, config, signal, emit) {
+  <span class="kw">const</span> toolCalls = assistantMessage.content.filter((c) =&gt; c.type === <span class="st">"toolCall"</span>);
+  <span class="cmt">// 只要这批里有一个工具自称必须串行，整批就走串行</span>
+  <span class="kw">const</span> hasSequentialToolCall = toolCalls.some(
+    (tc) =&gt; currentContext.tools?.find((t) =&gt; t.name === tc.name)?.executionMode === <span class="st">"sequential"</span>,
+  );
+  <span class="kw">if</span> (config.toolExecution === <span class="st">"sequential"</span> || hasSequentialToolCall) {
+    <span class="kw">return</span> <span class="fn">executeToolCallsSequential</span>(...);
+  }
+  <span class="kw">return</span> <span class="fn">executeToolCallsParallel</span>(...);
+}</code></pre>
+    <p>两种模式的差别，精确定义为三件事：</p>
+    <table class="tbl">
+      <thead><tr><th>维度</th><th>顺序执行</th><th>并行执行</th></tr></thead>
+      <tbody>
+        <tr><td>工具是否同时跑</td><td>逐个 await，一个完成才跑下一个</td><td>所有非 immediate 的工具 <code class="inline">Promise.all</code> 并发</td></tr>
+        <tr><td>中途中止</td><td>每个工具后检查 <code class="inline">signal.aborted</code>，中止就 <code class="inline">break</code></td><td>中止就停止继续收集，已提交的用 <code class="inline">Promise.all</code> 等完</td></tr>
+        <tr><td>结果顺序</td><td>天然按 call 顺序</td><td><code class="inline">Promise.all</code> 仍按原数组顺序归位（不会乱序）</td></tr>
+      </tbody>
+    </table>
+    <p>并行版本把「要真正执行的部分」收集成函数数组，最后统一 <code class="inline">Promise.all</code>：</p>
+    <div class="code-title">agent-loop.ts · executeToolCallsParallel（节选）</div>
+    <pre class="code"><code><span class="cmt">// immediate 的（已直接出结果）直接归位；剩下的包成 async 函数</span>
+finalizedCalls.push(<span class="kw">async</span> () =&gt; {
+  <span class="kw">const</span> executed = <span class="kw">await</span> <span class="fn">executePreparedToolCall</span>(preparation, signal, emit);
+  <span class="kw">const</span> finalized = <span class="kw">await</span> <span class="fn">finalizeExecutedToolCall</span>(currentContext, assistantMessage, preparation, executed, config, signal);
+  <span class="kw">await</span> emitToolExecutionEnd(finalized, emit);
+  <span class="kw">return</span> finalized;
+});
+<span class="cmt">// …最后：</span>
+<span class="kw">const</span> orderedFinalizedCalls = <span class="kw">await</span> Promise.all(finalizedCalls);</code></pre>
+    <p>还有一层批次级的终止语义 <code class="inline">shouldTerminateToolBatch</code>：</p>
+    <div class="code-title">agent-loop.ts · 整批终止</div>
+    <pre class="code"><code><span class="kw">function</span> <span class="fn">shouldTerminateToolBatch</span>(finalizedCalls): <span class="kw">boolean</span> {
+  <span class="cmt">// 批次的「全部工具都要求 terminate」才提前结束本轮 turn</span>
+  <span class="kw">return</span> finalizedCalls.length &gt; <span class="nu">0</span> &amp;&amp;
+    finalizedCalls.<span class="fn">every</span>((f) =&gt; f.result.terminate === <span class="nu">true</span>);
+}</code></pre>
+    <div class="callout">
+      <strong>设计巧思：</strong>必须「<strong>全部</strong>都 terminate」才结束 turn，而不是「有任何一个」。因为工具结果里带 <code class="inline">terminate</code> 通常是「这轮已经完成任务」，但如果同一批里还有个只读查询，仍应让模型读到它的结果再决定。安全与灵活在这里做了妥协——极端保守（全 terminate 才收手）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>生产工具箱：七个核心工具</h2>
+    <p>生产 harness 的工具在 <code class="inline">packages/coding-agent/src/core/tools/</code>。它们不是散装函数，而是统一通过 <code class="inline">createToolDefinition</code> / <code class="inline">createTool</code> 工厂，按需开关（读只读/编码/全部三套）：</p>
+    <div class="code-title">tools/index.ts · 工具清单与分类</div>
+    <pre class="code"><code><span class="kw">export type</span> ToolName = <span class="st">"read"</span> | <span class="st">"bash"</span> | <span class="st">"edit"</span> | <span class="st">"write"</span> | <span class="st">"grep"</span> | <span class="st">"find"</span> | <span class="st">"ls"</span>;
+<span class="kw">export const</span> allToolNames: Set&lt;ToolName&gt; = <span class="kw">new</span> Set([...]);
+
+<span class="cmt">// 只读三件套（read / grep / find / ls）—— 安全无副作用</span>
+<span class="kw">export function</span> <span class="fn">createReadOnlyToolDefinitions</span>(cwd, options) {
+  <span class="kw">return</span> [<span class="fn">createReadToolDefinition</span>(cwd, options?.read),
+           <span class="fn">createGrepToolDefinition</span>(cwd, options?.grep),
+           <span class="fn">createFindToolDefinition</span>(cwd, options?.find),
+           <span class="fn">createLsToolDefinition</span>(cwd, options?.ls)];
+}
+<span class="cmt">// 编码四件套（+ bash / edit / write / read）—— 会改动工作区</span>
+<span class="kw">export function</span> <span class="fn">createCodingToolDefinitions</span>(cwd, options) {
+  <span class="kw">return</span> [<span class="fn">createReadToolDefinition</span>(...), <span class="fn">createBashToolDefinition</span>(...),
+           <span class="fn">createEditToolDefinition</span>(...), <span class="fn">createWriteToolDefinition</span>(...)];
+}</code></pre>
+    <table class="tbl">
+      <thead><tr><th>工具</th><th>动作</th><th>典型返回</th><th>特性</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">read</code></td><td>读文件（多文件可合并请求）</td><td>内容 + 行号，超长截断</td><td>路径白名单校验、大文件截断</td></tr>
+        <tr><td><code class="inline">bash</code></td><td>执行 shell 命令</td><td>stdout/stderr + 退出码</td><td><strong>最高权限</strong>，sudo/危险命令走确认，输出累积/截断</td></tr>
+        <tr><td><code class="inline">edit</code></td><td>精确替换文件片段</td><td>成功/失败 + 该行上下文</td><td>片段唯一性校验、写前 diff、文件变更队列</td></tr>
+        <tr><td><code class="inline">write</code></td><td>整文件写入</td><td>写入确认</td><td>覆盖确认、配合 edit 的队列</td></tr>
+        <tr><td><code class="inline">grep</code></td><td>正则搜索</td><td>匹配行 + 文件名</td><td>忽略二进制、限定扩展名</td></tr>
+        <tr><td><code class="inline">find</code></td><td>按名/模式找文件</td><td>路径列表</td><td>结果截断</td></tr>
+        <tr><td><code class="inline">ls</code></td><td>列目录</td><td>条目 + 类型/大小</td><td>辅助定位</td></tr>
+      </tbody>
+    </table>
+    <p>重点看 <code class="inline">bash</code>——它的 execute 签名里接了 <code class="inline">signal</code>，让「用户 Esc 打断一个跑飞了的命令」在工具层可中止；同时它是唯一能提出终端表示层、真正改变系统状态的工具，所以权限确认最严格。生产 harness 把所有核心工具都挂到 <code class="inline">ToolExecutionMode</code> 与全局 <code class="inline">beforeToolCall/afterToolCall</code> 钩子上（见第 8 章 event bridge），扩展可以给任意工具加权限门。</p>
+    <div class="callout">
+      <strong>安全模型的一句话：</strong>Pi 的工具分「<strong>只读</strong>（read/grep/find/ls）」与「<strong>会改动系统</strong>（bash/edit/write）」。前者几乎无条件放行，后者在 <em>beforeToolCall 钩子</em> 处接受权限确认（bash 尤其）。你自己做 Runtime 时，把<b>副作用强度</b>作为工具分类的第一维，能让权限系统简单一半。
+    </div>
+    <h3>9.4.1 <code class="inline">edit</code> 工具的「容错输入」与 BOM 处理</h3>
+    <p><code class="inline">edit</code> 工具的契约是「一组 <code class="inline">{ oldText, newText }</code> 编辑」，但真实模型并不总按契约来。生产版的 <code class="inline">prepareEditArguments</code> 做了三道容错，本质上是「<strong>宁可猜对也别让一次合法编辑失败</strong>」：</p>
+    <div class="code-title">core/tools/edit.ts · prepareEditArguments 容错分支</div>
+    <pre class="code"><code><span class="cmt">// 1) 有些模型（Opus 4.6、GLM-5.1）把 edits 当 JSON 字符串发，而非数组</span>
+<span class="kw">if</span> (<span class="kw">typeof</span> args.edits === <span class="st">"string"</span>) {
+  <span class="kw">const</span> parsed = <span class="fn">JSON</span>.parse(args.edits);
+  <span class="kw">if</span> (<span class="fn">Array</span>.isArray(parsed))       args.edits = parsed;       <span class="cmt">// 数组：直接用</span>
+  <span class="kw">else if</span> (<span class="fn">isSingleEditInput</span>(parsed)) args.edits = [parsed];     <span class="cmt">// 单对象：包成数组</span>
+<span class="kw">else if</span> (<span class="fn">isSingleEditInput</span>(args.edits)) args.edits = [args.edits]; <span class="cmt">// 对象（非字符串）：同样包成数组</span>
+}</code></pre>
+    <p>注意第三条——有的模型直接发一个 <code class="inline">{ oldText, newText }</code> 对象（不是数组、也不是字符串）。<code class="inline">isSingleEditInput</code> 会把它识别出来并包成单元素数组。三道分支合起来覆盖了「数组 / JSON 字符串里是数组 / JSON 字符串里是对象 / 直接对象」四种乱法。基础层 <code class="inline">agent/src/harness/tools/edit.ts</code> 同步了同样的逻辑——契约层与生产层保持一致。</p>
+    <p>另一个细节是 <strong>BOM（字节顺序标记）</strong>。带 UTF-8 BOM 的文件，匹配前要先剥离 BOM（模型不会在 <code class="inline">oldText</code> 里写那个不可见字符）。Pi 把这个能力从 <code class="inline">edit-diff.ts</code> 里原先的 <code class="inline">stripBom</code> 抽到 <code class="inline">utils/text.ts</code>，重命名为 <code class="inline">splitBom</code>——返回 <code class="inline">{ bom, text }</code>，写回时再把 BOM 拼回去，避免剥离 BOM 后悄悄改了文件编码。</p>
+    <div class="callout">
+      <strong>容错的边界：</strong>这些容错只动「输入形状的归一」，不替模型判断语义（不猜它想改哪行、不放松唯一性校验）。把「模型不守契约」当成常态来设计工具入口，是让 Agent 在真实模型下少崩的关键工程习惯。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>钩子 × 工具的叠加：两处拦截</h2>
+    <p>你可能会疑惑：工具自己可以带 <code class="inline">beforeToolCall</code>（9.1），config 也有全局 <code class="inline">beforeToolCall</code>（9.2），生产 agent-session 里又装了钩子（第 8 章）。它们如何共存？看 agent-loop 的调度，实际上<strong>自定义钩子与内置钩子是同一套 config 字段</strong>，生产 harness 在构造 Agent 时把它们注入：</p>
+    <div class="code-title">agent-session.ts · 安装工具钩子（line ~472）</div>
+    <pre class="code"><code><span class="cmt">// 安装一次工具钩子，复用给每个 Agent run（避免重复安装）</span>
+<span class="fn">this</span>.agent.beforeToolCall = <span class="kw">async</span> ({ toolCall, args }) =&gt; {
+  <span class="cmt">// ① 先给扩展一个 tool_call 拦截机会（可 block）</span>
+  <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.emitToolCall({ type: <span class="st">"tool_call"</span>, toolCall, args });
+  <span class="cmt">// ② 再跑内置权限确认 / bash 确认等</span>
+  ...
+};
+<span class="fn">this</span>.agent.afterToolCall = <span class="kw">async</span> ({ toolCall, args, result, isError }) =&gt; {
+  <span class="cmt">// 给扩展 tool_result 钩子 + 累积 usage / 决定 terminate</span>
+};</code></pre>
+    <p>这一处是实现「扩展能拦工具」与「bash 要确认」共存的钩子。它把「<strong>谁有权放行一个工具</strong>」收敛成一条链：扩展（可 block）→ 内置权限/确认 → 真正 execute。任何一层都能 interrupt。</p>
+    <div class="callout">
+      <strong>架构洞察：</strong>工具本身<strong>不该</strong>关心权限与审校——那是 harness 的职责。工具只做「被允许做的 IO」。分层之后，你能在不动任何工具源码的情况下，给所有工具统一加日志、限流、审校、权限。这就是「<strong>关注点分离</strong>」在 Agent 工具层的最佳示范，也是你第 12 章值得借鉴的。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>终端的秩序：stdout 接管与文件写串行化</h2>
+    <p>9.1–9.5 讲的是「工具怎么定义、怎么被管线驱动」，但有两处工程细节藏在「<strong>多个组件抢同一资源</strong>」时起作用——一个是<strong>抢终端输出</strong>，一个是<strong>抢同一个文件</strong>。它们决定了工具在并发与 TUI 共存时是否还能保持秩序。</p>
+
+    <h3>9.6.1 安全接管 stdout/stderr</h3>
+    <p>TUI 要渲染界面，而 bash 工具会往 stdout 写——两者直接打架会让屏幕花掉。<code class="inline">coding-agent/src/core/output-guard.ts</code> 通过「暂时接管 <code class="inline">process.stdout.write</code>」再"还给"原实现，并维护一条<strong>串行化的 raw 写入链</strong>（<code class="inline">rawStdoutWriteTail</code>），加 10ms 重试防背压：</p>
+    <div class="code-title">output-guard.ts · 接管 stdout</div>
+    <pre class="code"><code><span class="kw">let</span> rawStdoutWriteTail: <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; = <span class="fn">Promise</span>.<span class="fn">resolve</span>();
+<span class="kw">async function</span> <span class="fn">writeRawStdoutChunk</span>(text: <span class="kw">string</span>): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
+  <span class="kw">while</span> (<span class="nu">true</span>) {
+    <span class="kw">try</span> {
+      <span class="kw">await</span> <span class="kw">new</span> <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt;((resolve, reject) =&gt; {
+        <span class="fn">getRawStdoutWrite</span>()(text, (error) =&gt; error ? reject(error) : resolve());
+      });
+      <span class="kw">return</span>;                  <span class="cmt">// 成功即返回</span>
+    } <span class="kw">catch</span> {
+      <span class="kw">await</span> <span class="fn">sleep</span>(RAW_STDOUT_RETRY_DELAY_MS); <span class="cmt">// 10ms 后重试（应对背压）</span>
+    }
+  }
+}</code></pre>
+    <p>它的价值不在「抢」，而在<strong>有序</strong>——所有写终端的内容都汇入同一条串行管道，谁也别想在别人的字符中间插队，从而避免花屏与字符撕裂。</p>
+
+    <h3>9.6.2 按"真实文件"串行化写入</h3>
+    <p>9.4 的工具表里 <code class="inline">edit</code>/<code class="inline">write</code> 那行写着「文件变更队列」，但没展开它最妙的一点：<strong>队列键取自 <code class="inline">realpath</code>，而不是传入的路径字符串</strong>。</p>
+    <div class="code-title">tools/file-mutation-queue.ts · realpath 键 + Promise 链队列</div>
+    <pre class="code"><code><span class="kw">async function</span> <span class="fn">getMutationQueueKey</span>(filePath: <span class="kw">string</span>): <span class="fn">Promise</span>&lt;<span class="kw">string</span>&gt; {
+  <span class="kw">const</span> resolvedPath = <span class="fn">resolve</span>(filePath);
+  <span class="kw">try</span> { <span class="kw">return</span> <span class="kw">await</span> realpath(resolvedPath); }   <span class="cmt">// 同一个真实文件→同一个键</span>
+  <span class="kw">catch</span> (error) {
+    <span class="kw">if</span> (<span class="fn">isMissingPathError</span>(error)) <span class="kw">return</span> resolvedPath; <span class="cmt">// 文件尚不存在，退回绝对路径</span>
+    <span class="kw">throw</span> error;
+  }
+}
+
+<span class="cmt">// 维护每文件一条 Promise 链：前一个写完，才轮到自己</span>
+<span class="kw">const</span> currentQueue = fileMutationQueues.<span class="fn">get</span>(key) ?? <span class="fn">Promise</span>.<span class="fn">resolve</span>();
+<span class="kw">let</span> releaseNext!: () =&gt; <span class="kw">void</span>;
+<span class="kw">const</span> nextQueue = <span class="kw">new</span> <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt;((r) =&gt; { releaseNext = r; });
+<span class="kw">const</span> chainedQueue = currentQueue.<span class="fn">then</span>(() =&gt; nextQueue);
+fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
+<span class="kw">await</span> currentQueue;   <span class="cmt">// 等前面的写完成</span>
+<span class="kw">try</span> { <span class="kw">return</span> <span class="kw">await</span> fn(); } <span class="kw">finally</span> { releaseNext(); ... }</code></pre>
+    <p>用 <code class="inline">realpath</code> 的妙处：对「同一个物理文件」的并发编辑——哪怕一个用 <code class="inline">./src/a.ts</code>、一个用 <code class="inline">/abs/src/a.ts</code>、一个经过符号链接——都会被归到同一把「锁」串行执行；而<strong>不同文件仍并发</strong>，不拖慢整体。Promise 链 + <code class="inline">releaseNext</code> 是一个极简、无外部依赖的「异步互斥锁」。</p>
+    <div class="callout">
+      <strong>共通教训：</strong>两处都是「<strong>并发下的秩序治理</strong>」。shared 资源的竞争（终端、文件）若放任不管，系统偶尔就出“灵异”bug。Pi 的做法可移植性极强——<code class="inline">realpath</code> 归并 + Promise 链互斥，是你在自制 Runtime 里给任何外部状态（文件、日志、UI）加串行化时可直接复用的模板。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>工具层小结</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t9b d9b">
+        <title id="t9b">工具层心智模型</title>
+        <desc id="d9b">三层：契约 / 管线 / 生产工具</desc>
+        <defs>
+          <marker id="arrow9b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="70" width="250" height="90" rx="10" fill="#eef4fb" stroke="#2563eb"/>
+        <text class="lbl" x="155" y="95" font-size="14" fill="#2563eb" text-anchor="middle">契约（AgentTool）</text>
+        <text class="lbl" x="155" y="115" font-size="12" fill="#1f2937" text-anchor="middle">schema + execute(signal, update)</text>
+        <text class="lbl" x="155" y="132" font-size="12" fill="#1f2937" text-anchor="middle">executionMode · prepareArguments</text>
+
+        <rect class="node" x="340" y="70" width="250" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="465" y="95" font-size="14" fill="#0f7d7a" text-anchor="middle">管线（agent-loop）</text>
+        <text class="lbl" x="465" y="115" font-size="12" fill="#1f2937" text-anchor="middle">prepare → execute → finalize</text>
+        <text class="lbl" x="465" y="132" font-size="12" fill="#1f2937" text-anchor="middle">顺序/并行 · terminate · 钩子</text>
+
+        <rect class="node" x="650" y="70" width="220" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
+        <text class="lbl" x="760" y="95" font-size="14" fill="#0f7d7a" text-anchor="middle">生产工具（coding-agent）</text>
+        <text class="lbl" x="760" y="115" font-size="12" fill="#1f2937" text-anchor="middle">只读: read/grep/find/ls</text>
+        <text class="lbl" x="760" y="132" font-size="12" fill="#1f2937" text-anchor="middle">改动: bash/edit/write</text>
+
+        <line x1="280" y1="115" x2="338" y2="115" stroke="#556674" stroke-width="2" marker-end="url(#arrow9b)"/>
+        <line x1="590" y1="115" x2="648" y2="115" stroke="#556674" stroke-width="2" marker-end="url(#arrow9b)"/>
+      </svg>
+    </div>
+    <div class="arrow-nav">
+      <a class="prev" href="08-agent-session.html">← 上一章 · 生产 Harness</a>
+      <a class="next" href="10-ai-layer.html">下一章 · AI 层 →</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>

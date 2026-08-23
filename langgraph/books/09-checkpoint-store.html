@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 持久化记忆 — LangGraph 学习站</title>
+<link rel="stylesheet" href="assets/lg-learn.css">
+<script src="assets/anim.js" defer></script>
+<script src="assets/scenes.js" defer></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>LangGraph 学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-core-concepts.html">核心概念</a>
+      <a href="02-first-graph.html">第一个图</a>
+      <a href="03-state-reducers.html">状态·Reducer</a>
+      <a href="04-control-flow.html">控制流</a>
+      <a href="05-react-agent.html">ReAct Agent</a>
+      <a href="06-human-in-the-loop.html">人机协同</a>
+      <a href="09-checkpoint-store.html" style="color:var(--brand);font-weight:600">持久化</a>
+      <a href="07-multi-agent.html">多智能体</a>
+      <a href="08-patterns.html">经典模式</a>
+      <a href="11-streaming.html">流式输出</a>
+      <a href="10-agent-selector.html">选型指南</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 持久化记忆</div>
+    <h1>持久化记忆:Checkpointer 与 Store</h1>
+    <div class="subtitle">LangGraph 用两层记忆模型分别解决"单次对话"和"跨会话长期记忆"——Checkpointer 按 thread_id 存状态快照,Store 按 namespace + key 存共享数据,理解它们的边界是自建生产级 Agent 的关键一步。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>两层记忆:为什么不是一个笼统的"记忆"</h2>
+    <p>一个 Agent 跑起来之后,最常被问到的两个工程问题是:"它能记住我上句话吗?"和"它能记住我是谁吗?"。听起来都像"记忆",但这两件事的<strong>作用域</strong>完全不同:前者属于<strong>一次会话内部</strong>的上下文累积,后者属于<strong>跨多次会话</strong>的用户档案。LangGraph 没有把它们塞进一个笼统的"记忆"概念里,而是拆成了两个正交的抽象——<code class="inline">Checkpointer</code>(短期 / 会话记忆)和 <code class="inline">Store</code>(长期 / 跨会话记忆)。这种分离本身就是一种设计取舍,我们在选型时也应该照着这个边界去划分自己的数据。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t91 d91">
+        <title id="t91">两层记忆模型</title>
+        <desc id="d91">Checkpointer 按 thread_id 分桶,Store 全局命名空间</desc>
+        <defs><marker id="arr91" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <rect class="node core" x="20" y="20" width="380" height="220" rx="10"></rect>
+        <text class="lbl" x="210" y="44" text-anchor="middle" font-weight="bold" fill="var(--brand)">Checkpointer(短期记忆)</text>
+        <rect class="node" x="50" y="70" width="150" height="60" rx="8"></rect>
+        <text class="lbl" x="125" y="95" text-anchor="middle">thread_id = A</text>
+        <text class="lbl sm" x="125" y="112" text-anchor="middle">每步存快照</text>
+        <rect class="node" x="230" y="70" width="150" height="60" rx="8"></rect>
+        <text class="lbl" x="305" y="95" text-anchor="middle">thread_id = B</text>
+        <text class="lbl sm" x="305" y="112" text-anchor="middle">互不可见</text>
+        <line class="st" x1="200" y1="100" x2="230" y2="100" stroke-dasharray="4 3"></line>
+        <text class="lbl sm" x="210" y="160" text-anchor="middle" fill="var(--fg-muted)">按 thread_id 分桶,各自独立的状态链</text>
+
+        <rect class="node acc" x="460" y="20" width="380" height="220" rx="10"></rect>
+        <text class="lbl" x="650" y="44" text-anchor="middle" font-weight="bold" fill="var(--accent)">Store(长期记忆)</text>
+        <rect class="node" x="490" y="70" width="320" height="70" rx="8"></rect>
+        <text class="lbl" x="650" y="95" text-anchor="middle">namespace: ('user','123')</text>
+        <text class="lbl sm code" x="650" y="115" text-anchor="middle">key='prefs' → {theme: dark}</text>
+        <text class="lbl sm" x="650" y="170" text-anchor="middle" fill="var(--fg-muted)">全局命名空间键值库</text>
+        <text class="lbl sm" x="650" y="190" text-anchor="middle" fill="var(--fg-muted)">任何 thread 都能读写同一份数据</text>
+
+        <line class="edge" x1="125" y1="130" x2="490" y2="95" marker-end="url(#arr91)"></line>
+        <line class="edge" x1="305" y1="130" x2="490" y2="100" marker-end="url(#arr91)"></line>
+        <text class="lbl sm code" x="360" y="115">put / get</text>
+      </svg>
+      <div class="fig-cap">图 9.1:Checkpointer 按 <code class="inline">thread_id</code> 分桶,每个 thread 是一条独立状态链;Store 是全局命名空间键值库,任何 thread 都能按 <code class="inline">(namespace, key)</code> 读写同一份数据。</div>
+    </div>
+    <p>上图是核心区分:<strong>Checkpointer 按 <code class="inline">thread_id</code> 分桶,每个 thread 是一条独立的状态链</strong>,彼此完全隔离;而 <strong>Store 是一个全局的命名空间键值库</strong>,任何 thread、任何节点都能按 <code class="inline">(namespace, key)</code> 读写同一份数据。一个管"这次会话走到哪了",一个管"这个用户是谁、喜欢什么"。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>Checkpointer:短期 / 会话记忆</h2>
+    <p>Checkpointer 的职责是:在图执行的<strong>每个 superstep 之后</strong>,把当前完整状态(channel 值、版本、pending writes)做一次快照,按 <code class="inline">thread_id</code> 存起来。它是在 <code class="inline">compile(checkpointer=...)</code> 时挂上去的,挂上之后你必须在 <code class="inline">invoke</code> 时传入 <code class="inline">thread_id</code>——否则它不知道把快照存到哪个桶里。</p>
+
+    <div class="code-title">thread_id = 会话的身份证</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> <span class="cl">InMemorySaver</span>   <span class="cmt"># 仅用于测试/开发</span>
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+
+<span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
+    messages: Annotated[<span class="cl">list</span>, add_messages]   <span class="cmt"># add_messages: 追加而非覆盖</span>
+
+<span class="kw">def</span> <span class="fn">chatbot</span>(state: <span class="cl">State</span>) -> <span class="cl">State</span>:
+    <span class="cmt"># 这里简化为回显;真实场景里会调 LLM</span>
+    last = state[<span class="st">"messages"</span>][-<span class="nu">1</span>].content
+    <span class="kw">return</span> {<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: <span class="st">f"你说的是: {last}"</span>}]}
+
+builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>)
+builder.add_node(<span class="st">"chatbot"</span>, chatbot)
+builder.add_edge(START, <span class="st">"chatbot"</span>)
+builder.add_edge(<span class="st">"chatbot"</span>, END)
+
+<span class="cmt"># 启用 checkpointer: 之后每次 invoke 都要带 thread_id</span>
+graph = builder.compile(checkpointer=<span class="cl">InMemorySaver</span>())
+
+config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"thread-1"</span>}}
+
+<span class="cmt"># 第一轮: 用户说话 -> 存入 thread-1 的状态链</span>
+graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"你好"</span>}]}, config)
+
+<span class="cmt"># 第二轮: 同一个 thread_id, 框架自动加载上一轮的状态(含历史消息)</span>
+graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"我刚才说了什么?"</span>}]}, config)
+
+<span class="cmt"># 换一个 thread_id = 全新会话, 看不到 thread-1 的历史</span>
+new_config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"thread-2"</span>}}
+state2 = graph.get_state(new_config)
+print(state2.values)   <span class="cmt"># -> {}  (空状态, 新会话从零开始)</span></pre>
+    <div class="annotation"><b>读懂这段:</b> <code class="inline">thread_id</code> 的本质就是"会话"的身份证。同一个 <code class="inline">thread_id</code> 多次 <code class="inline">invoke</code>,状态(这里是消息列表)会在 reducer(<code class="inline">add_messages</code>)作用下不断累积——这就是"多轮对话记忆"的全部秘密,没有魔法,就是"按 key 存取 + 每次加载"。换了 <code class="inline">thread_id</code>,就是开了一个全新会话,对之前的对话一无所知。</div>
+
+    <p>那么该选哪种 Checkpointer 实现?本代码库提供了三种,对应不同部署阶段:</p>
+    <ul>
+      <li><strong><code class="inline">InMemorySaver</code></strong>(<code class="inline">langgraph.checkpoint.memory</code>):数据存在进程内存,进程退出即丢。源码 docstring 写着"Only use for debugging or testing purposes"。<strong>仅用于测试/开发</strong>。</li>
+      <li><strong><code class="inline">SqliteSaver</code></strong>(<code class="inline">langgraph.checkpoint.sqlite</code>,本仓库 <code class="inline">libs/checkpoint-sqlite</code>):落本地文件,单机、轻量,适合 Demo。注意它"does not scale to multiple threads",要并发请用 <code class="inline">AsyncSqliteSaver</code> 或上 Postgres。</li>
+      <li><strong><code class="inline">PostgresSaver</code> / <code class="inline">AsyncPostgresSaver</code></strong>(<code class="inline">langgraph.checkpoint.postgres</code>,本仓库 <code class="inline">libs/checkpoint-postgres</code>):生产推荐,支持并发连接池与 pipeline。<strong>需要单独安装</strong>。</li>
+    </ul>
+
+    <div class="code-title">三种 Checkpointer 实现</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># SqliteSaver: 本地文件, 适合单机 Demo</span>
+<span class="kw">import</span> sqlite3
+<span class="kw">from</span> langgraph.checkpoint.sqlite <span class="kw">import</span> <span class="cl">SqliteSaver</span>
+
+<span class="cmt"># 方式一: 自己管理连接(check_same_thread=False 是必须的)</span>
+conn = sqlite3.connect(<span class="st">"checkpoints.sqlite"</span>, check_same_thread=<span class="kw">False</span>)
+checkpointer = <span class="cl">SqliteSaver</span>(conn)
+
+<span class="cmt"># 方式二: 用上下文管理器, 自动开关连接</span>
+<span class="kw">with</span> <span class="cl">SqliteSaver</span>.from_conn_string(<span class="st">"checkpoints.sqlite"</span>) <span class="kw">as</span> checkpointer:
+    graph = builder.compile(checkpointer=checkpointer)
+    <span class="cmt"># ... invoke ...</span>
+
+<span class="cmt"># PostgresSaver: 生产环境(需先 pip install langgraph-checkpoint-postgres)</span>
+<span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> <span class="cl">PostgresSaver</span>
+
+DB_URI = <span class="st">"postgresql://postgres:postgres@localhost:5432/langgraph?sslmode=disable"</span>
+<span class="kw">with</span> <span class="cl">PostgresSaver</span>.from_conn_string(DB_URI) <span class="kw">as</span> checkpointer:
+    checkpointer.setup()   <span class="cmt"># 首次使用必须调用: 建表 + 跑迁移</span>
+    graph = builder.compile(checkpointer=checkpointer)
+    <span class="cmt"># ... invoke ...</span></pre>
+    <div class="callout warn">
+      <b class="tag">PostgresSaver.setup() 不能忘</b>
+      看源码,<code class="inline">PostgresSaver.setup()</code> 会创建 <code class="inline">checkpoints</code>、<code class="inline">writes</code> 等表并执行版本迁移,它的 docstring 明确写着"MUST be called directly by the user the first time checkpointer is used"。而 <code class="inline">SqliteSaver.setup()</code> 是在被调用时自动触发的——这是两个实现的一个细节差异,部署时容易踩坑。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>Store:长期 / 跨会话记忆</h2>
+    <p>Checkpointer 的作用域是<strong>单个 thread</strong>——它天生看不到别的 thread。但很多场景需要跨 thread 共享数据:用户偏好、长期档案、知识库片段。这些数据不该塞进某个会话的状态里(否则换会话就丢了),于是有了 <code class="inline">Store</code>。Store 是一个<strong>全局命名空间键值库</strong>,在 <code class="inline">compile(store=...)</code> 时挂上,节点里通过注入的 <code class="inline">store</code> 参数按 <code class="inline">(namespace_tuple, key)</code> 存取。</p>
+    <p>关键在于 <code class="inline">namespace</code> 是一个<strong>元组</strong>,能天然表达层级,比如 <code class="inline">("user", user_id)</code>。这样"记住用户偏好"就变成:在节点里 <code class="inline">store.put(("user", user_id), "prefs", {...})</code>,之后<strong>哪怕换了 thread_id</strong>,只要拿到同一个 <code class="inline">user_id</code> 就能 <code class="inline">store.get(("user", user_id), "prefs")</code> 取出来——真正实现了"跨会话记忆"。</p>
+
+    <div class="code-title">Store 实现跨会话用户偏好</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langchain_core.runnables <span class="kw">import</span> <span class="cl">RunnableConfig</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> <span class="cl">InMemorySaver</span>
+<span class="kw">from</span> langgraph.store.memory <span class="kw">import</span> <span class="cl">InMemoryStore</span>
+<span class="kw">from</span> langgraph.store.base <span class="kw">import</span> <span class="cl">BaseStore</span>
+<span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
+
+<span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
+    user_id: <span class="cl">str</span>
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    response: <span class="cl">str</span>
+
+<span class="kw">def</span> <span class="fn">assistant</span>(state: <span class="cl">State</span>, config: <span class="cl">RunnableConfig</span>, store: <span class="cl">BaseStore</span>) -> <span class="cl">State</span>:
+    user_id = state[<span class="st">"user_id"</span>]
+    <span class="cmt"># 1. 从 Store 读这个用户的长期偏好(跨会话!)</span>
+    item = store.get((<span class="st">"user"</span>, user_id), <span class="st">"prefs"</span>)
+    prefs = item.value <span class="kw">if</span> item <span class="kw">else</span> {<span class="st">"lang"</span>: <span class="st">"zh"</span>}
+
+    <span class="cmt"># 2. 基于偏好生成回复(这里简化)</span>
+    last = state[<span class="st">"messages"</span>][-<span class="nu">1</span>][<span class="st">"content"</span>]
+    reply = <span class="st">f"[偏好 {prefs}] 收到: {last}"</span>
+
+    <span class="cmt"># 3. 把本次学到的偏好写回 Store —— 下次别的 thread 还能读到</span>
+    store.put((<span class="st">"user"</span>, user_id), <span class="st">"prefs"</span>, {<span class="st">"lang"</span>: <span class="st">"zh"</span>, <span class="st">"theme"</span>: <span class="st">"dark"</span>})
+
+    <span class="kw">return</span> {<span class="st">"response"</span>: reply}
+
+builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>)
+builder.add_node(<span class="st">"assistant"</span>, assistant)
+builder.add_edge(START, <span class="st">"assistant"</span>)
+builder.add_edge(<span class="st">"assistant"</span>, END)
+
+<span class="cmt"># 同时挂 checkpointer(短期) + store(长期): 两层记忆各司其职</span>
+graph = builder.compile(
+    checkpointer=<span class="cl">InMemorySaver</span>(),
+    store=<span class="cl">InMemoryStore</span>(),   <span class="cmt"># 生产可换 PostgresStore</span>
+)
+
+<span class="cmt"># 会话 1: thread-1, 写入偏好</span>
+cfg1 = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"thread-1"</span>}}
+graph.invoke(
+    {<span class="st">"user_id"</span>: <span class="st">"u-42"</span>, <span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"我喜欢深色主题"</span>}]},
+    cfg1,
+)
+
+<span class="cmt"># 会话 2: 换了 thread_id, 但同一个 user_id —— Store 里的偏好还在!</span>
+cfg2 = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"thread-2"</span>}}
+result = graph.invoke(
+    {<span class="st">"user_id"</span>: <span class="st">"u-42"</span>, <span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"你好"</span>}]},
+    cfg2,
+)
+<span class="cmt"># result["response"] 里会带上刚才写入的 {lang: zh, theme: dark}</span></pre>
+    <div class="annotation"><b>读懂这段:</b> 节点签名 <code class="inline">def assistant(state, config, store: BaseStore)</code>——LangGraph 会<strong>按参数名注入</strong>已挂载的 <code class="inline">store</code>。这一点在本仓库的节点协议 <code class="inline">langgraph/graph/_node.py</code> 里有明确定义:<code class="inline">store: BaseStore</code> 是可注入的形参。除了 <code class="inline">store</code>,还可以注入 <code class="inline">config</code>、<code class="inline">writer: StreamWriter</code>,或通过 <code class="inline">runtime: Runtime</code> 拿到 <code class="inline">runtime.store</code>。</div>
+
+    <div class="callout info">
+      <b class="tag">为什么 Store 用 namespace 元组</b>
+      看 <code class="inline">InMemoryStore</code> 的实现,内部数据结构是 <code class="inline">dict[tuple[str,...], dict[str, Item]]</code>——按 namespace 分桶、桶内按 key 取值。元组天然是层级路径,既能做精确存取 <code class="inline">("user","42")</code>,也能用 <code class="inline">search(("user",))</code> 按前缀批量检索某用户下的所有条目。这比扁平的字符串 key 表达力强得多,也和 Postgres 的 JSONB 前缀匹配语义对齐,从内存实现平滑迁移到数据库几乎不用改业务代码。
+    </div>
+
+    <h3 class="subhead">Store 的语义检索:不止是键值,还能向量搜索</h3>
+    <p>上面演示的 <code class="inline">get/put</code> 是精确存取,但 Store 还有一项更强的能力:<strong>语义搜索</strong>。源码里 <code class="inline">BaseStore</code>(在 <code class="inline">libs/checkpoint/langgraph/store/base/__init__.py</code>)的 <code class="inline">search</code> 方法支持 <code class="inline">query</code> 参数——传入一段自然语言,它会按向量相似度返回匹配的条目。这让 Store 能直接当"长期记忆库 / RAG 知识库"用,不用再外挂一个向量库。</p>
+    <p>要开启语义搜索,创建 Store 时传 <code class="inline">index</code> 配置(见 <code class="inline">InMemoryStore</code> 实现):</p>
+
+    <div class="code-title">Store 语义搜索:把长期记忆变成可检索的知识库</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.store.memory <span class="kw">import</span> <span class="cl">InMemoryStore</span>
+
+store = <span class="cl">InMemoryStore</span>(
+    index={
+        <span class="st">"dims"</span>: <span class="nu">1536</span>,                 <span class="cmt"># 向量维度,要对齐你用的 embedding 模型</span>
+        <span class="st">"embed"</span>: my_embed_fn,         <span class="cmt"># 把文本转向量的函数</span>
+        <span class="st">"fields"</span>: [<span class="st">"text"</span>],           <span class="cmt"># 对 value 里的哪些字段建索引</span>
+    },
+)
+
+<span class="cmt"># 存入若干条记忆(每个 item 的 value 含被索引的 "text" 字段)</span>
+store.put((<span class="st">"memories"</span>, <span class="st">"u-42"</span>), <span class="st">"m1"</span>, {<span class="st">"text"</span>: <span class="st">"用户在研究 LangGraph 的流式输出"</span>})
+store.put((<span class="st">"memories"</span>, <span class="st">"u-42"</span>), <span class="st">"m2"</span>, {<span class="st">"text"</span>: <span class="st">"用户偏好简洁的代码示例"</span>})
+
+<span class="cmt"># 语义检索:用自然语言 query,按相似度返回</span>
+results = store.search(
+    (<span class="st">"memories"</span>, <span class="st">"u-42"</span>),
+    query=<span class="st">"这家伙最近在折腾什么"</span>,   <span class="cmt"># 自然语言,非精确 key</span>
+    limit=<span class="nu">3</span>,
+)
+<span class="cmt"># results 按相似度排序,最相关的在前;m1 会排前面</span></pre>
+    <div class="annotation"><b>读懂这段:</b> <code class="inline">index</code> 配置三要素:<code class="inline">dims</code>(向量维度)、<code class="inline">embed</code>(embedding 函数)、<code class="inline">fields</code>(对 value 的哪些字段建向量索引)。<code class="inline">search</code> 的 <code class="inline">query</code> 参数一旦传入,就走语义相似度排序;不传则退化为按 namespace 前缀的普通检索。这套机制让 Store 既能做精确 KV(<code class="inline">get/put</code>),又能做模糊语义检索(<code class="inline">search(query=)</code>),是 LangGraph 把"长期记忆"和"检索增强"合并到一处的关键设计。注意 Store 的实现都在 <code class="inline">libs/checkpoint</code>(和 checkpointer 同库),内存版用于开发,生产可换 Postgres 版。</div>
+
+    <h3 class="subhead">Runtime:Store 与上下文的统一注入</h3>
+    <p>前面节点都是靠形参 <code class="inline">store: BaseStore</code> 单独注入 Store。除了这种"逐个注入",LangGraph 还提供一个<strong>统一容器</strong> <code class="inline">Runtime</code>(源码 <code class="inline">langgraph/runtime.py:125</code>):<code class="inline">Runtime[ContextT]</code> 同时持有 <code class="inline">.store</code> 和 <code class="inline">.context</code>。节点声明形参 <code class="inline">runtime: Runtime</code> 就能一次性拿到这两个对象。</p>
+
+    <div class="code-title">Runtime:Store + 上下文一起注入</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.runtime <span class="kw">import</span> <span class="cl">Runtime</span>
+
+<span class="cmt"># 用 context_schema 声明图的上下文类型(替代已弃用的 config_schema)</span>
+<span class="kw">class</span> <span class="cl">MyContext</span>(<span class="cl">TypedDict</span>):
+    user_id: <span class="cl">str</span>
+    tenant: <span class="cl">str</span>
+
+builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>, context_schema=<span class="cl">MyContext</span>)
+
+<span class="kw">def</span> <span class="fn">node</span>(state: <span class="cl">State</span>, runtime: <span class="cl">Runtime</span>[<span class="cl">MyContext</span>]):
+    store = runtime.store          <span class="cmt"># 挂载的 Store</span>
+    ctx = runtime.context          <span class="cmt"># 上下文(user_id, tenant 等)</span>
+    item = store.get((<span class="st">"user"</span>, ctx[<span class="st">"user_id"</span>]), <span class="st">"prefs"</span>)
+    ...</pre>
+    <div class="callout info">
+      <b class="tag">context_schema 与 config_schema</b>
+      源码 <code class="inline">langgraph/graph/state.py:212</code> 里 <code class="inline">StateGraph</code> 支持 <code class="inline">context_schema</code> 参数,用于声明"运行时上下文"的类型。<strong>旧的 <code class="inline">config_schema</code> 已被弃用</strong>,新代码用 <code class="inline">context_schema</code>。区分: <code class="inline">config</code>(<code class="inline">RunnableConfig</code>)仍用于传可变调用参数(如 <code class="inline">thread_id</code>、模型温度);<code class="inline">context</code> 用于传相对稳定的运行时上下文(如当前用户、租户、权限)。两者都可通过 <code class="inline">Runtime</code> 拿到,而 <code class="inline">store</code> 也归 <code class="inline">Runtime</code> 管——这是 LangGraph 把"运行时依赖"收敛到单一入口的设计。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>Checkpointer vs Store:一张表说清边界</h2>
+    <table class="tbl">
+      <tr><th>维度</th><th>Checkpointer(短期记忆)</th><th>Store(长期记忆)</th></tr>
+      <tr><td><strong>作用域</strong></td><td>单个 <code class="inline">thread_id</code> 内</td><td>跨所有 thread / 全局</td></tr>
+      <tr><td><strong>主键</strong></td><td><code class="inline">thread_id</code>(+ checkpoint_id)</td><td><code class="inline">(namespace_tuple, key)</code></td></tr>
+      <tr><td><strong>存的内容</strong></td><td>图的完整状态快照(channel 值 + 版本 + writes)</td><td>任意 JSON 可序列化字典</td></tr>
+      <tr><td><strong>写入时机</strong></td><td>框架自动:每个 superstep 后</td><td>节点里显式 <code class="inline">store.put(...)</code></td></tr>
+      <tr><td><strong>读取方式</strong></td><td>按 <code class="inline">thread_id</code> 自动加载为初始状态</td><td>节点里显式 <code class="inline">store.get/search(...)</code></td></tr>
+      <tr><td><strong>典型用途</strong></td><td>多轮对话历史、HITL 暂停/恢复、回放重试</td><td>用户档案、长期偏好、知识库、共享数据</td></tr>
+      <tr><td><strong>启用方式</strong></td><td><code class="inline">compile(checkpointer=...)</code></td><td><code class="inline">compile(store=...)</code></td></tr>
+      <tr><td><strong>生产实现</strong></td><td><code class="inline">PostgresSaver</code> / <code class="inline">SqliteSaver</code></td><td><code class="inline">PostgresStore</code> / <code class="inline">InMemoryStore</code></td></tr>
+    </table>
+    <p>一个常见的误区是"用 Store 来存对话历史"。这通常不是好主意:对话历史是<strong>带时序、与图执行强绑定</strong>的状态,Checkpointer 已经在每个 superstep 自动快照了它(配合 <code class="inline">add_messages</code> reducer),再用 Store 手动存一遍既重复又容易和图状态不一致。反过来,用户偏好这种<strong>与单次会话无关、需要跨会话共享</strong>的数据,也不该塞进某个 thread 的状态里——会话一换就丢了。按作用域选对抽象,是这章最该带走的一条判断准则。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>Checkpoint 的能力:不止于"记住"</h2>
+    <p>Checkpointer 的价值远不止"让对话有记忆"。因为每一步都存了完整快照,它顺带解锁了三个生产级能力:</p>
+    <h3>暂停 / 恢复(人机协同 HITL)</h3>
+    <p>这是 Checkpointer 存在的<strong>首要理由之一</strong>。当节点调用 <code class="inline">interrupt()</code> 时,框架把当前状态存入 checkpoint 后暂停执行,把控制权交回调用方;等你拿到人的输入后,用 <code class="inline">Command(resume=...)</code> 再次 <code class="inline">invoke</code>,框架从 checkpoint 加载状态、注入 resume 值、继续往下走。没有 Checkpointer,interrupt 之后进程就没了,resume 根本无从谈起——这正是第 06 章讲 HITL 的前提。</p>
+    <h3>时间旅行:从历史 checkpoint 重放</h3>
+    <p>因为同一个 thread 下存的是一串带 <code class="inline">checkpoint_id</code> 的历史快照,你可以用 <code class="inline">get_state_history(config)</code> 拿到这条时间线,然后挑任意一个历史点作为起点重新跑——就像"存档读档"。</p>
+    <div class="code-title">时间旅行:历史快照重放</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> <span class="cl">InMemorySaver</span>
+
+graph = builder.compile(checkpointer=<span class="cl">InMemorySaver</span>())
+config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"demo"</span>}}
+
+<span class="cmt"># 跑几步, 每步都会产生一个 checkpoint</span>
+graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"第一步"</span>}]}, config)
+graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"第二步"</span>}]}, config)
+
+<span class="cmt"># get_state_history: 拿到这条 thread 的历史快照列表(从新到旧)</span>
+history = <span class="cl">list</span>(graph.get_state_history(config))
+print(<span class="st">f"共 {len(history)} 个快照"</span>)
+<span class="kw">for</span> snap <span class="kw">in</span> history:
+    <span class="cmt"># StateSnapshot: values / next / config / metadata / created_at / parent_config</span>
+    print(snap.config[<span class="st">"configurable"</span>][<span class="st">"checkpoint_id"</span>], snap.metadata)
+
+<span class="cmt"># 时间旅行: 选一个历史快照, 用它的 config 作为新起点重新 invoke</span>
+<span class="cmt"># 这会从那个 checkpoint "分叉"出一条新的状态线, 不影响主线</span>
+past_config = history[-<span class="nu">1</span>].config   <span class="cmt"># 比如选最早的那个</span>
+graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"从过去重新走"</span>}]}, past_config)</pre>
+    <div class="annotation"><b>读懂这段:</b> <code class="inline">StateSnapshot</code> 是个 NamedTuple(见 <code class="inline">langgraph/types.py</code>),字段包括 <code class="inline">values</code>(当时的状态值)、<code class="inline">next</code>(下一步要执行的节点)、<code class="inline">config</code>(含 <code class="inline">checkpoint_id</code>)、<code class="inline">parent_config</code>(父快照,用于回溯整条链)等。配合 <code class="inline">update_state(config, values)</code> 还能在某个历史点上手动改状态再续跑,实现"假设分析"。</div>
+
+    <p><strong>动态演示</strong>——步进看 checkpoint 时间线如何累积,再从历史快照分叉出一条新线(回溯/分叉是纯时序操作,静态图读不出):</p>
+    <div data-anim="time-travel"></div>
+    <h3>容错重试</h3>
+    <p>当某个节点抛异常,因为前面的步骤都已经持久化,你可以<strong>从最近一个成功的 checkpoint 恢复</strong>,而不是从头重跑整个流程。对于长链路 Agent(跑了几十步、调了多个外部工具),这一点直接决定了可用性:外部 API 偶发失败不应该让用户重来。配合 <code class="inline">interrupt</code> 还能在失败处停下等人介入修正,再 resume。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>thread_id 设计实践</h2>
+    <p><code class="inline">thread_id</code> 看起来是个小细节,但它直接决定了记忆的边界,值得单独说清:</p>
+    <ul>
+      <li><strong>一个用户 + 一个会话 = 一个 thread_id</strong>:同一用户连续对话用同一个 <code class="inline">thread_id</code>,状态累加,实现"多轮对话记忆"。</li>
+      <li><strong>换 thread_id = 开新会话</strong>:新 <code class="inline">thread_id</code> 从空状态开始,看不到旧 thread 的历史。这是"重开对话"的标准做法。</li>
+      <li><strong>单次独立任务用唯一 ID</strong>:如果每次执行都是独立的一次性工作流(比如批处理一个文档),用 <code class="inline">uuid4</code> 这种唯一 ID,避免互相污染。</li>
+      <li><strong>跨会话记忆不要靠 thread_id</strong>:用户在 thread-A 说"我喜欢深色",thread-B 不会因为换了 thread_id 就知道——这正是 <code class="inline">Store</code> 要解决的问题。thread_id 管会话内,Store 管跨会话。</li>
+    </ul>
+    <p>典型组合是:<code class="inline">thread_id</code> 由你的会话管理逻辑生成(比如 <code class="inline">f"{user_id}-{session_id}"</code>),而 <code class="inline">user_id</code> 同时作为 Store 的 namespace 之一(<code class="inline">("user", user_id)</code>)。这样既保证会话内记忆隔离,又让长期偏好可共享。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t96 d96">
+        <title id="t96">thread_id 与 Store 的协作</title>
+        <desc id="d96">用户多会话各自 thread_id 隔离,Store 共享偏好</desc>
+        <defs><marker id="arr96" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <rect class="node acc" x="20" y="20" width="140" height="50" rx="8"></rect>
+        <text class="lbl" x="90" y="50" text-anchor="middle">用户 user-42</text>
+        <rect class="node core" x="220" y="10" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="305" y="32" text-anchor="middle">会话 A</text>
+        <text class="lbl sm code" x="305" y="48" text-anchor="middle">thread=u42-sessA</text>
+        <rect class="node core" x="220" y="70" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="305" y="92" text-anchor="middle">会话 B</text>
+        <text class="lbl sm code" x="305" y="108" text-anchor="middle">thread=u42-sessB</text>
+        <rect class="node core" x="220" y="130" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="305" y="152" text-anchor="middle">会话 C</text>
+        <text class="lbl sm code" x="305" y="168" text-anchor="middle">thread=u42-sessC</text>
+        <line class="edge" x1="160" y1="35" x2="218" y2="35" marker-end="url(#arr96)"></line>
+        <line class="edge" x1="160" y1="45" x2="218" y2="95" marker-end="url(#arr96)"></line>
+        <line class="edge" x1="160" y1="55" x2="218" y2="155" marker-end="url(#arr96)"></line>
+
+        <rect class="node" x="470" y="10" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="555" y="30" text-anchor="middle">Checkpointer</text>
+        <text class="lbl sm code" x="555" y="48" text-anchor="middle">sessA 状态链</text>
+        <rect class="node" x="470" y="70" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="555" y="90" text-anchor="middle">Checkpointer</text>
+        <text class="lbl sm code" x="555" y="108" text-anchor="middle">sessB 状态链</text>
+        <rect class="node" x="470" y="130" width="170" height="50" rx="8"></rect>
+        <text class="lbl sm" x="555" y="150" text-anchor="middle">Checkpointer</text>
+        <text class="lbl sm code" x="555" y="168" text-anchor="middle">sessC 状态链</text>
+        <text class="lbl sm" x="555" y="205" text-anchor="middle" fill="var(--fg-muted)">隔离,互不可见</text>
+        <line class="edge" x1="390" y1="35" x2="468" y2="35" marker-end="url(#arr96)"></line>
+        <line class="edge" x1="390" y1="95" x2="468" y2="95" marker-end="url(#arr96)"></line>
+        <line class="edge" x1="390" y1="155" x2="468" y2="155" marker-end="url(#arr96)"></line>
+
+        <rect class="node acc" x="700" y="70" width="130" height="80" rx="8"></rect>
+        <text class="lbl sm" x="765" y="92" text-anchor="middle">Store</text>
+        <text class="lbl sm code" x="765" y="110" text-anchor="middle">('user','u-42')</text>
+        <text class="lbl sm code" x="765" y="128" text-anchor="middle">prefs</text>
+        <rect class="node acc" x="700" y="170" width="130" height="44" rx="8"></rect>
+        <text class="lbl sm code" x="765" y="197" text-anchor="middle">{theme:dark}</text>
+        <line class="edge acc" x1="640" y1="35" x2="698" y2="95" marker-end="url(#arr96)"></line>
+        <line class="edge acc" x1="640" y1="95" x2="698" y2="105" marker-end="url(#arr96)"></line>
+        <line class="edge acc" x1="640" y1="155" x2="698" y2="120" marker-end="url(#arr96)"></line>
+        <text class="lbl sm code" x="660" y="80">put/get</text>
+        <text class="lbl sm" x="765" y="235" text-anchor="middle" fill="var(--accent)">跨会话共享</text>
+      </svg>
+      <div class="fig-cap">图 9.2:同一用户的多个会话各自 thread_id 互不可见,但都通过 Store 共享同一份偏好。</div>
+    </div>
+
+    <div class="callout info">
+      <b class="tag">记忆策略速查</b>
+      <strong>对话历史 / 当前任务状态 / 待恢复的中断</strong> → 用 <code class="inline">checkpointer</code>(靠 <code class="inline">thread_id</code> 累积,框架自动存取)。<strong>用户档案 / 长期偏好 / 跨会话知识库 / 多 Agent 间共享数据</strong> → 用 <code class="inline">store</code>(按 namespace + key,节点里显式存取)。判据只有一条:这份数据<strong>是否需要跨 thread_id 共享</strong>?是 → Store;否 → Checkpointer。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>Durability:检查点到底何时落盘</h2>
+    <p>前面几节一直在说"checkpointer 会存状态",但有一个更细的问题没回答:一个 super-step 内如果有多个节点,检查点是每个节点都存、还是整个 step 存一次?节点执行到一半进程崩了怎么办?这就涉及 <strong>Durability</strong>——源码里它是 <code class="inline">Literal</code>(见 <code class="inline">langgraph/types.py:89</code>):</p>
+
+    <div class="code-title">langgraph/types.py — Durability 定义</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cl">Durability</span> = <span class="cl">Literal</span>[<span class="st">"sync"</span>, <span class="st">"async"</span>, <span class="st">"exit"</span>]
+<span class="cmt"># 默认值:"async"(在 invoke/stream 时传入,不是 compile)</span></pre>
+
+    <p>三种模式控制的是<strong>检查点的写入时机与保证强度</strong>。这是性能与可靠性之间的旋钮——写得越频繁,崩溃后丢的越少,但开销越大:</p>
+
+    <table class="tbl">
+      <tr><th>模式</th><th>写入时机</th><th>崩溃后能恢复吗</th><th>开销</th></tr>
+      <tr><td><strong>sync</strong></td><td>每个<strong>节点</strong>完成后同步落盘</td><td>能,粒度到单个节点</td><td>最高(每节点一次写)</td></tr>
+      <tr><td><strong>async</strong></td><td>每个<strong>super-step</strong>完成后落盘(默认)</td><td>能,但可能丢失最后未完成的 step</td><td>中等</td></tr>
+      <tr><td><strong>exit</strong></td><td>仅在图执行<strong>结束/中断</strong>时落盘</td><td>仅中断或正常结束点可恢复</td><td>最低</td></tr>
+    </table>
+
+    <div class="code-title">设置 Durability(invoke / stream 时,不是 compile)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># durability 是运行期参数,挂在 invoke/stream 上(见 pregel/main.py 的 stream 签名)。</span>
+<span class="cmt"># 注意:compile() 不接受 durability —— 写 compile(durability="sync") 会 TypeError。</span>
+config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"t-1"</span>}}
+
+graph.<span class="fn">invoke</span>(
+    inputs,
+    config,
+    durability=<span class="st">"sync"</span>,   <span class="cmt"># 本次运行:每节点落盘,最安全但最慢</span>
+)
+
+<span class="cmt"># 也可以不传,默认 "async";或写进 config 的 configurable 里复用:</span>
+<span class="cmt"># config["configurable"]["checkpoint_during"] 已弃用,改名 durability</span></pre>
+    <div class="annotation"><b>读懂这段:</b> <code class="inline">durability</code> 是<strong>运行期参数</strong>,传给 <code class="inline">invoke</code>/<code class="inline">stream</code>,而不是 <code class="inline">compile</code>——源码里 <code class="inline">CompiledStateGraph.stream()</code> 的签名有 <code class="inline">durability: Durability | None = None</code>(<code class="inline">pregel/main.py</code>),为 <code class="inline">None</code> 时回落到 <code class="inline">"async"</code>(<code class="inline">main.py:2602</code> 的 <code class="inline">config.get(...).get(CONFIG_KEY_DURABILITY, "async")</code>)。这意味着<strong>同一段图可以按调用不同粒度落盘</strong>:敏感步骤用 <code class="inline">"sync"</code>,日常用默认 <code class="inline">"async"</code>。默认 <code class="inline">"async"</code> 是个经过权衡的选择:它保证"已完成的 super-step 不丢",对绝大多数 Agent 场景够用——Agent 的一个 step 通常就是一个完整的推理+工具调用轮次,丢失未完成的那一步重新跑即可,代价可接受。只有当单步内有不可重做的副作用(比如 step 内调了外部付款 API)时,才需要上 <code class="inline">"sync"</code> 确保每节点落盘。</div>
+
+    <div class="callout info">
+      <b class="tag">怎么选</b>
+      默认 <code class="inline">async</code> 适合 95% 的场景。<code class="inline">sync</code> 留给"单步内有不可重做副作用"的场景。<code class="inline">exit</code> 适合一次性短任务、对崩溃恢复要求低(崩了重跑整个图也无所谓)。注意:要享受任何 Durability 保证,前提是<strong>配了真正的持久化 checkpointer</strong>(SQLite/Postgres)——<code class="inline">InMemorySaver</code> 进程一退就全没了,谈不上"耐久"。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.8</span>DeltaChannel:增量通道(Beta)</h2>
+    <p>这是持久化体系里较新的一块。<code class="inline">DeltaChannel</code> 是一种特殊的 channel 类型(源码 <code class="inline">langgraph/channels/delta.py:25</code>),和普通 channel 不同:普通 channel 存"当前值",<code class="inline">DeltaChannel</code> 存<strong>增量</strong>——它内部保存一个 sentinel(哨兵)并重放(replay)写入记录,而不是直接存最终值。</p>
+
+    <p>它解决的问题是:<strong>流式增量语义</strong>。普通 channel 每次 update 会覆盖旧值;但有些状态字段天生是"累加"的(比如逐 token 的 LLM 输出、事件流),你希望下游拿到的是"这一步新增了什么",而不是"当前全部是什么"。<code class="inline">DeltaChannel</code> 让这种增量语义在 channel 层就成立。</p>
+
+    <div class="code-title">langgraph/channels/delta.py — DeltaChannel 要点</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 类定义(源码 delta.py:25),标注为 Beta:</span>
+<span class="kw">class</span> <span class="cl">DeltaChannel</span>(<span class="cl">Generic</span>[<span class="cl">Value</span>], <span class="cl">BaseChannel</span>[<span class="cl">Any</span>, <span class="cl">Any</span>, <span class="cl">Any</span>]):
+    <span class="cmt"># 只在 checkpoint blob 里存 sentinel</span>
+    <span class="cmt"># 重建状态靠"重放祖先 writes 经过 reducer"</span>
+    <span class="cmt"># 快照节奏由两个计数器控制: per-channel 更新数 + 总 supersteps</span>
+    ...</pre>
+    <div class="callout warn">
+      <b class="tag">Beta,勿用于生产</b>
+      源码里 <code class="inline">DeltaChannel</code> 明确标注为 <strong>Beta</strong>——它的快照节奏由两个内部计数器控制,API 和行为可能变化。除非你在做底层实验或紧跟框架演进,否则<strong>暂不要在生产 StateGraph 里直接使用</strong>。理解它的存在价值在于:它解释了"为什么有些字段你看到的是增量而非全量"——这是框架为高效流式做的底层设计。
+    </div>
+    <p>对应用层开发者,记住一句话就够:<strong>DeltaChannel 是框架内部用来支持增量流式的底层通道,Beta 阶段你不需要手动碰它</strong>。你用到的是它"上层"的能力——即第 11 章讲的 <code class="inline">stream_mode="updates"</code> / <code class="inline">"messages"</code>,那些是 DeltaChannel 思想在用户侧的体现。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.9</span>安装与本仓库对照</h2>
+    <p>Checkpointer 的不同实现是各自独立发布的包。核心抽象 <code class="inline">BaseCheckpointSaver</code> 在 <code class="inline">langgraph-checkpoint</code>(本仓库 <code class="inline">libs/checkpoint</code>),<code class="inline">InMemorySaver</code> 就在这里;SQLite 和 Postgres 实现是单独的库:</p>
+    <ul>
+      <li><strong>SQLite</strong>:随 <code class="inline">langgraph-checkpoint-sqlite</code> 提供,源码在 <code class="inline">libs/checkpoint-sqlite</code>。开箱即用,无需额外依赖。</li>
+      <li><strong>Postgres</strong>:需要单独安装,源码在 <code class="inline">libs/checkpoint-postgres</code>。</li>
+    </ul>
+    <div class="code-title">生产实现替换</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Postgres checkpointer 需要单独安装(psycopg 3 + 连接池)</span>
+<span class="cmt">#   pip install langgraph-checkpoint-postgres</span>
+<span class="cmt"># 该包的 pyproject.toml 声明了: psycopg>=3.2.0, psycopg-pool>=3.2.0</span>
+<span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> <span class="cl">PostgresSaver</span>      <span class="cmt"># 同步</span>
+<span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> <span class="cl">AsyncPostgresSaver</span> <span class="cmt"># 异步</span>
+
+<span class="cmt"># 安装后即可与 InMemorySaver 平替替换:</span>
+<span class="kw">with</span> <span class="cl">PostgresSaver</span>.from_conn_string(DB_URI) <span class="kw">as</span> checkpointer:
+    checkpointer.setup()                 <span class="cmt"># 首次建表 + 迁移(必调)</span>
+    graph = builder.compile(checkpointer=checkpointer)
+
+<span class="cmt"># Store 同理: InMemoryStore 用于开发, 生产换 PostgresStore</span>
+<span class="kw">from</span> langgraph.store.memory <span class="kw">import</span> <span class="cl">InMemoryStore</span>            <span class="cmt"># 开发/测试</span>
+<span class="cmt"># from langgraph.store.postgres import PostgresStore        # 生产(需安装)</span></pre>
+    <div class="callout info">
+      <b class="tag">从测试到生产:平滑替换</b>
+      因为 <code class="inline">InMemorySaver</code>、<code class="inline">SqliteSaver</code>、<code class="inline">PostgresSaver</code> 都实现同一个 <code class="inline">BaseCheckpointSaver</code> 抽象(<code class="inline">get_tuple / put / put_writes / list / delete_thread</code>),<code class="inline">compile(checkpointer=...)</code> 接口完全一致——开发时用内存、联调用 SQLite、生产上 Postgres,<strong>业务代码一行都不用改</strong>。Store 这边的 <code class="inline">InMemoryStore</code> 和 <code class="inline">PostgresStore</code> 同样遵循 <code class="inline">BaseStore</code> 的 <code class="inline">get/put/search/delete</code> 契约。这种"抽象先行、实现可换"的设计,是你在自建 Agent 时也应该模仿的:把记忆后端做成可替换的依赖,而不是写死在节点里。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.10</span>新手常犯的错误</h2>
+    <p>持久化这一章的坑几乎都集中在"我以为它存了,其实没存"和"我以为它会自动配,其实要手动调"上。下面四个都是对照本仓库源码验证过的真实报错,踩过一遍就记住了。</p>
+
+    <div class="code-title">① 挂了 checkpointer 却忘记传 thread_id → KeyError</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+<span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> <span class="cl">InMemorySaver</span>
+
+<span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
+    x: <span class="cl">int</span>
+
+<span class="kw">def</span> <span class="fn">add</span>(state: <span class="cl">State</span>) -> <span class="cl">State</span>:
+    <span class="kw">return</span> {<span class="st">"x"</span>: state[<span class="st">"x"</span>] + <span class="nu">1</span>}
+
+g = <span class="cl">StateGraph</span>(<span class="cl">State</span>).add_node(<span class="st">"add"</span>, add).add_edge(START, <span class="st">"add"</span>).add_edge(<span class="st">"add"</span>, END).compile(checkpointer=<span class="cl">InMemorySaver</span>())
+
+<span class="cmt"># ✗ 挂了 checkpointer, 却没带 thread_id —— 框架不知道往哪个桶存</span>
+g.<span class="fn">invoke</span>({<span class="st">"x"</span>: <span class="nu">1</span>})
+<span class="cmt"># KeyError: 'thread_id'</span>
+<span class="cmt"># 追踪: _loop.py 的 __enter__ 调 checkpointer.get_tuple(config),</span>
+<span class="cmt"># InMemorySaver.get_tuple 里直接 config["configurable"]["thread_id"] 取值,缺键即 KeyError。</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 挂了 checkpointer 就一定要带 thread_id:</span>
+cfg = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"t-1"</span>}}
+g.<span class="fn">invoke</span>({<span class="st">"x"</span>: <span class="nu">1</span>}, cfg)   <span class="cmt"># 正常</span></pre>
+    <div class="annotation"><b>踩坑点:</b> 没有 checkpointer 时 <code class="inline">invoke</code> 不需要 <code class="inline">thread_id</code>;一旦 <code class="inline">compile(checkpointer=...)</code>,<strong>每次调用都必须带</strong>。报错是一个裸的 <code class="inline">KeyError</code>,不是友好提示,新人容易误以为是别的 bug。</div>
+
+    <div class="code-title">② PostgresSaver 忘记调 setup() → 表不存在</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.checkpoint.postgres <span class="kw">import</span> <span class="cl">PostgresSaver</span>
+
+<span class="cmt"># ✗ 直接拿来 compile, 没调 setup()</span>
+<span class="kw">with</span> <span class="cl">PostgresSaver</span>.from_conn_string(DB_URI) <span class="kw">as</span> ckpt:
+    g = builder.<span class="fn">compile</span>(checkpointer=ckpt)
+    g.<span class="fn">invoke</span>(inputs, {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"t-1"</span>}})
+    <span class="cmt"># psycopg.errors.UndefinedTable: relation "checkpoints" does not exist</span>
+    <span class="cmt"># 因为 put() 会跑 UPSERT_CHECKPOINTS_SQL, 而建表的 setup() 没执行过。</span>
+    <span class="cmt">#</span>
+    <span class="cmt"># ✓ 首次必须显式调 setup()(docstring: "MUST be called directly by the user"):</span>
+    <span class="kw">with</span> <span class="cl">PostgresSaver</span>.from_conn_string(DB_URI) <span class="kw">as</span> ckpt:
+        ckpt.<span class="fn">setup</span>()          <span class="cmt"># 建 checkpoints/writes/blobs 表 + 跑迁移</span>
+        g = builder.<span class="fn">compile</span>(checkpointer=ckpt)</pre>
+    <div class="annotation"><b>踩坑点:</b> <code class="inline">SqliteSaver.setup()</code> 是<strong>被调用时自动触发</strong>的(docstring 明说"called automatically when needed"),所以 SQLite 从不报这个错;但 <code class="inline">PostgresSaver.setup()</code> <strong>必须用户手动调</strong>。两套实现的细节差异,是部署从 SQLite 切到 Postgres 时最常踩的坑。</div>
+
+    <div class="code-title">③ 拿 InMemorySaver / InMemoryStore 上生产 → 重启即清零</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ 生产环境用内存版, 进程一重启, 所有 checkpoint / 长期记忆全没</span>
+graph = builder.<span class="fn">compile</span>(checkpointer=<span class="cl">InMemorySaver</span>(), store=<span class="cl">InMemoryStore</span>())
+<span class="cmt"># InMemorySaver docstring: "Only use for debugging or testing purposes."</span>
+<span class="cmt"># InMemoryStore docstring: "Data is lost when the process exits."</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 生产换持久化实现(接口一致, 业务代码不改):</span>
+graph = builder.<span class="fn">compile</span>(
+    checkpointer=<span class="cl">PostgresSaver</span>.from_conn_string(DB_URI),  <span class="cmt"># 或 SqliteSaver(单机)</span>
+    store=<span class="cl">InMemoryStore</span>(),   <span class="cmt"># 长期记忆: 生产换 PostgresStore</span>
+)</pre>
+    <div class="annotation"><b>踩坑点:</b> 内存版在开发联调时一切正常(速度快、零配置),容易直接带进生产。判断准则:这份数据<strong>进程重启后还要不要</strong>?要,就必须用 <code class="inline">SqliteSaver</code>/<code class="inline">PostgresSaver</code> 等落盘实现。两者实现同一个 <code class="inline">BaseCheckpointSaver</code> 接口,替换只改 <code class="inline">compile(checkpointer=...)</code> 这一行。</div>
+
+    <div class="code-title">④ Store 的 namespace 不能带点号、也不能为空</div>
+    <pre class="code"><span class="lang-tag">python</span>store.<span class="fn">put</span>((<span class="st">"user.42"</span>,), <span class="st">"prefs"</span>, {<span class="st">"theme"</span>: <span class="st">"dark"</span>})   <span class="cmt"># ✗ label 里有 '.'</span>
+<span class="cmt"># InvalidNamespaceError: Invalid namespace label 'user.42' ... cannot contain periods ('.').</span>
+
+store.<span class="fn">put</span>((), <span class="st">"prefs"</span>, {<span class="st">"theme"</span>: <span class="st">"dark"</span>})          <span class="cmt"># ✗ 空 namespace</span>
+<span class="cmt"># InvalidNamespaceError: Namespace cannot be empty.</span>
+<span class="cmt">#</span>
+<span class="cmt"># ✓ 用元组分层, 每段都是纯字符串、无点号:</span>
+store.<span class="fn">put</span>((<span class="st">"user"</span>, <span class="st">"42"</span>), <span class="st">"prefs"</span>, {<span class="st">"theme"</span>: <span class="st">"dark"</span>})</pre>
+    <div class="annotation"><b>踩坑点:</b> 点号被保留给 Postgres 实现里的路径/前缀匹配语义,所以 label 内禁用;空 namespace 也不行。这条校验在 <code class="inline">store/base/__init__.py</code> 的 <code class="inline">_validate_namespace</code> 里,所有 Store 实现共享。想用 <code class="inline">user.id</code> 这种复合 key,拆成元组 <code class="inline">("user", "42")</code> 才是正确姿势。</div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="06-human-in-the-loop.html">← 人机协同</a>
+    <a href="07-multi-agent.html">多智能体 →</a>
+  </div>
+</div>
+
+<footer>
+  LangGraph 学习站 · 09 持久化记忆 · 基于本代码库源码 · 所有 API 引用以仓库最新为准
+</footer>
+
+</body>
+</html>

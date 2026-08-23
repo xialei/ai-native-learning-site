@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 调度器 — vLLM 引擎学习站</title>
+<link rel="stylesheet" href="assets/vllm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-paged-attention.html">PagedAttention</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-model-runner.html">Model Runner</a>
+      <a href="06-sampling.html">采样</a>
+      <a href="07-kernels.html">Kernel</a>
+      <a href="08-memory.html">内存</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-build-own-engine.html">自制引擎</a>
+      <a href="12-model-weights.html">实战·权重</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 调度器</div>
+    <h1>调度器：决定“这一步跑哪些请求”的大脑</h1>
+    <div class="subtitle">vLLM v1 的调度器用「连续批处理」把每一寸 GPU 算力喂满。它没有单独的 prefill 阶段和 decode 阶段——只有一个统一的目标：让每个请求的 <code class="inline">num_computed_tokens</code> 追上 <code class="inline">num_tokens_with_spec</code>。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>为什么要调度器：连续批处理 vs 静态批处理</h2>
+    <p>Transformer 推理是<strong>自回归</strong>的：一次只生成一个 token，下一步要拿到上一步的输出才能继续。最朴素的做法是「静态批处理」——一批请求同时进去，<strong>等整批全部生成完</strong>才轮到下一批。问题是：</p>
+    <ul>
+      <li><strong>批内拖尾（tail latency）</strong>：只要有一个请求要生成很多 token，整批都得陪它等，GPU 频繁空转。</li>
+      <li><strong>批间空隙</strong>：批与批之间、以及一批内早结束的请求侧，都有计算资源闲置。</li>
+    </ul>
+    <p><strong>连续批处理（continuous batching）</strong>的解法是：不再把请求捆成不可拆分的“批”，而是<strong>每一步</strong>都重新决定「这步让哪些请求、各算多少个 token」。一个请求结束了就立刻从这批里摘掉，让新请求无缝补进来，GPU 始终忙于有效计算。</p>
+    <div class="annotation"><b>为什么要“尽量多塞请求”？</b>因为 decode 每一步只是读回 KV cache、算一次 attention，是典型的<strong>访存（memory-bandwidth）瓶颈</strong>：算力其实富余，但显存带宽被 “把整个序列的 KV 读一遍” 占满。所以同一时刻并行请求越多，访存被摊得越薄，吞吐越高——这就是调度器拼命塞请求的动机。而 <strong>prefill</strong> 要同时喂完整段 prompt、算全部注意力，是<strong>算力（compute）密集</strong>的。两者内存/算力特征不同，调度器要照顾到这种不对称。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>核心思想：没有“阶段”，只有两个计数器（重点）</h2>
+    <p>vLLM v1 的调度器最反直觉的一点，是它<strong>没有显式的 prefill 阶段 / decode 阶段</strong>。作者在 <code class="inline">schedule()</code> 里用一大段注释说明了设计意图。这段注释是整个 v1 调度器的灵魂，值得逐句读懂：</p>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:486 — 调度算法设计注释</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># NOTE(woosuk) on the scheduling algorithm:</span>
+<span class="cmt"># There's no "decoding phase" nor "prefill phase" in the scheduler.</span>
+<span class="cmt"># Each request just has the num_computed_tokens and</span>
+<span class="cmt"># num_tokens_with_spec. num_tokens_with_spec =</span>
+<span class="cmt"># len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).</span>
+<span class="cmt"># At each step, the scheduler tries to assign tokens to the requests</span>
+<span class="cmt"># so that each request's num_computed_tokens can catch up its</span>
+<span class="cmt"># num_tokens_with_spec. This is general enough to cover</span>
+<span class="cmt"># chunked prefills, prefix caching, speculative decoding,</span>
+<span class="cmt"># and the "jump decoding" optimization in the future.</span></pre>
+    <div class="annotation"><b>读懂这段：</b>每步调度不过是：给每个请求定一个 <code class="inline">num_new_tokens</code>，然后把 <code class="inline">num_computed_tokens</code> 往前推一点，让它朝 <code class="inline">num_tokens_with_spec</code> 逼近。当 <code class="inline">num_computed_tokens</code> 还没到 <code class="inline">num_prompt_tokens</code> 即「还没把 prompt 算完」→ 那就是 prefill（可能是一个 prefill chunk）；一旦追平、开始追加输出 token → 那就是 decode。二者是<strong>同一个循环</strong>的两个瞬间，而不是两套流程。</div>
+    <p>这两个计数器在 <code class="inline">Request</code> 上有真实定义：</p>
+    <div class="code-title">vllm/v1/request.py:182 与 :292 — 两个计数器</div>
+    <pre class="code"><span class="lang-tag">python</span>self.num_computed_tokens = <span class="nu">0</span>            <span class="cmt"># 已算出 KV 的 token 数（前缀可真可假看缓存）</span>
+...
+<span class="kw">@property</span>
+<span class="kw">def</span> <span class="fn">num_tokens</span>(self) <span class="kw">-&gt;</span> <span class="cl">int</span>:
+    <span class="kw">return</span> <span class="fn">len</span>(self._all_token_ids)
+
+<span class="kw">@property</span>
+<span class="kw">def</span> <span class="fn">num_tokens_with_spec</span>(self) <span class="kw">-&gt;</span> <span class="cl">int</span>:
+    <span class="kw">return</span> <span class="fn">len</span>(self._all_token_ids) + <span class="fn">len</span>(self.spec_token_ids)</pre>
+    <div class="annotation"><b>为什么“统一模型”如此优雅：</b>新请求若前缀缓存命中，<code class="inline">num_computed_tokens</code> 一上来就已推进到命中长度，不必从 0 算；被抢占后重算的请求则从「已算 + 输出」的进度继续。<code class="inline">num_tokens_with_spec</code> 里的 <code class="inline">+ len(spec_token_ids)</code> 把投机解码的 draft token 也并进来；<code class="inline">max_tokens</code>（来自 <code class="inline">sampling_params.max_tokens</code>，见 request.py:113）决定什么时候算“完事”可以收尾。因为一切都被表达成“数字追数字”，所以 <code class="inline">chunked prefill</code>（prefill 拆小）、<code class="inline">prefix caching</code>（开头直接算好）、<code class="inline">speculative decoding</code>（提前多算几个）在调度器眼里都只是同一套机制的不同“追赶距离”——这正是那份注释说的 generality。自研引擎最大的启示也在这里。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>用代码看 schedule()：每一步怎么填满 GPU</h2>
+    <p><code class="inline">schedule()</code> 每次被调用，都对应模型的一次 forward。它维护一个 <code class="inline">token_budget</code>——这步总共最多能算多少个 token（来自 <code class="inline">max_num_scheduled_tokens</code>），然后逐请求“分”这个预算。开头是这样的：</p>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:484 — schedule() 开头</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">schedule</span>(self, throttle_prefills: <span class="cl">bool</span> = <span class="kw">False</span>) <span class="kw">-&gt;</span> <span class="cl">SchedulerOutput</span>:
+    self.current_step += <span class="nu">1</span>
+    ...
+    scheduled_new_reqs: <span class="cl">list</span>[<span class="cl">Request</span>] = []
+    scheduled_running_reqs: <span class="cl">list</span>[<span class="cl">Request</span>] = []
+    preempted_reqs: <span class="cl">list</span>[<span class="cl">Request</span>] = []
+    num_scheduled_tokens: <span class="cl">dict</span>[<span class="cl">str</span>, <span class="cl">int</span>] = {}
+    token_budget = self.max_num_scheduled_tokens
+    ...
+    <span class="cmt"># First, schedule the RUNNING requests.</span>
+    req_index = <span class="nu">0</span>
+    <span class="kw">while</span> req_index &lt; <span class="fn">len</span>(self.running) <span class="kw">and</span> token_budget &gt; <span class="nu">0</span>:
+        request = self.running[req_index]
+        ...
+        num_new_tokens = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        num_new_tokens = <span class="fn">min</span>(
+            num_new_tokens, token_budget, input_budget - draft_slots
+        )</pre>
+    <div class="annotation"><b>逐段读：</b>
+      <ul>
+        <li><strong><code class="inline">token_budget = self.max_num_scheduled_tokens</code></strong>：这步的“总 token 定额”。每把一个请求纳入，就减掉它的 <code class="inline">num_new_tokens</code>；预算耗尽则停止继续塞。</li>
+        <li><strong>先调度 RUNNING，再调度新请求</strong>：注释 <code class="inline"># First, schedule the RUNNING requests.</code> 说明优先级——已经在跑的请求（多数是 decode）优先续命，避免它们等太久；等 running 处理完、<code class="inline">token_budget</code> 还有富余，才去看 <code class="inline">waiting</code> 里的新请求（下面 4.5 会讲 waiting 的调度）。</li>
+        <li><strong>待算 token 数的计算</strong>：<code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code>——“还差多少没算”，然后被 <code class="inline">min()</code> 约束在预算之内。这就是 4.2 那个“追赶模型”在代码里的直接落地。</li>
+      </ul>
+    </div>
+    <p>拿到 <code class="inline">num_new_tokens</code> 后，下一步是找 KV cache 要块。如果 KV 不够（比如被别的请求占满），<code class="inline">allocate_slots</code> 会返回 <code class="inline">None</code>，此时调度器要么抢占一个低优先级请求腾地方，要么放弃调度当前请求：</p>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:637 — allocate_slots 失败则跳过</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Schedule newly needed KV blocks for the request.</span>
+<span class="kw">with</span> record_function_or_nullcontext(<span class="st">"schedule: allocate_slots"</span>):
+    <span class="kw">while</span> <span class="kw">True</span>:
+        new_blocks = self.kv_cache_manager.<span class="fn">allocate_slots</span>(
+            request, num_new_tokens,
+            num_lookahead_tokens=self.num_lookahead_tokens,
+        )
+        <span class="kw">if</span> new_blocks <span class="kw">is not</span> <span class="kw">None</span>:
+            <span class="cmt"># The request can be scheduled.</span>
+            <span class="kw">break</span>
+        <span class="cmt"># The request cannot be scheduled.</span>
+        <span class="cmt"># Preempt the lowest-priority request.</span>
+        ...
+<span class="kw">if</span> new_blocks <span class="kw">is</span> <span class="kw">None</span>:
+    <span class="cmt"># Cannot schedule this request.</span>
+    <span class="kw">break</span></pre>
+    <div class="annotation"><b>读懂这段：</b><code class="inline">allocate_slots</code> 返回 <code class="inline">None</code> 是核心的“背压”信号——KV cache 满时它拿不到新块，就不会硬塞。这一小块逻辑与 3.4 章你见过的 <code class="inline">allocate_slots</code> 正好呼应：调度侧用返回值决定“这个请求这步到底排不排”。<code class="inline">num_lookahead_tokens</code> 又为投机解码预留了 KV 空间，等下 4.5 里再说。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>状态流：一个请求的一生</h2>
+    <p>请求在调度器里按状态流动。核心节点是 <strong>Waiting（排队）→ Running（运行）→ Finished（结束）</strong>，Running 里又内部区分 prefill 与 decode；Running 因资源不足被抢占时，会回退到 Waiting（状态为 <code class="inline">PREEMPTED</code>）重算。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">请求状态流转（scheduler 视角）</text>
+
+        <rect class="node" x="30" y="60" width="150" height="52" rx="8"></rect>
+        <text class="lbl" x="105" y="82" text-anchor="middle">Waiting</text>
+        <text class="lbl sm" x="105" y="100" text-anchor="middle">在 waiting 队列排队</text>
+
+        <line class="edge core" x1="180" y1="86" x2="270" y2="86"></line>
+        <text class="lbl sm" x="225" y="78" text-anchor="middle">入队调度（add_request / 抢占后重排）</text>
+
+        <rect class="node core" x="280" y="46" width="170" height="44" rx="8"></rect>
+        <text class="lbl" x="365" y="65" text-anchor="middle">Running · prefill</text>
+        <text class="lbl sm" x="365" y="81" text-anchor="middle">没算完 prompt，可能被拆成 chunk</text>
+
+        <line class="edge" x1="450" y1="68" x2="530" y2="68"></line>
+        <text class="lbl sm" x="490" y="60" text-anchor="middle">算完 prompt 后</text>
+
+        <rect class="node core" x="540" y="46" width="150" height="44" rx="8"></rect>
+        <text class="lbl" x="615" y="65" text-anchor="middle">Running · decode</text>
+        <text class="lbl sm" x="615" y="81" text-anchor="middle">每步生成 1 个 token（+draft）</text>
+
+        <line class="edge" x1="690" y1="68" x2="770" y2="68"></line>
+        <text class="lbl sm" x="730" y="60" text-anchor="middle">到 max_tokens / 停</text>
+
+        <rect class="node acc" x="780" y="46" width="100" height="44" rx="8"></rect>
+        <text class="lbl" x="830" y="65" text-anchor="middle">Finished</text>
+        <text class="lbl sm" x="830" y="81" text-anchor="middle">释放 KV 块</text>
+
+        <line class="edge" x1="540" y1="90" x2="390" y2="116"></line>
+        <text class="lbl sm" x="430" y="112" text-anchor="middle">KV/预算不足 → 抢占，回退重算</text>
+
+        <rect class="node warn" x="540" y="150" width="150" height="44" rx="8"></rect>
+        <text class="lbl" x="615" y="169" text-anchor="middle">PREEMPTED（回到 waiting）</text>
+        <text class="lbl sm" x="615" y="185" text-anchor="middle">num_computed_tokens 归零，draft 清空</text>
+
+        <line class="edge" x1="540" y1="172" x2="185" y2="112"></line>
+
+        <text class="lbl sm" x="30" y="150" fill="#165a7b">失败/客户端中止</text>
+        <line class="edge" x1="105" y1="112" x2="105" y2="186"></line>
+        <rect class="node acc" x="30" y="190" width="150" height="44" rx="8"></rect>
+        <text class="lbl" x="105" y="209" text-anchor="middle">Finished (abort/error)</text>
+        <text class="lbl sm" x="105" y="225" text-anchor="middle">同样释放 KV 块</text>
+
+        <text class="lbl sm" x="20" y="270">抢占（preempt）：_preempt_request 把请求从 running 摘除、编号退回 waiting，num_computed_tokens 重置为 0</text>
+      </svg>
+      <div class="fig-cap">图 4.4：请求状态循环。抢占是 Running 里唯一向后的边。</div>
+    </div>
+    <div class="annotation"><b>注意 decode 那条回退边：</b>decode 并不总是一路走到 Finished——当这步预算或 KV cache 不够、而 running 队列里还有更“重”的请求时，调度器会 <strong>preempt</strong> 掉最低优先级请求，让它回 waiting 重来（见 4.5）。这也是为什么“统一模型 + 抢占”能保证稀缺资源始终被高优先级工作占用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>优先级与抢占：稀缺资源怎么分</h2>
+    <p>调度策略由 <code class="inline">SchedulingPolicy</code> 决定（FCFS 或 PRIORITY）。在 PRIORITY 策略下，抢占发生时，调度器会挑 <strong>最低优先级</strong>的请求下手。代码里用 <code class="inline">key=(r.priority, r.arrival_time)</code> 作为排序依据：</p>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:652 — 抢占最低优先级请求</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># The request cannot be scheduled.</span>
+<span class="cmt"># Preempt the lowest-priority request.</span>
+<span class="kw">if</span> self.policy == SchedulingPolicy.PRIORITY:
+    preempted_req = <span class="fn">max</span>(
+        self.running,
+        key=<span class="kw">lambda</span> r: (r.priority, r.arrival_time),
+    )
+    ...
+<span class="kw">else</span>:
+    preempted_req = self.running.<span class="fn">pop</span>()
+
+self._preempt_request(
+    preempted_req, scheduled_timestamp,
+    drop_stale_output=self.requires_kv_delivery,
+)
+preempted_reqs.<span class="fn">append</span>(preempted_req)</pre>
+    <div class="annotation"><b>读懂这段：</b><code class="inline">max(..., key=(r.priority, r.arrival_time))</code>——取 <code class="inline">priority</code> 最大者，同优先级再取 <code class="inline">arrival_time</code> 最大（即来得最晚）者：也就是“最不重要、最新到”的那个先被牺牲。选完调用 <code class="inline">_preempt_request</code>，把它的 KV 块释放、<code class="inline">num_computed_tokens = 0</code>、投回 waiting 队列（见 4.4 的回退边）。<code class="inline">num_preemptions</code> 计数会 +1，用于观测与评估。</div>
+    <div class="callout info">
+      <b class="tag">延伸</b>
+      “低优先级先让路”这个思想，正是<strong>投机解码（speculative decoding）</strong>能跑起来的调度的另一半。投机解码用一个小而快的 <strong>draft model</strong> 先猜接下来的几个 token，再用大模型一次性验证，接受就赚、拒绝就只损失一点点（<code class="inline">num_rejected</code> 会回滚 <code class="inline">num_computed_tokens</code>，见 scheduler.py:1857）。但要让投机有效，调度器必须给 draft 的 lookahead 预留 KV 空间（<code class="inline">num_lookahead_tokens</code>、<code class="inline">spec_token_ids</code> 一并算进 <code class="inline">num_tokens_with_spec</code>）。调度器越会“夹缝里塞请求”，投机 batch 越满，draft 越可能一次命中多个 token——吞吐增益和调度质量强相关。这也是理解第 4.7 里“先不碰投机”结论的原因。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>PD 分离：把 prefill 和 decode 拆到不同的 GPU</h2>
+    <p>前面 4.1–4.5 讲的是<strong>一个实例内部</strong>如何混排 prefill 与 decode。但还有一种更“外科手术”的做法——<strong>PD 分离（disaggregated prefilling）</strong>：干脆让 prefill 和 decode 在<strong>两个独立的 vLLM 实例 / 两张卡</strong>上跑，prefill 节点算出的 KV cache 通过高速网络传给 decode 节点，后者只做“读已有 KV、一步步 decode”。仓库是支持这个的（<code class="inline">vllm/distributed/kv_transfer/</code> + <code class="inline">docs/features/disagg_prefill.md</code>，标注为 experimental）。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="30" y="26" font-weight="bold" fill="#165a7b">非分离（单实例）—— 现在：</text>
+        <rect class="node core" x="120" y="38" width="180" height="52" rx="6"></rect>
+        <text class="lbl sm" x="210" y="60" text-anchor="middle">同一个 vLLM 实例</text>
+        <text class="lbl sm" x="210" y="78" text-anchor="middle">prefill + decode 混批</text>
+        <text class="lbl sm" x="300" y="70" text-anchor="middle" fill="#5c6b7a">← prefill 可能打断 decode（尾延迟高）</text>
+
+        <text class="lbl" x="30" y="146" font-weight="bold" fill="#165a7b">PD 分离（两实例）—— 目标：</text>
+        <rect class="node" x="60" y="158" width="170" height="64" rx="6"></rect>
+        <text class="lbl sm" x="145" y="182" text-anchor="middle">Prefill 节点</text>
+        <text class="lbl sm" x="145" y="200" text-anchor="middle">专吃长 prompt，算 KV</text>
+        <text class="lbl sm" x="145" y="216" text-anchor="middle">（可 TP/PP 扩算力 → 降 TTFT）</text>
+        <rect class="node acc" x="420" y="158" width="170" height="64" rx="6"></rect>
+        <text class="lbl sm" x="505" y="182" text-anchor="middle">Decode 节点</text>
+        <text class="lbl sm" x="505" y="200" text-anchor="middle">只读已有 KV，逐 token 出</text>
+        <text class="lbl sm" x="505" y="216" text-anchor="middle">（告别 prefill 打断 → 稳 ITL）</text>
+        <line class="edge" x1="230" y1="190" x2="418" y2="190"></line>
+        <text class="lbl sm" x="324" y="182" text-anchor="middle">KV cache</text>
+        <text class="lbl sm" x="324" y="196" text-anchor="middle">经 connector 传输</text>
+        <text class="lbl sm" x="324" y="210" text-anchor="middle">(Nixl/LMCache/…)</text>
+        <line class="edge" x1="290" y1="158" x2="210" y2="122"></line>
+        <text class="lbl sm" x="236" y="132" text-anchor="middle" fill="#5c6b7a">请求先 prefill</text>
+      </svg>
+      <div class="fig-cap">图 4.6：PD 分离用两个独立实例分别承载 prefill 与 decode，靠 KV connector 在中间搬运 KV。</div>
+    </div>
+
+    <h3 style="color:#165a7b;margin:22px 0 8px">为什么值得</h3>
+    <p>官方文档点出两个动机（<code class="inline">docs/features/disagg_prefill.md</code>）：</p>
+    <ul>
+      <li><strong>TTFT 与 ITL 可以分开调</strong>：prefill 节点和 decode 节点各自用不同的并行策略（如不同的 TP / PP）——想降 TTFT 就扩 prefill 的算力，想稳 ITL 就调 decode 节点，互不影响。</li>
+      <li><strong>压住尾部 ITL</strong>：非分离时，一个长 prefill 请求会插进 decode 的批次里，抬高某些请求的尾延迟。PD 分离让 decode 节点<strong>永远只做 decode</strong>，尾部延迟更可控、可预测。</li>
+    </ul>
+    <div class="callout warn">
+      <b class="tag">别误会</b>
+      PD 分离<strong>不提升吞吐</strong>（文档明确写着 "Disaggregated prefill DOES NOT improve throughput"）。它换的是<strong>延迟可预测性</strong>与<strong>调优自由度</strong>——用「多一台机器的网络传输」换「更低的、更稳的延迟」。如果你的目标只是把吞吐拉满，单实例连续批处理就够；PD 分离是延迟敏感在线服务的选择。
+    </div>
+
+    <h3 style="color:#165a7b;margin:22px 0 8px">用代码看：怎么配</h3>
+    <p>关键是一份 <code class="inline">--kv-transfer-config</code>（配置类在 <code class="inline">vllm/config/kv_transfer.py</code>），里面声明用哪个 <code class="inline">kv_connector</code>、本实例当 <code class="inline">kv_producer</code>（prefill）还是 <code class="inline">kv_consumer</code>（decode）：</p>
+    <div class="code-title">两个独立实例启动，各给一个 role——下面这段是 prefill 端（示例，模型路径按你加载的 checkpoint 填）</div>
+    <pre class="code"><span class="lang-tag">bash</span>vllm serve &lt;your-model-path&gt; <span class="cmt">\</span>
+  --kv-transfer-config <span class="st">'{"kv_connector":"NixlConnector",</span>
+                                    <span class="st">"kv_role":"kv_producer",   # prefill 端</span>
+                                    <span class="st">"kv_connector_extra_config":{"backends":["UCX","GDS"]}}'</span></pre>
+    <p>decode 端则用 <code class="inline">"kv_role":"kv_consumer"</code>。NixlConnector 源码里写得很直白：「use <code class="inline">kv_role='kv_producer'</code> for prefill instances and <code class="inline">kv_role='kv_consumer'</code> for decode instances」（<code class="inline">vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:126-131</code>），旧版 <code class="inline">kv_both</code> 已被弃用。支持的 connector 有 Nixl、LMCache、Mooncake、Offloading、FlexKV、Multi 等，本质都是「一条 push / pull KV 的通道」。</p>
+    <div class="annotation"><b>回到调度视角：</b>PD 分离并没有推翻 4.1–4.5 的调度模型——每个实例内部<strong>仍</strong>用统一调度器连续批处理。它只是在<strong>更外层</strong>把“阶段”拆开了：prefill 节点的 decode…其实没 decode，decode 节点的 prefill…其实没 prefill。也就是说：你先把单实例内的“统一调度”学好（本章前半），PD 分离只是把这类实例<strong>按阶段分机部署</strong>，外加一层 KV 搬运约定。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>小结与自研启示</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
+      <tr><td>统一调度</td><td>无 prefill/decode 阶段，只有 num_computed_tokens 追 num_tokens_with_spec</td><td>别维护两套状态机，用一个“还差多少没算”覆盖一切</td></tr>
+      <tr><td>连续批处理</td><td>每步 schedule() 重排 running + waiting</td><td>请求结束即腾出、新请求即补位，中间不空转</td></tr>
+      <tr><td>token 预算</td><td>token_budget / max_num_scheduled_tokens</td><td>设一个每步 token 上限，防止一步算太多拖慢延迟</td></tr>
+      <tr><td>抢占</td><td>allocate_slots 失败 → preempt 最低优先级 (priority, arrival_time)</td><td>KV 不够先让低优让位，兼顾“尽量让请求跑得动”的稳健性</td></tr>
+      <tr><td>投机解码</td><td>num_lookahead_tokens + spec_token_ids 并入 num_tokens_with_spec</td><td>先不做；这是吞吐优化，等基础连续批处理跑通再说</td></tr>
+      <tr><td>PD 分离</td><td>prefill / decode 拆到两个实例，kv_producer / kv_consumer 靠 --kv-transfer-config 传 KV</td><td>更晚的部署级优化：为压尾部延迟、分开调 TTFT/ITL；不提升吞吐，起步别碰</td></tr>
+    </table>
+    <div class="annotation"><b>一句话记住：</b>调度器不是“判断 vanilla 还是 greedy”的分派器，而是一个<strong>预算分配器</strong>——每步把有限的 token 预算、KV 空间，按请求优先级分摊出去，让每个请求的 <code class="inline">num_computed_tokens</code> 都朝目标持续推进。</div>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      调度器想好了“这步跑谁、各算多少 token”，但<strong>“怎么真正把这些 token 算出来”</strong>是另一回事——输入如何拼成 tensor、KV 如何喂进 kernel、NCCL 如何同步，都由下一层的 Model Runner 负责。这是<a href="05-model-runner.html">第 5 章：Model Runner</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="03-paged-attention.html">← 上一步：PagedAttention</a>
+    <a href="05-model-runner.html">下一步：Model Runner →</a>
+  </div>
+</div>
+
+<footer>
+  vLLM 引擎学习站 · 04 调度器 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

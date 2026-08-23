@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 消息与类型体系 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 消息与类型体系</div>
+    <h1>消息与类型体系：AgentMessage 与 Message 的「翻译」</h1>
+    <div class="subtitle">整个 Pi 都围绕一个核心抽象——<code class="inline">AgentMessage</code>——运转。它比 LLM 认识的 <code class="inline">Message</code> 更宽、更可扩展。下面厘清两者的边界，以及那座「桥」convertToLlm。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>核心矛盾：一个灵活的运行时 + 一个固执的 LLM</h2>
+    <p>LLM 只理解三种角色：<code class="inline">user</code>、<code class="inline">assistant</code>、<code class="inline">toolResult</code>。但一个真正的 Agent 运行时还想表达很多「非 LLM 消息」——比如给 UI 的通知、自定义的应用消息。Pi 的解法是<strong>两套类型</strong>：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t2 d2">
+        <title id="t2">AgentMessage 与 Message 的桥接</title>
+        <desc id="d2">transformContext 与 convertToLlm 两个转换点</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="70" width="250" height="90" rx="10"></rect>
+        <text class="lbl" x="145" y="96" text-anchor="middle" font-weight="bold">AgentMessage[]</text>
+        <text class="lbl sm" x="145" y="116" text-anchor="middle">user / assistant / toolResult</text>
+        <text class="lbl sm" x="145" y="132" text-anchor="middle">+ 自定义（声明合并扩展）</text>
+        <text class="lbl sm" x="145" y="148" text-anchor="middle">全程贯穿运行时</text>
+
+        <rect class="node core" x="360" y="70" width="150" height="90" rx="10"></rect>
+        <text class="lbl" x="435" y="104" text-anchor="middle" font-weight="bold">Message[]</text>
+        <text class="lbl sm" x="435" y="124" text-anchor="middle">user/assistant</text>
+        <text class="lbl sm" x="435" y="140" text-anchor="middle">toolResult</text>
+        <text class="lbl sm" x="435" y="156" text-anchor="middle">LLM 唯一认识</text>
+
+        <rect class="node acc" x="600" y="70" width="230" height="90" rx="10"></rect>
+        <text class="lbl" x="715" y="104" text-anchor="middle" font-weight="bold">LLM（provider）</text>
+        <text class="lbl sm" x="715" y="124" text-anchor="middle">需符合各 provider 规则</text>
+        <text class="lbl sm" x="715" y="140" text-anchor="middle">末条必须是 user/toolResult</text>
+
+        <line class="edge" x1="270" y1="115" x2="358" y2="115"></line>
+        <text class="lbl sm" x="300" y="60" text-anchor="middle">convertToLlm</text>
+        <line class="edge" x1="510" y1="115" x2="598" y2="115"></line>
+        <text class="lbl sm" x="548" y="160" text-anchor="middle">provider 适配</text>
+
+        <text class="lbl sm" x="20" y="200" fill="#556674">可选的 transformContext 在 convertToLlm 之前做 AgentMessage → AgentMessage 的清洗/注入。</text>
+      </svg>
+      <div class="fig-cap">图 2.1：AgentMessage 是「宽」的运行时类型，Message 是「窄」的 LLM 类型，convertToLlm 是唯一的窄化出口。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>AgentMessage：一个可扩展的消息</h2>
+    <p>看 <code class="inline">packages/agent/src/types.ts</code> 里 <code class="inline">AgentMessage</code> 的定义：</p>
+    <div class="code-title">packages/agent/src/types.ts — AgentMessage 与声明合并</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// 基础消息：直接复用 pi-ai 的 Message（user/assistant/toolResult）</span>
+<span class="kw">import type</span> { Message } <span class="kw">from</span> <span class="st">"@earendil-works/pi-ai"</span>;
+
+<span class="cmt">// 空的"扩展点"接口 —— 应用通过 declaration merging 塞自定义消息类型</span>
+<span class="kw">export interface</span> <span class="cl">CustomAgentMessages</span> {
+  <span class="cmt">// Empty by default - apps extend via declaration merging</span>
+}
+
+<span class="cmt">// Message 联合上应用自定义的消息，构成"宽"的运行时消息</span>
+<span class="kw">export type</span> <span class="cl">AgentMessage</span> =
+  | <span class="cl">Message</span>
+  | <span class="cl">CustomAgentMessages</span>[keyof <span class="cl">CustomAgentMessages</span>];</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">CustomAgentMessages</code> 初始为空，应用可用 TypeScript 的<strong>声明合并</strong>往里面加键，例如：<code class="inline">declare module "..." { interface CustomAgentMessages { notification: NotificationMessage } }</code>。于是 <code class="inline">AgentMessage</code> 就自动包含你的自定义类型。<strong>这套「可扩展消息」设计是 Pi 的基石</strong>：会话、UI、harness 都能往会话里塞「不是 LLM 消息」的东西而保持类型安全。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>convertToLlm：那座唯一出口的桥</h2>
+    <p>每次调 LLM 前，循环必须把所有 <code class="inline">AgentMessage</code> 变成 LLM 懂的 <code class="inline">Message</code>。这个职责由一个「必须不抛异常」的函数承担：</p>
+    <div class="code-title">packages/agent/src/types.ts — convertToLlm 的契约（文档注释 + 默认实现）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// 每次 LLM 调用前，把 AgentMessage[] 转为 Message[]</span>
+convertToLlm: (messages: <span class="cl">AgentMessage</span>[]) =&gt; <span class="cl">Message</span>[] | Promise&lt;<span class="cl">Message</span>[]&gt;;
+
+<span class="cmt">// agent.ts 里的默认实现：只放行 LLM 认识的三种角色，其余一律过滤</span>
+<span class="kw">function</span> <span class="fn">defaultConvertToLlm</span>(messages: <span class="cl">AgentMessage</span>[]): <span class="cl">Message</span>[] {
+  <span class="kw">return</span> messages.filter(
+    (message) =&gt;
+      message.role === <span class="st">"user"</span> ||
+      message.role === <span class="st">"assistant"</span> ||
+      message.role === <span class="st">"toolResult"</span>,
+  );
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 默认实现就是个过滤器——自定义消息（如 <code class="inline">notification</code>）直接被丢弃，不进 LLM。但你可以覆盖它：把自定义消息<strong>转换成</strong> user 消息，或做更复杂的字段归一化。契约规定「绝不能 throw」，失败时返回安全回退值，否则会打乱事件流。这是自研时容易踩坑的地方：<strong>转换器一旦崩，整个 loop 就乱了。</strong></div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>transformContext：窄化之前的可选项</h2>
+    <p>在 <code class="inline">convertToLlm</code> 之前，还有一个可选的 <code class="inline">transformContext</code>，它工作在 <code class="inline">AgentMessage</code> 层面——做「上下文管理」「注入外部上下文」这类需要完整消息类型的操作：</p>
+    <div class="code-title">packages/agent/src/agent-loop.ts — streamAssistantResponse 里的两步转换</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// 第一步：AgentMessage[] → AgentMessage[]（可选清洗/裁剪/注入）</span>
+<span class="kw">let</span> messages = context.messages;
+<span class="kw">if</span> (config.transformContext) {
+  messages = <span class="kw">await</span> config.transformContext(messages, signal);
+}
+
+<span class="cmt">// 第二步：AgentMessage[] → Message[]（窄化到 LLM 认识的格式）</span>
+<span class="kw">const</span> llmMessages = <span class="kw">await</span> config.convertToLlm(messages);</pre>
+    <div class="annotation"><b>读懂这段：</b> 官方文档给的动机是「<code class="inline">transformContext</code>：剪掉旧消息、注入外部上下文」。而<strong>生产 harness 正是在这个位置接入会话树的上下文构建</strong>——它会从会话里挑出该发给模型的消息（见 <a href="05-context.html">第 5 章</a>）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>消息的三段生命周期</h2>
+    <p>把前面串起来：<code class="inline">AgentMessage</code> 的一生</p>
+    <div class="code-title">消息流转总括</div>
+    <pre class="code"><span class="lang-tag">text</span>用户输入 ──&gt; AgentMessage(user) ──&gt; [会话/上下文] ──&gt; transformContext
+                                              （可裁剪/注入）
+                                                     │
+                                                     └──&gt; convertToLlm ──&gt; Message[] ──&gt; LLM
+                                                                                        │
+                                                       回填: LLM 输出 ──&gt; AssistantMessage
+                                                                        │ 带 toolCall
+                                                                        └──&gt; 工具执行 ──&gt; ToolResultMessage</pre>
+    <div class="annotation"><b>关键点：</b> 助理回复（<code class="inline">AssistantMessage</code>）与工具结果（<code class="inline">ToolResultMessage</code>）也都是 <code class="inline">AgentMessage</code> 的一员。于是<strong>整条会话历史就是一串 AgentMessage</strong>——这让我们能在第 4 章的「会话树」里，把它作为一等公民存储和检索。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>TypeScript 层面的收益</h2>
+    <table class="tbl">
+      <tr><th>类型</th><th>角色</th><th>用于</th></tr>
+      <tr><td><code class="inline">Message</code></td><td>LLM 真懂</td><td>provider 调用边界</td></tr>
+      <tr><td><code class="inline">AgentMessage</code></td><td>运行时统一</td><td>会话、上下文、循环全程</td></tr>
+      <tr><td><code class="inline">AgentTool</code></td><td>工具定义</td><td>schema + execute + 钩子</td></tr>
+      <tr><td><code class="inline">AgentEvent</code></td><td>UI 事件</td><td>agent_start … agent_end</td></tr>
+      <tr><td><code class="inline">AgentToolResult</code></td><td>工具返回</td><td>回填给 LLM 的内容 + 元数据</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.7</span>对自研与使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      你也应该维护「宽的运行时消息」和「窄的 LLM 消息」两个类型，并只在一个明确的出口做转换。<strong>好处是：自定义消息（进度、UI、工具副作用）可以自由进出会话，而 LLM 始终只看到干净的历史。</strong>别把两套类型揉在一起，那是很多 Agent 框架变乱的根源。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="01-architecture.html">← 上一页：整体架构</a>
+    <a href="03-agent-loop.html">下一步：Agent 循环 →</a>
+  </div>
+</div>
+
+<footer>
+  Pi Agent Harness · 02 消息与类型体系 · 版本 v0.84.2-6-g086c32e74 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

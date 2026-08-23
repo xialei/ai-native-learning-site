@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15 · Pi vs LangGraph 逐项对比 — Pi Agent Harness</title>
+<link rel="stylesheet" href="assets/pi-learn.css">
+<style>
+  /* 本章专用：对照表双色 + 维度卡 */
+  .cmp-tbl th, .cmp-tbl td { vertical-align: top; }
+  .cmp-tbl thead th { background: #0f7d7a; color: #fff; }
+  .cmp-tbl td.pi { background: #eafaf8; }
+  .cmp-tbl td.lg { background: #eef4fb; }
+  .dim-card { border:1px solid #d7e3ea; border-radius:10px; padding:14px 18px; margin:18px 0; background:#fbfdff; }
+  .dim-card h3 { margin:0 0 6px; color:#0f7d7a; }
+  .vs-pill { display:inline-block; font-size:12px; font-weight:700; padding:2px 10px; border-radius:999px; margin-left:8px; }
+  .vs-pi { background:#0f7d7a; color:#fff; }
+  .vs-lg { background:#2563eb; color:#fff; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Pi Agent Harness</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-messages-types.html">消息类型</a>
+      <a href="03-agent-loop.html">Agent 循环</a>
+      <a href="04-session-storage.html">会话存储</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-harness.html">Harness</a>
+      <a href="08-agent-session.html">生产 Harness</a>
+      <a href="09-tools.html">工具</a>
+      <a href="10-ai-layer.html">AI 层</a>
+      <a href="11-coding-agent.html">编码 Agent</a>
+      <a href="12-build-own-runtime.html">自制 Runtime</a>
+      <a href="14-security-local-integration.html">安全·本地·集成</a>
+      <a href="15-comparison-langgraph.html" style="color:var(--brand);font-weight:700;">vs LangGraph</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 15 Pi vs LangGraph</div>
+    <h1>Pi vs LangGraph：两个 Agent 运行时的逐项对比</h1>
+    <div class="subtitle">读到这里，你已经把 Pi 的内核拆了个遍。但「Pi 这么做」并不等于「只能这么做」——市面上另一条主流路线是 LangGraph：把 Agent 建模成一张<strong>有状态的图</strong>。本章不评高下，而是沿着<strong>六个维度</strong>把两者并排放，让你看清它们各自把复杂度放在哪里、为谁优化、又各自牺牲了什么。理解了这层差异，你自研 Runtime 时才能选对自己的路线。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">一句话定位</span>
+    <span class="ep-quote">「LangGraph 给你一张可拼的图；Pi 给你一条可改的流水线。」</span> LangGraph 把控制流外化成<strong>声明式的节点与边</strong>，状态是图里流转的字典；Pi 把控制流内化成<strong>一段写死的顺序流程</strong>，状态是 append-only 的会话树。前者赢在「可拼可组合」，后者赢在「可读可改、崩溃即重生」。<span class="ep-arrow">→</span> 下面六个维度逐一拆开看。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">15.1</span>设计哲学与核心抽象</h2>
+    <p>两者的根分歧在这里：Agent 的「逻辑」到底该用什么形状表达。</p>
+    <div class="dim-card">
+      <h3>LangGraph：图是第一公民<span class="vs-pill vs-lg">声明式图</span></h3>
+      <p>LangGraph 的核心抽象是 <code class="inline">StateGraph</code>——你用 <code class="inline">add_node</code> 注册计算单元（一个函数：读状态、返回状态更新），用 <code class="inline">add_edge</code> / <code class="inline">add_conditional_edges</code> 连控制流，最后 <code class="inline">compile()</code> 出一个 <code class="inline">CompiledStateGraph</code>。状态（<code class="inline">State</code>）是节点间流转的结构化字典，合并语义由 <strong>reducer</strong> 决定（如 <code class="inline">Annotated[list, add_messages]</code> 幂等追加、<code class="inline">operator.add</code> 累加、默认 last-write-wins）。</p>
+      <p>它刻意把循环「打开」给你看：ReAct 的「调模型↔调工具」不是黑盒 while，而是两个节点 + 一条条件边。理由很朴素——黑盒循环在「先做 A、人审核不过回 A、过了进并行子任务」这类有结构流程里很难表达，而图天然描述分支/循环/并行/子图嵌套。</p>
+    </div>
+    <div class="dim-card">
+      <h3>Pi：流程是第一公民<span class="vs-pill vs-pi">固化流程</span></h3>
+      <p>Pi 的核心抽象是 <strong>Harness</strong>——把 LLM 循环、会话存储、上下文、压缩、工具、持久化、恢复收口成<strong>一个对象</strong>。但这个对象怎么跑？第 8 章看过：<code class="inline">AgentSession.prompt()</code> 就是一条<strong>写死的顺序方法体</strong>（命令解析 → 钩子 → 展开 → 校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>），韧性（重试/压缩/续跑）硬编码在 <code class="inline">_handlePostAgentRun</code> 的 while 里。系统提示词只决定「模型怎么想」，<strong>这段流程才决定「运行时怎么跑」</strong>。</p>
+      <p>状态不是字典，而是一棵 <strong>append-only 会话树</strong>（Lanes / Entries / Records）。控制流不靠你拼边，而靠 harness 提供的<strong>三种操作</strong>：<code class="inline">run</code>（往后长对话）/ <code class="inline">compaction</code>（折叠历史）/ <code class="inline">navigation</code>（挪指针到别的叶子）。契约层（<code class="inline">AgentHarness</code>）全是抛 <code class="inline">HarnessNotImplemented</code> 的 stub，真正能跑的是 <code class="inline">AgentSession</code>——它<strong>不继承</strong>基类，而是按同一套 <code class="inline">AgentLane</code> 契约重新实现。</p>
+    </div>
+    <div class="callout">
+      <strong>根分歧：</strong>LangGraph 让你「声明结构，框架负责跑」；Pi 让你「读一段流程，它就那么跑、你按需改」。前者把复杂度交给<strong>图的拓扑设计</strong>，后者把复杂度交给<strong>流程的编排代码</strong>。哪条更顺手，取决于你要的 Agent 是「很多条分叉的流程」还是「一条主干 + 大量扩展点」。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.2</span>核心能力与生态</h2>
+    <p>抽象不同，长出来的能力树也不同。下面把两边「开箱能干什么」对齐看。</p>
+    <table class="tbl cmp-tbl">
+      <thead>
+        <tr><th style="width:22%">能力</th><th class="pi" style="width:39%">Pi</th><th class="lg" style="width:39%">LangGraph</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>控制流表达</strong></td>
+          <td class="pi">固化流程 + 三操作状态机（run/compact/navigate）+ outcome（completed/aborted/failed/suspended/declined）。想加分支？改 <code class="inline">prompt()</code> 方法体或挂钩子。</td>
+          <td class="lg">节点 + 边 / 条件边 + <code class="inline">Command(goto=)</code> 路由 + <code class="inline">Send</code> 扇出做 map-reduce 并行。<code class="inline">recursion_limit</code> 兜底防死循环。</td>
+        </tr>
+        <tr>
+          <td><strong>状态模型</strong></td>
+          <td class="pi">append-only 会话树：Entry（内容）+ Record（簿记），seq/parentId/timestamp。分支是树形结构的一等公民（<code class="inline">/tree</code>、<code class="inline">/fork</code>）。</td>
+          <td class="lg">结构化字典（TypedDict/Pydantic）+ reducer 合并。分支靠 thread + 时间旅行分叉，不是原生树。</td>
+        </tr>
+        <tr>
+          <td><strong>多智能体</strong></td>
+          <td class="pi"><strong>故意不内置</strong>——「No 子 Agent」。经 tmux 拉起 Pi 实例，或写扩展自建。把可观测性留给操作系统。</td>
+          <td class="lg"><strong>一等公民</strong>——子图即节点，Supervisor / Hierarchical / Swarm 三范式，<code class="inline">Command(goto=)</code> 在子 agent 间接力。</td>
+        </tr>
+        <tr>
+          <td><strong>持久化</strong></td>
+          <td class="pi">LaneRecord append-only 日志 + <code class="inline">reduceLaneState()</code> 纯函数重放（第 7 章 §7.4）。现场可从日志重算，非快照。</td>
+          <td class="lg">Checkpointer 每 superstep 存<strong>完整状态快照</strong>，按 <code class="inline">thread_id</code> 分桶。InMemory/Sqlite/Postgres 后端。</td>
+        </tr>
+        <tr>
+          <td><strong>人机协同 HITL</strong></td>
+          <td class="pi"><code class="inline">suspended</code> outcome + <code class="inline">DeferredHandle</code> + <code class="inline">resume()</code>；运行中 <code class="inline">steer</code>/<code class="inline">followUp</code> 队列插话。无内置「权限弹窗」。</td>
+          <td class="lg"><code class="inline">interrupt()</code>（首次抛异常、恢复时返回 resume 值、节点重跑）+ <code class="inline">interrupt_before=</code> + <code class="inline">Command(resume=)</code>。依赖 checkpointer。</td>
+        </tr>
+        <tr>
+          <td><strong>上下文管理</strong></td>
+          <td class="pi">第 5/6 章的灵魂：<code class="inline">buildSessionContext</code> 把 entries 投影成 messages、自动压缩、分支摘要、<code class="inline">AGENTS.md</code>/<code class="inline">SYSTEM.md</code> 注入、Skills 按需载入。</td>
+          <td class="lg">状态里的 <code class="inline">messages</code> 由 <code class="inline">add_messages</code> 累积；窗口管理靠自建节点裁剪或 prebuilt 的 trim。Store 做跨会话长期记忆。</td>
+        </tr>
+        <tr>
+          <td><strong>供应商/模型</strong></td>
+          <td class="pi">pi-ai 抽象层：15+ 供应商、数百模型，<code class="inline">/model</code> 会话中途切，流式代理 + prompt caching + usage 累积（第 10 章）。</td>
+          <td class="lg">模型由 langchain 的 <code class="inline">BaseChatModel</code> 抽象，<code class="inline">bind_tools</code> 接工具；<code class="inline">create_react_agent</code> 支持传 <code class="inline">(state, runtime) -&gt; BaseChatModel</code> 做<strong>基于状态的动态选模型</strong>，但没有「会话中途用斜杠命令热切 + 缓存策略」这种产品级体验。</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="annotation"><b>读懂这张表：</b> 能力上两者「该有的都有」，但长法不同。LangGraph 的多智能体、并行扇出、子图嵌套是<strong>框架原生</strong>——你拼图就行；Pi 这些要么「故意不做」（子 Agent），要么靠「会话树的天然分叉」（navigation）或扩展。反过来，Pi 的<strong>上下文工程</strong>（压缩/分支摘要/指令注入）和<strong>会话中途热切模型</strong>是产品级深度，LangGraph 需要你自己补节点。生态差异由此而来：LangGraph 长在「编排范式」丰富，Pi 长在「单 Agent 跑得久、跑得稳」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.3</span>适用场景与复杂度</h2>
+    <p>抽象差异直接决定「什么样的任务在哪边更顺手」。LangGraph 的选型思路可以概括成一棵从轻到重升级的决策树：单轮问答→直接调 LLM；带工具助手→<code class="inline">create_react_agent</code>；需要定制控制流→<code class="inline">StateGraph</code> 自建；多角色协作→多智能体。Pi 没有这棵树，因为它<strong>不替你决定工作流</strong>——它给你一条主干流水线 + 扩展点，你按需改。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t15c d15c">
+        <title id="t15c">场景-复杂度对照：LangGraph 升级树 vs Pi 主干+扩展</title>
+        <desc id="d15c">左：LangGraph 从单轮 LLM 到多智能体逐级升级的决策树；右：Pi 一条主干流程，复杂度靠扩展点横向生长。</desc>
+        <defs>
+          <marker id="arrow15c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <!-- LangGraph 侧 -->
+        <rect class="node" x="30" y="20" width="380" height="340" rx="10" fill="#eef4fb" stroke="#2563eb" stroke-dasharray="4 3"/>
+        <text class="lbl" x="220" y="42" text-anchor="middle" fill="#2563eb" font-size="14">LangGraph：按任务复杂度升级</text>
+        <rect class="node core" x="60" y="60" width="160" height="36" rx="6" fill="#2563eb"/>
+        <text class="lbl sm" x="140" y="82" text-anchor="middle" fill="#fff">单轮 → model.invoke()</text>
+        <rect class="node" x="60" y="120" width="200" height="36" rx="6" fill="#dbeafe"/>
+        <text class="lbl sm" x="160" y="142" text-anchor="middle" fill="#1e40af">带工具 → create_react_agent</text>
+        <rect class="node" x="60" y="180" width="220" height="36" rx="6" fill="#bfdbfe"/>
+        <text class="lbl sm" x="170" y="202" text-anchor="middle" fill="#1e3a8a">定制控制流 → StateGraph 自建</text>
+        <rect class="node" x="60" y="240" width="240" height="36" rx="6" fill="#93c5fd"/>
+        <text class="lbl sm" x="180" y="262" text-anchor="middle" fill="#1e3a8a">多角色 → 多智能体 Supervisor</text>
+        <line x1="140" y1="96" x2="140" y2="118" stroke="#556674" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <line x1="160" y1="156" x2="160" y2="178" stroke="#556674" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <line x1="170" y1="216" x2="170" y2="238" stroke="#556674" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <text class="lbl sm" x="300" y="82" fill="#556674">A1 最轻</text>
+        <text class="lbl sm" x="300" y="142" fill="#556674">A2 prebuilt</text>
+        <text class="lbl sm" x="300" y="202" fill="#556674">A3 自建图</text>
+        <text class="lbl sm" x="300" y="262" fill="#556674">A4 多智能体</text>
+        <text class="lbl sm" x="220" y="330" text-anchor="middle" fill="#556674">复杂度 ↑ = 拼更多节点/边/子图</text>
+
+        <!-- Pi 侧 -->
+        <rect class="node" x="490" y="20" width="380" height="340" rx="10" fill="#eafaf8" stroke="#0f7d7a" stroke-dasharray="4 3"/>
+        <text class="lbl" x="680" y="42" text-anchor="middle" fill="#0f7d7a" font-size="14">Pi：一条主干，横向扩展</text>
+        <rect class="node core" x="560" y="70" width="240" height="180" rx="8" fill="#0f7d7a"/>
+        <text class="lbl" x="680" y="100" text-anchor="middle" fill="#fff">AgentSession 主干流程</text>
+        <text class="lbl sm" x="680" y="122" text-anchor="middle" fill="#d1faf4">命令→钩子→展开→校验→</text>
+        <text class="lbl sm" x="680" y="140" text-anchor="middle" fill="#d1faf4">压缩预检→runAgent→收敛</text>
+        <text class="lbl sm" x="680" y="168" text-anchor="middle" fill="#fff">（写死的顺序，第 8 章）</text>
+        <text class="lbl sm" x="680" y="200" text-anchor="middle" fill="#d1faf4">run / compact / navigate</text>
+        <text class="lbl sm" x="680" y="222" text-anchor="middle" fill="#d1faf4">+ steer / followUp / resume</text>
+        <!-- 扩展点 -->
+        <rect class="node" x="510" y="278" width="150" height="40" rx="6" fill="#ccfbf1" stroke="#0f7d7a"/>
+        <text class="lbl sm" x="585" y="295" text-anchor="middle" fill="#0f7d7a">扩展 Extensions</text>
+        <text class="lbl sm" x="585" y="310" text-anchor="middle" fill="#556674">工具/命令/钩子</text>
+        <rect class="node" x="680" y="278" width="150" height="40" rx="6" fill="#ccfbf1" stroke="#0f7d7a"/>
+        <text class="lbl sm" x="755" y="295" text-anchor="middle" fill="#0f7d7a">技能 Skills</text>
+        <text class="lbl sm" x="755" y="310" text-anchor="middle" fill="#556674">按需载入能力包</text>
+        <line x1="585" y1="278" x2="620" y2="252" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <line x1="755" y1="278" x2="720" y2="252" stroke="#0f7d7a" stroke-width="2" marker-end="url(#arrow15c)"/>
+        <text class="lbl sm" x="680" y="338" text-anchor="middle" fill="#556674">复杂度 ↑ = 挂更多扩展点，不动主干</text>
+      </svg>
+      <div class="fig-cap">图 15.3：复杂度生长方向不同。LangGraph 纵向升级——任务越复杂，图的节点/边/子图越多；Pi 横向扩展——主干流程不变，复杂度塞进 Extensions / Skills / 钩子。</div>
+    </div>
+    <div class="callout warn">
+      <b class="tag">怎么选</b>
+      <ul style="margin:6px 0 0">
+        <li><strong>选 LangGraph</strong>：任务天然是「多角色分工」「并行扇出」「先规划再分步执行」「带审核回环」这类<strong>有结构的复杂流程</strong>——图能干净地表达拓扑，且每个分支可观测、可中断、可恢复。</li>
+        <li><strong>选 Pi</strong>：任务核心是「一个 Agent 长时间跑、跑得稳、能崩溃重生、上下文要精细控制」——你要的是一条被工程验证过的主干，外加按需扩展，而不是自己拼一张大图。编码 Agent、CLI 助手、可嵌入的运行时内核是它的甜区。</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.4</span>开发体验与学习曲线</h2>
+    <p>「能跑起来」和「跑得舒服」是两回事。两者的上手路径差别很大。</p>
+    <div class="dim-card">
+      <h3>LangGraph：三行起手，按需下钻<span class="vs-pill vs-lg">平缓升级</span></h3>
+      <p>最爽的入口是 <code class="inline">create_react_agent(model, tools)</code>——三行起一个能调工具的 ReAct Agent，返回一个 <code class="inline">CompiledStateGraph</code>。它本质是预置好的「LLM 节点↔工具节点」循环图。当你需要更多控制，下钻到 <code class="inline">StateGraph</code> 手拼节点和边——<strong>关键的是，prebuilt 和自建共享同一套原语</strong>（<code class="inline">ToolNode</code>、<code class="inline">MessagesState</code>、<code class="inline">add_messages</code>），所以从 A2 升到 A3 不是推倒重来，而是「把现成循环拆开加节点」。这条平缓升级路径是 LangGraph 学习曲线最大的优势。</p>
+      <p>但要付的税是<strong>心智模型多</strong>：State/Reducer/Channel/Conditional Edge/Command/Send/interrupt/checkpointer/store——每个都是独立概念，reducer 写错还会「状态静默丢失」（最隐蔽的坑），社区甚至把「自建 Agent 四大杀手」单列出来警示。</p>
+    </div>
+    <div class="dim-card">
+      <h3>Pi：读一段流程，改一个点<span class="vs-pill vs-pi">流程可读</span></h3>
+      <p>Pi 的上手不是「拼图」而是「读流程」。你打开 <code class="inline">agent-session.ts</code>，<code class="inline">prompt()</code> 是一条从上到下的方法体——没有图的拓扑要脑补，控制流就是你读到的顺序。想加行为？挂钩子（<code class="inline">beforeToolCall</code>/<code class="inline">afterToolCall</code>/<code class="inline">before_agent_start</code>…）或写扩展，不动主干。</p>
+      <p>契约/实现分层也利于学习：第 7 章的 <code class="inline">AgentHarness</code> 是<strong>全是 stub 的虚线框</strong>，告诉你「运行时该长什么样」；第 8 章的 <code class="inline">AgentSession</code> 才是实心实现。读虚线框建立心智模型，读实心框看落地，路径清晰。代价是：<strong>想改主干流程本身</strong>（比如插入一个全新的操作类型）要动 <code class="inline">prompt()</code> 的硬编码，比加一个 LangGraph 节点重。</p>
+    </div>
+    <table class="tbl">
+      <thead><tr><th>维度</th><th>Pi</th><th>LangGraph</th></tr></thead>
+      <tbody>
+        <tr><td>第一个能跑的 Agent</td><td>装好即用（TUI 开箱），但要理解 harness 分层</td><td><code class="inline">create_react_agent</code> 三行</td></tr>
+        <tr><td>从简单到复杂的路径</td><td>挂扩展点（横向），主干不变</td><td>prebuilt→StateGraph→多智能体（纵向），原语共享</td></tr>
+        <tr><td>核心心智模型</td><td>一条流程 + 三操作 + 会话树 + 日志重放</td><td>图 + 状态/reducer + 边/条件边 + checkpoint</td></tr>
+        <tr><td>最常见的坑</td><td>改主干要碰硬编码流程</td><td>reducer 写错→状态静默丢失；循环无终止→GraphRecursionError</td></tr>
+        <tr><td>语言/生态</td><td>TypeScript，monorepo，<code class="inline">pi install</code> 装包</td><td>Python（也有 JS SDK），langchain 生态，LangSmith 可观测</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.5</span>灵活性与控制力</h2>
+    <p>「灵活」是个含混的词——得拆成「能组合的灵活」和「能直改的控制」两种，两边各自赢一面。</p>
+    <div class="dim-card">
+      <h3>LangGraph：组合的灵活<span class="vs-pill vs-lg">拓扑自由</span></h3>
+      <p>图抽象的赢面在<strong>组合</strong>：任意节点 + 任意边 + 条件边回环 + 子图嵌套 + <code class="inline">Send</code> 并行，你能拼出 Reflection、Plan-Execute、RAG、HITL、多智能体任意组合——这些模式可自由组合，把对应节点和条件边一起塞进同一张 <code class="inline">StateGraph</code> 即可。控制流的形状完全由你定义，框架只负责按拓扑执行 + 每步存快照。这是「声明式」的红利：你描述「要什么结构」，不用描述「怎么一步步跑」。</p>
+      <p>但代价是<strong>对单步的精细控制较弱</strong>：你想在「模型返回后、工具执行前」插一段自定义逻辑，得专门加一个节点 + 改边；流程细节被分散到图的拓扑里，而不是集中在一处可读的方法体。</p>
+    </div>
+    <div class="dim-card">
+      <h3>Pi：直改的控制<span class="vs-pill vs-pi">流程可改</span></h3>
+      <p>Pi 的赢面在<strong>直改</strong>：因为流程是写死的方法体，你能在任意两步之间插入逻辑——它就在 <code class="inline">prompt()</code> 那行代码的位置，看得见、改得动。钩子系统（<code class="inline">UnavailableRegistry</code> 让未实现钩子「注册即报错」而非静默失效）把可变策略移出主干，但主干本身对你是<strong>完全可读可改</strong>的源码。Pi 狂热追求可扩展，是为了「不必替你规定工作流」：别的工具烤进内核的（子 Agent、计划模式、权限弹窗、MCP），你都能自己搭或装包。</p>
+      <p>代价是<strong>组合的灵活度低</strong>：没有原生的多智能体拓扑、没有 <code class="inline">Send</code> 式并行扇出、子图嵌套要靠 tmux 或扩展自己组织。要拼一张「研究员→写手→审稿」的多角色图，Pi 不如 LangGraph 顺手——它更擅长「一个 Agent 把一件事跑深」。</p>
+    </div>
+    <div class="callout">
+      <strong>一句话：</strong>LangGraph 给你「乐高积木」——组合自由、拓扑可拼，但单点控制要绕到节点层面；Pi 给你「一台可改的机器」——单点控制直接改源码，但拼大型拓扑不是它的强项。前者是「框架替你跑结构」，后者是「你直接改流程」。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.6</span>生产就绪性</h2>
+    <p>「能上线」是真金白银的考验。这里聚焦三件最硬的：崩溃恢复、持久化、可观测。</p>
+    <table class="tbl cmp-tbl">
+      <thead><tr><th style="width:20%">生产维度</th><th class="pi" style="width:40%">Pi</th><th class="lg" style="width:40%">LangGraph</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>崩溃恢复机制</strong></td>
+          <td class="pi"><strong>append-only 日志 + 纯函数重放</strong>。每步先写 <code class="inline">LaneRecord</code>（operation_started/step_attempt/tool_started/…）再动手；崩溃后 <code class="inline">reduceLaneState()</code> 重放日志算出「上次停在哪」，从那接着跑。「先写日志再动手 = 崩了也不丢现场」（第 7 章 §7.4）。</td>
+          <td class="lg"><strong>每步完整状态快照</strong>。Checkpointer 在每个 superstep 后存整个 state（channel 值 + 版本 + pending writes），按 <code class="inline">thread_id</code> 分桶。崩溃后从最近 checkpoint 恢复。HITL 的 <code class="inline">interrupt()</code> 也依赖它跨进程续跑。</td>
+        </tr>
+        <tr>
+          <td><strong>持久化形态</strong></td>
+          <td class="pi">会话存成树形 JSONL（Entry + Record），单文件含全部分支；<code class="inline">assertJsonSerializable</code> 写前显式栈式校验，杜绝脏数据读不回来（第 4 章 §4.8）。内存 / SQLite 后端。</td>
+          <td class="lg">InMemorySaver（仅测试）/ SqliteSaver（单机）/ PostgresSaver（生产、并发连接池）。Store 做跨会话长期记忆（namespace+key）。<code class="inline">get_state_history</code> 时间旅行、可从历史 checkpoint 分叉新线。</td>
+        </tr>
+        <tr>
+          <td><strong>恢复粒度</strong></td>
+          <td class="pi">动作级——重放告诉你「停在某次 step_attempt 之后、工具还没开始」，精确续跑。<code class="inline">suspended</code> + <code class="inline">DeferredHandle</code> 支持主动挂起后 <code class="inline">resume()</code>。</td>
+          <td class="lg">节点级——从某 superstep 的完整快照恢复，<code class="inline">interrupt()</code> 恢复时节点会从头重跑（故铁律：interrupt 必须在副作用之前）。</td>
+        </tr>
+        <tr>
+          <td><strong>韧性编排</strong></td>
+          <td class="pi">运行后收敛三段式（第 8 章 §8.5）：重试优先于压缩、压缩优先于兜底续跑，硬编码在 <code class="inline">_handlePostAgentRun</code>。<code class="inline">_willRetryAfterAgentEnd</code> 回扫最后一条 assistant 判可重试错误。</td>
+          <td class="lg">节点级 <code class="inline">RetryPolicy(max_attempts=, retry_on=)</code> 挂 <code class="inline">add_node</code>；图级 <code class="inline">recursion_limit</code> 兜底抛 <code class="inline">GraphRecursionError</code>。两者都要配。</td>
+        </tr>
+        <tr>
+          <td><strong>可观测</strong></td>
+          <td class="pi">JSON event stream / RPC 模式把内部事件（agent_start/turn_start/message_update…）结构化外发；同内核四种形态（交互/print/RPC/SDK）都可观测可直连（第 14 章）。</td>
+          <td class="lg">内建 tracing + LangSmith 平台看完整调用链；<code class="inline">stream()</code> 多模式（values/updates/messages/debug/custom）既拿状态增量也逐 token 流式。</td>
+        </tr>
+        <tr>
+          <td><strong>并发秩序</strong></td>
+          <td class="pi">stdout 接管串行化（防 TUI 花屏）+ <code class="inline">realpath</code> 归并的文件写互斥锁（同文件串行、异文件并行）（第 9 章 §9.6）。工程细节就地解决并发抢资源。</td>
+          <td class="lg">原生 async + 并发节点 + 超时控制；并行靠 <code class="inline">Send</code> 扇出 + reducer 聚合，框架在 superstep 边界同步。</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="callout info">
+      <b class="tag">两种「稳」的哲学</b>
+      <strong>Pi 的稳靠「日志重放」</strong>——现场不在内存里凭空维护，而是可从 append-only 日志重算，所以「先写日志再动手」是它的铁律，崩在哪都能精确接回。<strong>LangGraph 的稳靠「快照存档」</strong>——每步存完整状态，恢复即读档，时间旅行还能回到任意历史点分叉。两者都做到了生产级崩溃恢复，但路径相反：Pi 重算（轻量、动作级精确），LangGraph 存档（重量、节点级完整）。选哪个，看你更信任「重放确定性」还是「快照完备性」。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">15.7</span>六维总览与选型决策</h2>
+    <p>把六个维度压成一张速查表。每格只放最锐利的一句话对照，方便你快速定位「我的场景更偏哪边」。</p>
+    <table class="tbl cmp-tbl">
+      <thead><tr><th style="width:18%">维度</th><th class="pi" style="width:41%">Pi</th><th class="lg" style="width:41%">LangGraph</th></tr></thead>
+      <tbody>
+        <tr><td><strong>设计哲学</strong></td><td class="pi">固化流程 + 会话树；流程是第一公民</td><td class="lg">声明式图 + 状态字典；图是第一公民</td></tr>
+        <tr><td><strong>核心能力</strong></td><td class="pi">上下文工程深、模型热切、崩溃重生强；多智能体故意不做</td><td class="lg">多智能体/并行/子图原生；上下文管理要自补节点</td></tr>
+        <tr><td><strong>适用场景</strong></td><td class="pi">单 Agent 长跑稳跑、CLI/可嵌入内核、编码助手</td><td class="lg">多角色分工、并行扇出、有结构的复杂流程</td></tr>
+        <tr><td><strong>开发体验</strong></td><td class="pi">读一段可改流程；改主干较重</td><td class="lg">三行起手、平缓升级；心智模型多、reducer 易踩坑</td></tr>
+        <tr><td><strong>灵活性</strong></td><td class="pi">直改控制强（源码可读可改）；组合灵活度低</td><td class="lg">组合灵活强（拓扑可拼）；单点控制要绕到节点</td></tr>
+        <tr><td><strong>生产就绪</strong></td><td class="pi">日志重放恢复（动作级精确）+ 并发秩序工程细节</td><td class="lg">快照存档恢复（节点级完整）+ tracing/Store 生态</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn">
+      <b class="tag">选型心法</b>
+      别问「哪个更好」，问「我的复杂度长在哪」。如果你的复杂度是<strong>「流程拓扑复杂、多角色多分支」</strong>——选 LangGraph，图能干净表达，且每步可观测可恢复。如果你的复杂度是<strong>「单 Agent 要跑得久、上下文要精细、崩溃要能接回、还要能嵌入我的产品」</strong>——选 Pi，它把这条主干工程化到了极致，外加扩展点留给你。<strong>两者不是替代关系，而是两条路线</strong>：LangGraph 是「编排框架」，Pi 是「运行时内核」。理解了这层，你自研时才不会把「该拼图的需求」硬塞进「该改流程的内核」，反之亦然。
+    </div>
+    <div class="annotation"><b>最后一句话：</b> 本站通篇在教你「Pi 这么做」，这一章把它和「另一种做法」并排，不是为了分高下，而是为了让你看清<strong>设计取舍</strong>。能看清取舍的人，自研 Runtime 时才敢做选择——而不是把别家的烤进内核、又抄不透其理由。Pi 那句口号「There are many agent harnesses, but this one is yours」的真意，正在于此。</div>
+    <div class="arrow-nav">
+      <a class="prev" href="14-security-local-integration.html">← 上一章 · 安全·本地·集成</a>
+      <a class="top" href="index.html">返回首页</a>
+    </div>
+  </section>
+</div>
+
+<footer>
+  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理 · LangGraph 对照基于 <code>github.com/langchain-ai/langgraph</code> 学习站</p>
+  <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a> · <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
+</footer>
+
+</body>
+</html>
