@@ -59,10 +59,10 @@
       <tr><td><strong>messages</strong></td><td>LLM 逐 token 输出 <code class="inline">(chunk, metadata)</code></td><td>节点内任何 LLM 调用产 token 时</td><td>否</td></tr>
       <tr><td><strong>custom</strong></td><td>节点内用 <code class="inline">StreamWriter</code> 主动推的任意数据</td><td>节点内调用 <code class="inline">writer(...)</code> 时</td><td>否</td></tr>
       <tr><td><strong>checkpoints</strong></td><td>检查点事件(格式同 <code class="inline">get_state()</code>)</td><td>每次创建 checkpoint 时</td><td><strong>是</strong></td></tr>
-      <tr><td><strong>tasks</strong></td><td>任务开始/结束事件(含结果与报错)</td><td>每个 task 开始与结束时</td><td><strong>是</strong></td></tr>
-      <tr><td><strong>debug</strong></td><td>checkpoints + tasks 的合集 + 额外元数据</td><td>上述两者触发时</td><td><strong>是</strong></td></tr>
+      <tr><td><strong>tasks</strong></td><td>任务开始/结束事件(含结果与报错)</td><td>每个 task 开始与结束时</td><td>否</td></tr>
+      <tr><td><strong>debug</strong></td><td>checkpoints + tasks 的合集 + 额外元数据</td><td>上述两者触发时</td><td>部分(仅 checkpoints 部分需)</td></tr>
     </table>
-    <p>注意三个细节:第一,<strong>messages 是逐 token 的</strong>——这是官方"first-class streaming"卖点对应的能力,能让你前端像 ChatGPT 那样一个字一个字蹦出来。第二,<strong>checkpoints / tasks / debug 必须配 checkpointer</strong>,因为它们依赖持久化层产生的事件。第三,<code class="inline">debug</code> 本质是 <code class="inline">checkpoints + tasks</code> 的合集(源码 docstring 原文: Emit `"checkpoints"` and `"tasks"` events for debugging purposes),不是独立信息源。</p>
+    <p>注意三个细节:第一,<strong>messages 是逐 token 的</strong>——这是官方"first-class streaming"卖点对应的能力,能让你前端像 ChatGPT 那样一个字一个字蹦出来。第二,<strong>只有 checkpoints 模式必须配 checkpointer</strong>:它的 emit 被 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫,无 checkpointer 时静默跳过;而 <code class="inline">tasks</code> 的 emit 无此守卫,有没有 checkpointer 都正常吐。第三,<code class="inline">debug</code> 本质是 <code class="inline">checkpoints + tasks</code> 的合集(源码 docstring 原文: Emit `"checkpoints"` and `"tasks"` events for debugging purposes),不是独立信息源——所以无 checkpointer 时 <code class="inline">debug</code> 仍会吐 task 事件,只是少了 checkpoint 事件。</p>
 
     <div class="callout info">
       <b class="tag">最常用的两种</b>
@@ -257,19 +257,20 @@ final = run.output          <span class="cmt"># 最终输出</span>
   <section class="block">
     <h2><span class="num">11.10</span>新手常犯的错误</h2>
 
-    <div class="code-title">① checkpoints / tasks / debug 模式静默不吐——因为没配 checkpointer</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 没给图 compile checkpointer,却想用 debug 模式排查问题</span>
+    <div class="code-title">① checkpoints 模式静默不吐——因为没配 checkpointer</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 没给图 compile checkpointer,却想用 checkpoints 模式看检查点事件</span>
 graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">compile</span>()   <span class="cmt"># 没有 checkpointer=</span>
 
-<span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(inputs, stream_mode=<span class="st">"debug"</span>, version=<span class="st">"v2"</span>):
+<span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(inputs, stream_mode=<span class="st">"checkpoints"</span>, version=<span class="st">"v2"</span>):
     print(part)   <span class="cmt"># 什么都不输出!for 循环一次都不进,也不报错</span>
 
-<span class="cmt"># 原因:tasks / checkpoints / debug 的事件由 self.tasks / self.cache 驱动,</span>
-<span class="cmt"># 而它们只有在配了 checkpointer 时才会被创建(见 _loop.py: self.cache = cache)。</span>
-<span class="cmt"># 无 checkpointer 时,这些模式的 emit 被 `if self.cache is None` 短路 → 静默无输出。</span>
-<span class="cmt"># 修复:compile 时传入 checkpointer,或用不需要 checkpointer 的 values/updates/messages/custom。</span>
+<span class="cmt"># 原因:checkpoints 事件的 emit 被 `if self._checkpointer_put_after_previous is not None` 守卫</span>
+<span class="cmt"># (见 _loop.py:632)。无 checkpointer 时该字段为 None,emit 被短路 → 静默产出 0 个事件。</span>
+<span class="cmt"># 注意:tasks 模式不受此影响(emit 在 _loop.py:674 无守卫),没有 checkpointer 也照常吐;</span>
+<span class="cmt"># debug 模式 = checkpoints + tasks,无 checkpointer 时仍会吐 task 事件,只是少了 checkpoint 事件。</span>
+<span class="cmt"># 修复:想看 checkpoint 事件就 compile 时传入 checkpointer;只想看任务流用 tasks 即可,不必配 checkpointer。</span>
 graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">compile</span>(checkpointer=InMemorySaver())</pre>
-    <div class="annotation"><b>读懂这段:</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。§11.2 表格里写"checkpoints / tasks / debug 需 checkpointer",但"需"的真实含义是:没有 checkpointer 时这些模式<strong>静默产出 0 个事件</strong>,而不是抛异常。源码依据是 <code class="inline">_loop.py</code> 里 <code class="inline">self.cache</code>(checkpointer 的缓存)为 <code class="inline">None</code> 时,task 事件的 emit 被短路(<code class="inline">if self.cache is None</code> / <code class="inline">if not writes or self.cache is None or not hasattr(self, "tasks")</code>)。排查时一旦发现 debug 流"空跑",先查图有没有 <code class="inline">checkpointer</code>,再看 stream_mode。</div>
+    <div class="annotation"><b>读懂这段:</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。"需 checkpointer"的只有 <code class="inline">checkpoints</code> 模式:无 checkpointer 时它<strong>静默产出 0 个事件</strong>,而不是抛异常。源码依据是 <code class="inline">_loop.py:632</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫——无 checkpointer 时该字段为 <code class="inline">None</code>,emit 被短路。但别误伤 <code class="inline">tasks</code>:它的 emit(<code class="inline">_loop.py:674</code>)没有这道守卫,有没有 checkpointer 都正常工作。排查时一旦发现 <code class="inline">checkpoints</code> 流"空跑",先查图有没有 <code class="inline">checkpointer</code>,再看 stream_mode。</div>
 
     <div class="code-title">② custom 模式收不到数据——writer 在异步 + Python &lt; 3.11 下拿不到 runtime</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Python 3.10 + 异步运行,节点里调 get_stream_writer()</span>

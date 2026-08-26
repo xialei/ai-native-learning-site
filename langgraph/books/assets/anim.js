@@ -130,9 +130,12 @@
   };
 
   // 自动挂载
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", window.LGAnim.mountAll);
-  } else {
+  // 注意:defer 脚本执行时 readyState 为 "interactive"(非 "loading"),
+  // 此时若立即挂载,排在后面的 scenes.js 还没执行、场景未注册 → 显示"未知演示"。
+  // 因此只要还没到 "complete" 就等 DOMContentLoaded(此时所有 defer 脚本均已跑完)。
+  if (document.readyState === "complete") {
     window.LGAnim.mountAll();
+  } else {
+    document.addEventListener("DOMContentLoaded", window.LGAnim.mountAll);
   }
 })();

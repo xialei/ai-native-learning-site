@@ -88,6 +88,11 @@
         <rect class="node" x="480" y="128" width="10" height="34" rx="2"></rect>
         <text class="lbl sm" x="20" y="310">profile 的目标就是量出「权重 + activation 峰值」之后，把剩余显存全部给 KV → 这决定了 num_gpu_blocks</text>
       </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>模型权重（固定）</span>
+        <span class="lg-item"><span class="sw acc"></span>KV cache（变量）</span>
+        <span class="lg-item"><span class="sw"></span>activation / 临时</span>
+      </div>
       <div class="fig-cap">图 8.1：显存三块——权重与 activation 是固定开销，KV 是“吃剩下的”。比例仅为示意。</div>
     </div>
     <p>划总预算的开关是 <code class="inline">CacheConfig.gpu_memory_utilization</code>：0~1 之间，表示「这份 GPU 显存的多少比例拿来给本实例」。注意：<strong>当前代码里默认值是 0.92</strong>，而不是很多人以为的 0.9，它是可配置的（<code class="inline">--gpu-memory-utilization</code>）。</p>
@@ -143,15 +148,16 @@ self.available_kv_cache_memory_bytes = (
     一条 4K 的序列就要 128 KiB × 4096 ≈ 512 MiB；GPU 里想塞 10 条这样的，KV 就得 5 GiB 起步。</p>
     <p>vLLM 按「块」来装这些 token。每块 <code class="inline">block_size</code>（默认 16）个 token，那么一块的字节就是「每 token 字节 × 16」。块数和可用显存的关系，在 <code class="inline">kv_cache_utils.py</code> 里就是一句除法：</p>
     <div class="code-title">vllm/v1/core/kv_cache_utils.py — 可用显存 ÷ 每块字节（摘录）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_get_kv_cache_config_packed</span>(vllm_config, kv_cache_groups,
-                                  available_memory):
-    block_stride, layers_by_offset = <span class="fn">_get_packed_kv_cache_layout</span>(
-        kv_cache_groups)
-    <span class="cmt"># 块数 = 可用显存 / 一个块的字节跨度</span>
-    num_blocks = available_memory // block_stride
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_kv_cache_config_from_groups</span>(vllm_config, kv_cache_groups,
+                                           available_memory):
+    <span class="cmt"># 每个块占多少字节（把该组所有层、所有 KV 头的 K+V 都算进去）</span>
+    bytes_per_block = <span class="fn">_get_kv_cache_bytes_per_block</span>(kv_cache_groups)
+    <span class="cmt"># 块数 = 可用显存 / 一个块的字节</span>
+    num_blocks = available_memory // bytes_per_block
     num_blocks = <span class="fn">may_override_num_blocks</span>(vllm_config, num_blocks)
-    <span class="kw">return</span> total_size, num_blocks</pre>
-    <div class="annotation"><b>读懂 <code class="inline">num_blocks = available_memory // block_stride</code>：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值，即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
+    size = bytes_per_block * num_blocks
+    <span class="kw">return</span> <span class="cl">KVCacheConfig</span>(num_blocks=num_blocks, kv_cache_tensors=[...], ...)</pre>
+    <div class="annotation"><b>读懂 <code class="inline">num_blocks = available_memory // bytes_per_block</code>：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值，即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
   </section>
 
   <section class="block">
@@ -246,6 +252,11 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 
         <text class="lbl sm" x="20" y="282">省掉的 = A 已经算过、B 直接白拿的那两段 prefix prefill；只有当 ref_cnt 归 0 时才 evict 该物理块</text>
       </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>共享前缀块（ref=2）</span>
+        <span class="lg-item"><span class="sw acc"></span>分歧后各自新建块（ref=1）</span>
+        <span class="lg-item"><span class="sw"></span>请求</span>
+      </div>
       <div class="fig-cap">图 8.5：前缀命中让第二个请求跳过整段重复 prefill，物理块引用计数体现共享。</div>
     </div>
     <div class="annotation"><b>为什么“块哈希”是关键：</b>一样的 token 序列一定算出一样的块哈希，所以 <code class="inline">BlockHashToBlockMap</code> 一查即中。默认 <code class="inline">enable_prefix_caching = True</code> 且哈希算法为 <code class="inline">"sha256"</code>（见 <code class="inline">CacheConfig</code>，可用 xxhash 提速）。命中率越高，省下的 prefill 越多——而省下的 prefill 本身就是省显存省时间。</div>
@@ -281,7 +292,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 </div>
 
 <footer>
-  vLLM 引擎学习站 · 08 内存 · 版本 v0.26.1rc0-1046-gba07e4a48f · 所有引用代码路径以仓库最新为准
+  vLLM 引擎学习站 · 08 内存 · 版本 v0.26.1rc0-1188-gd9fbe526c0 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

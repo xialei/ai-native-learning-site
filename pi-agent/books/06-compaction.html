@@ -187,7 +187,7 @@
   }
   <span class="kw">return</span> { firstKeptEntryIndex: cutIndex, turnStartIndex, isSplitTurn };
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 一个<strong>精细的细节</strong>——切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>。此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的回合也有上下文。这是「压掉一半对话」时仍不丢语义的关键。</div>
+    <div class="annotation"><b>读懂这段：</b> 一个<strong>精细的细节</strong>——切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>。此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的turn也有上下文。这是「压掉一半对话」时仍不丢语义的关键。</div>
   </section>
 
   <section class="block">
@@ -219,7 +219,7 @@
 <span class="kw">const</span> response = <span class="kw">await</span> <span class="fn">completeSimpleWithRetries</span>(models, model,
   { systemPrompt: <span class="cl">SUMMARIZATION_SYSTEM_PROMPT</span>, messages: summarizationMessages },
   completionOptions, retry, callbacks);</pre>
-    <div class="annotation"><b>读懂这段：</b> 摘要 prompt 的格式（<code class="inline">SUMMARIZATION_PROMPT</code>）很讲究：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context</code>——这几乎就是「让我能无缝接手」的充分信息集。它把「压缩」变成了「结构化交接班」。<strong>每次摘要 <code class="inline">cacheRetention: 'none'</code>，sessionId 走 <code class="inline">options.sessionId ?? uuidv7()</code>——有调用方就复用其路由 ID、没有才生成新 uuid</strong>，避免污染主对话的缓存；同时强制 <code class="inline">toolChoice: "none"</code>，摘要请求不得调用工具，若响应里出现 <code class="inline">toolCall</code> 即抛错。</div>
+    <div class="annotation"><b>读懂这段：</b> 摘要 prompt 的格式（<code class="inline">SUMMARIZATION_PROMPT</code>）很讲究：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context</code>——这几乎就是「让我能无缝接手」的充分信息集。它把「压缩」变成了「结构化交接班」。<strong>摘要走的是独立请求：<code class="inline">completeSimpleWithRetries</code> 内部强制 <code class="inline">{ ...options, cacheRetention: "none", sessionId: uuidv7() }</code>——<code class="inline">sessionId</code> 写在 <code class="inline">...options</code> 之后，无条件生成新 <code class="inline">uuidv7()</code>（不复用调用方传入的路由 ID），<code class="inline">cacheRetention</code> 设为 <code class="inline">"none"</code> 不写缓存</strong>，让摘要彻底脱离主对话的缓存与路由；摘要请求不传 <code class="inline">toolChoice</code>，<code class="inline">completionOptions</code> 只含 <code class="inline">{ maxTokens, signal[, reasoning] }</code>。</div>
   </section>
 
   <section class="block">
@@ -259,23 +259,32 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
   </section>
 
   <section class="block">
-    <h2><span class="num">6.8</span>摘要内部结构：分支概览 + 文件操作清单</h2>
-    <p>6.1–6.7 讲的是「压缩流程怎么跑」，但没展开<strong>摘要文本本身长什么样</strong>。摘要不是纯文本块，而是由 <code class="inline">branch-summarization.ts</code> 拼出的<strong>结构化文档</strong>，两部分：</p>
-    <div class="code-title">harness/compaction/branch-summarization.ts — 摘要的两段式拼装</div>
-    <pre class="code"><code><span class="cmt">// 第 1 段：分支概览（谁说了什么、谁 fork 了什么）</span>
-<span class="kw">function</span> <span class="fn">summarizeBranch</span>(branch: LaneBranch[]): string {
-  <span class="kw">const</span> overview = branch.<span class="fn">map</span>(b =&gt; <span class="st">`- `</span> + <span class="fn">formatBranchLine</span>(b)).<span class="fn">join</span>(<span class="st">"\n"</span>);
-  <span class="kw">return</span> <span class="st">`## Branches\n`</span> + overview;
+    <h2><span class="num">6.8</span>分支摘要：navigation 时把「被离开的分支」压成一条</h2>
+    <p>6.1–6.7 讲的是「上下文压缩」——同一条主线上的历史被压成摘要。但还有另一种摘要：当你 <strong>navigate 切到另一条分支</strong>（第 7 章 navigation）时，那条<strong>被离开的旧分支</strong>不该凭空消失，而会被压成<strong>一条 <code class="inline">branch_summary</code> 条目</strong>留作路标。这件事由 <code class="inline">branch-summarization.ts</code> 负责，分三步：</p>
+    <div class="code-title">harness/compaction/branch-summarization.ts — 分支摘要三步</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// ① 收集要摘要的 entries：从旧叶子 oldLeafId 回溯到「与目标分支的最近公共祖先」</span>
+<span class="kw">export async function</span> <span class="fn">collectEntriesForBranchSummary</span>(
+  session, oldLeafId, targetId,
+): <span class="fn">Promise</span>&lt;CollectEntriesResult&gt; {
+  <span class="cmt">// oldLeafId 到最近公共祖先之间的 entries，就是要摘要的「旧分支尾段」</span>
 }
 
-<span class="cmt">// 第 2 段：被压缩区间内的文件写操作清单（追加在概览之后）</span>
-<span class="kw">function</span> <span class="fn">collectFileMutations</span>(ops: ToolOp[]): FileEntry[] {
-  <span class="kw">return</span> ops
-    .<span class="fn">filter</span>(op =&gt; op.name === <span class="st">"write"</span> || op.name === <span class="st">"edit"</span>)
-    .<span class="fn">map</span>(op =&gt; ({ path: op.input.path, verb: op.name }));
-}</code></pre>
-    <p><strong>分支概览</strong>保留了"对话结构"——哪些轮次、有没有分叉、分叉在哪。这对 navigation（第 7 章切分支）至关重要：摘要后模型还能"记起"这条线上发生过哪些结构性事件。<strong>文件操作清单</strong>则是一份"元上下文"——不保留文件具体内容，只保留"动过哪些文件、动词是什么（write/edit）"，让模型压缩后仍知道项目里哪些文件是自己碰过的。6.7 的「摘要假消息」装的就是这两段的拼接结果。</p>
-    <div class="annotation"><b>设计取舍：</b> 不保留文件内容、只留清单，是 token 预算的精算——内容大概率会在后续轮次被重新读，而"动过哪些文件"这种元信息一旦丢失就要重头猜。压缩的本质不是"少说话"，而是"留下以后还能用的索引"。</div>
+<span class="cmt">// ② 在 token 预算内挑消息 + 提取文件操作（prepareBranchEntries）</span>
+<span class="kw">export function</span> <span class="fn">prepareBranchEntries</span>(entries, tokenBudget): BranchPreparation {
+  <span class="cmt">// 从新到旧累加，超预算就停；toolResult 不进消息但会抽文件操作</span>
+  <span class="cmt">// 已有的 branch_summary/compaction 条目会先把其 readFiles/modifiedFiles 并进来</span>
+  <span class="kw">return</span> { messages, fileOps, totalTokens };
+}
+
+<span class="cmt">// ③ 调 LLM 生成结构化摘要，再追加文件操作清单（generateBranchSummary）</span>
+<span class="kw">const</span> response = <span class="kw">await</span> <span class="fn">completeSimpleWithRetries</span>(models, model, context,
+  { signal, maxTokens: <span class="nu">2048</span> }, retry, callbacks);
+<span class="kw">let</span> summary = <span class="cl">BRANCH_SUMMARY_PREAMBLE</span> + contentText(response.content);
+<span class="kw">const</span> { readFiles, modifiedFiles } = <span class="fn">computeFileLists</span>(fileOps);
+summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles);  <span class="cmt">// 末尾追加文件清单</span></pre>
+    <p>关键是 <strong>BRANCH_SUMMARY_PROMPT 的格式与 compaction 摘要同构</strong>——都是结构化「交接班」：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps</code>（比 compaction 少一节 <code class="inline">## Critical Context</code>）。所以分支摘要不是「自由文本」，而是一份让模型回到这条分支时能无缝接手的清单。它生成的摘要前面会加一段 <code class="inline">BRANCH_SUMMARY_PREAMBLE</code>（说明「用户刚才探索了另一条分支」），末尾再用 <code class="inline">formatFileOperations</code> 追加「读过/改过哪些文件」的清单——这部分与 §6.6 的 compaction 摘要复用同一套 <code class="inline">computeFileLists</code> / <code class="inline">formatFileOperations</code> 工具。</p>
+    <div class="annotation"><b>读懂这段：</b> 别把分支摘要和上下文压缩混为一谈——compaction 是「主线太长压一压」，branch summary 是「离开分支前留张便条」。两者<strong>共用同款结构化 prompt、同一套文件清单工具、同一个 <code class="inline">completeSimpleWithRetries</code>（同样 <code class="inline">cacheRetention:"none"</code> + 新 <code class="inline">sessionId</code>）</strong>，只是触发时机与产物条目类型（<code class="inline">compaction</code> vs <code class="inline">branch_summary</code>）不同。6.7 的「摘要假消息」对二者一视同仁，都包成 <code class="inline">&lt;summary&gt;</code> 塞进上下文。</div>
+    <div class="annotation"><b>设计取舍：</b> 不保留文件内容、只留清单，是 token 预算的精算——内容大概率会在后续 turn 被重新读，而「动过哪些文件」这种元信息一旦丢失就要重头猜。压缩的本质不是「少说话」，而是「留下以后还能用的索引」。</div>
   </section>
 
   <section class="block">
@@ -293,7 +302,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 </div>
 
 <footer>
-  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.84.2-6-g086c32e74 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.84.3-4-gdcd461925 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

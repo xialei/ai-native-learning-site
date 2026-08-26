@@ -108,7 +108,7 @@
 
   <section class="block">
     <h2><span class="num">14.3</span>本地模型：把 llama.cpp 变成一个 Provider</h2>
-    <p>没有网络、在意隐私时，你想在本地跑模型。Pi 用第 10 章那套「多供应商抽象」顺手就接上了 <code class="inline">llama.cpp</code>——<strong>它根本不需要为本地模型造新机制，只需要一个「把本地 llama 服务器翻译成 Model/Provider」的适配器</strong>。</p>
+    <p>没有网络、在意隐私时，你想在本地跑模型。Pi 用第 10 章那套「多 Provider 抽象」顺手就接上了 <code class="inline">llama.cpp</code>——<strong>它根本不需要为本地模型造新机制，只需要一个「把本地 llama 服务器翻译成 Model/Provider」的适配器</strong>。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t14 d14">
         <title id="t14">llama.cpp 作为 Provider 接入</title>
@@ -158,13 +158,29 @@
     contextWindow, <span class="kw">...</span>
   };
 }</code></pre>
-    <p>二是 Provider 的 <code class="inline">stream</code>/<code class="inline">streamSimple</code> <strong>直接复用 pi-ai 的 OpenAI 兼容流</strong>，<code class="inline">refreshModels</code> 里还会先恢复「上次持久化的模型清单」，并从 <code class="inline">catalog</code> 里筛出 <code class="inline">status.value === "loaded"</code>（<strong>真正加载到内存</strong>的）模型作为活跃目录：</p>
-    <div class="code-title">extensions/llama/provider.ts · 活跃模型目录</div>
-    <pre class="code"><code>models = catalog
-  .filter((model) =&gt; model.status.value === <span class="st">"loaded"</span>)   <span class="cmt">// 只暴露已加载的</span>
-  .map((model) =&gt; <span class="fn">toPiModel</span>(model, serverUrl));</code></pre>
+    <p>二是 Provider 的 <code class="inline">stream</code>/<code class="inline">streamSimple</code> <strong>直接复用 pi-ai 的 OpenAI 兼容流</strong>，<code class="inline">refreshModels</code> 里还会先恢复「上次持久化的模型清单」，并从 <code class="inline">catalog</code> 里筛出<strong>可选模型</strong>作为活跃目录——判定由 <code class="inline">modelIsSelectable</code> 收口：</p>
+    <div class="code-title">extensions/llama/provider.ts · 模型可选性判定</div>
+    <pre class="code"><code><span class="kw">function</span> <span class="fn">modelIsSelectable</span>(model: LlamaModelInfo, routerAutoload: <span class="kw">boolean</span>): <span class="kw">boolean</span> {
+  <span class="kw">if</span> (model.status.value === <span class="st">"loaded"</span>)   <span class="kw">return</span> <span class="kw">true</span>;   <span class="cmt">// 已加载到内存，直接可路由</span>
+  <span class="cmt">// llama.cpp 把空闲休眠的模型报成 "sleeping"；发请求时会自动唤醒它</span>
+  <span class="kw">if</span> (model.status.value === <span class="st">"sleeping"</span>) <span class="kw">return</span> <span class="kw">true</span>;
+  <span class="cmt">// 未加载的 preset 模型：只有 llama.cpp router 开了 autoload（首次用时自动加载）才可选</span>
+  <span class="kw">return</span> routerAutoload &amp;&amp; model.status.value === <span class="st">"unloaded"</span>
+    &amp;&amp; !model.status.failed &amp;&amp; model.source === <span class="st">"preset"</span>;
+}
+
+<span class="cmt">// router 是否开了 autoload？先看 catalog 里有没有未加载的 preset，再问 server 的 /props</span>
+<span class="kw">async function</span> <span class="fn">routerAutoloadEnabled</span>(client, catalog, signal): <span class="fn">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
+  <span class="kw">if</span> (!catalog.<span class="fn">some</span>(m =&gt; m.status.value === <span class="st">"unloaded"</span> &amp;&amp; m.source === <span class="st">"preset"</span>)) <span class="kw">return</span> <span class="kw">false</span>;
+  <span class="kw">return</span> (<span class="kw">await</span> client.<span class="fn">props</span>({ signal })).models_autoload === <span class="kw">true</span>;
+}
+
+models = catalog
+  .<span class="fn">filter</span>((model) =&gt; <span class="fn">modelIsSelectable</span>(model, routerAutoload))   <span class="cmt">// loaded / sleeping /（autoload 时）未加载 preset</span>
+  .<span class="fn">map</span>((model) =&gt; <span class="fn">toPiModel</span>(model, serverUrl));</code></pre>
+    <div class="annotation"><b>读懂这段：</b>「可选」分三档——<code class="inline">loaded</code>（已驻留内存）、<code class="inline">sleeping</code>（休眠、发请求时唤醒）、<code class="inline">unloaded</code> preset（连内存都没进，但若 llama.cpp router 开了 <code class="inline">models_autoload</code>，首次请求会自动加载它）。前两档无条件可选，第三档要 <code class="inline">routerAutoload</code> 为真——而这个标志是 <code class="inline">refreshModels</code> 时调 <code class="inline">LlamaClient.props()</code> 问 server 的 <code class="inline">/props</code> 接口拿来的。注意 <code class="inline">routerAutoloadEnabled</code> 会先看 catalog 里有没有未加载 preset，没有就直接短路返回 <code class="inline">false</code>，避免无谓的 <code class="inline">/props</code> 往返。</div>
     <div class="callout">
-      <strong>最大的启示：</strong>接入本地模型<strong>没有造任何新机制</strong>——只是把一个本地服务器“伪装”成既有的 OpenAI 兼容 Provider。这正是第 10 章「统一协议抽象」的全部回报：一个新供应商的成本被压到「写一个适配器」。而 <code class="inline">LlamaClient</code> 负责的 list/load/unload/download/SSE watch，才是本地场景特有的「模型管理」逻辑（内存里该驻留哪几个模型、要不要先下载）。你把 <code class="inline">/llama</code> 这套「本地路由 + 按需加载」的思想用到自己 Runtime 的本地模型支持上，能省不少弯路。
+      <strong>最大的启示：</strong>接入本地模型<strong>没有造任何新机制</strong>——只是把一个本地服务器“伪装”成既有的 OpenAI 兼容 Provider。这正是第 10 章「统一协议抽象」的全部回报：一个新 Provider 的成本被压到「写一个适配器」。而 <code class="inline">LlamaClient</code> 负责的 list/load/unload/download/props/SSE watch，才是本地场景特有的「模型管理」逻辑（内存里该驻留哪几个模型、要不要先下载、router 能不能按需 autoload）。你把 <code class="inline">/llama</code> 这套「本地路由 + 按需加载」的思想用到自己 Runtime 的本地模型支持上，能省不少弯路。
     </div>
   </section>
 

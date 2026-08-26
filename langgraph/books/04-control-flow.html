@@ -372,7 +372,7 @@ print(graph.invoke({<span class="st">"foo"</span>: []}))
     <p>控制流这一章最容易踩的两个坑,都和"路径没闭合"有关:一个是循环跑不出去,一个是条件边返回了一个没被声明的出口。</p>
 
     <h3>① 循环永远到不了 END,撞上 recursion_limit</h3>
-    <p>4.4 讲过循环靠"条件边返回 <code class="inline">__end__</code> 跳出"。但如果你的退出条件写错了(比如 LLM 一直返回 <code class="inline">tool_calls</code>、或判断逻辑恒真),循环就永远停不下来。LangGraph 不会任由它跑死:每个图都有一个 <code class="inline">recursion_limit</code>(源码默认值很大——<code class="inline">_internal/_config.py</code> 里 <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>,可用环境变量 <code class="inline">LANGGRAPH_DEFAULT_RECURSION_LIMIT</code> 覆盖),超了就抛 <code class="inline">GraphRecursionError</code>。这是循环的"保险丝"。</p>
+    <p>4.4 讲过循环靠"条件边返回 <code class="inline">__end__</code> 跳出"。但如果你的退出条件写错了(比如 LLM 一直返回 <code class="inline">tool_calls</code>、或判断逻辑恒真),循环就永远停不下来。LangGraph 不会任由它跑死:每个图都有一个 <code class="inline">recursion_limit</code>(源码默认值 <code class="inline">_internal/_config.py</code> 里 <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>,可用环境变量 <code class="inline">LANGGRAPH_DEFAULT_RECURSION_LIMIT</code> 覆盖),超了就抛 <code class="inline">GraphRecursionError</code>。这是循环的"保险丝"——默认值给得很宽裕,正常 Agent 不会撞到,但一旦写出真正的逻辑死循环,跑满 10007 步后仍会撞限报错暴露问题。</p>
     <div class="code-title">最小复现:条件边永远返回 "loop",撞 recursion_limit 报错</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
@@ -402,7 +402,7 @@ graph = builder.<span class="fn">compile</span>()
 graph.<span class="fn">invoke</span>({<span class="st">"n"</span>: <span class="nu">0</span>}, {<span class="st">"recursion_limit"</span>: <span class="nu">5</span>})
 <span class="cmt"># GraphRecursionError: Recursion limit of 5 reached ...
 #                limit by setting the `recursion_limit` config key.</span></pre>
-    <div class="annotation"><b>读懂这段:</b> 这里把 <code class="inline">recursion_limit</code> 调到 5 方便复现,框架实际默认值很大(<code class="inline">_internal/_config.py</code>: <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>)。报错信息直接告诉你解法:在 config 里设 <code class="inline">{"recursion_limit": N}</code>。但调大只是兜底——真正的修法是让退出条件确实能成立(比如 LLM 不再带 <code class="inline">tool_calls</code> 时返回 <code class="inline">END</code>)。生产环境建议把这个 limit 设成一个合理上限(如 25),防止逻辑死循环把整张图拖垮——别依赖那个 10007 的大默认值兜底。</div>
+    <div class="annotation"><b>读懂这段:</b> 这里把 <code class="inline">recursion_limit</code> 调到 5 方便复现,框架实际默认值是 10007(<code class="inline">_internal/_config.py</code>: <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>)。报错信息直接告诉你解法:在 config 里设 <code class="inline">{"recursion_limit": N}</code>。注意 recursion_limit 是"每张图最多执行多少个 super-step",默认值给得很宽裕,正常带工具循环的 Agent 远用不到——所以生产里更常见的做法是按需调小(<code class="inline">{"recursion_limit": N}</code>),给 Agent 套一道更紧的保险。但调参只是兜底——真正的修法是让退出条件确实能成立(比如 LLM 不再带 <code class="inline">tool_calls</code> 时返回 <code class="inline">END</code>)。</div>
 
     <h3>② 条件边返回了 Literal/path_map 里没有的出口</h3>
     <p>4.3 强调过:要么给 path 函数加 <code class="inline">-&gt; Literal[...]</code> 注解,要么提供 <code class="inline">path_map</code>。但常见错误是:注解里漏写一个实际会返回的出口(比如忘了 <code class="inline">"__end__"</code>),或 path 返回的标识在 path_map 里查不到。结果是图走到这一步后"无处可去"——执行停滞或报错,且因为可视化依据的就是 Literal/path_map,你在结构图上根本看不出这条隐藏出口。</p>
