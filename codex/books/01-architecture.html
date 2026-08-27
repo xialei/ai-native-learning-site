@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — Codex CLI</title>
+<link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <h1>整体架构：Codex 这台「Agent 机器」由哪些部件组成</h1>
+    <div class="subtitle">Codex 是一个 136 个 crate 的 Rust 工作区，但真正理解它的 Agent 运行时，只需抓住三层：协议层（类型）、内核层（运行时引擎）、前端层（外壳）。下面把整台机器拆开，看清每个 crate 各管什么。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <p>一个编码 Agent 运行时，本质上是在回答三个问题：<strong>① 模型这一轮该看到什么（Context）？② 这一轮要做什么（调用 LLM / 执行工具）？③ 这一切如何被记住、并能在崩溃后重建（Session/Rollout）？</strong> Codex 把这三个问题的答案落在 <code class="inline">codex-rs</code> 工作区的一组 crate 里：</p>
+    <ul>
+      <li><code class="inline">codex-protocol</code> — <strong>类型契约</strong>：ResponseItem、Op、EventMsg、SandboxPolicy…… 所有跨层共享的数据类型独立成一个 crate。</li>
+      <li><code class="inline">codex-core</code> — <strong>Agent 内核</strong>：CodexThread / Session / run_turn 循环、上下文构建、压缩、工具调度、配置。</li>
+      <li><code class="inline">codex-tui</code> / <code class="inline">codex-cli</code> / <code class="inline">codex-app-server</code> — <strong>前端外壳</strong>：终端 UI、命令行、程序化 RPC，三者共享内核与协议。</li>
+    </ul>
+    <p>关键洞察：<strong>内核不直接调 LLM API、不渲染终端、不持有 UI 状态——它只通过 protocol 定义的 Op/Event 与外界通信。</strong> 想自己做 Agent Runtime，你真正要消化的是 <code class="inline">core</code> 与 <code class="inline">protocol</code> 两个 crate。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>Crate 分层与依赖</h2>
+    <p>Codex 的 <code class="inline">codex-rs/Cargo.toml</code> 声明了 136 个 workspace 成员，但它们呈清晰的分层结构。下图把最关键的几层画出来：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
+        <title id="t12">Codex crate 分层依赖</title>
+        <desc id="d12">从 protocol 到前端外壳的依赖关系</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#566574"></path>
+          </marker>
+        </defs>
+
+        <!-- L0: protocol -->
+        <rect class="node" x="20" y="20" width="900" height="86" rx="10"></rect>
+        <text class="lbl" x="40" y="44" font-weight="bold" fill="#0d7377">L0 · codex-protocol — 类型契约（无业务逻辑）</text>
+        <rect class="node core" x="40" y="52" width="200" height="40" rx="6"></rect>
+        <text class="lbl" x="140" y="76" text-anchor="middle">ResponseItem / models</text>
+        <rect class="node core" x="254" y="52" width="180" height="40" rx="6"></rect>
+        <text class="lbl" x="344" y="76" text-anchor="middle">Op / EventMsg</text>
+        <rect class="node core" x="448" y="52" width="180" height="40" rx="6"></rect>
+        <text class="lbl" x="538" y="76" text-anchor="middle">SandboxPolicy</text>
+        <rect class="node core" x="642" y="52" width="180" height="40" rx="6"></rect>
+        <text class="lbl" x="732" y="76" text-anchor="middle">config_types / approvals</text>
+        <text class="lbl sm" x="40" y="100" fill="#566574">职责：把所有跨层共享的 enum/struct 独立出来，内核与前端共享同一套类型，零序列化歧义。</text>
+
+        <!-- L1: core -->
+        <rect class="node" x="20" y="146" width="900" height="150" rx="10"></rect>
+        <text class="lbl" x="40" y="170" font-weight="bold" fill="#0d7377">L1 · codex-core — Agent 内核（运行时引擎）</text>
+        <rect class="node" x="40" y="180" width="150" height="48" rx="6"></rect>
+        <text class="lbl" x="115" y="202" text-anchor="middle">codex_thread.rs</text>
+        <text class="lbl sm" x="115" y="218" text-anchor="middle">CodexThread 驱动</text>
+        <rect class="node" x="204" y="180" width="150" height="48" rx="6"></rect>
+        <text class="lbl" x="279" y="202" text-anchor="middle">session/turn.rs</text>
+        <text class="lbl sm" x="279" y="218" text-anchor="middle">run_turn 循环</text>
+        <rect class="node" x="368" y="180" width="150" height="48" rx="6"></rect>
+        <text class="lbl" x="443" y="202" text-anchor="middle">context/</text>
+        <text class="lbl sm" x="443" y="218" text-anchor="middle">上下文片段</text>
+        <rect class="node" x="532" y="180" width="150" height="48" rx="6"></rect>
+        <text class="lbl" x="607" y="202" text-anchor="middle">tools/</text>
+        <text class="lbl sm" x="607" y="218" text-anchor="middle">工具调度</text>
+        <rect class="node" x="696" y="180" width="204" height="48" rx="6"></rect>
+        <text class="lbl" x="798" y="202" text-anchor="middle">compact.rs / config/</text>
+        <text class="lbl sm" x="798" y="218" text-anchor="middle">压缩 + 配置</text>
+        <text class="lbl sm" x="40" y="262" fill="#566574">职责：可复用的运行时引擎。不渲染 UI，通过 Op 接收指令、通过 EventMsg 发出事件。</text>
+        <text class="lbl sm" x="40" y="280" fill="#566574">关键文件：codex_thread.rs / client.rs / session/{session,turn}.rs / context/ / tools/ / compact.rs</text>
+
+        <!-- L2: 前端外壳 -->
+        <rect class="node" x="20" y="332" width="900" height="128" rx="10"></rect>
+        <text class="lbl" x="40" y="356" font-weight="bold" fill="#0d7377">L2 · 前端外壳（共享内核 + 协议）</text>
+        <rect class="node acc" x="40" y="364" width="210" height="48" rx="6"></rect>
+        <text class="lbl" x="145" y="386" text-anchor="middle">codex-tui</text>
+        <text class="lbl sm" x="145" y="402" text-anchor="middle">终端 UI（差分渲染）</text>
+        <rect class="node acc" x="266" y="364" width="210" height="48" rx="6"></rect>
+        <text class="lbl" x="371" y="386" text-anchor="middle">codex-cli</text>
+        <text class="lbl sm" x="371" y="402" text-anchor="middle">命令行入口 / 子命令</text>
+        <rect class="node acc" x="492" y="364" width="210" height="48" rx="6"></rect>
+        <text class="lbl" x="597" y="386" text-anchor="middle">codex-app-server</text>
+        <text class="lbl sm" x="597" y="402" text-anchor="middle">RPC 服务端（IDE 集成）</text>
+        <rect class="node acc" x="718" y="364" width="182" height="48" rx="6"></rect>
+        <text class="lbl" x="809" y="386" text-anchor="middle">codex-exec</text>
+        <text class="lbl sm" x="809" y="402" text-anchor="middle">非交互脚本模式</text>
+        <text class="lbl sm" x="40" y="442" fill="#566574">职责：把内核接上真实界面。同一个 CodexThread，四种外壳。</text>
+
+        <!-- 依赖箭头 -->
+        <line class="edge core" x1="470" y1="106" x2="470" y2="144"></line>
+        <text class="lbl sm" x="486" y="128" fill="#2563eb">core 依赖 protocol</text>
+        <line class="edge core" x1="470" y1="296" x2="470" y2="330"></line>
+        <text class="lbl sm" x="486" y="316" fill="#2563eb">外壳依赖 core + protocol</text>
+      </svg>
+      <div class="fig-cap">图 1.2：三层依赖。箭头表示「依赖」。protocol 是地基，core 是引擎，外壳是产品。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">codex-rs/protocol/src/</code> → L0；<code class="inline">codex-rs/core/src/codex_thread.rs</code>、<code class="inline">session/</code>、<code class="inline">context/</code>、<code class="inline">tools/</code>、<code class="inline">compact.rs</code> → L1；
+      <code class="inline">codex-rs/tui/</code>、<code class="inline">codex-rs/cli/</code>、<code class="inline">codex-rs/app-server/</code>、<code class="inline">codex-rs/exec/</code> → L2。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>协议先行：为什么类型要独立成 crate</h2>
+    <p>可能让你意外的是：<code class="inline">codex-protocol</code> 这个 crate <strong>几乎不含业务逻辑</strong>，它只定义类型。但它是整个架构的地基。来看 <code class="inline">lib.rs</code> 导出了什么：</p>
+    <div class="code-title">codex-rs/protocol/src/lib.rs — 协议层导出的模块</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub mod</span> approvals;
+<span class="kw">pub mod</span> config_types;
+<span class="kw">pub mod</span> items;          <span class="cmt">// TurnItem、ContextCompactionItem 等</span>
+<span class="kw">pub mod</span> models;         <span class="cmt">// ResponseItem —— 会话条目的核心枚举</span>
+<span class="kw">pub mod</span> protocol;       <span class="cmt">// Op、EventMsg、SandboxPolicy、Event</span>
+<span class="kw">pub mod</span> turn_input;     <span class="cmt">// TurnInput / TurnInputRequest / SteerSubmission</span>
+<span class="kw">pub mod</span> permissions;
+<span class="kw">pub mod</span> openai_models;  <span class="cmt">// ReasoningEffort、ToolMode 等</span>
+<span class="cmt">// ... 还有 mcp / network_policy / realtime / 等等</span>
+<span class="kw">pub use</span> thread_id::{RolloutId, ThreadId};
+<span class="kw">pub use</span> tool_name::{ToolName, DEFAULT_FUNCTION_NAMESPACE};</pre>
+    <div class="annotation"><b>读懂这段：</b> 把所有「跨层共享的数据形状」抽出来，意味着 <strong>内核发出的 Event 和前端收到的 Event 是同一个 Rust 类型</strong>——编译期保证两端对齐，没有手写 JSON schema 漂移的问题。这是 Codex 架构的第一个关键决策：<strong>协议即类型</strong>。第 2 章会彻底拆开 Op/Event/ResponseItem。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>内核的入口：CodexThread</h2>
+    <p>L1 的核心是 <code class="inline">CodexThread</code>——它是「一个会话线程」的拥有者，对内驱动 <code class="inline">Session</code>，对外暴露 Op 通道。来看它的导出与字段：</p>
+    <div class="code-title">codex-rs/core/src/lib.rs — 内核导出 CodexThread</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">mod</span> codex_thread;
+<span class="cmt">// ...</span>
+<span class="kw">pub use</span> codex_thread::{BackgroundTerminalInfo, CodexThread};
+<span class="kw">pub use</span> codex_thread::{CodexThreadSettingsOverrides, GuardianRootMessage};
+<span class="kw">pub use</span> codex_thread::{GuardianRootSnapshot, ThreadConfigSnapshot};
+<span class="kw">pub use</span> session::turn_context::TurnContext;</pre>
+    <div class="code-title">codex-rs/core/src/codex_thread.rs — CodexThread 持有的东西（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">use</span> codex_protocol::protocol::{Event, Op, Submission, ...};
+<span class="kw">use</span> codex_rollout::state_db::StateDbHandle;
+<span class="kw">use</span> tokio::sync::{Mutex, oneshot, watch};
+<span class="kw">use</span> tokio_util::sync::CancellationToken;
+
+<span class="kw">static</span> LIVE_THREADS: Gauge = Gauge::new(<span class="st">"core.threads.live"</span>);
+
+<span class="kw">#[derive(Clone, Debug)]</span>
+<span class="kw">pub struct</span> ThreadConfigSnapshot {
+    <span class="kw">pub</span> model: String,
+    <span class="cmt">// ... 模型、审批、沙箱等当前线程配置</span>
+}</pre>
+    <div class="annotation"><b>为什么这么设计：</b> <code class="inline">CodexThread</code> 把「一个会话的所有运行时状态」打包成一个可克隆的句柄——它内部用 <code class="inline">tokio</code> 的异步通道（<code class="inline">oneshot</code> 做请求-响应、<code class="inline">watch</code> 做状态广播、<code class="inline">CancellationToken</code> 做取消）。前端拿到 <code class="inline">CodexThread</code> 后，只需往里发 <code class="inline">Op</code>、从 <code class="inline">Event</code> 流里读结果。<strong>内核与前端之间唯一的耦合就是 Op/Event 通道。</strong> 第 3 章会展开它如何驱动 turn。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>一张表记牢关键 crate</h2>
+    <table class="tbl">
+      <tr><th>crate</th><th>目录</th><th>一句话职责</th><th>自研时借鉴什么</th></tr>
+      <tr><td>codex-protocol</td><td>codex-rs/protocol</td><td>所有跨层共享类型：ResponseItem / Op / EventMsg / SandboxPolicy</td><td>★ 协议即类型的地基</td></tr>
+      <tr><td>codex-core</td><td>codex-rs/core</td><td>Agent 运行时引擎：CodexThread / Session / turn / context / tools / compact</td><td>★ 主要学习对象</td></tr>
+      <tr><td>codex-tools</td><td>codex-rs/tools</td><td>工具抽象：ToolSpec / ToolExecutor / ToolRegistry（可独立于 core）</td><td>工具接口设计范本</td></tr>
+      <tr><td>codex-rollout</td><td>codex-rs/rollout</td><td>会话持久化：rollout JSONL 序列化 / 回放 / StateDb</td><td>持久化与恢复范本</td></tr>
+      <tr><td>codex-tui</td><td>codex-rs/tui</td><td>终端 UI（差分渲染、聊天界面）</td><td>前端外壳示例</td></tr>
+      <tr><td>codex-cli</td><td>codex-rs/cli</td><td>命令行入口与子命令分发</td><td>程序入口范本</td></tr>
+      <tr><td>codex-app-server</td><td>codex-rs/app-server*</td><td>RPC 服务端（IDE/编辑器集成）</td><td>远程化范本</td></tr>
+      <tr><td>codex-exec</td><td>codex-rs/exec</td><td>非交互脚本模式（<code>codex exec</code>）</td><td>无 UI 运行范本</td></tr>
+      <tr><td>sandboxing / bwrap / linux-sandbox</td><td>codex-rs/sandboxing 等</td><td>跨平台沙箱执行（seatbelt / bubblewrap）</td><td>安全隔离范本</td></tr>
+      <tr><td>execpolicy</td><td>codex-rs/execpolicy</td><td>命令安全判定（哪些命令免审批）</td><td>审批策略范本</td></tr>
+      <tr><td>codex-mcp / rmcp-client</td><td>codex-rs/codex-mcp 等</td><td>MCP 客户端（外部工具服务器）</td><td>工具扩展范本</td></tr>
+      <tr><td>config</td><td>codex-rs/config</td><td>config.toml 加载与校验</td><td>配置系统范本</td></tr>
+    </table>
+    <p class="annotation" style="margin-top:14px"><b>剩下约 120 个 crate</b> 多是工具库（<code class="inline">utils/*</code>）、扩展（<code class="inline">ext/*</code>）或特定能力（<code class="inline">cloud-tasks</code>、<code class="inline">login</code>、<code class="inline">analytics</code>）。初学时可以全部忽略，等需要时再看。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.6</span>对自研与使用的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      别一上来就做 TUI 和一堆工具。自研 Runtime 的 MVP 只需三件事串起来：<strong>① 一套协议类型（你的 Op/Event/Message）；② 一个「采样 → 工具 → 再采样」的循环；③ 一个能持久化与回放的会话模型。</strong>
+      这三件事恰好对应本章的 <code class="inline">protocol + codex_thread/turn + rollout</code>，后续章节逐一拆开。
+    </div>
+    <div class="callout tip">
+      <b class="tag">捷径</b>
+      想快速跑起来：<code class="inline">cd codex-rs && cargo run --bin codex -- "explain this codebase to me"</code>。源码入口在 <code class="inline">cli/src/main.rs</code>（命令分发）与 <code class="inline">tui/src/main.rs</code>（终端启动）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-protocol-model.html">下一步：消息与协议模型 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 01 整体架构 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

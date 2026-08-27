@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 上下文构建 — Codex CLI</title>
+<link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 上下文构建</div>
+    <h1>★ 上下文构建：模型每一轮到底看到什么</h1>
+    <div class="subtitle">上下文工程是 Agent 的灵魂。Codex 不是简单地把会话历史拼成字符串发给模型——它把上下文拆成可组合的「片段（Fragment）」，按角色（developer/user/system）和时机注入，并在每轮 turn 重新组装。本章拆开 Fragment 体系、AGENTS.md 注入、ContextManager 与 build_prompt 的完整流水线。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心洞见</span>
+    <span class="ep-quote">上下文不是历史，而是「历史 + 注入指令 + 工具结果 + 状态」的函数</span>
+    <span class="ep-arrow">→</span>
+    每轮采样前，Codex 用 <code class="inline">build_prompt</code> 把会话历史、base instructions、工具规格、输出 schema 组装成一个 <code class="inline">Prompt</code>，喂给模型。注入的指令来自一组可组合的 Fragment。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>一个 Prompt 由什么组成</h2>
+    <p>第 3 章看到 <code class="inline">run_sampling_request</code> 每轮调用 <code class="inline">build_prompt</code>。来看看它到底装了什么：</p>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1313 — build_prompt</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) fn</span> build_prompt(
+    input: Vec&lt;ResponseItem&gt;,              <span class="cmt">// 会话历史（消息/工具调用/结果）</span>
+    step_context: &amp;StepContext,
+    base_instructions: BaseInstructions,     <span class="cmt">// 基础系统指令</span>
+) -&gt; Prompt {
+    <span class="kw">let</span> turn_context = &amp;step_context.turn;
+    Prompt {
+        input,                                        <span class="cmt">// ① 会话历史</span>
+        tools: step_context.tool_router.model_visible_specs(), <span class="cmt">// ② 工具规格</span>
+        parallel_tool_calls: <span class="kw">true</span>,                    <span class="cmt">// ③ 允许并行工具</span>
+        base_instructions,                            <span class="cmt">// ④ 基础指令</span>
+        output_schema: turn_context.final_output_json_schema.clone(), <span class="cmt">// ⑤ 输出 schema</span>
+        output_schema_strict: !is_basic_session_source(...),
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 一个 Prompt 有五部分：<strong>① 会话历史 input</strong>（<code class="inline">ResponseItem</code> 列表，含已注入的 fragment）；<strong>② 工具规格</strong>（告诉模型有哪些工具可用）；<strong>③ 并行工具开关</strong>（Codex 默认允许模型一次请求多个工具）；<strong>④ base_instructions</strong>（系统级指令）；<strong>⑤ 输出 schema</strong>（结构化输出约束）。注意 <code class="inline">input</code> 不只是用户消息——它已经包含了被注入的 developer/user fragment（见 5.3）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>Fragment：上下文的乐高积木</h2>
+    <p>Codex 把要注入的上下文抽象成 <strong>ContextualUserFragment</strong>——一个 trait，每种指令/提醒都是一个实现。来看 <code class="inline">context/mod.rs</code> 里的 fragment 清单：</p>
+    <div class="code-title">codex-rs/core/src/context/mod.rs — Fragment 模块清单（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">mod</span> base_instructions;            <span class="cmt">// 基础指令（核心系统提示）</span>
+<span class="kw">mod</span> developer_instructions;        <span class="cmt">// developer 角色指令</span>
+<span class="kw">mod</span> user_instructions;             <span class="cmt">// user 角色指令</span>
+<span class="kw">mod</span> apps_instructions;             <span class="cmt">// 已启用 app 的指令</span>
+<span class="kw">mod</span> permissions_instructions;      <span class="cmt">// 权限/审批规则说明</span>
+<span class="kw">mod</span> current_time_reminder;         <span class="cmt">// 当前时间提醒</span>
+<span class="kw">mod</span> compaction_summary;            <span class="cmt">// 压缩摘要（替代旧历史）</span>
+<span class="kw">mod</span> model_switch_instructions;     <span class="cmt">// 模型切换说明</span>
+<span class="kw">mod</span> environment_context;           <span class="cmt">// 环境信息</span>
+<span class="kw">mod</span> hook_additional_context;       <span class="cmt">// hook 注入的额外上下文</span>
+<span class="kw">mod</span> token_budget_context;          <span class="cmt">// token 预算提醒</span>
+<span class="kw">mod</span> user_shell_command;            <span class="cmt">// 用户 shell 信息</span>
+<span class="kw">mod</span> multi_agent_role_instructions; <span class="cmt">// 多 Agent 角色指令</span>
+<span class="kw">mod</span> guardian_policy;               <span class="cmt">// 守护策略</span>
+<span class="cmt">// ... 还有约 30 个其他 fragment（共 ~45 个模块）</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 每一种「要告诉模型的东西」都是一个独立 fragment 模块。<strong>这种拆分让上下文可组合、可按需启用</strong>——例如多 Agent 模式才注入 <code class="inline">multi_agent_role_instructions</code>，压缩后才注入 <code class="inline">compaction_summary</code>。这是 Codex 上下文工程的核心设计：不是一坨写死的 system prompt，而是积木。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t52 d52">
+        <title id="t52">Fragment 组装成 Prompt</title>
+        <desc id="d52">多个 fragment 按角色注入会话历史</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#566574"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="20" width="180" height="40" rx="6"></rect>
+        <text class="lbl sm" x="110" y="45" text-anchor="middle">base_instructions</text>
+        <rect class="node" x="20" y="70" width="180" height="40" rx="6"></rect>
+        <text class="lbl sm" x="110" y="95" text-anchor="middle">developer_instructions</text>
+        <rect class="node" x="20" y="120" width="180" height="40" rx="6"></rect>
+        <text class="lbl sm" x="110" y="145" text-anchor="middle">permissions_instructions</text>
+        <rect class="node" x="20" y="170" width="180" height="40" rx="6"></rect>
+        <text class="lbl sm" x="110" y="195" text-anchor="middle">compaction_summary ...</text>
+
+        <line class="edge" x1="200" y1="110" x2="328" y2="110" marker-end="url(#arrow)"></line>
+        <text class="lbl sm" x="264" y="102" text-anchor="middle" fill="#2563eb">注入</text>
+
+        <rect class="node core" x="330" y="60" width="280" height="110" rx="8"></rect>
+        <text class="lbl" x="470" y="90" text-anchor="middle">会话历史 input</text>
+        <text class="lbl sm" x="470" y="112" text-anchor="middle">[dev fragment, user msg,</text>
+        <text class="lbl sm" x="470" y="128" text-anchor="middle"> FunctionCall, Output,</text>
+        <text class="lbl sm" x="470" y="144" text-anchor="middle"> assistant msg, ...]</text>
+
+        <line class="edge core" x1="610" y1="115" x2="718" y2="115" marker-end="url(#arrow)"></line>
+        <rect class="node acc" x="720" y="80" width="160" height="70" rx="8"></rect>
+        <text class="lbl" x="800" y="108" text-anchor="middle">build_prompt</text>
+        <text class="lbl sm" x="800" y="128" text-anchor="middle">→ Prompt</text>
+      </svg>
+      <div class="fig-cap">图 5.2：Fragment 按角色注入历史，build_prompt 装成最终 Prompt。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>Fragment 的契约：ContextualUserFragment trait</h2>
+    <p>每个 fragment 实现同一个 trait，决定它以什么角色、什么内容注入：</p>
+    <div class="code-title">codex-rs/context-fragments/src/fragment.rs:64 — Fragment trait（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 作为消息片段注入的上下文载荷。
+/// /// 实现者拥有 response role，并提供确切的片段正文。</span>
+<span class="kw">pub trait</span> ContextualUserFragment {
+    <span class="kw">fn</span> content_kind(&amp;self) -&gt; ContentItemKind;   <span class="cmt">// 分类标识</span>
+    <span class="kw">fn</span> role(&amp;self) -&gt; &amp;<span class="st">'static str</span>;            <span class="cmt">// "developer" | "user" | "system"</span>
+    <span class="kw">fn</span> body(&amp;self) -&gt; String;                   <span class="cmt">// 正文</span>
+    <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>); <span class="cmt">// 起止标记（识别已注入片段）</span>
+    <span class="kw">fn</span> requires_separate_message(&amp;self) -&gt; bool { <span class="kw">false</span> }
+}</pre>
+    <div class="code-title">codex-rs/core/src/context/developer_instructions.rs:5 — 一个具体 fragment</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) struct</span> DeveloperInstructions { instructions: String }
+
+<span class="kw">impl</span> ContextualUserFragment <span class="kw">for</span> DeveloperInstructions {
+    <span class="kw">fn</span> content_kind(&amp;self) -&gt; ContentItemKind {
+        ContentItemKind(<span class="st">"generic.developer_instructions"</span>.to_string())
+    }
+    <span class="kw">fn</span> role(&amp;self) -&gt; &amp;<span class="st">'static str</span> { <span class="st">"developer"</span> }   <span class="cmt">// ← 以 developer 角色注入</span>
+    <span class="kw">fn</span> body(&amp;self) -&gt; String { self.instructions.clone() }
+    <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>) { (<span class="st">""</span>, <span class="st">""</span>) }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">role()</code> 决定片段以什么身份出现——<code class="inline">DeveloperInstructions</code> 用 <code class="inline">"developer"</code>，<code class="inline">UserInstructions</code> 用 <code class="inline">"user"</code>。<strong>markers</strong> 是巧思：注入的片段带起止标记，之后可以识别并 diff——这支撑了「只在变化时重新注入」的增量机制（见 5.5）。<code class="inline">content_kind</code> 给片段分类，方便统计与过滤。</div>
+    <div class="callout info">
+      <b class="tag">角色</b>
+      OpenAI Responses API 区分 <code class="inline">system</code> / <code class="inline">developer</code> / <code class="inline">user</code> 三种角色。Codex 把不可协商的规则放 <code class="inline">developer</code>，把项目/用户指令也倾向 <code class="inline">developer</code> 或 <code class="inline">user</code>。<code class="inline">base_instructions</code> 是最高优先级的系统指令。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>AGENTS.md：项目级指令注入</h2>
+    <p>Codex 的「项目指令」机制是 <strong>AGENTS.md</strong>——放在项目根目录（或子目录）的 Markdown 文件，告诉 Agent 这个项目该怎么干活。它由 <code class="inline">AgentsMdManager</code> 发现并加载：</p>
+    <div class="code-title">codex-rs/core/src/agents_md_manager.rs:15 — AgentsMdManager</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 拥有会话的 AGENTS.md 发现输入与缓存结果。</span>
+<span class="kw">pub(crate) struct</span> AgentsMdManager {
+    user_instructions: Option&lt;UserInstructions&gt;,   <span class="cmt">// 用户额外指令</span>
+    cache: Mutex&lt;AgentsMdCache&gt;,                   <span class="cmt">// 缓存，避免重复读盘</span>
+}
+
+<span class="kw">struct</span> AgentsMdCache {
+    selections: Option&lt;Vec&lt;TurnEnvironmentSelection&gt;&gt;,
+    active_project_trust_level: Option&lt;TrustLevel&gt;,  <span class="cmt">// 信任级别影响审批</span>
+    loaded: Option&lt;Arc&lt;LoadedAgentsMd&gt;&gt;,             <span class="cmt">// 加载到的 AGENTS.md 内容</span>
+}
+
+<span class="cmt">// 每个 turn 前刷新：重新发现并加载 AGENTS.md</span>
+<span class="kw">pub(crate) async fn</span> refresh(&amp;self, config, environments) -&gt; io::Result&lt;()&gt;;</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">AgentsMdManager</code> 在每个 turn 前 <code class="inline">refresh</code>——重新扫描项目目录的 AGENTS.md 文件，加载内容并缓存。<strong>关键：它还解析 <code class="inline">TrustLevel</code></strong>（Trusted / Untrusted）。这直接影响安全：untrusted 项目的命令默认要审批（见第 8 章）。<strong>AGENTS.md 不只是指令，还是信任边界</strong>——这是 Codex 把「上下文」和「安全」绑在一起的精妙之处。</div>
+    <div class="callout tip">
+      <b class="tag">实践</b>
+      在项目根放一个 <code class="inline">AGENTS.md</code>，写上构建命令、代码规范、禁忌操作。Codex 每个 turn 都会读到它。仓库自己的 <code class="inline">AGENTS.md</code> 就是个范例——它告诉 Codex 该用 <code class="inline">just</code> 跑测试、crate 名带 <code class="inline">codex-</code> 前缀等。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>ContextManager：历史的管家与增量注入</h2>
+    <p><code class="inline">ContextManager</code> 是会话历史的管家——它不只存历史，还负责「该注入什么、哪些变了」的增量计算：</p>
+    <div class="code-title">codex-rs/core/src/context_manager/history.rs — ContextManager 字段（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 会话历史的转录</span>
+<span class="kw">pub(crate) struct</span> ContextManager {
+    <span class="cmt">// 最老的 item 在前面。快照共享 vector 直到需要修改，避免深拷贝。</span>
+    items: Arc&lt;Vec&lt;ResponseItemEnvelope&gt;&gt;,
+    <span class="cmt">// 历史被重写（压缩或回滚）时递增。</span>
+    history_version: u64,
+    token_info: Option&lt;TokenUsageInfo&gt;,
+    <span class="cmt">/// 用于 diffing 和生成模型可见设置更新 item 的参考上下文快照。</span>
+    <span class="cmt">/// 这是下一个常规模型 turn 的基线。</span>
+    reference_context_item: Option&lt;TurnContextItem&gt;,
+    <span class="cmt">/// 最近追加到模型可见历史的世界状态。</span>
+    world_state_baseline: Option&lt;WorldStateSnapshot&gt;,
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个关键字段揭示设计：<strong>① <code class="inline">items: Arc&lt;Vec&gt;</code></strong> 用 <code class="inline">Arc</code> 共享——只读消费者（如克隆历史构建 prompt）零拷贝，只有修改时才复制（COW）。<strong>② <code class="inline">history_version</code></strong> 是版本号，压缩/回滚时递增，让消费者能检测历史是否变了。<strong>③ <code class="inline">reference_context_item</code></strong> 是增量注入的核心：它记录「上一次注入给模型的上下文状态」，下一轮 diff 之——<strong>只在变化时才重新注入完整上下文，没变就跳过</strong>，省 token、保 prompt cache。</div>
+    <div class="callout warn">
+      <b class="tag">关键</b>
+      <code class="inline">reference_context_item</code> 为 <code class="inline">None</code> 时，下一轮会做<strong>全量重注入</strong>（没有基线可 diff）。回滚可能清空它——这正是「回滚后第一个 turn 上下文会重建」的原因。这种增量 diff 机制让 Codex 的上下文既完整又不浪费。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>工具结果截断与图像处理</h2>
+    <p>上下文里最占 token 的是工具输出（尤其 shell 命令的长输出）和图像。ContextManager 也管这些的截断：</p>
+    <div class="code-title">codex-rs/core/src/context_manager/mod.rs — 截断与估算工具</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) use</span> history::estimate_image_bytes;          <span class="cmt">// 估算图像字节</span>
+<span class="kw">pub(crate) use</span> history::estimate_item_token_count;     <span class="cmt">// 估算 item 的 token 数</span>
+<span class="kw">pub(crate) use</span> history::truncate_function_output_payload; <span class="cmt">// 截断工具输出</span>
+<span class="cmt">// 来自 codex_utils_output_truncation：</span>
+<span class="cmt">//   approx_token_count / truncate_text / TruncationPolicy</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 工具输出不会无脑全塞进 prompt——<code class="inline">truncate_function_output_payload</code> 按策略截断（保留头尾、中间省略），避免一个 <code class="inline">ls -R</code> 就把上下文撑爆。图像也估算 token 占用。这些都是「上下文预算管理」的一部分，与第 6 章的压缩配合。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.7</span>小结：上下文工程的全景</h2>
+    <div class="callout warn">
+      <b class="tag">一张图记牢</b>
+      每 turn 开始：① <code class="inline">AgentsMdManager::refresh</code> 重新发现项目指令；② <code class="inline">capture_step_context</code> 快照模型可见状态；③ 按 diff 决定注入哪些 Fragment（developer/user 角色）；④ Fragment 与历史合并进 <code class="inline">input</code>；⑤ <code class="inline">build_prompt</code> 装上 tools / base_instructions / output_schema；⑥ 喂给 LLM。
+    </div>
+    <div class="callout tip">
+      <b class="tag">对自研的启示</b>
+      别把 system prompt 写成一坨。把指令拆成可独立启用的片段（项目指令、工具规则、时间提醒、状态摘要），每轮按需组装。<strong>实现一个 <code class="inline">reference</code> 基线做增量 diff</strong>——没变的指令不重复注入，这是省 token 和保 prompt cache 的关键。最小 MVP：一个 <code class="inline">system</code> 消息 + 会话历史，先跑通，再逐步拆 fragment。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="04-session-rollout.html">← 04 会话与 Rollout</a>
+    <a href="06-compaction.html">下一步：上下文压缩 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 05 上下文构建 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

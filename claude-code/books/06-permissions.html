@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 权限模型 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 权限模型</div>
+    <h1>权限模型：把「能动手」框在边界里</h1>
+    <div class="subtitle">循环让模型能动手，权限让它别闯祸。这一章拆开每个工具调用前的那个决策点：allow / ask / deny 三态、按工具与路径的规则匹配、沙箱 Bash，以及企业如何用托管策略收口。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">设计原则</span>
+    <span class="ep-quote">默认安全（secure by default）——写文件、跑命令先问你；能放开，也能锁死。</span>
+    <span class="ep-arrow">→</span>
+    权限是内建在循环里的一道闸，而非事后补救。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>一分钟版本</h2>
+    <p>第 3 章那张循环图里，「执行工具」这个节点并非想跑就跑。每一次工具调用都是一个<strong>决策点</strong>：系统先查权限规则，结果落在三态之一：</p>
+    <ul>
+      <li><strong>allow</strong>：直接执行，不打扰你。</li>
+      <li><strong>ask</strong>：暂停，弹给你确认（交互模式下）。</li>
+      <li><strong>deny</strong>：直接拒绝，模型会收到「被拒」的结果并据此调整。</li>
+    </ul>
+    <p>规则可以按<strong>工具名 + 参数模式</strong>粒度配置：允许读文件、命令要先确认、<code class="inline">rm -rf</code> 一律拒绝。也能按团队、按企业策略统一收口。这就是 Claude Code「agentic 但不失控」的根基。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>三态模型与规则匹配</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t62 d62">
+        <title id="t62">工具调用的权限决策</title>
+        <desc id="d62">tool_use 进入规则匹配，输出 allow/ask/deny</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <rect class="node core" x="30" y="90" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="120" y="116" text-anchor="middle">tool_use 到达</text>
+        <text class="lbl sm" x="120" y="134" text-anchor="middle">工具名 + 参数</text>
+        <path class="edge" d="M210 120 L300 120" marker-end="url(#arrow)"></path>
+
+        <rect class="node" x="300" y="80" width="220" height="80" rx="8"></rect>
+        <text class="lbl" x="410" y="108" text-anchor="middle">规则匹配</text>
+        <text class="lbl sm" x="410" y="126" text-anchor="middle">工具名 + 命令/路径模式</text>
+        <text class="lbl sm" x="410" y="142" text-anchor="middle">逐条查 deny → ask → allow</text>
+
+        <path class="edge" d="M520 100 L620 50" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M520 120 L620 120" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M520 140 L620 190" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="620" y="30" width="220" height="44" rx="8"></rect>
+        <text class="lbl" x="730" y="50" text-anchor="middle">allow → 静默执行</text>
+        <rect class="node warn" x="620" y="100" width="220" height="44" rx="8"></rect>
+        <text class="lbl" x="730" y="120" text-anchor="middle">ask → 弹确认</text>
+        <rect class="node warn" x="620" y="170" width="220" height="44" rx="8"></rect>
+        <text class="lbl" x="730" y="190" text-anchor="middle">deny → 拒绝（告知模型）</text>
+      </svg>
+      <div class="fig-cap">图 6.1：每个工具调用先过权限规则，再决定 allow/ask/deny。</div>
+    </div>
+    <div class="annotation"><b>匹配逻辑：</b> 规则按「工具 + 参数模式」匹配——比如 <code class="inline">Bash</code> 工具可按命令前缀匹配（<code class="inline">git *</code> 放行、<code class="inline">rm -rf *</code> 拒绝），<code class="inline">Read/Write</code> 可按文件路径 glob 匹配。通常 deny 优先级最高，先于 ask 与 allow 判定，确保危险操作无论如何都被拦。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>规则配置</h2>
+    <p>权限规则写在 settings 的 <code class="inline">permissions</code> 块里，分 <code class="inline">allow / ask / deny</code> 三组：</p>
+    <div class="code-title">概念示例：.claude/settings.json 权限规则</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"permissions"</span>: {
+    <span class="st">"allow"</span>: [
+      <span class="st">"Read"</span>,                       <span class="cmt">// 读文件一律放行</span>
+      <span class="st">"Bash(git status)"</span>,           <span class="cmt">// 只放行 git status 这一条</span>
+      <span class="st">"Bash(pnpm test*)"</span>            <span class="cmt">// 放行测试命令</span>
+    ],
+    <span class="st">"ask"</span>: [
+      <span class="st">"Bash"</span>,                       <span class="cmt">// 其余 Bash 命令都要确认</span>
+      <span class="st">"Write"</span>                       <span class="cmt">// 写文件要确认</span>
+    ],
+    <span class="st">"deny"</span>: [
+      <span class="st">"Bash(rm -rf*)"</span>,             <span class="cmt">// 危险命令一律拒绝</span>
+      <span class="st">"WebFetch"</span>,                   <span class="cmt">// 禁止网络抓取</span>
+      <span class="st">"Read(./.env*)"</span>              <span class="cmt">// 保护密钥文件</span>
+    ]
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 三组规则覆盖了从「全放行」到「精准拒绝」的光谱。注意 <code class="inline">Bash(git status)</code> 这种<strong>带参数模式</strong>的写法——它不是放行所有 Bash，只放行匹配 <code class="inline">git status</code> 的。本仓库 <code class="inline">examples/settings/</code> 下的三套范例（lax / strict / bash-sandbox）就是这种配置的成熟范本，详见 §6.7。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>沙箱 Bash</h2>
+    <p>对 <code class="inline">Bash</code> 工具，除了 allow/ask/deny，还有一道更强的约束：<strong>沙箱（sandbox）</strong>。沙箱把命令关进受限环境，限制网络访问与文件写入：</p>
+    <table class="tbl">
+      <tr><th></th><th>普通 Bash</th><th>沙箱 Bash</th></tr>
+      <tr><td>网络访问</td><td>允许</td><td>受限/禁止</td></tr>
+      <tr><td>文件写入</td><td>允许（受权限规则）</td><td>受限/禁止</td></tr>
+      <tr><td>适用</td><td>日常</td><td>不信任命令、CI 自动化</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">重要边界（来自仓库 README）</b>
+      <code class="inline">sandbox</code> 属性<strong>只对 Bash 工具生效</strong>——它不适用于 Read、Write、WebSearch、WebFetch、MCP 工具、Hooks 或内部命令。所以要拦网络，光开沙箱不够，还得用 <code class="inline">deny WebFetch / WebSearch</code>（见 <code class="inline">examples/settings/settings-strict.json</code>）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.5</span>--dangerously-skip-permissions</h2>
+    <p>有一个开关能跳过所有确认：<code class="inline">--dangerously-skip-permissions</code>。它让每个工具调用直接 allow，不再 ask。典型用途是 <strong>CI / SDK 无人值守自动化</strong>——没有人坐在终端前点确认。</p>
+    <div class="callout warn">
+      <b class="tag">危险</b>
+      名字里带 <code class="inline">dangerously</code> 不是吓唬人：它意味着模型可以<strong>不经确认地写文件、跑任意命令</strong>。只应在<strong>可信且隔离</strong>的环境里用（一次性容器、受限 VM、无敏感凭据的临时目录）。本仓库 <code class="inline">examples/settings/settings-strict.json</code> 与 <code class="inline">settings-lax.json</code> 都<strong>禁用了</strong>这个开关——可见官方态度：宁可不方便，不可不安全。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.6</span>企业托管策略与 MDM</h2>
+    <p>在组织里，安全不能依赖个人自觉。Claude Code 提供<strong>托管策略（managed settings）</strong>：由 IT/安全团队下发，优先级最高，下级无法覆盖。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t66 d66">
+        <title id="t66">配置层级与优先级</title>
+        <desc id="d66">企业策略最高且不可覆盖</desc>
+        <rect class="node warn" x="40" y="20" width="800" height="40" rx="8"></rect>
+        <text class="lbl" x="60" y="45">企业 managed-settings.json（MDM 下发，最高优先级，不可覆盖）</text>
+        <rect class="node core" x="40" y="68" width="800" height="40" rx="8"></rect>
+        <text class="lbl" x="60" y="93">用户 ~/.claude/settings.json（个人偏好）</text>
+        <rect class="node" x="40" y="116" width="800" height="40" rx="8"></rect>
+        <text class="lbl" x="60" y="141">项目 .claude/settings.json（随仓库提交，团队共享）</text>
+        <rect class="node acc" x="40" y="164" width="800" height="40" rx="8"></rect>
+        <text class="lbl" x="60" y="189">本地 settings.local.json（个人覆盖，不提交）</text>
+      </svg>
+      <div class="fig-cap">图 6.2：配置按层级叠加，企业策略在最上层且不可被下级推翻。</div>
+    </div>
+    <p>本仓库 <code class="inline">examples/mdm/</code> 提供了真实部署模板：macOS 用 <code class="inline">com.anthropic.claudecode.plist</code> / <code class="inline">.mobileconfig</code>，Windows 用 <code class="inline">ClaudeCode.admx</code> / <code class="inline">.adml</code> 配 <code class="inline">Set-ClaudeCodePolicy.ps1</code>。可通过 Jamf、Kandji、Intune、组策略下发。某些键如 <code class="inline">strictKnownMarketplaces</code>、<code class="inline">allowManagedHooksOnly</code>、<code class="inline">allowManagedPermissionRulesOnly</code> 只在企业设置里才生效。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.7</span>三套范例对照（来自仓库 examples/settings/README.md）</h2>
+    <p>本仓库自带三套成熟配置，覆盖从宽松到严格的光谱：</p>
+    <table class="tbl">
+      <tr><th>设置项</th><th>settings-lax</th><th>settings-strict</th><th>settings-bash-sandbox</th></tr>
+      <tr><td>禁用 --dangerously-skip-permissions</td><td>✅</td><td>✅</td><td></td></tr>
+      <tr><td>封禁插件市场</td><td>✅</td><td>✅</td><td></td></tr>
+      <tr><td>封禁用户/项目自定义 allow/ask/deny</td><td></td><td>✅</td><td>✅</td></tr>
+      <tr><td>封禁用户/项目自定义 Hooks</td><td></td><td>✅</td><td></td></tr>
+      <tr><td>拒绝 WebFetch / WebSearch 工具</td><td></td><td>✅</td><td></td></tr>
+      <tr><td>Bash 工具需要审批</td><td></td><td>✅</td><td></td></tr>
+      <tr><td>Bash 工具必须在沙箱内运行</td><td></td><td></td><td>✅</td></tr>
+    </table>
+    <div class="annotation"><b>怎么选：</b> <strong>lax</strong> 适合个人开发、信任仓库；<strong>strict</strong> 适合团队/受监管环境，把能收的口都收了；<strong>bash-sandbox</strong> 专门针对「命令不可信」场景。三者可按需合并片段，不必整体照搬。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.8</span>对使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 权限是循环里的闸，不是事后审计</strong>——每个工具调用都过一次。<strong>② deny 不是终点而是反馈</strong>——模型会收到拒绝原因并换路，所以精细的 deny 规则等于在「教」模型边界。<strong>③ 沙箱只管 Bash</strong>——拦网络要靠 deny WebFetch/WebSearch。<strong>④ 企业策略不可绕过</strong>——这是默认安全的最后一道墙。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="05-tools.html">← 上一页：内置工具</a>
+    <a href="07-subagents.html">下一步：子代理与并行 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 06 权限模型 · 仓库实例路径以最新为准
+</footer>
+
+</body>
+</html>

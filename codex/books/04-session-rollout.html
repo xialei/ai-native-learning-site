@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 会话与 Rollout — Codex CLI</title>
+<link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 会话与 Rollout</div>
+    <h1>会话与 Rollout：Codex 怎么记住、怎么重生</h1>
+    <div class="subtitle">一个 Agent 跑了几十轮，中途崩溃了——重开后怎么接着干？答案在两个 crate 里：<code class="inline">core/src/session/</code> 维护内存中的会话状态，<code class="inline">rollout</code> + <code class="inline">history</code> 把会话以 JSONL 追加式持久化、并能回放重建。本章拆开这套「会话即日志」的设计。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>会话在内存里长什么样：Session</h2>
+    <p><code class="inline">Session</code> 是一个会话线程在内存中的拥有者。它持有会话历史（一串 <code class="inline">ResponseItem</code>）、世界状态（world state）、以及各种服务句柄。第 3 章的 <code class="inline">run_turn</code> 就是它的方法驱动的。</p>
+    <div class="code-title">codex-rs/core/src/session/session.rs — Session 的角色（关键方法节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// Session 持有会话的全部运行时状态，对内被 run_turn 驱动，对外通过 Event 通信。</span>
+<span class="cmt">// 关键能力（方法名示意）：</span>
+sess.clone_history().await            <span class="cmt">// 克隆当前会话历史 → 用于构建 prompt</span>
+sess.send_event(&amp;turn_context, msg)   <span class="cmt">// 发出一个 EventMsg 给前端</span>
+sess.capture_step_context(...)        <span class="cmt">// 快照模型可见状态（step context）</span>
+sess.record_context_updates(...)      <span class="cmt">// 记录上下文更新并设参考 item</span>
+sess.build_world_state_for_step(...)  <span class="cmt">// 为当前 step 构建 world state</span>
+sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span></pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">Session</code> 不直接持久化——它只管「这一轮内存里会话长什么样」。持久化交给 <code class="inline">RolloutRecorder</code>（见 4.3）。<strong>这种分离让内存模型与磁盘格式解耦</strong>：你可以换持久化后端而不动内核逻辑。注意 <code class="inline">clone_history</code>——每次采样前克隆历史，保证流式产出期间历史的一致性。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>会话条目的信封：ResponseItemEnvelope</h2>
+    <p>持久化时，每个 <code class="inline">ResponseItem</code> 被包进一个「信封」，附带 harness 自己的元数据：</p>
+    <div class="code-title">codex-rs/history/src/lib.rs:39 — ResponseItemEnvelope</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 带 history-only 元数据的模型历史条目。
+span/// 持久化保持 response item 完整，元数据单独存储。</span>
+<span class="kw">#[derive(Debug, Clone, PartialEq)]</span>
+<span class="kw">pub struct</span> ResponseItemEnvelope {
+    <span class="kw">pub</span> item: ResponseItem,
+    <span class="kw">pub</span> metadata: Option&lt;CodexHarnessMetadata&gt;,
+}
+
+<span class="cmt">/// harness 拥有、随 response item 一起持久化的元数据</span>
+<span class="kw">pub struct</span> CodexHarnessMetadata {
+    <span class="kw">pub</span> client_authored: bool,   <span class="cmt">// 是否由 app-server 客户端提供的 developer 消息</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">Envelope</code> 模式（信封）是持久化的常见手法：<strong>保持原始 <code class="inline">ResponseItem</code> 不被污染</strong>，把 harness 私有的元数据挂在旁边。这样回放时既能拿到纯净的会话内容，又能读到附带的上下文。注意它实现了 <code class="inline">Deref&lt;Target=ResponseItem&gt;</code>——大多数地方可以当 <code class="inline">ResponseItem</code> 直接用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>Rollout：追加式 JSONL 日志</h2>
+    <p>「rollout」是 Codex 对会话持久化文件的称呼。它的格式是 <strong>JSONL（每行一个 JSON）</strong>，<strong>追加写入</strong>——每发生一件值得记录的事，就 append 一行。这等价于一个事件溯源日志（event sourcing）。</p>
+    <div class="code-title">codex-rs/history/src/lib.rs:206 — 一行 rollout 的结构</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[derive(Serialize, Deserialize, Clone, JsonSchema)]</span>
+<span class="kw">pub struct</span> RolloutLine {
+    <span class="kw">pub</span> timestamp: String,
+    <span class="kw">pub</span> ordinal: Option&lt;u64&gt;,     <span class="cmt">// 序号，用于排序/定位</span>
+    <span class="kw">#[serde(flatten)]</span>
+    <span class="kw">pub</span> item: RolloutItem,        <span class="cmt">// 真正的内容（展开进同一层 JSON）</span>
+}</pre>
+    <div class="code-title">codex-rs/history/src/rollout_payload.rs:23 — RolloutItem 能记什么</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[serde(tag = </span><span class="st">"type"</span><span class="kw">, rename_all = </span><span class="st">"snake_case"</span><span class="kw">)]</span>
+<span class="kw">enum</span> RolloutItemWire&lt;<span class="st">'a</span>&gt; {
+    SessionMeta { payload },                 <span class="cmt">// 会话元信息（id、cwd、forked_from...）</span>
+    ResponseItem { payload, metadata },      <span class="cmt">// 一条会话条目（消息/工具调用/结果）</span>
+    InterAgentCommunication { payload },     <span class="cmt">// 多 Agent 间通信</span>
+    Compacted { payload },                   <span class="cmt">// 压缩事件（旧的被摘要替代）</span>
+    TurnContext { payload },                 <span class="cmt">// turn 上下文快照</span>
+    WorldState { payload },                  <span class="cmt">// 世界状态变更</span>
+    SecurityRiskScore { payload },           <span class="cmt">// 安全风险评分</span>
+    EventMsg { payload },                    <span class="cmt">// 原始事件（用于完整回放）</span>
+    RealtimeItem { payload },                <span class="cmt">// 实时对话条目</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> rollout 不只记 <code class="inline">ResponseItem</code>，还记 <code class="inline">SessionMeta</code>（会话 id、工作目录、从谁 fork 的）、<code class="inline">WorldState</code>（世界状态变更）、<code class="inline">Compacted</code>（压缩发生）、甚至原始 <code class="inline">EventMsg</code>。<strong>这使得 rollout 既是会话历史，也是完整的运行轨迹</strong>——回放时能重建到任意时刻的完整状态。<code class="inline">#[serde(flatten)]</code> 让 item 展开进 RolloutLine 同一层，配合 <code class="inline">tag = "type"</code> 每行自描述。</div>
+    <div class="callout tip">
+      <b class="tag">工具</b>
+      注释里写了：<code class="inline">Rollouts are recorded as JSONL and can be inspected with tools such as...</code>——你可以直接 <code class="inline">cat</code> 或 <code class="inline">jq</code> 看 rollout 文件，每行就是一个事件。文件存在 <code class="inline">~/.codex/sessions/</code> 下。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>记录器与状态库</h2>
+    <p>实际写入磁盘的是 <code class="inline">RolloutRecorder</code>，而会话索引/元数据存在一个 SQLite 状态库里：</p>
+    <div class="code-title">codex-rs/rollout/src/recorder.rs:86 — RolloutRecorder</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// Rollout 以 JSONL 记录，可用如下工具检视：...</span>
+<span class="kw">pub struct</span> RolloutRecorder { ... }
+
+<span class="cmt">// 关键 API：</span>
+RolloutRecorder::new(...)                       <span class="cmt">// 新建会话</span>
+recorder.with_session_id(id)                    <span class="cmt">// 指定 session id</span>
+recorder.with_rollout_id(id)                    <span class="cmt">// 指定 rollout id</span>
+recorder.with_history_mode(mode)                <span class="cmt">// 历史模式</span>
+RolloutRecorder::resume(path: PathBuf)          <span class="cmt">// ★ 恢复已有 rollout</span>
+recorder.list_threads(...)                      <span class="cmt">// 列出所有会话</span></pre>
+    <div class="code-title">codex-rs/rollout/src/state_db.rs — SQLite 状态库（函数节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> init(config) -&gt; Option&lt;StateDbHandle&gt;           <span class="cmt">// 初始化状态库</span>
+<span class="kw">pub async fn</span> list_thread_ids_db(...) -&gt; ...                   <span class="cmt">// 列出会话 id</span>
+<span class="kw">pub async fn</span> list_threads_db(...) -&gt; ...                      <span class="cmt">// 列出会话（带元数据）</span>
+<span class="kw">pub async fn</span> find_rollout_path_by_id(...)                     <span class="cmt">// 按 id 找 rollout 文件路径</span>
+<span class="kw">pub async fn</span> apply_rollout_items(...)                        <span class="cmt">// 把 rollout 条目写进索引</span>
+<span class="kw">pub async fn</span> reconcile_rollout(...)                          <span class="cmt">// 对账：索引 vs JSONL 文件</span>
+<span class="kw">pub async fn</span> read_repair_rollout_path(...)                   <span class="cmt">// 读修复</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 双层存储——<strong>JSONL 文件是事实来源（append-only，不可变），SQLite 是索引/缓存</strong>（快速列出会话、按 id 查路径）。<code class="inline">reconcile_rollout</code> 和 <code class="inline">read_repair_rollout_path</code> 负责「对账」：当索引与 JSONL 不一致时，以 JSONL 为准修复索引。这是事件溯源 + 物化视图的经典组合。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>回放与重建：InitialHistory</h2>
+    <p>重启后恢复会话，就是把 rollout 文件回放成内存历史。这由 <code class="inline">InitialHistory</code> 表达：</p>
+    <div class="code-title">codex-rs/history/src/lib.rs:222 — 会话的初始历史来源</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> InitialHistory {
+    New,                              <span class="cmt">// 全新会话</span>
+    Cleared,                          <span class="cmt">// 已清空</span>
+    Resumed(ResumedHistory),          <span class="cmt">// ★ 从 rollout 恢复</span>
+    Forked(Vec&lt;RolloutItem&gt;),         <span class="cmt">// 从某点 fork 出新分支</span>
+}
+
+<span class="kw">pub struct</span> ResumedHistory {
+    <span class="kw">pub</span> conversation_id: ThreadId,
+    <span class="kw">pub</span> history: Arc&lt;Vec&lt;RolloutItem&gt;&gt;,   <span class="cmt">// 回放出的历史条目</span>
+    <span class="kw">pub</span> rollout_path: Option&lt;PathBuf&gt;,     <span class="cmt">// rollout 文件路径（继续追加）</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 恢复会话就是 <code class="inline">RolloutRecorder::resume(path)</code> → 把 JSONL 逐行反序列化成 <code class="inline">Vec&lt;RolloutItem&gt;</code> → 包成 <code class="inline">ResumedHistory</code> → 喂给 <code class="inline">Session</code>。<strong>关键在于：恢复后 rollout 文件继续追加</strong>（<code class="inline">rollout_path</code> 还在），所以恢复的会话和原会话是同一个文件。<code class="inline">Forked</code> 变体支持「从某历史点分叉」——类似 git 的分支，<code class="inline">forked_from_id</code> 记录了来源。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>World State：会话追踪的真实世界</h2>
+    <p>除了消息历史，Session 还追踪一个 <strong>world state（世界状态）</strong>——模型在当前会话里「造成的外部影响」的快照。它由 <code class="inline">context/world_state/</code> 模块构建，每轮 turn 开始时刷新：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t46 d46">
+        <title id="t46">World State 与会话历史的关系</title>
+        <desc id="d46">世界状态从会话历史派生</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#566574"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="30" y="30" width="380" height="80" rx="8"></rect>
+        <text class="lbl" x="220" y="56" text-anchor="middle">会话历史 Vec&lt;ResponseItem&gt;</text>
+        <text class="lbl sm" x="220" y="76" text-anchor="middle">消息 / 工具调用 / 工具结果 / 推理</text>
+        <text class="lbl sm" x="220" y="94" text-anchor="middle">（append-only，持久化为 rollout）</text>
+
+        <line class="edge core" x1="410" y1="70" x2="488" y2="70" marker-end="url(#arrow)"></line>
+        <text class="lbl sm" x="449" y="62" text-anchor="middle" fill="#2563eb">派生</text>
+
+        <rect class="node core" x="490" y="30" width="380" height="80" rx="8"></rect>
+        <text class="lbl" x="680" y="56" text-anchor="middle">World State</text>
+        <text class="lbl sm" x="680" y="76" text-anchor="middle">ModelInstructions / Permissions / Tools / Environments …</text>
+        <text class="lbl sm" x="680" y="94" text-anchor="middle">（每轮 turn 开始时重建快照）</text>
+
+        <line class="edge" x1="680" y1="110" x2="680" y2="140" marker-end="url(#arrow)"></line>
+        <rect class="node acc" x="430" y="142" width="500" height="40" rx="6"></rect>
+        <text class="lbl sm" x="680" y="167" text-anchor="middle">注入 prompt → 模型知道「我到目前为止改了什么」</text>
+      </svg>
+      <div class="fig-cap">图 4.6：世界状态从历史派生，每轮注入 prompt，让模型有「记忆」。</div>
+    </div>
+    <p>world state 让模型不只看到对话文本，还能知道「当前的指令、权限、可用工具、环境等运行时状态」——这对编码 Agent 至关重要，保持状态一致。它由若干 <code class="inline">WorldStateSection</code>（<code class="inline">ModelInstructionsState</code>、<code class="inline">PermissionsState</code>、<code class="inline">ToolsState</code>、<code class="inline">EnvironmentsState</code> 等）拼成，每个 section 独立 diff，只在变化时更新。它也被持久化进 rollout（<code class="inline">WorldState</code> 变体）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>回滚：扔掉最近几轮</h2>
+    <p>会话支持回滚——扔掉最近 N 个用户 turn，回到之前的状态。这通过 <code class="inline">Op::ThreadRollback</code> 触发，对应事件 <code class="inline">EventMsg::ThreadRolledBack</code>。因为 rollout 是 append-only，回滚不是删除文件内容，而是<strong>记录一个回滚点、重建历史时截断到该点</strong>（或 fork 出新分支）。</p>
+    <div class="callout info">
+      <b class="tag">设计</b>
+      append-only + fork 的设计借鉴了 git：历史不可变，新进展是新行，想「回到过去」就从过去某点 fork。这让会话天然支持分支探索，且崩溃恢复时不会因部分写入损坏（最多丢最后半行）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.8</span>小结与对自研的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      Codex 的会话持久化有三个关键决策：<strong>① 会话即日志</strong>（append-only JSONL，每行一个带 type 标签的事件）；<strong>② 事实来源 + 索引分离</strong>（JSONL 是真相，SQLite 是加速索引，带对账修复）；<strong>③ 恢复即回放</strong>（重启时把日志重放成内存历史，继续追加）。
+    </div>
+    <div class="callout tip">
+      <b class="tag">自研 checklist</b>
+      最小持久化：每产生一个消息/工具调用/结果，就 <code class="inline">println!</code> 一行 JSON 到 <code class="inline">session.jsonl</code>。重启时逐行读回成消息列表。先别管 SQLite 索引和 fork——等会话多了再加。崩溃恢复天然就有了：最后一行可能残缺，跳过即可。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="03-turn-loop.html">← 03 Turn 循环</a>
+    <a href="05-context.html">下一步：上下文构建 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 04 会话与 Rollout · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

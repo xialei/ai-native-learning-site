@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 内置工具 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 内置工具</div>
+    <h1>内置工具：模型动手的双手</h1>
+    <div class="subtitle">循环让模型能多步推进，而工具让它真的「动得了手」。这一章拆开 Claude Code 内置的工具集——Bash、文件读写编辑、网络搜索抓取——看清每一次 tool_use 如何落地成一次真实动作，又如何把结果变成模型可读的 tool_result。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心关系</span>
+    <span class="ep-quote">模型只产出 tool_use 意图，真正动手的是 harness；动作的结果再被格式化回灌。</span>
+    <span class="ep-arrow">→</span>
+    工具，就是模型伸向真实世界的那双手。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>一分钟版本</h2>
+    <p>模型自己不会跑命令、不会读写磁盘——它只能<strong>声明意图</strong>：「我要调 Bash，参数是 …」。Claude Code 的 harness 接管这个声明，真正执行，再把结果喂回去。这套内置工具就是模型的「双手」：</p>
+    <ul>
+      <li><strong>Bash</strong>：跑 shell 命令，stdout/stderr/退出码成为结果。</li>
+      <li><strong>Read</strong>：读文件（含图片、PDF、Jupyter notebook，可指定行范围）。</li>
+      <li><strong>Write</strong>：创建或整体覆盖文件。</li>
+      <li><strong>Edit</strong>：精确字符串替换（old → new，需唯一匹配）。</li>
+      <li><strong>WebSearch / WebFetch</strong>：搜索与抓取网页。</li>
+      <li><strong>Task / TaskOutput</strong>：派遣子代理与读取其输出（见第 7 章）。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">心智锚点</b>
+      工具不是「功能」，而是<strong>模型与世界的接口</strong>。每加一个工具，模型能触达的世界就大一圈；每关一个工具（权限 deny），它就少一条路。MCP（第 12 章）的存在，正是为了让你能无限往这个工具集里加东西。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>工具调用全流程：一次 tool_use 的旅程</h2>
+    <p>第 3 章把循环画成「模型 ⇄ 工具」，这里把「工具」这个节点放大。一次 tool_use 从声明到结果回灌，要穿过权限与 Hooks 两道关卡：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t52 d52">
+        <title id="t52">工具调用全流程</title>
+        <desc id="d52">tool_use 经权限与 Hooks 检查后执行，结果回灌</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+
+        <rect class="node core" x="20" y="110" width="140" height="56" rx="8"></rect>
+        <text class="lbl" x="90" y="134" text-anchor="middle">模型产出</text>
+        <text class="lbl sm" x="90" y="152" text-anchor="middle">tool_use</text>
+        <line class="edge" x1="160" y1="138" x2="208" y2="138"></line>
+
+        <rect class="node" x="210" y="110" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="285" y="134" text-anchor="middle">权限检查</text>
+        <text class="lbl sm" x="285" y="152" text-anchor="middle">allow/ask/deny</text>
+        <line class="edge" x1="360" y1="138" x2="408" y2="138"></line>
+
+        <rect class="node acc" x="410" y="110" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="485" y="134" text-anchor="middle">PreToolUse Hook</text>
+        <text class="lbl sm" x="485" y="152" text-anchor="middle">可拦截/改写</text>
+        <line class="edge" x1="560" y1="138" x2="608" y2="138"></line>
+
+        <rect class="node core" x="610" y="110" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="685" y="134" text-anchor="middle">执行工具</text>
+        <text class="lbl sm" x="685" y="152" text-anchor="middle">真实动作</text>
+        <line class="edge" x1="760" y1="138" x2="808" y2="138"></line>
+
+        <rect class="node acc" x="810" y="110" width="70" height="56" rx="8"></rect>
+        <text class="lbl sm" x="845" y="134" text-anchor="middle">Post</text>
+        <text class="lbl sm" x="845" y="150" text-anchor="middle">Hook</text>
+
+        <!-- deny 分支 -->
+        <path class="edge" d="M285 166 L285 220 L685 220 L685 220" marker-end="url(#arrow)"></path>
+        <rect class="node warn" x="430" y="208" width="250" height="30" rx="6"></rect>
+        <text class="lbl sm" x="555" y="228" text-anchor="middle">deny / Hook 拦截 → 不执行，直接回灌拒绝结果</text>
+
+        <!-- 结果回灌 -->
+        <path class="edge" d="M685 110 L685 70 L90 70 L90 110" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="350" y="62" text-anchor="middle">tool_result（含 is_error）回灌到循环</text>
+      </svg>
+      <div class="fig-cap">图 5.1：tool_use 经权限 → PreToolUse → 执行 → PostToolUse，结果回灌。任一关卡可拦截。</div>
+    </div>
+    <div class="annotation"><b>读懂这张图：</b> 工具调用不是「模型说要就跑」，而是穿过一条<strong>流水线</strong>：权限先判生死（allow/ask/deny），PreToolUse Hook 还能改写或拦截，执行后才轮到 PostToolUse 收尾。这条流水线把第 3 章的循环、第 6 章的权限、第 8 章的 Hooks 串成一条线——<strong>每个工具调用都是一个可拦截、可审计的决策点</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>Bash 工具：把终端交给模型</h2>
+    <p>Bash 是最强也最危险的工具：模型能跑任意 shell 命令。它的结果由 <strong>stdout / stderr / 退出码</strong> 三件套组成，非零退出码会被标成 <code class="inline">is_error</code>。</p>
+    <div class="code-title">概念示例：Bash 的 tool_use（Anthropic 消息格式）</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"type"</span>: <span class="st">"tool_use"</span>,
+  <span class="st">"id"</span>: <span class="st">"toolu_01ABC..."</span>,
+  <span class="st">"name"</span>: <span class="st">"Bash"</span>,
+  <span class="st">"input"</span>: {
+    <span class="st">"command"</span>: <span class="st">"pnpm test --filter auth"</span>,   <span class="cmt">// 要执行的命令</span>
+    <span class="st">"description"</span>: <span class="st">"跑 auth 模块测试"</span>         <span class="cmt">// 模型对命令的说明</span>
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <strong>① 退出码即语义</strong>——命令以非零退出，<code class="inline">tool_result.is_error=true</code>，模型在下一轮会看到报错并据此调整（这正是「看报错再改」的来源）。<strong>② 工作目录持久</strong>——多次 Bash 调用共享工作目录与部分环境，<code class="inline">cd</code> 的效果会延续，但 shell 函数/变量不一定跨调用保留。<strong>③ 可上沙箱</strong>——配置里可让 Bash 在沙箱里跑，限制网络与文件写，本仓库 <code class="inline">examples/settings/settings-bash-sandbox.json</code> 就是一例。</div>
+    <div class="callout warn">
+      <b class="tag">安全提示</b>
+      Bash 能跑任意命令 = 能 <code class="inline">rm</code>、能联网、能读密钥。所以它默认<strong>需要确认</strong>，且常被 PreToolUse Hook 审查（见 5.7 的真实范例）。生产环境务必搭配权限规则与沙箱，别裸跑。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>文件工具：Read / Write / Edit</h2>
+    <p>这三个工具让模型能读写你的代码。理解它们的差别，就理解了 Claude Code 改代码的纪律：</p>
+    <ul>
+      <li><strong>Read</strong>：读文件。可指定 <code class="inline">offset/limit</code> 只读一段；能读图片、PDF、Jupyter notebook（按页或按 cell）。大文件不必全读。</li>
+      <li><strong>Write</strong>：创建或<strong>整体覆盖</strong>文件。慎用——它会冲掉原内容。</li>
+      <li><strong>Edit</strong>：精确<strong>字符串替换</strong>：<code class="inline">old_string</code> → <code class="inline">new_string</code>，且 <code class="inline">old_string</code> 在文件里必须唯一。</li>
+    </ul>
+    <div class="code-title">概念示例：Edit 的 tool_use</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"type"</span>: <span class="st">"tool_use"</span>,
+  <span class="st">"name"</span>: <span class="st">"Edit"</span>,
+  <span class="st">"input"</span>: {
+    <span class="st">"file_path"</span>: <span class="st">"src/auth/login.ts"</span>,
+    <span class="st">"old_string"</span>: <span class="st">"const user = await db.find(email);"</span>,
+    <span class="st">"new_string"</span>: <span class="st">"const user = await db.findByEmail(email);"</span>
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <strong>① 唯一性是硬约束</strong>——<code class="inline">old_string</code> 必须在文件里唯一匹配，否则 Edit 报错不改。这逼着模型定位到足够具体的上下文，避免改错地方。<strong>② 偏向 Edit 而非 Write</strong>——改现有文件优先用 Edit（小而准），Write 留给新建文件或整体重写，这是文件变更的纪律。<strong>③ 改前先读</strong>——模型通常先 Read 看准上下文再 Edit，盲改会被唯一性约束挡住。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>网络工具：WebSearch / WebFetch</h2>
+    <p>模型的知识有截止日期，且不知道你内部的文档站点。网络工具补这块：</p>
+    <ul>
+      <li><strong>WebSearch</strong>：搜索网页，返回标题与 URL 列表（仅美国地区可用）。</li>
+      <li><strong>WebFetch</strong>：抓取一个 URL，转成 Markdown，再用一个小模型针对该内容回答你给的 prompt。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">可被权限关闭</b>
+      网络工具不是非要开。本仓库 <code class="inline">examples/settings/settings-strict.json</code> 就<strong>禁用了 WebFetch 与 WebSearch</strong>——在对网络泄露敏感的环境里，这是一道常见闸门。这再次说明：工具是可选的，权限决定哪些手可用。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>工具结果的结构化：原始输出如何变模型可读</h2>
+    <p>第 3 章 §3.3 讲过 <code class="inline">tool_result</code> 的结构，这里按工具看它们各自回什么。原始输出会被整理、必要时截断，再配上 <code class="inline">tool_use_id</code> 与 <code class="inline">is_error</code>：</p>
+    <table class="tbl">
+      <tr><th>工具</th><th>原始产出</th><th>回灌给模型的 tool_result</th></tr>
+      <tr><td>Bash</td><td>stdout / stderr / 退出码</td><td>输出文本；非零退出 → is_error=true</td></tr>
+      <tr><td>Read</td><td>文件内容</td><td>带行号文本；超长截断；图片/PDF 转可读表示</td></tr>
+      <tr><td>Edit</td><td>替换是否成功</td><td>成功提示 / 失败原因（如不唯一）</td></tr>
+      <tr><td>Write</td><td>写入结果</td><td>成功提示</td></tr>
+      <tr><td>WebSearch</td><td>搜索结果</td><td>标题 + URL 列表</td></tr>
+      <tr><td>WebFetch</td><td>网页内容 + 小模型回答</td><td>针对 prompt 的答案</td></tr>
+    </table>
+    <div class="annotation"><b>关键点：</b> 所有工具的输出最终都归约成<strong>同一种结构</strong>喂回模型——文本 + 错误标志 + id 配对。这种统一让循环不用关心「这是文件还是命令」，只消消费 tool_result。<strong>截断</strong>尤其重要：一个 <code class="inline">cat</code> 出几万行的文件，会被裁成头尾带省略号，避免撑爆上下文窗口（见第 4 章压缩与裁剪）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.7</span>一个真实范例：拦截 Bash 把 grep 改成 rg</h2>
+    <p>本仓库 <code class="inline">examples/hooks/bash_command_validator_example.py</code> 是一个真实的 PreToolUse Hook，专门盯 Bash 工具——它把 <code class="inline">grep</code> 改劝成 <code class="inline">rg</code>、把 <code class="inline">find -name</code> 改劝成 <code class="inline">rg --files</code>。这是「工具拦截」最直白的活样本：</p>
+    <div class="code-title">examples/hooks/bash_command_validator_example.py — 校验规则（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 定义校验规则：(正则模式, 提示信息)</span>
+_VALIDATION_RULES = [
+    (
+        <span class="st">r"^grep\b(?!.*\|)"</span>,
+        <span class="st">"Use 'rg' (ripgrep) instead of 'grep' ..."</span>,
+    ),
+    (
+        <span class="st">r"^find\s+\S+\s+-name\b"</span>,
+        <span class="st">"Use 'rg --files | rg pattern' instead of 'find -name' ..."</span>,
+    ),
+]
+
+<span class="cmt"># 命中规则 → 退出码 2，阻断工具调用并把提示展示给 Claude</span>
+<span class="kw">if</span> issues:
+    <span class="kw">for</span> message <span class="kw">in</span> issues:
+        print(<span class="st">f"• {message}"</span>, file=sys.stderr)
+    sys.exit(<span class="nu">2</span>)   <span class="cmt"># 退出码 2 = 阻断 + 把 stderr 给模型</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 这就是图 5.1 里「PreToolUse Hook」的真实样子。<strong>退出码即协议</strong>——0 放行、2 阻断并把 stderr 喂给模型、1 出错但不阻断。模型收到「请用 rg 而非 grep」后会换命令重试。<strong>一个几行脚本，就把团队规范焊进了循环</strong>——这正是 Hooks 的威力，第 8 章会完整拆开这套 stdin/stdout JSON 协议。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.8</span>对使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 工具是接口不是功能</strong>——决定模型能触达的世界，按需开/关。<strong>② 每次调用都过流水线</strong>——权限 → PreToolUse → 执行 → PostToolUse，任一节可拦。<strong>③ 改文件守纪律</strong>——先 Read 后 Edit，old_string 要唯一，慎用 Write 覆盖。<strong>④ Bash 最强也最险</strong>——默认确认 + Hook 审查 + 沙箱三件套别省。<strong>⑤ 想加工具就上 MCP</strong>（第 12 章），工具集是开放的。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="04-context.html">← 上一页：上下文构建</a>
+    <a href="06-permissions.html">下一步：权限模型 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 05 内置工具 · 仓库实例路径以最新为准
+</footer>
+
+</body>
+</html>

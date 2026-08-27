@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Agentic 循环 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 Agentic 循环</div>
+    <h1>Agentic 循环：让模型自己决定下一步的那台机器</h1>
+    <div class="subtitle">★ 重点。这一章拆开 Claude Code 的「心脏」：提示进入后，模型如何被反复调用、工具结果如何回灌、循环何时停。理解了它，你就理解了「agentic」的全部含义。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心机制</span>
+    <span class="ep-quote">模型不再只回答一次，而是「回答 → 调用工具 → 看结果 → 再回答」直到任务完成。</span>
+    <span class="ep-arrow">→</span>
+    这就是 ReAct（Reason + Act）模式在真实产品里的落地。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>一分钟版本：什么是 agentic 循环</h2>
+    <p>普通聊天是<strong>单轮</strong>：你问 → 模型答 → 结束。Agentic 循环是<strong>多轮自驱动</strong>：模型答的时候可以附带「我要调用某个工具」，系统执行该工具、把结果塞回去，模型再基于结果继续答——如此往复，直到模型不再要求调用工具，循环结束。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
+        <title id="t31">Agentic 循环</title>
+        <desc id="d31">提示进入循环，模型与工具交替推进直到完成</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <rect class="node acc" x="30" y="30" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="105" y="52" text-anchor="middle">用户提示</text>
+        <text class="lbl sm" x="105" y="68" text-anchor="middle">进入循环</text>
+        <line class="edge" x1="180" y1="55" x2="238" y2="55"></line>
+
+        <rect class="node core" x="240" y="30" width="180" height="50" rx="8"></rect>
+        <text class="lbl" x="330" y="52" text-anchor="middle">调用模型</text>
+        <text class="lbl sm" x="330" y="68" text-anchor="middle">流式产出文本 + tool_use</text>
+        <line class="edge" x1="420" y1="55" x2="478" y2="55"></line>
+
+        <rect class="node" x="480" y="30" width="180" height="50" rx="8"></rect>
+        <text class="lbl" x="570" y="52" text-anchor="middle">有 tool_use?</text>
+        <line class="edge" x1="660" y1="55" x2="718" y2="55"></line>
+
+        <rect class="node warn" x="720" y="30" width="120" height="50" rx="8"></rect>
+        <text class="lbl" x="780" y="52" text-anchor="middle">否 → 结束</text>
+        <text class="lbl sm" x="780" y="68" text-anchor="middle">输出最终回答</text>
+
+        <!-- 是 → 执行工具 -->
+        <path class="edge core" d="M570 80 L570 130" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="580" y="112">是</text>
+        <rect class="node acc" x="430" y="130" width="280" height="56" rx="8"></rect>
+        <text class="lbl" x="570" y="152" text-anchor="middle">执行工具（受权限 + Hooks 约束）</text>
+        <text class="lbl sm" x="570" y="170" text-anchor="middle">Bash / Read / Edit / 网络 …</text>
+
+        <!-- 结果回灌 -->
+        <path class="edge" d="M430 158 L330 158 L330 80" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="340" y="150">tool_result 回灌到上下文</text>
+
+        <text class="lbl sm" x="30" y="220">每一圈 = 一次「模型思考 + 一次工具执行」。循环把<strong>单次推理</strong>变成<strong>有状态的推进</strong>。</text>
+        <text class="lbl sm" x="30" y="244">停的条件：模型这轮<strong>不再要求调用任何工具</strong>（任务完成或无法继续）。</text>
+        <text class="lbl sm" x="30" y="268">人为停：用户随时可中断（Esc / abort）；SDK 可设 <code>maxTurns</code> 等上限。</text>
+      </svg>
+      <div class="fig-cap">图 3.1：Agentic 循环。模型与工具交替推进，工具结果回灌成下一轮的上下文。</div>
+    </div>
+    <div class="annotation"><b>这一张图胜过千言：</b> 整个 Claude Code 的「agentic」就浓缩在这条回路里。后面所有机制——上下文（第 4 章）、工具（第 5 章）、权限与 Hooks（第 6、8 章）——都是挂在<strong>「执行工具」</strong>这个节点上的：上下文决定模型看到什么，权限决定工具能不能跑，Hooks 决定跑前后插什么逻辑。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>turn 与 tool_use：循环的两个粒度</h2>
+    <p>循环里有两个粒度要分清：</p>
+    <ul>
+      <li><strong>turn（轮）</strong>：一次「调用模型 → 拿到它的回复」。一个 turn 里模型可能产出文本，也可能产出若干个 <code class="inline">tool_use</code>。</li>
+      <li><strong>tool_use（工具调用）</strong>：模型在回复里声明「我要调 Bash，参数是 …」。系统执行后，把 <code class="inline">tool_result</code> 作为新的 user 角色消息回灌，触发下一个 turn。</li>
+    </ul>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t32 d32">
+        <title id="t32">turn 与 tool_use 的时序</title>
+        <desc id="d32">多个 turn 交替推进</desc>
+        <line class="st" x1="80" y1="30" x2="80" y2="210"></line>
+        <text class="lbl sm" x="30" y="180">时间</text>
+        <line class="st" x1="80" y1="30" x2="830" y2="30"></line>
+        <text class="lbl sm" x="836" y="34">→</text>
+
+        <rect class="node" x="100" y="40" width="120" height="30" rx="6"></rect>
+        <text class="lbl" x="160" y="60" text-anchor="middle">user 提示</text>
+
+        <rect class="node core" x="100" y="80" width="220" height="30" rx="6"></rect>
+        <text class="lbl" x="210" y="100" text-anchor="middle">turn 1：assistant（含 tool_use: Read）</text>
+
+        <rect class="node acc" x="100" y="120" width="220" height="30" rx="6"></rect>
+        <text class="lbl" x="210" y="140" text-anchor="middle">tool_result（文件内容）回灌</text>
+
+        <rect class="node core" x="360" y="80" width="240" height="30" rx="6"></rect>
+        <text class="lbl" x="480" y="100" text-anchor="middle">turn 2：assistant（含 tool_use: Edit）</text>
+
+        <rect class="node acc" x="360" y="120" width="240" height="30" rx="6"></rect>
+        <text class="lbl" x="480" y="140" text-anchor="middle">tool_result（编辑结果）回灌</text>
+
+        <rect class="node core" x="640" y="80" width="180" height="30" rx="6"></rect>
+        <text class="lbl" x="730" y="100" text-anchor="middle">turn 3：assistant（纯文本）</text>
+
+        <rect class="node warn" x="640" y="120" width="180" height="30" rx="6"></rect>
+        <text class="lbl" x="730" y="140" text-anchor="middle">无 tool_use → 循环结束</text>
+        <text class="lbl sm" x="100" y="180">turn 3 没有 tool_use，循环自然终止，最后这段文本就是给用户的最终回答。</text>
+      </svg>
+      <div class="fig-cap">图 3.2：三个 turn 的序列。每个 tool_result 都成为下一个 turn 的输入。</div>
+    </div>
+    <div class="callout info">
+      <b class="tag">为什么必须回灌成 user 消息</b>
+      在 Anthropic 的消息 API 里，<code class="inline">tool_result</code> 以 <strong>user 角色</strong>出现，且必须紧跟在对应的 <code class="inline">tool_use</code> 之后。这解释了一个常见约束：<strong>对话不能以 assistant 的 tool_use 结尾</strong>——否则模型在等一个永远不会到来的结果。循环必须把结果补上，或主动结束。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>工具结果如何变成模型可读的东西</h2>
+    <p>循环执行工具后，原始输出（文件内容、命令 stdout、报错）要被格式化成 <code class="inline">tool_result</code> 喂回模型。这一步决定了模型「看得清不清楚」：</p>
+    <div class="code-title">概念示例：tool_result 的结构（Anthropic 消息格式）</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"role"</span>: <span class="st">"user"</span>,
+  <span class="st">"content"</span>: [
+    {
+      <span class="st">"type"</span>: <span class="st">"tool_result"</span>,
+      <span class="st">"tool_use_id"</span>: <span class="st">"toolu_01ABC..."</span>,      <span class="cmt">// 必须对应模型声明的 tool_use_id</span>
+      <span class="st">"content"</span>: <span class="st">"文件全部内容 / 命令输出 / 错误信息"</span>,  <span class="cmt">// 字符串或结构化块</span>
+      <span class="st">"is_error"</span>: <span class="kw">false</span>                        <span class="cmt">// 工具失败时标 true，模型会据此调整</span>
+    }
+  ]
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 两个细节决定循环质量。<strong>① <code class="inline">tool_use_id</code> 配对</strong>——模型一轮可能并发多个 tool_use，结果必须按 id 配对回灌，否则模型会混乱。<strong>② <code class="inline">is_error</code></strong>——工具失败（如命令非零退出、文件不存在）不是悄悄吞掉，而是明确告诉模型「这一步失败了」，模型会在下一轮换策略。这就是 agentic 循环能「看报错再改」的根基。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>循环在哪里停：终止条件</h2>
+    <table class="tbl">
+      <tr><th>终止情形</th><th>谁触发</th><th>说明</th></tr>
+      <tr><td>自然完成</td><td>模型</td><td>某轮不再产出 tool_use，仅文本回答 → 循环结束</td></tr>
+      <tr><td>用户中断</td><td>人</td><td>交互模式下 Esc 中断当前 turn；SDK 可 abort</td></tr>
+      <tr><td>达到上限</td><td>系统</td><td>SDK 可设 <code class="inline">maxTurns</code>，防失控</td></tr>
+      <tr><td>工具被拒</td><td>权限 / Hooks</td><td>关键工具被 deny，模型可能放弃或换路</td></tr>
+      <tr><td>出错</td><td>系统</td><td>API 错误、不可恢复异常 → 终止并报错</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>「自然完成」是最被低估的信号</strong>：模型选择不再调工具，意味着它认为任务做完了或做不动了。在 agentic 工作流里，区分「做完了」和「卡住了」要靠后续判断（测试 / review / Hook 校验），而非相信模型的自述。这也是为什么 Hooks 常被用来兜底验证。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>流式：循环不是「等完才给」</h2>
+    <p>循环里每一次「调用模型」都是<strong>流式</strong>的——文本一个 token 一个 token 地吐，工具调用也是增量解析。这带来两个体验上的关键点：</p>
+    <ul>
+      <li><strong>实时反馈</strong>：你在 TUI 里看到模型边想边写，而不是干等几秒后整段蹦出。</li>
+      <li><strong>可中断</strong>：流式意味着你可以在模型还在吐的时候 Esc 打断，已吐的部分不丢。</li>
+    </ul>
+    <p>在 SDK 里，流式表现为一个<strong>事件流</strong>：文本增量、工具调用开始 / 结束、消息结束等事件依次到达，程序按需消费。这正是第 11 章的核心。</p>
+    <div class="code-title">SDK 概念示例：消费流式事件（伪代码）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">for await</span> (<span class="kw">const</span> message <span class="kw">of</span> query({ prompt, options })) {
+  <span class="kw">for</span> (<span class="kw">const</span> block <span class="kw">of</span> message.content) {
+    <span class="kw">if</span> (block.type === <span class="st">"text"</span>)        process.stdout.write(block.text);  <span class="cmt">// 文本增量</span>
+    <span class="kw">else if</span> (block.type === <span class="st">"tool_use"</span>) console.log(<span class="st">"调用工具:"</span>, block.name); <span class="cmt">// 工具调用</span>
+  }
+}
+<span class="cmt">// 循环在 query() 迭代器耗尽时结束——背后就是 agentic loop</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 表面是一段 <code class="inline">for await</code>，背后是完整的 agentic 循环在转：每次模型要调工具，SDK 自动执行并把结果回灌，再继续产出下一个 message——<strong>你消费的是循环的输出流，循环本身被 SDK 封装了</strong>。这就是「同一内核，SDK 外壳」的含义。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>把循环画进整张图</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t36 d36">
+        <title id="t36">循环与周边机制的关系</title>
+        <desc id="d36">循环在中心，上下文/权限/Hooks/工具挂在四周</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <rect class="node core" x="330" y="130" width="240" height="80" rx="10"></rect>
+        <text class="lbl" x="450" y="160" text-anchor="middle" font-weight="bold">Agentic Loop</text>
+        <text class="lbl sm" x="450" y="180" text-anchor="middle">模型 ⇄ 工具，交替推进</text>
+        <text class="lbl sm" x="450" y="198" text-anchor="middle">turn / tool_use / 流式</text>
+
+        <rect class="node" x="60" y="40" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="160" y="64" text-anchor="middle">Context（第 4 章）</text>
+        <text class="lbl sm" x="160" y="82" text-anchor="middle">每轮模型看到什么</text>
+        <path class="edge" d="M260 70 L360 130" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="640" y="40" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="740" y="64" text-anchor="middle">Tools（第 5 章）</text>
+        <text class="lbl sm" x="740" y="82" text-anchor="middle">模型能调什么</text>
+        <path class="edge" d="M640 70 L540 130" marker-end="url(#arrow)"></path>
+
+        <rect class="node" x="60" y="240" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="160" y="264" text-anchor="middle">权限（第 6 章）</text>
+        <text class="lbl sm" x="160" y="282" text-anchor="middle">工具能不能跑</text>
+        <path class="edge" d="M260 270 L360 210" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="640" y="240" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="740" y="264" text-anchor="middle">Hooks（第 8 章）</text>
+        <text class="lbl sm" x="740" y="282" text-anchor="middle">跑前后插什么</text>
+        <path class="edge" d="M640 270 L540 210" marker-end="url(#arrow)"></path>
+      </svg>
+      <div class="fig-cap">图 3.3：循环是中心，其余机制都是挂载点。后续章节逐个展开。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.7</span>对使用与扩展的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 循环让「看报错再改」成为默认</strong>——所以别怕让模型跑测试，它的价值在失败后那一轮。<strong>② 停止信号要靠外部验证</strong>——模型说「完成」不等于真完成，用 Hook / 测试兜底。<strong>③ 流式 + 可中断是体验关键</strong>——做 SDK 自动化时记得消费事件流而非死等。<strong>④ 每个工具调用都是一个可拦截决策点</strong>——这是权限与 Hooks 的立足之地。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="02-architecture.html">← 上一页：整体架构</a>
+    <a href="04-context.html">下一步：上下文构建 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 03 Agentic 循环 · 内核机制以官方公开文档为准
+</footer>
+
+</body>
+</html>

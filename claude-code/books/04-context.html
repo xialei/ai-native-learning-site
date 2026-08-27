@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 上下文构建 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 上下文构建</div>
+    <h1>上下文构建：模型每一轮到底看到什么</h1>
+    <div class="subtitle">★ 重点。循环决定「怎么干」，上下文决定「看到什么」。这一章拆开每次调用模型前，那段被组装出来的消息列表：系统提示、CLAUDE.md 记忆、对话历史、工具结果、以及超长时的压缩。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心问题</span>
+    <span class="ep-quote">模型不能直接「看见」你的仓库，它只能看见发给它的那段文本。上下文工程就是决定这段文本装什么。</span>
+    <span class="ep-arrow">→</span>
+    控制好上下文 = 控制好模型的注意力。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>一分钟版本</h2>
+    <p>每次循环要调模型前，系统会组装一段<strong>消息列表</strong>发出去。这段列表大致由四部分拼成：</p>
+    <ul>
+      <li><strong>系统提示（system prompt）</strong>：固定指令——你是谁、怎么用工具、守什么规矩。</li>
+      <li><strong>项目记忆（CLAUDE.md）</strong>：随仓库走的「备忘录」，告诉模型这个项目的约定、命令、结构。</li>
+      <li><strong>对话历史</strong>：之前每一轮的 user / assistant / tool_result。</li>
+      <li><strong>环境注入</strong>：当前目录、git 状态、时间等动态信息。</li>
+    </ul>
+    <p>当历史太长快超窗口时，<strong>压缩（compaction）</strong>会把旧消息摘要化，腾出空间继续。子代理（第 7 章）则用<strong>独立窗口</strong>避免污染主上下文。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>一次调用的消息结构</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t42 d42">
+        <title id="t42">上下文消息结构</title>
+        <desc id="d42">从系统提示到对话历史</desc>
+        <rect class="node core" x="40" y="20" width="800" height="50" rx="8"></rect>
+        <text class="lbl" x="60" y="42" font-weight="bold" fill="#2f6f8f">system prompt</text>
+        <text class="lbl sm" x="60" y="58">固定：身份 / 工具说明 / 安全规则 / 输出格式</text>
+
+        <rect class="node acc" x="40" y="80" width="800" height="50" rx="8"></rect>
+        <text class="lbl" x="60" y="102" font-weight="bold" fill="#c15f3c">CLAUDE.md（项目记忆，可多层叠加）</text>
+        <text class="lbl sm" x="60" y="118">~/.claude/CLAUDE.md · 项目根 CLAUDE.md · 子目录 CLAUDE.md · 命令注入</text>
+
+        <rect class="node" x="40" y="140" width="800" height="40" rx="8"></rect>
+        <text class="lbl" x="60" y="165">环境注入：cwd / git status / 时间 / 平台 …</text>
+
+        <rect class="node" x="40" y="190" width="800" height="44" rx="8"></rect>
+        <text class="lbl" x="60" y="212">user：本次提示</text>
+
+        <rect class="node" x="40" y="244" width="800" height="44" rx="8"></rect>
+        <text class="lbl" x="60" y="266">assistant（历史，含 tool_use）+ user（tool_result）… 多轮交替</text>
+
+        <rect class="node warn" x="40" y="298" width="800" height="44" rx="8"></rect>
+        <text class="lbl" x="60" y="320">超长时：旧消息被压缩成 summary，腾出窗口继续</text>
+      </svg>
+      <div class="fig-cap">图 4.1：发往模型的消息列表，自上而下拼接。</div>
+    </div>
+    <div class="annotation"><b>关键认知：</b> 模型的全部「世界」就是这张图里装的东西。它不知道图外的任何事——除非有个工具去读、去搜。所以「让模型了解仓库」本质是「让仓库的 relevant 部分进入这张图」，要么靠 CLAUDE.md 预先写好，要么靠工具运行时拉进来。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>CLAUDE.md：随仓库走的记忆</h2>
+    <p><code class="inline">CLAUDE.md</code> 是 Claude Code 最重要的上下文机制之一。它是一份 Markdown，告诉模型「在这个项目里该怎么干活」，并且<strong>随仓库提交，团队共享</strong>。</p>
+    <div class="code-title">典型 CLAUDE.md 内容（概念示例）</div>
+    <pre class="code"><span class="lang-tag">markdown</span><span class="cmt"># 项目：my-service</span>
+
+## 构建与测试
+- <span class="kw">跑测试：</span><span class="st">pnpm test</span>（单测）/ <span class="st">pnpm test:e2e</span>（端到端，需 docker）
+- <span class="kw">类型检查：</span><span class="st">pnpm tsc --noEmit</span>
+
+## 代码约定
+- 用函数式风格，少用 class
+- 错误用 Result 类型，不要 throw 控制流
+- 新增 API 必须在 <span class="st">openapi.yaml</span> 同步登记
+
+## 结构
+- <span class="st">src/domain/</span> 业务逻辑（核心，先看这里）
+- <span class="st">src/adapters/</span> 外部依赖适配</pre>
+    <div class="annotation"><b>读懂这段：</b> CLAUDE.md 不是文档给人看，是<strong>指令给模型看</strong>。写它的诀窍是写「模型猜不到、容易做错的」：构建命令、隐式约定、目录意图。模型能从代码读出来的（比如用了什么框架）少写；模型猜不到的（比如「这个目录是核心」）多写。</div>
+    <div class="callout info">
+      <b class="tag">多层叠加</b>
+      CLAUDE.md 会按目录层级<strong>叠加</strong>：全局 <code class="inline">~/.claude/CLAUDE.md</code>（个人偏好）+ 仓库根（团队共享）+ 当前工作子目录（局部约定）。越靠近工作目录的越具体，模型会都看到。所以你可以在子目录放一个只管该模块的 CLAUDE.md。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>压缩：当历史超过窗口</h2>
+    <p>循环跑久了，对话历史 + 工具结果会越来越长，逼近模型的上下文窗口上限。这时<strong>压缩（compaction / auto-compact）</strong>介入：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t44 d44">
+        <title id="t44">压缩前后</title>
+        <desc id="d44">旧消息被摘要化</desc>
+        <rect class="node" x="30" y="20" width="380" height="200" rx="8"></rect>
+        <text class="lbl" x="50" y="44" font-weight="bold">压缩前：满满的历史</text>
+        <rect class="node acc" x="50" y="56" width="340" height="24" rx="4"></rect>
+        <text class="lbl sm" x="60" y="72">turn 1 … turn 2 …（大量 tool_result）</text>
+        <rect class="node acc" x="50" y="86" width="340" height="24" rx="4"></rect>
+        <text class="lbl sm" x="60" y="102">turn 3 … turn 4 …</text>
+        <rect class="node acc" x="50" y="116" width="340" height="24" rx="4"></rect>
+        <text class="lbl sm" x="60" y="132">… 越积越多，逼近窗口上限</text>
+        <rect class="node core" x="50" y="150" width="340" height="24" rx="4"></rect>
+        <text class="lbl sm" x="60" y="166">最近几轮（保留原样）</text>
+
+        <path class="edge core" d="M410 120 L470 120" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="416" y="112">压缩</text>
+
+        <rect class="node" x="470" y="20" width="380" height="200" rx="8"></rect>
+        <text class="lbl" x="490" y="44" font-weight="bold">压缩后：摘要 + 近期</text>
+        <rect class="node warn" x="490" y="56" width="340" height="60" rx="4"></rect>
+        <text class="lbl sm" x="500" y="76">summary：把旧轮次摘要成</text>
+        <text class="lbl sm" x="500" y="92">「做了什么、改了哪些文件、关键决定」</text>
+        <rect class="node core" x="490" y="124" width="340" height="24" rx="4"></rect>
+        <text class="lbl sm" x="500" y="140">最近几轮（保留原样）</text>
+        <text class="lbl sm" x="490" y="170">腾出大量窗口，循环可继续</text>
+      </svg>
+      <div class="fig-cap">图 4.2：压缩把旧的、低信息密度的消息摘要化，保留近期原样。</div>
+    </div>
+    <div class="callout warn">
+      <b class="tag">代价</b>
+      压缩是<strong>有损</strong>的：摘要可能丢掉某些细节（比如某次工具的具体输出）。所以重要信息（如关键决定、文件结构）最好落到 CLAUDE.md 或文件里，而不是指望它留在对话历史里被压缩保留。这也解释了为什么「把进度写进 todo 文件」是个好习惯——它不依赖上下文窗口。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>工具结果裁剪：另一个吃窗口的大户</h2>
+    <p>对话历史里最占地方的往往不是文字，而是<strong>工具结果</strong>——读了个大文件、命令输出几千行。上下文构建会对此做裁剪：</p>
+    <ul>
+      <li><strong>截断</strong>：超长输出只保留头尾，中间省略并标注。</li>
+      <li><strong>结构化</strong>：把原始输出整理成模型好读的格式（如表格、键值）。</li>
+      <li><strong>按需重读</strong>：旧的工具结果可能被压缩掉，需要时模型再用工具重新拉。</li>
+    </ul>
+    <div class="annotation"><b>实践启示：</b> 别让模型一次读整个大文件再反复带在历史里。更好的做法是<strong>让模型用工具精准读它需要的那部分</strong>（指定行号、grep 关键字），既省窗口又准。这是「agentic 读代码」比「把仓库塞进提示」高明的地方。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>子代理：用独立窗口隔离上下文</h2>
+    <p>当主代理需要做一件<strong>信息量大、可能污染主线</strong>的事（比如全仓库搜索、读一堆文件做调研），与其把这些全堆进主上下文，不如派一个<strong>子代理</strong>：它有自己的上下文窗口，干完只把<strong>结论</strong>回传给主代理。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t46 d46">
+        <title id="t46">子代理隔离上下文</title>
+        <desc id="d46">主代理派子代理，只回收结论</desc>
+        <rect class="node core" x="40" y="80" width="220" height="60" rx="8"></rect>
+        <text class="lbl" x="150" y="108" text-anchor="middle">主代理</text>
+        <text class="lbl sm" x="150" y="126" text-anchor="middle">上下文窗口 A</text>
+
+        <path class="edge" d="M260 100 L380 60" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="290" y="70">派遣（带任务）</text>
+
+        <rect class="node acc" x="380" y="30" width="220" height="60" rx="8"></rect>
+        <text class="lbl" x="490" y="58" text-anchor="middle">子代理</text>
+        <text class="lbl sm" x="490" y="76" text-anchor="middle">独立上下文窗口 B（读一堆文件）</text>
+
+        <path class="edge acc" d="M600 60 L720 100" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="640" y="70">只回传结论</text>
+
+        <rect class="node core" x="720" y="80" width="120" height="60" rx="8"></rect>
+        <text class="lbl" x="780" y="108" text-anchor="middle">主代理</text>
+        <text class="lbl sm" x="780" y="126" text-anchor="middle">窗口 A 不被污染</text>
+
+        <text class="lbl sm" x="40" y="180">窗口 B 里读了多少文件、产生多少 tool_result，都不进 A——A 只收到一段浓缩结论。</text>
+      </svg>
+      <div class="fig-cap">图 4.3：子代理用独立窗口隔离噪声，主上下文只保留结论。</div>
+    </div>
+    <p>这同时解决了两个问题：上下文污染与上下文窗口不够。详见第 7 章。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>对使用的启示：写好上下文比写好提示更重要</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① CLAUDE.md 是最高杠杆的投资</strong>——一份好的项目记忆能让每次会话都省掉大量重复解释。<strong>② 别把仓库塞进提示</strong>——让模型用工具按需读，精准且省窗口。<strong>③ 重要信息落文件</strong>——别依赖对话历史，压缩会丢。<strong>④ 脏活累活派给子代理</strong>——保护主线上下文的信噪比。上下文工程的本质是<strong>注意力管理</strong>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="03-agentic-loop.html">← 上一页：Agentic 循环</a>
+    <a href="05-tools.html">下一步：内置工具 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 04 上下文构建 · 内核机制以官方公开文档为准
+</footer>
+
+</body>
+</html>

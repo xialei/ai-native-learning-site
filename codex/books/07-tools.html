@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 工具系统 — Codex CLI</title>
+<link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 工具系统</div>
+    <h1>★ 工具系统：模型能做什么，怎么做</h1>
+    <div class="subtitle">工具是 Agent 的手。Codex 用 <code class="inline">ToolExecutor</code> trait 定义工具的运行时契约，用 <code class="inline">ToolSpec</code> 描述给模型的 JSON schema，用注册表统一调度内置工具与 MCP 工具。本章拆开工具抽象、内置工具清单、从分发到执行的全生命周期，以及 apply_patch 的自由格式语法。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心洞见</span>
+    <span class="ep-quote">工具 = 给模型的规格 + 给内核的执行器</span>
+    <span class="ep-arrow">→</span>
+    一个工具有两面：<code class="inline">spec()</code> 告诉模型「我叫什么、参数是什么」（JSON schema），<code class="inline">handle()</code> 告诉内核「收到调用后怎么执行」。两面由 <code class="inline">ToolExecutor</code> trait 绑在一起。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>ToolExecutor：工具的运行时契约</h2>
+    <p>工具抽象住在独立的 <code class="inline">codex-tools</code> crate（不依赖 core），这样它可以被多处复用。核心是 <code class="inline">ToolExecutor</code> trait：</p>
+    <div class="code-title">codex-rs/tools/src/tool_executor.rs:106 — ToolExecutor trait</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 模型可见工具的共享运行时契约。
+/// ///
+/// 实现者把模型可见的 spec 与可执行运行时绑定在一起。
+/// 宿主 crate 可在之上叠加路由、hook、遥测等编排，而无需重开 spec/runtime 拆分。</span>
+<span class="kw">pub trait</span> ToolExecutor&lt;Invocation&gt;: Send + Sync {
+    <span class="cmt">/// 此运行时实例处理的具体工具名。</span>
+    <span class="kw">fn</span> tool_name(&amp;self) -&gt; ToolName;
+
+    <span class="cmt">/// 给模型的规格（JSON schema）</span>
+    <span class="kw">fn</span> spec(&amp;self) -&gt; ToolSpec;
+
+    <span class="cmt">/// 宿主应用 step 级策略前的首选暴露方式。</span>
+    <span class="kw">fn</span> exposure(&amp;self) -&gt; ToolExposure { ToolExposure::Direct }
+
+    <span class="kw">fn</span> search_info(&amp;self) -&gt; Option&lt;ToolSearchInfo&gt; { ... }
+
+    <span class="cmt">/// 是否支持并行工具调用</span>
+    <span class="kw">fn</span> supports_parallel_tool_calls(&amp;self) -&gt; bool { <span class="kw">false</span> }
+
+    <span class="cmt">/// ★ 收到调用后怎么执行</span>
+    <span class="kw">fn</span> handle(&amp;self, invocation: Invocation) -&gt; ToolExecutorFuture&lt;<span class="st">'_</span>&gt;;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">ToolExecutor</code> 是泛型 <code class="inline">&lt;Invocation&gt;</code>——不同工具的调用参数类型可以不同（内置工具用一种、扩展工具用 <code class="inline">ExtensionToolCall</code>）。<strong>三个关键方法</strong>：<code class="inline">tool_name()</code> 报名号、<code class="inline">spec()</code> 给模型看规格、<code class="inline">handle()</code> 执行。<code class="inline">exposure()</code> 决定工具是「直接可见」还是「需搜索发现」（配合 tool_search，见第 10 章）。<code class="inline">supports_parallel_tool_calls</code> 默认 false——shell 这类有副作用的工具不并行。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>ToolSpec：给模型看的规格</h2>
+    <p><code class="inline">ToolSpec</code> 是工具的「对外简历」，序列化后就是 OpenAI Responses API 的 Tool JSON：</p>
+    <div class="code-title">codex-rs/tools/src/tool_spec.rs — ToolSpec 枚举</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 序列化为 JSON 时，产生一个合法的 OpenAI Responses API "Tool"。</span>
+<span class="kw">#[derive(Debug, Clone, Serialize, PartialEq)]</span>
+<span class="kw">#[serde(tag = </span><span class="st">"type"</span><span class="kw">)]</span>
+<span class="kw">pub enum</span> ToolSpec {
+    Function(ResponsesApiTool),         <span class="cmt">// 普通函数工具（JSON 参数）</span>
+    Namespace(ResponsesApiNamespace),   <span class="cmt">// 命名空间工具（一组工具）</span>
+    ToolSearch { execution, description, parameters }, <span class="cmt">// 工具搜索</span>
+    WebSearch { ... },                  <span class="cmt">// 内置网页搜索</span>
+    Freeform(FreeformTool),             <span class="cmt">// ★ 自由格式工具（非 JSON）</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 大多数工具是 <code class="inline">Function</code>（参数是 JSON）。但 <code class="inline">apply_patch</code> 用 <code class="inline">Freeform</code>——参数不是 JSON 而是一段自定义语法的文本（见 7.5）。<code class="inline">Namespace</code> 把一组相关工具打包成一个命名空间。<code class="inline">WebSearch</code> 是 OpenAI 内置的网页搜索能力。<strong>这套枚举覆盖了 Responses API 支持的所有工具形态</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>内置工具清单</h2>
+    <p>Codex 内置了一组工具，覆盖编码任务的核心动作。以下是 <code class="inline">tools/handlers/</code> 目录里的主要工具：</p>
+    <table class="tbl">
+      <tr><th>工具名</th><th>作用</th><th>类型</th><th>源码</th></tr>
+      <tr><td>shell</td><td>执行 shell 命令（带 tty、workdir、超时控制）</td><td>Function</td><td>handlers/shell_spec.rs</td></tr>
+      <tr><td>exec_command</td><td>结构化执行（code-mode 持久 shell 会话入口）</td><td>Function</td><td>handlers/unified_exec/exec_command.rs</td></tr>
+      <tr><td>apply_patch</td><td>编辑文件（增/删/改，基于上下文匹配）</td><td>Freeform</td><td>handlers/apply_patch.rs</td></tr>
+      <tr><td>view_image</td><td>查看本地图像文件</td><td>Function</td><td>handlers/view_image.rs</td></tr>
+      <tr><td>update_plan</td><td>更新任务计划</td><td>Function</td><td>handlers/plan.rs</td></tr>
+      <tr><td>request_user_input</td><td>向用户提问获取输入</td><td>Function</td><td>handlers/request_user_input.rs</td></tr>
+      <tr><td>request_permissions</td><td>请求额外权限</td><td>Function</td><td>handlers/request_permissions.rs</td></tr>
+      <tr><td>request_plugin_install</td><td>请求安装插件</td><td>Function</td><td>handlers/request_plugin_install.rs</td></tr>
+      <tr><td>mcp__&lt;server&gt;__&lt;tool&gt;</td><td>调用 MCP 服务器工具（动态命名空间，见 7.10）</td><td>Function</td><td>handlers/mcp.rs</td></tr>
+      <tr><td>list_mcp_resources / read_mcp_resource / list_mcp_resource_templates</td><td>列举 / 读取 MCP 资源与模板</td><td>Function</td><td>handlers/mcp_resource.rs</td></tr>
+      <tr><td>spawn_agent / send_input / wait_agent / list_agents / close_agent</td><td>派生、投递、等待、列举、关闭子 Agent</td><td>Namespace</td><td>handlers/multi_agents_spec.rs</td></tr>
+      <tr><td>tool_search</td><td>搜索发现可用工具</td><td>ToolSearch</td><td>handlers/tool_search.rs</td></tr>
+      <tr><td>wait_for_environment</td><td>等待环境就绪</td><td>Function</td><td>handlers/wait_for_environment.rs</td></tr>
+      <tr><td>sleep</td><td>休眠等待</td><td>Function</td><td>handlers/sleep.rs</td></tr>
+      <tr><td>curr_time</td><td>获取当前时间</td><td>Function</td><td>handlers/current_time.rs</td></tr>
+      <tr><td>get_context_remaining</td><td>查询剩余上下文</td><td>Function</td><td>handlers/get_context_remaining.rs</td></tr>
+    </table>
+    <div class="annotation" style="margin-top:14px"><b>读懂这张表：</b> <strong>注意工具名以源码 <code class="inline">TOOL_NAME</code> 常量为准</strong>，而非文件名——<code class="inline">current_time.rs</code> 内部的 <code class="inline">TOOL_NAME = "curr_time"</code>，<code class="inline">plan.rs</code> 的工具名是 <code class="inline">update_plan</code>。<code class="inline">shell</code> 与 <code class="inline">exec_command</code> 是两个不同的执行工具：前者来自 <code class="inline">shell_spec.rs</code>，后者是 <code class="inline">unified_exec</code> 模块下 code-mode 的结构化执行入口（<code class="inline">ExecCommandArgs</code>，见 7.8）。MCP 工具并非固定名 <code class="inline">mcp</code>，而是按 <code class="inline">mcp__&lt;server&gt;__&lt;tool&gt;</code> 动态生成的命名空间工具（7.10 详述）。多 Agent 也不再是单一 <code class="inline">multi_agents</code> 工具，而是一个命名空间下的 <code class="inline">spawn_agent</code>/<code class="inline">send_input</code>/<code class="inline">wait_agent</code>/<code class="inline">list_agents</code>/<code class="inline">close_agent</code>。</div>
+    <p class="annotation" style="margin-top:14px"><b>注册入口：</b> 这些工具由 <code class="inline">spec_plan.rs</code> 的 <code class="inline">build_core_tool_registry</code> 注册到 <code class="inline">ToolRegistry</code>，再由 <code class="inline">build_model_visible_specs</code> 决定哪些对模型可见（按 step 级策略过滤）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>shell 工具：参数与控制</h2>
+    <p>shell 是最高频的工具。它的参数 schema 揭示了 Codex 对命令执行的精细控制：</p>
+    <div class="code-title">codex-rs/core/src/tools/handlers/shell_spec.rs — shell 工具参数</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let mut</span> properties = BTreeMap::from([
+    (<span class="st">"cmd"</span>, JsonSchema::string(Some(<span class="st">"Shell command to execute."</span>.into()))),
+    (<span class="st">"workdir"</span>, JsonSchema::string(Some(
+        <span class="st">"Working directory for the command. Defaults to the turn cwd."</span>.into()))),
+    (<span class="st">"tty"</span>, JsonSchema::boolean(Some(
+        <span class="st">"True allocates a PTY; false or omitted uses plain pipes."</span>.into()))),
+    (<span class="st">"yield_time_ms"</span>, JsonSchema::number(Some(
+        <span class="st">"Wait before yielding output. Defaults to 10000 ms."</span>.into()))),
+    (<span class="st">"max_output_tokens"</span>, JsonSchema::number(Some(
+        <span class="st">"Output token budget. Defaults to 10000 tokens."</span>.into()))),
+    <span class="cmt">// ... 可能还有 environment_id 等</span>
+]);</pre>
+    <div class="annotation"><b>读懂这段：</b> 四个控制点：<strong>① workdir</strong> 控制工作目录（默认 turn cwd）；<strong>② tty</strong> 决定是否分配伪终端（交互式命令需要）；<strong>③ yield_time_ms</strong> 是「长命令」的关键——命令跑超过这个时间不阻塞，先返回一个 session id 让模型继续，输出后续可拉取；<strong>④ max_output_tokens</strong> 限制输出 token，配合第 5 章的截断。这些参数让 shell 工具既能跑短命令，也能管理长进程。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>apply_patch：自由格式的文件编辑</h2>
+    <p><code class="inline">apply_patch</code> 是 Codex 编辑文件的核心工具。它不是普通 JSON 函数工具，而是 <strong>Freeform 自由格式工具</strong>——参数是一段基于 lark 语法定义的 patch 文本：</p>
+    <div class="code-title">codex-rs/core/src/tools/handlers/apply_patch_spec.rs — apply_patch 工具定义</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 返回一个可用于编辑文件的工具。适合 GPT-5 模型。</span>
+<span class="kw">pub fn</span> create_apply_patch_freeform_tool(...) -&gt; ToolSpec {
+    ToolSpec::Freeform(FreeformTool {
+        name: <span class="st">"apply_patch"</span>.to_string(),
+        description: <span class="st">"The `apply_patch` tool can be used to edit files. </span>
+<span class="st">            This is a FREEFORM tool, so do not wrap the patch in JSON."</span>.to_string(),
+        format: FreeformToolFormat {
+            r#type: <span class="st">"grammar"</span>.to_string(),
+            syntax: <span class="st">"lark"</span>.to_string(),
+            definition,   <span class="cmt">// APPLY_PATCH_LARK_GRAMMAR（include_str! 读入）</span>
+        },
+    })
+}</pre>
+    <div class="code-title">codex-rs/core/src/tools/handlers/apply_patch.lark — patch 语法</div>
+    <pre class="code"><span class="lang-tag">lark</span>start: begin_patch hunk+ end_patch
+begin_patch: <span class="st">"*** Begin Patch"</span> LF
+end_patch:   <span class="st">"*** End Patch"</span> LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk:    <span class="st">"*** Add File: "</span> filename LF add_line+
+delete_hunk: <span class="st">"*** Delete File: "</span> filename LF
+update_hunk: <span class="st">"*** Update File: "</span> filename LF change_move? change?
+
+change: (change_context | change_line)+ eof_line?
+change_context: (<span class="st">"@@"</span> | <span class="st">"@@ "</span> /(.+)/) LF
+change_line: (<span class="st">"+"</span> | <span class="st">"-"</span> | <span class="st">" "</span>) /(.*)/ LF
+eof_line: <span class="st">"*** End of File"</span> LF</pre>
+    <div class="annotation"><b>读懂这段：</b> apply_patch 用一种类似 unified diff 但更简洁的格式：<strong>每个 patch 以 <code class="inline">*** Begin Patch</code> 开头、<code class="inline">*** End Patch</code> 结尾</strong>，内含若干 hunk。hunk 有三种：Add File（新增）、Delete File（删除）、Update File（修改）。Update 用 <code class="inline">@@</code> 标上下文锚点，<code class="inline">+</code>/<code class="inline">-</code>/<code class="inline"> </code>（空格）表示增/删/保留行。<strong>选 Freeform 而非 JSON，是因为 patch 文本里的换行/特殊字符在 JSON 里要转义，徒增模型出错率</strong>——直接用语法格式更可靠。</div>
+    <div class="callout tip">
+      <b class="tag">设计</b>
+      <code class="inline">include_str!("apply_patch.lark")</code> 把语法文件在编译期嵌入二进制——无需运行时读盘。这种「工具的参数语法本身也是数据」的设计，让模型生成的 patch 可被 lark 解析器严格校验。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.6</span>工具调用生命周期：从分发到执行</h2>
+    <p>模型在流式产出里发出 <code class="inline">FunctionCall</code> 后，工具的执行经过一条流水线：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t76 d76">
+        <title id="t76">工具调用生命周期</title>
+        <desc id="d76">从 FunctionCall 到 FunctionCallOutput 的流水线</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#566574"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="30" y="20" width="880" height="38" rx="6"></rect>
+        <text class="lbl sm" x="470" y="44" text-anchor="middle">① LLM 流式产出 ResponseItem::FunctionCall { name, arguments }</text>
+
+        <line class="edge" x1="470" y1="58" x2="470" y2="74" marker-end="url(#arrow)"></line>
+
+        <rect class="node core" x="30" y="76" width="880" height="38" rx="6"></rect>
+        <text class="lbl sm" x="470" y="100" text-anchor="middle">② ToolRouter 路由 → 找到对应 ToolExecutor</text>
+
+        <line class="edge" x1="470" y1="114" x2="470" y2="130" marker-end="url(#arrow)"></line>
+
+        <rect class="node warn" x="30" y="132" width="430" height="38" rx="6"></rect>
+        <text class="lbl sm" x="245" y="156" text-anchor="middle">③ 审批检查（AskForApproval 策略）</text>
+
+        <rect class="node warn" x="480" y="132" width="430" height="38" rx="6"></rect>
+        <text class="lbl sm" x="695" y="156" text-anchor="middle">④ 沙箱约束（SandboxPolicy）</text>
+
+        <line class="edge" x1="245" y1="170" x2="245" y2="190" marker-end="url(#arrow)"></line>
+        <line class="edge" x1="695" y1="170" x2="695" y2="190" marker-end="url(#arrow)"></line>
+
+        <rect class="node core" x="30" y="192" width="880" height="38" rx="6"></rect>
+        <text class="lbl sm" x="470" y="216" text-anchor="middle">⑤ ToolExecutor::handle(invocation) 实际执行（可能并行）</text>
+
+        <line class="edge" x1="470" y1="230" x2="470" y2="246" marker-end="url(#arrow)"></line>
+
+        <rect class="node acc" x="30" y="248" width="880" height="38" rx="6"></rect>
+        <text class="lbl sm" x="470" y="272" text-anchor="middle">⑥ 产出 FunctionCallOutput → 追加进会话历史 → 下一轮采样</text>
+      </svg>
+      <div class="fig-cap">图 7.6：工具调用六步流水线。审批与沙箱是第 8 章的主题。</div>
+    </div>
+    <p><code class="inline">ToolRouter</code>（<code class="inline">tools/router.rs</code>）负责按工具名找到对应 executor，<code class="inline">orchestrator.rs</code> 负责编排执行（含并行），<code class="inline">lifecycle.rs</code> 管理工具调用的生命周期事件。审批和沙箱在执行前拦截（详见第 8 章）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.7</span>并行工具调用</h2>
+    <p>第 5 章看到 <code class="inline">build_prompt</code> 设了 <code class="inline">parallel_tool_calls: true</code>——Codex 允许模型一次请求多个工具。这些工具的并行执行由 <code class="inline">tools/parallel.rs</code> 和 orchestrator 协调：</p>
+    <ul>
+      <li>模型在一个回包里发出多个 <code class="inline">FunctionCall</code>。</li>
+      <li>orchestrator 检查每个工具的 <code class="inline">supports_parallel_tool_calls()</code>——只对支持并行的工具并行执行。</li>
+      <li>有副作用或状态依赖的工具默认不并行，串行执行避免竞态。</li>
+      <li>每个工具独立产出 <code class="inline">FunctionCallOutput</code>，全部完成后一起回填历史。</li>
+    </ul>
+    <div class="code-title">codex-rs/core/src/tools/parallel.rs:113 — 并行执行门</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let</span> supports_parallel = router.tool_supports_parallel(&amp;call);
+<span class="cmt">// ...</span>
+<span class="kw">let</span> _guard = <span class="kw">if</span> supports_parallel {
+    Either::Left(lock.read().await)    <span class="cmt">// 支持并行 → 读锁（多个可同时持有）</span>
+} <span class="kw">else</span> {
+    Either::Right(lock.write().await)  <span class="cmt">// 不支持并行 → 写锁（独占）</span>
+};</pre>
+    <div class="callout info">
+      <b class="tag">注意</b>
+      并行的边界是<strong>每个工具自己的 <code class="inline">supports_parallel_tool_calls()</code> 实现</strong>，而非运行时去检测「两个工具是否改同一文件」。机制很简洁：一个 <code class="inline">tokio::sync::RwLock&lt;()&gt;</code> 充当执行门——声明支持并行的工具拿<strong>读锁</strong>（多个可同时持有，真正并发），不支持的拿<strong>写锁</strong>（独占串行）。<code class="inline">supports_parallel_tool_calls()</code> 默认返回 <code class="inline">false</code>；<code class="inline">exec_command</code>、<code class="inline">view_image</code>、<code class="inline">tool_search</code> 等覆盖为 <code class="inline">true</code>。换句话说，是否并行由工具实现者静态声明，不靠运行时冲突检测。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.8</span>unified_exec 模块：shell 与文件操作的融合</h2>
+    <p><code class="inline">unified_exec</code> 是一个模块（<code class="inline">handlers/unified_exec/</code>），它把 shell 执行与文件操作统一到一个入口。注意：模块名是 <code class="inline">unified_exec</code>，但对模型暴露的工具名是 <code class="inline">exec_command</code>（<code class="inline">ToolName::plain("exec_command")</code>）。它的参数结构 <code class="inline">ExecCommandArgs</code> 定义在 <code class="inline">handlers/unified_exec.rs</code>：</p>
+    <div class="code-title">codex-rs/core/src/tools/handlers/unified_exec.rs — ExecCommandArgs</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[derive(Debug, Deserialize)]</span>
+<span class="kw">pub(crate) struct</span> ExecCommandArgs {
+    <span class="kw">pub(crate)</span> cmd: String,
+    shell: Option&lt;String&gt;,        <span class="cmt">// 指定 shell</span>
+    login: Option&lt;bool&gt;,          <span class="cmt">// 登录 shell</span>
+    tty: bool,                     <span class="cmt">// PTY</span>
+    yield_time_ms: u64,            <span class="cmt">// 长命令让出</span>
+    max_output_tokens: Option&lt;usize&gt;,
+    <span class="cmt">// ...</span>
+}</pre>
+    <p><code class="inline">exec_command</code> 与 code-mode（<code class="inline">code-mode</code> crate）配合，提供一个更结构化的执行环境——模型可以在一个持久 shell 会话里连续操作，而非每次都起新进程。它由 <code class="inline">code_mode_runtime</code> 支撑，是 Codex 向「长时编码会话」演进的方向。注意 §7.7 提到 <code class="inline">exec_command</code> 覆盖了 <code class="inline">supports_parallel_tool_calls()</code> 为 <code class="inline">true</code>——它拿读锁、可并行执行，这是它与普通 <code class="inline">shell</code>（写锁、串行）的关键区别。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.9</span>小结与对自研的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      Codex 工具系统的三个关键设计：<strong>① spec/runtime 双面体</strong>（ToolSpec 给模型看，ToolExecutor 给内核跑，一个 trait 绑定）；<strong>② 注册表 + 路由</strong>（ToolRegistry 注册，ToolRouter 按名路由，内置与 MCP 工具走同一套）；<strong>③ Freeform 工具</strong>（对 patch 这类非 JSON 友好的参数，用语法格式而非 JSON，降低模型出错率）。
+    </div>
+    <div class="callout tip">
+      <b class="tag">自研 checklist</b>
+      最小工具系统：定义一个 <code class="inline">Tool</code> trait（<code class="inline">name() / schema() / run(args)</code>），注册到 HashMap。先做两个工具：<code class="inline">run_command</code>（执行 shell）和 <code class="inline">edit_file</code>（改文件）。schema 用 JSON Schema 描述参数。先别管并行和 Freeform——等基础跑通再加。<strong>务必让工具的输出可截断</strong>，否则一个 <code class="inline">cat</code> 大文件就炸上下文。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="06-compaction.html">← 06 上下文压缩</a>
+    <a href="08-approvals-sandbox.html">下一步：审批与沙箱 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 07 工具系统 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

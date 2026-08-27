@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>08 审批与沙箱 — Codex CLI 学习站</title>
+  <link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <h1>08 · 审批与沙箱：让 Agent 安全地动手</h1>
+    <p class="lead">
+      一个能读写文件、执行 shell 的 Agent，其危险程度等同于「把键盘交给一个不知疲倦但偶会犯错的实习生」。Codex 用<b>两层防线</b>约束它：
+      <b>沙箱（Sandbox）</b>从 OS 层限制能碰什么；<b>审批（Approval）</b>决定哪些动作要停下来问人。
+      本章拆解这两个系统的协作，以及它们如何被同一个 <code class="inline">execpolicy</code> 引擎统一裁决。
+    </p>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>两条防线，一次裁决</h2>
+    <p>很多 Agent 框架把「能不能执行」拆成一堆零散的 if-else。Codex 的设计更收敛：它把<b>权限判定</b>（这条命令允许吗？）与<b>沙箱构造</b>（用什么沙箱跑它？）合并成一个 <code class="inline">ExecApprovalRequirement</code> 决策结果，由工具编排器（tool orchestrator）统一消费。</p>
+
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 760 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="审批与沙箱决策流">
+          <!-- input -->
+          <rect x="20" y="40" width="150" height="56" rx="10" fill="#0d7377"/>
+          <text x="95" y="64" fill="#fff" font-size="14" text-anchor="middle" font-weight="600">模型调用 exec_command</text>
+          <text x="95" y="82" fill="#cfe9e8" font-size="11" text-anchor="middle">cmd="git push ..."</text>
+
+          <!-- execpolicy -->
+          <rect x="230" y="30" width="180" height="76" rx="10" fill="none" stroke="#2563eb" stroke-width="2"/>
+          <text x="320" y="55" fill="#2563eb" font-size="14" text-anchor="middle" font-weight="600">execpolicy 引擎</text>
+          <text x="320" y="74" fill="#94a3b8" font-size="11" text-anchor="middle">requirements.toml 规则</text>
+          <text x="320" y="90" fill="#94a3b8" font-size="11" text-anchor="middle">Decision: Allow / Prompt / Forbidden</text>
+
+          <!-- approval policy -->
+          <rect x="230" y="130" width="180" height="66" rx="10" fill="none" stroke="#c2410c" stroke-width="2"/>
+          <text x="320" y="155" fill="#c2410c" font-size="14" text-anchor="middle" font-weight="600">审批策略</text>
+          <text x="320" y="174" fill="#94a3b8" font-size="11" text-anchor="middle">AskForApproval</text>
+          <text x="320" y="188" fill="#94a3b8" font-size="11" text-anchor="middle">Never / OnRequest / Granular / UnlessTrusted</text>
+
+          <!-- arrows in -->
+          <path d="M170 68 L225 68" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+          <path d="M170 68 C 200 68, 200 163, 225 163" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+          <!-- decision box -->
+          <rect x="480" y="80" width="160" height="100" rx="10" fill="#0f172a" stroke="#14a098" stroke-width="1.5"/>
+          <text x="560" y="108" fill="#14a098" font-size="13" text-anchor="middle" font-weight="600">ExecApprovalRequirement</text>
+          <text x="560" y="130" fill="#cfe9e8" font-size="11" text-anchor="middle">Skip { bypass_sandbox }</text>
+          <text x="560" y="148" fill="#cfe9e8" font-size="11" text-anchor="middle">NeedsApproval { reason }</text>
+          <text x="560" y="166" fill="#cfe9e8" font-size="11" text-anchor="middle">Forbidden { reason }</text>
+
+          <path d="M410 68 C 445 68, 445 115, 475 115" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+          <path d="M410 163 C 445 163, 445 145, 475 145" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+          <!-- outputs -->
+          <rect x="480" y="220" width="160" height="46" rx="8" fill="#0d7377"/>
+          <text x="560" y="247" fill="#fff" font-size="12" text-anchor="middle">SandboxManager.transform →</text>
+
+          <rect x="480" y="288" width="160" height="46" rx="8" fill="#1e293b" stroke="#c2410c"/>
+          <text x="560" y="315" fill="#fed7aa" font-size="12" text-anchor="middle">弹窗 / EventMsg 询问用户</text>
+
+          <path d="M560 180 L560 215" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+          <path d="M560 266 C 560 278, 560 282, 560 285" stroke="#c2410c" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+
+          <defs>
+            <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+              <path d="M0,0 L8,4 L0,8 z" fill="#94a3b8"/>
+            </marker>
+          </defs>
+        </svg>
+      </div>
+      <div class="fig-cap">图 8.1：一条命令的完整裁决路径。execpolicy 给出 <b>Decision</b>（语义判定），审批策略 <b>AskForApproval</b> 再决定要不要把判定结果上报给人。两者合并成 <code class="inline">ExecApprovalRequirement</code>。</div>
+    </div>
+
+    <div class="callout info">
+      <b class="tag">设计要点</b>
+      注意裁决是<b>静态发生</b>的——在进程真正 spawn 之前。Codex 不依赖「先跑了再说，出问题再回滚」。它先问 execpolicy「这条命令属于哪类」，再据此构造沙箱或拦下。这让安全策略可审计、可版本化（写成 TOML 规则文件）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>沙箱策略：SandboxPolicy</h2>
+    <p><code class="inline">SandboxPolicy</code> 是对「进程能访问哪些资源」的抽象描述——它<b>不绑定具体平台</b>，而是一个声明式的意图。平台后端（macOS seatbelt / Linux bubblewrap+seccomp / Windows restricted token）负责把这个意图落地成真实的内核限制。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/protocol.rs:1010</span>
+<span class="cmt">/// Determines execution restrictions for model shell commands.</span>
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, JsonSchema, TS)]
+<span class="kw">pub enum</span> <span class="cl">SandboxPolicy</span> {
+    <span class="cmt">/// No restrictions whatsoever. Use with caution.</span>
+    DangerFullAccess,
+
+    <span class="cmt">/// Read-only access configuration.</span>
+    ReadOnly {
+        <span class="cmt">/// true 时允许出站网络；默认 false。</span>
+        network_access: <span class="kw">bool</span>,
+    },
+
+    <span class="cmt">/// 进程已处在外部沙箱中。允许全盘访问，但遵守 network 设置。</span>
+    ExternalSandbox {
+        network_access: <span class="cl">NetworkAccess</span>,
+    },
+
+    <span class="cmt">/// 同 ReadOnly，但额外允许写入工作目录 (workspace)。</span>
+    WorkspaceWrite {
+        <span class="cmt">/// 额外可写目录（除 cwd 和可能的 TMPDIR 之外）。</span>
+        writable_roots: <span class="kw">Vec</span>&lt;<span class="cl">AbsolutePathBuf</span>&gt;,
+        network_access: <span class="kw">bool</span>,
+        <span class="cmt">/// true 时不在默认可写根中加入 per-user TMPDIR。</span>
+        exclude_tmpdir_env_var: <span class="kw">bool</span>,
+        <span class="cmt">/// true 时不在默认可写根中加入 /tmp (UNIX)。</span>
+        exclude_slash_tmp: <span class="kw">bool</span>,
+    },
+}</pre>
+
+    <p>四个变体构成一个从松到紧的阶梯。注意 <code class="inline">WorkspaceWrite</code> 才是 Agent 正常工作时的默认档——它允许写当前项目，但依然挡住对系统其它位置的写入。</p>
+
+    <div class="callout warn">
+      <b class="tag">反直觉点</b>
+      <code class="inline">ReadOnly</code> 和 <code class="inline">WorkspaceWrite</code> 都<b>默认禁网</b>（<code class="inline">network_access: false</code>）。也就是说，Agent 默认不能联网发请求。需要网络（如 <code class="inline">npm install</code>）时，要么显式放开，要么命中一条 execpolicy <code class="inline">allow</code> 规则。这是「最小权限」原则的直接体现。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>审批策略：AskForApproval</h2>
+    <p>如果说 SandboxPolicy 回答「能不能在技术上做」，那么 <code class="inline">AskForApproval</code> 回答「要不要停下来问问人」。二者正交：你可以沙箱很紧但从不问人（全自动），也可以沙箱很松但每步都问（人盯模式）。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/protocol.rs:924</span>
+<span class="kw">pub enum</span> <span class="cl">AskForApproval</span> {
+    <span class="cmt">/// 用于 untrusted 项目。除非 execpolicy 显式放行，否则每条命令都要审批。</span>
+    UnlessTrusted,
+
+    <span class="cmt">/// 模型决定何时请人审批（默认值）。</span>
+    OnRequest,
+
+    <span class="cmt">/// 细粒度控制：某类为 true 则放行，为 false 则自动拒绝而非询问。</span>
+    Granular(<span class="cl">GranularApprovalConfig</span>),
+
+    <span class="cmt">/// 从不请人审批。失败直接返回给模型，绝不升级给人。</span>
+    Never,
+}</pre>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/protocol.rs:948</span>
+<span class="kw">pub struct</span> <span class="cl">GranularApprovalConfig</span> {
+    <span class="cmt">/// 是否允许 shell 命令审批请求（含提权请求）。</span>
+    <span class="kw">pub</span> sandbox_approval: <span class="kw">bool</span>,
+    <span class="cmt">/// 是否允许 execpolicy 的 prompt 规则触发的询问。</span>
+    <span class="kw">pub</span> rules: <span class="kw">bool</span>,
+    <span class="cmt">/// 是否允许 skill 脚本执行的审批提示。</span>
+    <span class="kw">pub</span> skill_approval: <span class="kw">bool</span>,
+    <span class="cmt">/// 是否允许 request_permissions 工具触发的提示。</span>
+    <span class="kw">pub</span> request_permissions: <span class="kw">bool</span>,
+    <span class="cmt">/// 是否允许 MCP elicitation 提示。</span>
+    <span class="kw">pub</span> mcp_elicitations: <span class="kw">bool</span>,
+}</pre>
+
+    <p><code class="inline">Granular</code> 是面向「自动化部署」场景的关键设计。当评审者是一个<b>自动审核 Agent</b>（而非真人）时，你不希望它被某些类别的弹窗卡住，而是直接拒绝。例如：允许 <code class="inline">sandbox_approval</code>（让自动审核批准沙箱提权），但关掉 <code class="inline">mcp_elicitations</code>（不让外部 MCP 把流程挂起等待人工输入）。</p>
+
+    <table class="tbl">
+      <thead><tr><th>策略</th><th>何时问人</th><th>典型场景</th></tr></thead>
+      <tbody>
+        <tr><td><code>UnlessTrusted</code></td><td>几乎总是问</td><td>克隆下来的陌生项目（Untrusted）</td></tr>
+        <tr><td><code>OnRequest</code></td><td>模型判断需要时</td><td>日常交互开发（默认）</td></tr>
+        <tr><td><code>Granular(..)</code></td><td>按类别开关</td><td>自动审核 / CI 无人值守</td></tr>
+        <tr><td><code>Never</code></td><td>从不</td><td>完全信任的沙箱环境</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>信任等级与审批者</h2>
+    <p>两个辅助枚举把策略和「这个项目可信吗」「谁来回答审批」串起来。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/config_types.rs:636</span>
+<span class="cmt">/// 项目目录的信任等级，决定审批策略与沙箱模式。</span>
+<span class="kw">pub enum</span> <span class="cl">TrustLevel</span> {
+    Trusted,
+    Untrusted,
+}
+
+<span class="lang-tag">codex-rs/protocol/src/config_types.rs:183</span>
+<span class="kw">pub enum</span> <span class="cl">ApprovalsReviewer</span> {
+    <span class="cmt">/// 默认：由终端前的真人回答审批。</span>
+    User,
+    <span class="cmt">/// 由一个自动审核子 Agent 回答（无人值守）。</span>
+    AutoReview,
+}</pre>
+
+    <p>当一个项目被标记为 <code class="inline">Untrusted</code>，Codex 会强制套用 <code class="inline">AskForApproval::UnlessTrusted</code>——即「宁可烦人，不可越权」。而 <code class="inline">ApprovalsReviewer::AutoReview</code> 则把审批弹窗导向一个专门的审核 Agent，使整个闭环可以在 CI 里无人跑通。这两个枚举共同定义了 Codex 的「自主性光谱」：从全人盯到全自动。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>execpolicy：规则引擎与 Decision</h2>
+    <p>审批策略是粗粒度的开关，但 Agent 执行的命令千差万别——<code class="inline">ls</code> 该问人吗？<code class="inline">rm -rf /</code> 呢？<code class="inline">git push</code> 呢？这些判断不能写死在代码里。Codex 用一个独立的 <code class="inline">execpolicy</code> crate 提供可配置的规则引擎，规则写在 <code class="inline">requirements.toml</code> 里。</p>
+
+    <p>每条命令解析后，引擎给出一个三值判定：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/execpolicy/src/decision.rs</span>
+<span class="kw">pub enum</span> <span class="cl">Decision</span> {
+    Allow,      <span class="cmt">// 放行（可能附带 bypass_sandbox）</span>
+    Prompt,     <span class="cmt">// 需要审批</span>
+    Forbidden,  <span class="cmt">// 拒绝</span>
+}</pre>
+
+    <p>这个 <code class="inline">Decision</code> 进入 <code class="inline">create_exec_approval_requirement_for_parsed_commands</code>，与审批策略合并，产出最终的 <code class="inline">ExecApprovalRequirement</code>：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/exec_policy.rs:380</span>
+<span class="kw">match</span> decision {
+    <span class="cl">Decision</span>::Forbidden =&gt; <span class="cl">ExecApprovalRequirement</span>::Forbidden { reason, .. },
+    <span class="cl">Decision</span>::Prompt =&gt; {
+        <span class="kw">let</span> prompt_is_rule = evaluation.matched_rules.iter().any(|rm| {
+            is_policy_match(rm) &amp;&amp; rm.decision() == <span class="cl">Decision</span>::Prompt
+        });
+        <span class="kw">match</span> prompt_is_rejected_by_policy(approval_policy, prompt_is_rule) {
+            <span class="cmt">// 审批策略拒绝展示此 prompt → 直接 Forbidden</span>
+            Some(reason) <span class="kw">if</span> prompt_is_rule =&gt; <span class="cl">ExecApprovalRequirement</span>::Forbidden { reason, .. },
+            Some(reason)                  =&gt; <span class="cl">ExecApprovalRequirement</span>::Forbidden { reason, .. },
+            <span class="cmt">// 策略允许 → 需要审批</span>
+            None =&gt; <span class="cl">ExecApprovalRequirement</span>::NeedsApproval { reason, .. },
+        }
+    }
+    <span class="cl">Decision</span>::Allow =&gt; <span class="cl">ExecApprovalRequirement</span>::Skip {
+        bypass_sandbox: <span class="kw">false</span>,   <span class="cmt">// 显式 allow 可能附带 bypass</span>
+        ..
+    },
+}</pre>
+
+    <div class="callout tip">
+      <b class="tag">关键细节</b>
+      <code class="inline">prompt_is_rejected_by_policy</code> 是 Granular 模式的核心：当某类审批被配置成 <code class="inline">false</code>，一个本该 <code class="inline">Prompt</code> 的命令不会去打扰人，而是<b>直接被 Forbidden</b> 返回给模型。这让「自动审核」不会卡在等待输入上——它收到的是一个明确的「拒绝」，从而可以调整策略重试。
+    </div>
+
+    <p>更有意思的是 <code class="inline">proposed_execpolicy_amendment</code>：当一条命令被审批（或被放行）后，引擎会<b>提议</b>一条新规则，让下次同类命令免审批。这是 Codex 的「学习」机制——用户批一次 <code class="inline">npm test</code>，之后 <code class="inline">npm test</code> 就自动放行，规则被追加进 <code class="inline">requirements.toml</code>。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>ExecApprovalRequirement：统一决策结果</h2>
+    <p>三股输入（execpolicy Decision + AskForApproval + 文件系统沙箱状态）最终塌缩成一个枚举，供工具编排器消费：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/tools/sandboxing.rs:152</span>
+<span class="cmt">/// Specifies what tool orchestrator should do with a given tool call.</span>
+<span class="kw">pub(crate) enum</span> <span class="cl">ExecApprovalRequirement</span> {
+    <span class="cmt">/// 无需审批。</span>
+    Skip {
+        bypass_sandbox: <span class="kw">bool</span>,  <span class="cmt">// 首次尝试是否绕过沙箱（如被显式放行）</span>
+        proposed_execpolicy_amendment: <span class="kw">Option</span>&lt;<span class="cl">ExecPolicyAmendment</span>&gt;,
+    },
+    <span class="cmt">/// 需要审批。</span>
+    NeedsApproval {
+        reason: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+        proposed_execpolicy_amendment: <span class="kw">Option</span>&lt;<span class="cl">ExecPolicyAmendment</span>&gt;,
+    },
+    <span class="cmt">/// 禁止执行。</span>
+    Forbidden { reason: <span class="kw">String</span> },
+}</pre>
+
+    <p>这个枚举是「审批」与「沙箱」两大系统的事实接口。拿到 <code class="inline">Skip</code> 就直接构造沙箱跑；拿到 <code class="inline">NeedsApproval</code> 就发 <code class="inline">EventMsg</code> 询问；拿到 <code class="inline">Forbidden</code> 就把拒绝原因作为工具输出回灌给模型。模型于是知道「这条命令不被允许」，可以选择别的路径——这正是 Agent 在约束下自主规划的体现。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>平台沙箱后端</h2>
+    <p><code class="inline">SandboxPolicy</code> 是意图，落地靠 <code class="inline">sandboxing</code> crate 的 <code class="inline">SandboxManager</code>。它按平台选择后端，把意图翻译成具体的进程启动参数。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/sandboxing/src/manager.rs</span>
+<span class="kw">pub enum</span> <span class="cl">SandboxType</span> {
+    None,
+    MacosSeatbelt,         <span class="cmt">// macOS: sandbox-exec (seatbelt)</span>
+    LinuxSeccomp,          <span class="cmt">// Linux: bubblewrap + seccomp（landlock 为 legacy 选项）</span>
+    WindowsRestrictedToken,<span class="cmt">// Windows: 受限令牌</span>
+}
+
+<span class="kw">pub fn</span> get_platform_sandbox(windows_sandbox_enabled: <span class="kw">bool</span>) -&gt; <span class="kw">Option</span>&lt;<span class="cl">SandboxType</span>&gt; {
+    <span class="kw">if</span> cfg!(target_os = <span class="st">"macos"</span>) {
+        <span class="kw">Some</span>(<span class="cl">SandboxType</span>::MacosSeatbelt)
+    } <span class="kw">else if</span> cfg!(target_os = <span class="st">"linux"</span>) {
+        <span class="kw">Some</span>(<span class="cl">SandboxType</span>::LinuxSeccomp)
+    } <span class="kw">else if</span> cfg!(target_os = <span class="st">"windows"</span>) {
+        <span class="kw">if</span> windows_sandbox_enabled { <span class="kw">Some</span>(<span class="cl">SandboxType</span>::WindowsRestrictedToken) }
+        <span class="kw">else</span> { <span class="kw">None</span> }
+    } <span class="kw">else</span> { <span class="kw">None</span> }
+}</pre>
+
+    <p>关键方法是 <code class="inline">SandboxManager::transform</code>——它接收一个 <code class="inline">SandboxTransformRequest</code>（原始命令 + 权限配置 + 沙箱类型），输出一个 <code class="inline">SandboxCommand</code>（带沙箱参数的真实启动命令）。这是「意图 → 可执行进程」的转换边界。</p>
+
+    <table class="tbl">
+      <thead><tr><th>平台</th><th>后端</th><th>机制</th></tr></thead>
+      <tbody>
+        <tr><td>macOS</td><td>seatbelt</td><td><code>sandbox-exec</code>，profile 限定文件/网络</td></tr>
+        <tr><td>Linux</td><td>bubblewrap + seccomp</td><td>bwrap 建容器化命名空间限文件，seccomp 限系统调用；landlock 为可选 legacy（<code>--use-legacy-landlock</code>）</td></tr>
+        <tr><td>Windows</td><td>受限令牌</td><td>降权进程令牌 + ACL</td></tr>
+      </tbody>
+    </table>
+
+    <p>沙箱的<b>可写根</b>概念值得展开。即使 <code class="inline">WorkspaceWrite</code> 允许写工作目录，Codex 仍会保护目录内的敏感子路径——例如 <code class="inline">.git/hooks</code>。因为 Agent 一旦能写 git hook，就能在下次 commit 时插入恶意脚本，构成提权。于是有 <code class="inline">WritableRoot</code> 的「可写根内只读子路径」设计：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/protocol.rs</span>
+<span class="kw">pub struct</span> <span class="cl">WritableRoot</span> {
+    <span class="kw">pub</span> root: <span class="cl">AbsolutePathBuf</span>,
+    <span class="cmt">/// 这些子路径即便在可写根下也保持只读（防 .git/hooks 等提权点）。</span>
+    <span class="kw">pub</span> read_only_subpaths: <span class="kw">Vec</span>&lt;<span class="cl">AbsolutePathBuf</span>&gt;,
+    <span class="cmt">/// 受保护的元数据路径名（不得被创建/替换）。</span>
+    <span class="kw">pub</span> protected_metadata_names: <span class="kw">Vec</span>&lt;<span class="kw">String</span>&gt;,
+}</pre>
+
+    <div class="callout warn">
+      <b class="tag">安全纵深</b>
+      这是纵深防御（defense in depth）的典型例子：不只「能写工作目录」，还要「工作目录里的危险点仍不可写」。沙箱不是一道墙，而是一张带漏洞例外的网。自研 Agent 时极易忽略这类二级提权路径。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.8</span>权限配置：PermissionProfile</h2>
+    <p>在 <code class="inline">SandboxPolicy</code> 之上，Codex 还有一层 <code class="inline">PermissionProfile</code>，它决定「谁来构建沙箱」以及网络策略。这层主要服务于多前端场景（app-server / exec-server 可能自带外部沙箱）。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/models.rs:414</span>
+<span class="kw">pub enum</span> <span class="cl">PermissionProfile</span> {
+    <span class="cmt">/// Codex 自己负责构造沙箱。</span>
+    Managed {
+        file_system: <span class="cl">ManagedFileSystemPermissions</span>,
+        network: <span class="cl">NetworkSandboxPolicy</span>,
+    },
+    <span class="cmt">/// 不施加外层沙箱。</span>
+    Disabled,
+    <span class="cmt">/// 文件隔离由外部调用方强制执行。</span>
+    External { network: <span class="cl">NetworkSandboxPolicy</span> },
+}</pre>
+
+    <p>三个变体对应三种部署形态：<code class="inline">Managed</code> 是本地 CLI/TUI 的常态（Codex 自管沙箱）；<code class="inline">External</code> 用于进程已被外部沙箱包裹的场景（如容器内）；<code class="inline">Disabled</code> 则是显式放弃隔离。<code class="inline">sandboxing</code> crate 的 <code class="inline">compatibility_sandbox_policy_for_permission_profile</code> 负责把 profile 与 <code class="inline">SandboxPolicy</code> 协调成一致。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.9</span>小结与对自研的启示</h2>
+    <div class="callout tip">
+      <b class="tag">自研 checklist</b>
+      最小安全闭环，按优先级：<strong>① 先有沙箱再谈自主</strong>——哪怕第一版只是「只允许写工作目录」的简单包装，也比裸跑强。用平台原生机制（macOS seatbelt / Linux bubblewrap），别自己造。<strong>② 决策前置</strong>——在 spawn 前就用一个枚举（Allow/Prompt/Forbidden）裁决，别等出错再回滚。<strong>③ 规则可配置</strong>——把「哪些命令免审批」写成数据文件（TOML/JSON），而非硬编码，并支持「批一次就学会」的规则追加。<strong>④ 警惕二级提权</strong>——可写区内的 <code>.git/hooks</code>、<code>.ssh</code> 等必须额外只读。<strong>⑤ 预留自动审核位</strong>——审批回答者要可替换（人 / 子 Agent），为无人值守 CI 留口子。
+    </div>
+    <div class="callout info">
+      <b class="tag">一句话</b>
+      Codex 的安全哲学是<b>「意图声明 + 平台落地 + 规则可学」</b>：用 <code class="inline">SandboxPolicy</code>/<code class="inline">AskForApproval</code> 声明意图，用平台后端落地，用 execpolicy 规则让策略随使用自我进化。三层叠加，才让一个能跑 shell 的 Agent 既能干活又不出格。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="07-tools.html">← 07 工具系统</a>
+    <a href="09-config.html">下一步：配置系统 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 08 审批与沙箱 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

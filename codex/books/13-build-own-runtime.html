@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>13 自制 Agent Runtime 路线图 — Codex CLI 学习站</title>
+  <link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <h1>13 · 自制 Agent Runtime：从读到造的路线图</h1>
+    <p class="lead">
+      读 Codex 源码的最终目的，是造出你自己的 Agent Runtime。这一章把前 12 章拆解的机制浓缩成一条<b>可执行的构建路线</b>——
+      从最小可跑的循环开始，按里程碑逐步叠加能力，最终逼近一个生产级编码 Agent。每个里程碑都标明对应章节，让你能随时回查实现细节。
+    </p>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">13.1</span>核心理念：先跑通，再补全</h2>
+    <p>很多人想造 Agent，一上来就设计协议、做沙箱、搞多 Agent——结果几个月跑不出一个能用的循环。Codex 自己的演进顺序恰恰相反：先有一个能「收 prompt → 调模型 → 执行工具 → 再调模型」的闭环，再逐步加上下文管理、压缩、安全、扩展、协作。这条路线也应是你的路线。</p>
+
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 720 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="构建里程碑路线">
+          <!-- M0 -->
+          <rect x="20" y="30" width="680" height="55" rx="10" fill="#0d7377"/>
+          <text x="40" y="55" fill="#fff" font-size="14" font-weight="600">M0 · 最小循环</text>
+          <text x="40" y="74" fill="#cfe9e8" font-size="12">收 prompt → 调模型 → 解析工具调用 → 执行 → 回灌 → 再采样  （第 2、3 章）</text>
+
+          <!-- M1 -->
+          <rect x="20" y="100" width="680" height="55" rx="10" fill="#0d7377" opacity="0.92"/>
+          <text x="40" y="125" fill="#fff" font-size="14" font-weight="600">M1 · 工具系统</text>
+          <text x="40" y="144" fill="#cfe9e8" font-size="12">Tool trait + 注册表 + 路由；先做 run_command / edit_file  （第 7 章）</text>
+
+          <!-- M2 -->
+          <rect x="20" y="170" width="680" height="55" rx="10" fill="#14a098" opacity="0.92"/>
+          <text x="40" y="195" fill="#fff" font-size="14" font-weight="600">M2 · 持久化与恢复</text>
+          <text x="40" y="214" fill="#5eead4" font-size="12">JSONL 事件流 + 会话 resume/fork  （第 4 章）</text>
+
+          <!-- M3 -->
+          <rect x="20" y="240" width="680" height="55" rx="10" fill="#2563eb" opacity="0.92"/>
+          <text x="40" y="265" fill="#fff" font-size="14" font-weight="600">M3 · 上下文工程</text>
+          <text x="40" y="284" fill="#bfdbfe" font-size="12">Fragment 组装 + AGENTS.md 注入 + 增量 diff  （第 5 章）</text>
+
+          <!-- M4 -->
+          <rect x="20" y="310" width="680" height="55" rx="10" fill="#c2410c" opacity="0.92"/>
+          <text x="40" y="335" fill="#fff" font-size="14" font-weight="600">M4 · 压缩与安全</text>
+          <text x="40" y="354" fill="#fed7aa" font-size="12">token 预算压缩 + 沙箱 + 审批策略  （第 6、8 章）</text>
+
+          <!-- M5 -->
+          <rect x="20" y="380" width="680" height="35" rx="10" fill="#7f1d1d" opacity="0.92"/>
+          <text x="40" y="402" fill="#fff" font-size="13" font-weight="600">M5 · 扩展 / 协作 / 多前端</text>
+          <text x="320" y="402" fill="#fecaca" font-size="11">MCP 插件 / 多 Agent 派生 / 守护进程  （第 10、11、12 章）</text>
+        </svg>
+      </div>
+      <div class="fig-cap">图 13.1：六个里程碑。颜色由深到浅表示「必需度递减、可延后」——M0/M1 是底线，M5 是进阶。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.2</span>M0：最小循环（第 2、3 章）</h2>
+    <p>目标：一个能在终端里「问一句、答一句、必要时调一次工具」的程序。不要超过 300 行。</p>
+
+    <pre class="code"><span class="cmt">// 伪代码：最小 Agent 循环</span>
+<span class="kw">async fn</span> run_turn(messages: &amp;<span class="kw">mut</span> <span class="cl">Vec</span>&lt;<span class="cl">Message</span>&gt;, user_input: <span class="kw">String</span>) {
+    messages.push(<span class="cl">Message</span>::user(user_input));
+
+    <span class="kw">loop</span> {
+        <span class="cmt">// 1. 采样：把整个 messages 发给模型，附上工具 schema</span>
+        <span class="kw">let</span> response = model.sample(messages, &amp;tool_schemas).await;
+
+        <span class="cmt">// 2. 解析：模型回了消息还是工具调用？</span>
+        <span class="kw">match</span> parse(response) {
+            <span class="cl">AgentMessage</span>(text) =&gt; {
+                print(text);
+                <span class="kw">break</span>;            <span class="cmt">// 没有工具调用 → 本轮结束</span>
+            }
+            <span class="cl">ToolCall</span>(name, args) =&gt; {
+                <span class="cmt">// 3. 执行工具</span>
+                <span class="kw">let</span> output = registry.execute(name, args).await;
+                <span class="cmt">// 4. 回灌结果，继续循环</span>
+                messages.push(<span class="cl">Message</span>::tool_result(output));
+            }
+        }
+    }
+}</pre>
+
+    <div class="callout warn">
+      <b class="tag">这一步只做三件事</b>
+      ① 一个 <code class="inline">Message</code> 列表代表会话；② 一个 <code class="inline">sample()</code> 调用 LLM；③ 一个 <code class="inline">loop</code> 在「有工具调用」时继续、「纯消息」时退出。<b>别</b>在这步做流式、压缩、沙箱——那些是后面的里程碑。先把闭环跑通，能用 <code class="inline">echo</code> 当工具验证循环正确。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.3</span>M1：工具系统（第 7 章）</h2>
+    <p>把 M0 里硬编码的工具，抽象成一个可扩展的系统。核心是一个 trait 和一个注册表：</p>
+
+    <pre class="code"><span class="cmt">// 仿 Codex 的 ToolExecutor，但极简版</span>
+#[async_trait]
+<span class="kw">trait</span> <span class="cl">Tool</span> {
+    <span class="kw">fn</span> name(&amp;self) -&gt; &amp;<span class="kw">str</span>;
+    <span class="kw">fn</span> schema(&amp;self) -&gt; <span class="cl">JsonSchema</span>;          <span class="cmt">// 给模型看的参数描述</span>
+    <span class="kw">async fn</span> run(&amp;self, args: <span class="cl">Value</span>) -&gt; <span class="cl">Result</span>&lt;<span class="kw">String</span>&gt;;
+}
+
+<span class="kw">struct</span> <span class="cl">ToolRegistry</span> { tools: <span class="cl">HashMap</span>&lt;<span class="kw">String</span>, <span class="cl">Box</span>&lt;<span class="kw">dyn</span> <span class="cl">Tool</span>&gt;&gt; }
+
+<span class="cmt">// 先实现两个工具</span>
+<span class="kw">impl</span> <span class="cl">Tool</span> <span class="kw">for</span> <span class="cl">RunCommand</span> { .. }   <span class="cmt">// 执行 shell</span>
+<span class="kw">impl</span> <span class="cl">Tool</span> <span class="kw">for</span> <span class="cl">EditFile</span> { .. }     <span class="cmt">// 读写改文件</span></pre>
+
+    <p>关键点：① schema 用 JSON Schema，直接喂给模型的 function calling；② 工具输出<b>必须可截断</b>（一个 <code class="inline">cat</code> 大文件就会炸上下文）；③ 先别管并行和 Freeform——等基础稳定。Codex 的 <code class="inline">apply_patch</code> 用 Freeform（lark 语法）是因为 patch 参数用 JSON 描述太易错，但你 M1 阶段用普通 function 工具改文件就够了。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.4</span>M2：持久化与恢复（第 4 章）</h2>
+    <p>让会话不只是内存里的 <code class="inline">Vec&lt;Message&gt;</code>，而是可恢复的持久资产。最简实现：每条消息追加写一行 JSONL。</p>
+
+    <pre class="code"><span class="cmt">// 仿 Codex 的 RolloutLine，但极简</span>
+<span class="kw">struct</span> <span class="cl">RolloutLine</span> {
+    timestamp: <span class="kw">String</span>,
+    ordinal: <span class="kw">u64</span>,        <span class="cmt">// 单调递增序号</span>
+    item: <span class="cl">Item</span>,          <span class="cmt">// Message / ToolCall / ToolResult</span>
+}
+
+<span class="cmt">// 每个 turn 结束追加；启动时读回重建 messages</span>
+<span class="kw">fn</span> append(session_id, line) { writeln!(file, <span class="st">"{}"</span>, json(line))?; }
+<span class="kw">fn</span> resume(session_id) -&gt; <span class="cl">Vec</span>&lt;<span class="cl">Message</span>&gt; { read_jsonl(session_id).map(parse) }</pre>
+
+    <p>事件源（event sourcing）的好处在这里兑现：会话是一份只追加日志，resume 就是 replay，fork 就是从某点复制日志再继续。先别上 SQLite 索引——纯 JSONL 够你用很久，等会话多到扫描慢了再加索引（Codex 的 <code class="inline">state_db</code> 就是为此而生）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.5</span>M3：上下文工程（第 5 章）</h2>
+    <p>到这步你的 Agent 已经能干活，但系统提示是写死的。M3 让上下文<b>可组装</b>——把不同来源的指令拼成发给模型的 prompt。</p>
+
+    <pre class="code"><span class="cmt">// 仿 Codex 的 ContextualUserFragment，但极简</span>
+<span class="kw">trait</span> <span class="cl">Fragment</span> {
+    <span class="kw">fn</span> role(&amp;self) -&gt; <span class="cl">Role</span>;        <span class="cmt">// system / developer / user</span>
+    <span class="kw">fn</span> body(&amp;self) -&gt; <span class="kw">String</span>;
+}
+
+<span class="kw">fn</span> build_prompt(fragments: &amp;[<span class="kw">dyn</span> <span class="cl">Fragment</span>], history: &amp;[<span class="cl">Message</span>]) -&gt; <span class="cl">Vec</span>&lt;<span class="cl">Message</span>&gt; {
+    <span class="cmt">// 基础指令 + 项目 AGENTS.md + 环境信息 + 历史</span>
+    <span class="kw">let</span> <span class="kw">mut</span> msgs = fragments.iter().map(|f| <span class="cl">Message</span>::new(f.role(), f.body())).collect();
+    msgs.extend(history);
+    msgs
+}</pre>
+
+    <p>核心思想：上下文不是一个大字符串，而是<b>有序的 Fragment 列表</b>。每个 Fragment 知道自己的角色和内容。这样你能动态插入项目级 <code class="inline">AGENTS.md</code>（让 Agent 了解项目约定）、环境信息（OS、git 状态）、开发者指令——而不必改代码。Codex 的 <code class="inline">ContextManager</code> 还做了「增量 diff」（只发变化部分），但 M3 阶段全量重发即可。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.6</span>M4：压缩与安全（第 6、8 章）</h2>
+    <p>这是从「玩具」到「能用」的临界点。两个能力必须补：</p>
+
+    <p><b>压缩</b>——上下文会涨，涨过模型窗口就崩。最简实现：采样前检查 token 数，超阈值就把最早的历史消息摘要成一段。</p>
+    <pre class="code"><span class="kw">async fn</span> maybe_compact(messages: &amp;<span class="kw">mut</span> <span class="cl">Vec</span>&lt;<span class="cl">Message</span>&gt;) {
+    <span class="kw">if</span> count_tokens(messages) &gt; LIMIT {
+        <span class="kw">let</span> summary = model.summarize(&amp;messages[..half]).await;
+        *messages = [<span class="cl">Message</span>::system(summary), messages[half..].to_vec()].concat();
+    }
+}</pre>
+
+    <p><b>安全</b>——能跑 shell 的 Agent 必须有沙箱。M4 最小实现：用平台原生机制（macOS seatbelt / Linux bubblewrap）限制只写工作目录，在 spawn 前用一个 <code class="inline">Allow/Prompt/Forbidden</code> 枚举裁决。</p>
+
+    <div class="callout warn">
+      <b class="tag">安全不是可选</b>
+      M4 之前你的 Agent 跑在裸环境里，一个 <code class="inline">rm -rf</code> 就能毁掉一切。哪怕第一版沙箱只是「只允许写 cwd」的简单包装，也必须<b>在让 Agent 跑真实任务前</b>加上。Codex 的 <code class="inline">WritableRoot</code> 还保护 <code>.git/hooks</code> 这类二级提权点——你至少要想清楚「可写区里还有什么不能写」。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.7</span>M5：扩展、协作、多前端（第 10、11、12 章）</h2>
+    <p>前五个里程碑做完，你已有了一个能干活的、安全的、可恢复的 Agent。M5 是进阶——按需选取：</p>
+
+    <table class="tbl">
+      <thead><tr><th>能力</th><th>何时做</th><th>对应 Codex 机制</th></tr></thead>
+      <tbody>
+        <tr><td>MCP 工具接入</td><td>需要挂外部工具时</td><td>统一 ToolSpec + stdio/HTTP 传输（第 10 章）</td></tr>
+        <tr><td>多 Agent 派生</td><td>单 Agent 上下文不够 / 需并行</td><td>spawn_agent + 角色预设 + 深度护栏（第 11 章）</td></tr>
+        <tr><td>非交互 / 守护进程</td><td>要进 CI 或做服务</td><td>app-server 协议 + 多传输（第 12 章）</td></tr>
+        <tr><td>动态工具发现</td><td>工具数量爆炸时</td><td>ToolSearch 按需检索（第 10 章）</td></tr>
+        <tr><td>自动审核</td><td>要无人值守时</td><td>ApprovalsReviewer::AutoReview + Granular（第 8 章）</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout info">
+      <b class="tag">M5 的取舍</b>
+      这些能力每个都显著增加复杂度。<b>多 Agent</b> 尤其要慎重——它是放大器，既放大能力也放大 token 成本和调试难度。Codex 用派生深度 + 并发上限双重护栏兜底，但你自己实现时，建议先确认单 Agent 已经非常稳定，再引入派生。大多数场景下，一个上下文管理良好的单 Agent 比一群失控的子 Agent 更有效。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.8</span>贯穿始终的设计原则</h2>
+    <p>从 Codex 源码里提炼出的六条原则，适用于你的每个里程碑：</p>
+
+    <div class="philosophy">
+      <div class="philosophy-block do">
+        <h3>要做的</h3>
+        <ul>
+          <li><b>协议优先</b>：内核与前端用协议隔开，加新前端不重写内核（第 2、12 章）。</li>
+          <li><b>意图声明，平台落地</b>：SandboxPolicy 声明意图，平台后端落地，别自己造沙箱内核（第 8 章）。</li>
+          <li><b>决策前置</b>：在执行前裁决 Allow/Prompt/Forbidden，而非出错后回滚（第 8 章）。</li>
+          <li><b>事件源持久化</b>：会话是只追加日志，resume/fork 天然支持（第 4 章）。</li>
+          <li><b>按需加载</b>：上下文只装当前需要的，工具靠 ToolSearch 动态发现（第 5、10 章）。</li>
+          <li><b>配置与约束分离</b>：偏好可覆盖，安全红线不可覆盖（第 9 章）。</li>
+        </ul>
+      </div>
+      <div class="philosophy-block dont">
+        <h3>别做的</h3>
+        <ul>
+          <li><b>别一上来全做</b>：先跑通最小循环，沙箱/压缩/多 Agent 都是后面的事。</li>
+          <li><b>别让工具输出不截断</b>：一个大文件输出就炸上下文。</li>
+          <li><b>别随意改系统提示</b>：系统提示经过调优，优先用 developer 角色注入（第 5 章）。</li>
+          <li><b>别让子 Agent 提权</b>：派生的 Agent 权限只能降不能升（第 11 章）。</li>
+          <li><b>别忽略二级提权</b>：可写区里的 <code>.git/hooks</code>、<code>.ssh</code> 必须额外只读（第 8 章）。</li>
+          <li><b>别无护栏递归</b>：多 Agent 必须有深度 + 并发双重上限（第 11 章）。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.9</span>从读到造：检查清单</h2>
+    <p>把这条路线当作 checklist，每完成一个里程碑就回来打勾。每项都指向具体章节，可回查实现细节：</p>
+
+    <table class="tbl">
+      <thead><tr><th>里程碑</th><th>检查项</th><th>章节</th></tr></thead>
+      <tbody>
+        <tr><td>M0 最小循环</td><td>prompt→模型→工具→回灌→再采样的闭环跑通</td><td>2、3</td></tr>
+        <tr><td>M0 最小循环</td><td>「纯消息」退出、「工具调用」继续的判断正确</td><td>3</td></tr>
+        <tr><td>M1 工具系统</td><td>Tool trait + 注册表 + JSON Schema</td><td>7</td></tr>
+        <tr><td>M1 工具系统</td><td>run_command + edit_file 两个工具可用</td><td>7</td></tr>
+        <tr><td>M1 工具系统</td><td>工具输出可截断</td><td>7</td></tr>
+        <tr><td>M2 持久化</td><td>JSONL 追加写 + resume replay</td><td>4</td></tr>
+        <tr><td>M2 持久化</td><td>会话可 fork</td><td>4</td></tr>
+        <tr><td>M3 上下文</td><td>Fragment 组装 + AGENTS.md 注入</td><td>5</td></tr>
+        <tr><td>M3 上下文</td><td>系统提示与项目指令分离</td><td>5</td></tr>
+        <tr><td>M4 压缩</td><td>token 超限触发摘要压缩</td><td>6</td></tr>
+        <tr><td>M4 安全</td><td>平台原生沙箱（写限 cwd）</td><td>8</td></tr>
+        <tr><td>M4 安全</td><td>spawn 前 Allow/Prompt/Forbidden 裁决</td><td>8</td></tr>
+        <tr><td>M4 安全</td><td>二级提权点（.git/hooks）只读</td><td>8</td></tr>
+        <tr><td>M5 扩展</td><td>统一 ToolSpec 接 MCP</td><td>10</td></tr>
+        <tr><td>M5 协作</td><td>spawn_agent + 深度/并发护栏</td><td>11</td></tr>
+        <tr><td>M5 多前端</td><td>非交互 JSON 输出 / 守护进程</td><td>12</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.10</span>结语：Codex 教会我们的事</h2>
+    <p>读完这 13 章，你应该看到一个生产级编码 Agent 的全貌。它不是魔法，而是一组<b>可拆解、可仿造的工程机制</b>：一个 turn 循环驱动一切，工具系统提供手脚，上下文工程管理记忆，压缩对抗遗忘，沙箱与审批守住边界，rollout 让会话不朽，多 Agent 把能力正交扩展。</p>
+
+    <p>Codex 最值得学的，不是某个精巧的技巧，而是它的<b>分层克制</b>：每一层只管一件事，层与层用协议/枚举/trait 解耦。这种克制让它能在个人笔记本和企业集群里同样运行，能从「问一句答一句」长到「派生团队并行编码」。当你造自己的 Runtime 时，记住这份克制——先跑通闭环，再补全能力，永远让安全先于自主。</p>
+
+    <div class="callout tip">
+      <b class="tag">下一步</b>
+      合上这份教程，打开你的编辑器，从 M0 开始。用 300 行写出第一个能调工具的循环——那一刻，你就从「读 Agent」变成了「造 Agent」。Codex 的源码永远在这里作参考：每个机制都有对应的章节和文件路径，随时可回查。祝你造得顺利。
+    </div>
+
+    <p class="epigraph">「读源码是为了不再迷信源码。当你理解了一个系统为何如此设计，你就有能力设计一个更好的。」</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="12-tui-cli.html">← 12 TUI 与 CLI</a>
+    <a href="index.html">回到首页 ↑</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 13 自制 Agent Runtime 路线图 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

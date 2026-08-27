@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Codex CLI · 源码学习站</title>
+<link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <section class="hero">
+    <h1>深入 Codex：从源码到自研 Agent Runtime</h1>
+    <p class="tagline" style="margin-top:6px;font-size:18px;color:#0d7377;font-weight:600">
+      「一个 prompt 流过整个 Agent 运行时，会经历什么？」
+    </p>
+    <p class="tagline" style="margin-top:2px">
+      Codex CLI 是 OpenAI 用 <strong>Rust</strong> 写的编码 Agent——本站带你拆开它，看清 Turn 循环、上下文工程、工具系统与沙箱如何咬合。
+    </p>
+    <div class="version-badge">
+      <span class="vb-key">Codex 版本</span>
+      <span class="vb-val">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+      <span class="vb-meta">git describe 标注 · openai/codex · codex-rs 工作区（136 个 crate）</span>
+    </div>
+    <p style="color:#566574;font-size:14px;margin-top:14px">
+      目标读者：想理解一个真实生产级编码 Agent 如何运作、并最终<strong>写出自己 Agent Runtime</strong> 的工程师。<br>
+      浏览方式：双击 <code class="inline">index.html</code>，或用浏览器打开；可对照仓库源码逐行阅读。
+    </p>
+  </section>
+
+  <!-- 一张概括性 SVG：一次 prompt 流过整个 Agent 运行时 -->
+  <div class="figure">
+    <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d">
+      <title id="t">Codex 运行时高层数据流</title>
+      <desc id="d">一条用户消息从入口到最终回答的完整旅程</desc>
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#566574"></path>
+        </marker>
+      </defs>
+
+      <!-- L1 入口：Op -->
+      <rect class="node acc" x="20" y="26" width="170" height="54" rx="8"></rect>
+      <text class="lbl" x="105" y="48" text-anchor="middle">Op::TurnInput</text>
+      <text class="lbl sm" x="105" y="66" text-anchor="middle">用户消息入口（CLI/TUI）</text>
+
+      <!-- L2 CodexThread -->
+      <rect class="node core" x="240" y="26" width="180" height="54" rx="8"></rect>
+      <text class="lbl" x="330" y="48" text-anchor="middle">CodexThread</text>
+      <text class="lbl sm" x="330" y="66" text-anchor="middle">驱动 Session · 提交队列</text>
+
+      <line class="edge" x1="190" y1="53" x2="238" y2="53"></line>
+
+      <!-- L3 run_turn / 采样循环 -->
+      <rect class="node core" x="480" y="26" width="210" height="54" rx="8"></rect>
+      <text class="lbl" x="585" y="48" text-anchor="middle">run_turn / 采样循环</text>
+      <text class="lbl sm" x="585" y="66" text-anchor="middle">run_sampling_request</text>
+
+      <line class="edge" x1="420" y1="53" x2="478" y2="53"></line>
+
+      <!-- L4 LLM -->
+      <line class="edge core" x1="740" y1="53" x2="778" y2="53"></line>
+      <rect class="node acc" x="780" y="26" width="140" height="54" rx="8"></rect>
+      <text class="lbl" x="850" y="48" text-anchor="middle">LLM 流式</text>
+      <text class="lbl sm" x="850" y="66" text-anchor="middle">EventMsg 事件</text>
+
+      <!-- 下到 Session -->
+      <line class="edge" x1="330" y1="80" x2="330" y2="118"></line>
+      <rect class="node" x="140" y="120" width="300" height="56" rx="8"></rect>
+      <text class="lbl" x="290" y="142" text-anchor="middle">Session + Rollout</text>
+      <text class="lbl sm" x="290" y="160" text-anchor="middle">ResponseItem 列表 · 持久化 · 回放</text>
+
+      <!-- 下到 Context -->
+      <line class="edge" x1="290" y1="176" x2="290" y2="210"></line>
+      <rect class="node" x="40" y="212" width="240" height="56" rx="8"></rect>
+      <text class="lbl" x="160" y="234" text-anchor="middle">Context 构建</text>
+      <text class="lbl sm" x="160" y="252" text-anchor="middle">fragments → prompt · compaction</text>
+
+      <!-- 工具 -->
+      <line class="edge" x1="585" y1="80" x2="585" y2="212"></line>
+      <rect class="node" x="460" y="212" width="250" height="56" rx="8"></rect>
+      <text class="lbl" x="585" y="234" text-anchor="middle">Tools（ToolExecutor）</text>
+      <text class="lbl sm" x="585" y="252" text-anchor="middle">shell / apply_patch / exec_command …</text>
+
+      <!-- 沙箱 -->
+      <rect class="node warn" x="780" y="212" width="140" height="56" rx="8"></rect>
+      <text class="lbl" x="850" y="234" text-anchor="middle">Sandbox</text>
+      <text class="lbl sm" x="850" y="252" text-anchor="middle">seatbelt / bwrap</text>
+      <line class="edge" x1="710" y1="240" x2="778" y2="240"></line>
+
+      <!-- 工具结果回流 -->
+      <line class="edge acc" x1="585" y1="268" x2="585" y2="300"></line>
+      <line class="edge" x1="585" y1="300" x2="330" y2="300"></line>
+      <line class="edge" x1="330" y1="300" x2="330" y2="316"></line>
+      <text class="lbl sm" x="450" y="294" text-anchor="middle">工具输出回流 → 下一轮采样</text>
+
+      <!-- LLM 回答回流到 Thread -->
+      <line class="edge acc" x1="850" y1="80" x2="850" y2="110"></line>
+      <line class="edge" x1="850" y1="110" x2="330" y2="110" stroke-dasharray="4 3"></line>
+    </svg>
+    <div class="fig-cap">图 0：Codex 运行时高层数据流。后续各章会逐层放大其中的某个环节。</div>
+  </div>
+
+  <!-- 产品特色话术 -->
+  <section class="feature-intro">
+    <h2>Codex 的设计哲学</h2>
+    <p>Codex 自我定位是「安全、可控、可在终端里干活的编码 Agent」。下面把几条核心特色，对应到本站可以读到的源码章节——看完产品话术，再去看它怎么实现的。</p>
+  </section>
+
+  <div class="feature-grid">
+    <a class="feature-card" href="03-turn-loop.html">
+      <div class="fc-ico">↻</div>
+      <p class="fc-title">Turn 循环：采样 → 工具 → 再采样</p>
+      <p class="fc-desc">一个 turn 就是一个 <code class="inline">loop {}</code>：构建 prompt、流式调用 LLM、解析工具调用、执行、把结果塞回历史、再循环——直到模型不再请求工具。重试、中断、steering 全在循环里。</p>
+      <p class="fc-link">第 3 章 · Turn 循环 <span class="fc-arrow">→</span></p>
+    </a>
+
+    <a class="feature-card" href="07-tools.html">
+      <div class="fc-ico">⛏</div>
+      <p class="fc-title">工具系统：原语 + 注册表</p>
+      <p class="fc-desc"><code class="inline">ToolExecutor</code> trait 定义工具运行时契约，<code class="inline">ToolSpec</code> 描述给模型的 JSON schema。shell、apply_patch、exec_command、view_image…… 一套注册表统一调度，支持并行工具调用。</p>
+      <p class="fc-link">第 7 章 · 工具系统 <span class="fc-arrow">→</span></p>
+    </a>
+
+    <a class="feature-card" href="08-approvals-sandbox.html">
+      <div class="fc-ico">🛡</div>
+      <p class="fc-title">沙箱 + 审批：安全的默认值</p>
+      <p class="fc-desc">三档沙箱（read-only / workspace-write / danger-full-access），macOS 用 seatbelt、Linux 用 bubblewrap。审批策略决定哪些命令要人确认。默认安全，按需放权。</p>
+      <p class="fc-link">第 8 章 · 审批与沙箱 <span class="fc-arrow">→</span></p>
+    </a>
+
+    <a class="feature-card" href="05-context.html">
+      <div class="fc-ico">∑</div>
+      <p class="fc-title">真正的上下文工程</p>
+      <p class="fc-desc">每个 turn 重新组装 prompt：base instructions、AGENTS.md 项目指令、developer/user 指令、工具结果、压缩摘要…… 全部是可组合的 Context Fragment，按需注入。</p>
+      <p class="fc-link">第 5 章 · 上下文构建 <span class="fc-arrow">→</span></p>
+    </a>
+
+    <a class="feature-card" href="02-protocol-model.html">
+      <div class="fc-ico">{ }</div>
+      <p class="fc-title">Op / Event 双向协议</p>
+      <p class="fc-desc">客户端发 <code class="inline">Op</code>（提交、中断、审批），内核回 <code class="inline">EventMsg</code>（流式 token、工具调用、完成）。会话就是一串 <code class="inline">ResponseItem</code>。一套协议撑起 TUI、CLI、app-server 三种前端。</p>
+      <p class="fc-link">第 2 章 · 协议模型 <span class="fc-arrow">→</span></p>
+    </a>
+
+    <a class="feature-card" href="10-mcp-extensions.html">
+      <div class="fc-ico">⊕</div>
+      <p class="fc-title">MCP / 插件 / 技能扩展</p>
+      <p class="fc-desc">原生 MCP 客户端接外部工具服务器，连接器（connectors）接 SaaS，插件（plugins）注入工具与上下文，技能（skills）按需载入指令。扩展点遍布各层。</p>
+      <p class="fc-link">第 10 章 · MCP 与扩展 <span class="fc-arrow">→</span></p>
+    </a>
+  </div>
+
+  <!-- 哲学对照 -->
+  <div class="philosophy">
+    <div class="ph-block ph-do">
+      <p class="ph-title">✓ 它给你的，是分层 + 契约</p>
+      <ul>
+        <li><b>协议先行</b>：<code class="inline">codex-protocol</code> crate 把所有类型（Op/Event/ResponseItem/SandboxPolicy）独立出来，内核与前端共享</li>
+        <li><b>依赖注入</b>：内核不直接调 LLM API，通过 <code class="inline">ModelClientSession</code> 抽象，provider 可替换</li>
+        <li><b>ToolExecutor trait</b>：工具是接口，内置工具与 MCP 工具走同一套运行时</li>
+        <li><b>Context Fragment</b>：上下文是可组合的片段，不是写死的字符串拼接</li>
+      </ul>
+      <p class="ph-note">136 个 crate 的工作区，但真正理解 Agent 运行时，只需聚焦 <code class="inline">core</code> 与 <code class="inline">protocol</code> 两个 crate。</p>
+    </div>
+    <div class="ph-block ph-dont">
+      <p class="ph-title">✗ 它把复杂度放在了哪</p>
+      <ul>
+        <li><b>沙箱复杂度</b>：跨平台隔离（seatbelt/bwrap）+ 执行策略判定，是「安全默认」的代价</li>
+        <li><b>会话复杂度</b>：rollout 持久化 + 回放重建 + 压缩，保证崩溃可恢复与上下文不爆</li>
+        <li><b>多前端复杂度</b>：TUI/CLI/app-server/exec-server 四种外壳共享内核，协议层承担胶水</li>
+        <li><b>扩展复杂度</b>：MCP + 插件 + 连接器 + 技能，扩展点多意味着编排逻辑分散</li>
+      </ul>
+      <p class="ph-note">Codex 追求「安全可控的生产级编码 Agent」，因此把大量精力放在<strong>沙箱、审批、持久化</strong>——这些正是自研时容易偷懒却最该学的地方。</p>
+    </div>
+  </div>
+
+  <h2 style="color:#0d7377;margin-top:34px">学习路径</h2>
+  <div class="pathgrid">
+
+    <a class="pathcard" href="01-architecture.html">
+      <div class="pc-num">STEP 1</div>
+      <h3>整体架构</h3>
+      <p>Cargo workspace 的 136 个 crate 如何分层：protocol → core → tui/cli/app-server。一次 prompt 从哪里走到哪里。</p>
+    </a>
+
+    <a class="pathcard" href="02-protocol-model.html">
+      <div class="pc-num">STEP 2</div>
+      <h3>消息与协议模型</h3>
+      <p>ResponseItem（会话条目）、Op（客户端操作）、EventMsg（内核事件）三套类型，如何构成双向通信。</p>
+    </a>
+
+    <a class="pathcard" href="03-turn-loop.html">
+      <div class="pc-num">STEP 3</div>
+      <h3>★ Turn 循环</h3>
+      <p>核心中的核心：CodexThread → Session → run_turn → run_sampling_request 的 loop，流式、重试、中断、steering。</p>
+    </a>
+
+    <a class="pathcard" href="04-session-rollout.html">
+      <div class="pc-num">STEP 4</div>
+      <h3>会话与 Rollout</h3>
+      <p>Session 如何持有会话状态，rollout JSONL 如何持久化与回放，world state 追踪了什么。</p>
+    </a>
+
+    <a class="pathcard" href="05-context.html">
+      <div class="pc-num">STEP 5</div>
+      <h3>★ 上下文构建</h3>
+      <p>每个 turn 的 prompt 怎么拼：Context Fragment 体系、base instructions、AGENTS.md、context manager。</p>
+    </a>
+
+    <a class="pathcard" href="06-compaction.html">
+      <div class="pc-num">STEP 6</div>
+      <h3>上下文压缩</h3>
+      <p>token 预算、阈值触发、本地 vs 远程压缩、摘要生成、context window 管理。</p>
+    </a>
+
+    <a class="pathcard" href="07-tools.html">
+      <div class="pc-num">STEP 7</div>
+      <h3>★ 工具系统</h3>
+      <p>ToolSpec / ToolExecutor trait、工具注册表、内置工具清单、工具调用从分发到执行的全生命周期。</p>
+    </a>
+
+    <a class="pathcard" href="08-approvals-sandbox.html">
+      <div class="pc-num">STEP 8</div>
+      <h3>审批与沙箱</h3>
+      <p>审批策略（AskForApproval）、沙箱模式（SandboxPolicy）、execpolicy 命令判定、跨平台隔离实现。</p>
+    </a>
+
+    <a class="pathcard" href="09-config.html">
+      <div class="pc-num">STEP 9</div>
+      <h3>配置系统</h3>
+      <p>config.toml schema、requirements.toml、配置分层、权限档案（permission profiles）。</p>
+    </a>
+
+    <a class="pathcard" href="10-mcp-extensions.html">
+      <div class="pc-num">STEP 10</div>
+      <h3>MCP 与扩展</h3>
+      <p>MCP 服务器集成、连接器、插件、技能、动态工具与 tool_search。</p>
+    </a>
+
+    <a class="pathcard" href="11-multi-agent.html">
+      <div class="pc-num">STEP 11</div>
+      <h3>多 Agent 与协作</h3>
+      <p>Agent 角色、子 Agent 派生、agent 注册表、Agent 间通信、协作模式。</p>
+    </a>
+
+    <a class="pathcard" href="12-tui-cli.html">
+      <div class="pc-num">STEP 12</div>
+      <h3>TUI 与 CLI</h3>
+      <p>终端 UI 渲染、CLI 模式（交互 / exec / app-server）、客户端-服务端分离。</p>
+    </a>
+
+    <a class="pathcard" href="13-build-own-runtime.html">
+      <div class="pc-num">ROADMAP</div>
+      <h3>自制 Agent Runtime 路线图</h3>
+      <p>把前面学到的一切拆成可落地的里程碑：协议 → 循环 → 会话 → 上下文 → 工具 → 沙箱 → 持久化。</p>
+    </a>
+
+  </div>
+
+  <div class="callout info">
+    <b class="tag">说明</b>
+    本站在 Codex <strong>rusty-v8-v150.4.0-1109-gd52478c52e</strong>（<code class="inline">git describe --tags</code>，HEAD d52478c52e）基础上编写，
+    所有代码片段从当前仓库摘录并标注真实文件路径（<code class="inline">codex-rs/core/src/...</code>、<code class="inline">codex-rs/protocol/src/...</code>）。
+    仓库持续演进，若某处路径/函数名对不上，以仓库最新代码为准 —— 那本身就是最好的学习材料。
+  </div>
+
+  <div class="callout warn">
+    <b class="tag">三处重点</b>
+    本站在 <strong>第 3 章（Turn 循环）</strong>、<strong>第 5 章（上下文）</strong> 与 <strong>第 7 章（工具）</strong> 上着墨最多，
+    因为这三块是「Agent Runtime」的真正灵魂：<strong>循环决定怎么跑，上下文决定模型看到什么，工具决定它能做什么。</strong>
+  </div>
+
+</div>
+
+<footer>
+  Codex CLI · 基于仓库 <code class="inline">openai/codex</code> 编写 · 本页版本 rusty-v8-v150.4.0-1109-gd52478c52e · 用于学习与自研 Runtime 参考
+</footer>
+
+</body>
+</html>

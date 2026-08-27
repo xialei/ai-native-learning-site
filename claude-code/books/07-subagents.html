@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 子代理与并行 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 子代理与并行</div>
+    <h1>子代理与并行：用独立窗口隔离与加速</h1>
+    <div class="subtitle">主代理一条道走到黑，上下文会越来越脏、越来越满。子代理（subagent）是解药：它有自己的上下文窗口，干完只把结论回传。这一章拆开派遣/回传契约、专职代理的定义，以及并行编排。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">核心机制</span>
+    <span class="ep-quote">派一个子代理去做脏活累活，它读完一堆文件，只回传一段结论——主线上下文不被污染。</span>
+    <span class="ep-arrow">→</span>
+    既是上下文工程，也是并发工程。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>一分钟版本</h2>
+    <p>子代理是一个<strong>拥有独立上下文窗口的 agent</strong>，由主代理按需派遣去完成一个范围明确的小任务，完成后<strong>只把结论</strong>（最终文本）回传给主代理。它同时解决两个问题：</p>
+    <ul>
+      <li><strong>上下文污染</strong>：子代理内部读的一堆文件、产生的大量 <code class="inline">tool_result</code> 都不进主上下文，主线保持高信噪比。</li>
+      <li><strong>窗口上限</strong>：脏活在子代理的窗口里消化，不挤占主代理的预算。</li>
+    </ul>
+    <p>更进一步的收益是<strong>并行</strong>：多个子代理可同时跑，各自独立窗口、独立循环。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>主代理 vs 子代理：上下文隔离</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t72 d72">
+        <title id="t72">单代理 vs 主+子代理</title>
+        <desc id="d72">上下文隔离对比</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="40" y="30" font-weight="bold" fill="#c15f3c">单代理：窗口越积越满</text>
+        <rect class="node warn" x="40" y="44" width="380" height="200" rx="8"></rect>
+        <rect class="node" x="60" y="60" width="340" height="28" rx="4"></rect>
+        <text class="lbl sm" x="70" y="78">user 提示</text>
+        <rect class="node" x="60" y="94" width="340" height="28" rx="4"></rect>
+        <text class="lbl sm" x="70" y="112">turn1 + 大量 tool_result（读了一堆文件）</text>
+        <rect class="node" x="60" y="128" width="340" height="28" rx="4"></rect>
+        <text class="lbl sm" x="70" y="146">turn2 + 更多 tool_result …</text>
+        <rect class="node" x="60" y="162" width="340" height="28" rx="4"></rect>
+        <text class="lbl sm" x="70" y="180">窗口逼近上限，信噪比下降</text>
+        <text class="lbl sm" x="60" y="220">噪声与有用信息混在一起，模型注意力被稀释。</text>
+
+        <text class="lbl" x="490" y="30" font-weight="bold" fill="#2f6f8f">主 + 子代理：主线保持干净</text>
+        <rect class="node core" x="490" y="44" width="370" height="200" rx="8"></rect>
+        <rect class="node" x="510" y="60" width="330" height="28" rx="4"></rect>
+        <text class="lbl sm" x="520" y="78">主代理：user 提示 + 派遣 + 结论</text>
+        <rect class="node acc" x="510" y="100" width="330" height="120" rx="6"></rect>
+        <text class="lbl sm" x="520" y="120">子代理（独立窗口 B）：</text>
+        <text class="lbl sm" x="520" y="138">读文件 ×N、grep ×N、tool_result 一堆</text>
+        <text class="lbl sm" x="520" y="156">… 全部留在 B 里</text>
+        <text class="lbl sm" x="520" y="184">→ 只回传一段结论给主代理</text>
+        <text class="lbl sm" x="510" y="232">主窗口 A 只多了一行结论，干净。</text>
+      </svg>
+      <div class="fig-cap">图 7.1：子代理把噪声关在自己的窗口里，主上下文只接收结论。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>派遣与回传契约</h2>
+    <p>从主代理的视角，派遣子代理就是发出一次 <code class="inline">Task</code> 工具调用——描述目标、指定用哪个代理类型，子代理跑完自己的循环，把最终文本作为 <code class="inline">tool_result</code> 回灌：</p>
+    <div class="code-title">概念示例：主代理发出 Task 工具调用</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"type"</span>: <span class="st">"tool_use"</span>,
+  <span class="st">"name"</span>: <span class="st">"Task"</span>,
+  <span class="st">"input"</span>: {
+    <span class="st">"description"</span>: <span class="st">"调研 src/auth 目录的鉴权流程"</span>,
+    <span class="st">"subagent_type"</span>: <span class="st">"code-explorer"</span>,     <span class="cmt">// 专职代理类型</span>
+    <span class="st">"prompt"</span>: <span class="st">"找出登录鉴权的完整调用链，列出关键文件与函数"</span>
+  }
+}
+<span class="cmt">// 子代理在自己的窗口里读文件、grep、跑循环，最终产出一段文本</span>
+<span class="cmt">// → 作为 tool_result 回灌给主代理：调用链摘要 + 关键文件清单</span></pre>
+    <div class="annotation"><b>读懂这段（关键契约）：</b> 子代理内部干了什么——读了哪些文件、产生了多少 tool_result、来回多少轮——<strong>统统不回传</strong>，主代理拿到的只有 <code class="inline">tool_result</code> 里那段最终文本。这就是<strong>上下文隔离契约</strong>：噪声留在子窗口，结论进入主窗口。主代理据此决定下一步（比如亲自去改那些关键文件）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>专职子代理：可定义的专家</h2>
+    <p>子代理不一定是「通用助手」，可以定义成<strong>专职角色</strong>：一份 Markdown 文件，带 frontmatter 声明名字、描述、可用工具、模型，正文是它的系统提示。本仓库 <code class="inline">plugins/</code> 里就有大量真实范例：</p>
+    <table class="tbl">
+      <tr><th>插件</th><th>专职子代理</th><th>职责</th></tr>
+      <tr><td>feature-dev</td><td>code-explorer / code-architect / code-reviewer</td><td>代码探查 / 架构设计 / 质量审查</td></tr>
+      <tr><td>pr-review-toolkit</td><td>comment-analyzer / pr-test-analyzer / silent-failure-hunter / type-design-analyzer / code-reviewer / code-simplifier</td><td>评论 / 测试 / 静默失败 / 类型设计 / 代码质量 / 简化</td></tr>
+      <tr><td>agent-sdk-dev</td><td>agent-sdk-verifier-py / agent-sdk-verifier-ts</td><td>校验 SDK 应用最佳实践</td></tr>
+      <tr><td>plugin-dev</td><td>agent-creator / plugin-validator / skill-reviewer</td><td>创建 / 校验 / 审查</td></tr>
+    </table>
+    <div class="code-title">概念示例：一个专职代理的定义文件（结构参考 plugins/feature-dev/agents/code-reviewer.md，已简化）</div>
+    <pre class="code"><span class="lang-tag">markdown</span>---
+name: code-reviewer
+description: 审查代码变更，专注 bug、类型设计、可简化点
+tools: Read, Grep, Glob            <span class="cmt"># 只给需要的工具，最小权限</span>
+model: sonnet                      <span class="cmt"># 可指定模型档位</span>
+---
+
+你是资深代码审查者。收到一组变更后：
+1. 先用 Read/Grep 理解上下文，不要只看 diff。
+2. 按严重度排序给出问题，每条附文件:行号与具体建议。
+3. 区分「必须改」与「可选」，不纠结风格小事。
+只回传审查结论，不要试图自己改代码。</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个设计要点。<strong>① <code class="inline">tools</code> 收窄</strong>——审查者只需要读和搜，不给写/执行，天然安全（呼应第 6 章最小权限）。真实仓库里的 <code class="inline">code-reviewer.md</code> 工具集更宽（含 WebFetch/WebSearch 等），这里为说明「最小权限」做了简化。<strong>② <code class="inline">model</code> 可降档</strong>——专职任务未必需要最强模型，省成本。<strong>③ 系统提示聚焦</strong>——专职代理的 persona 越明确，产出越稳。这就是把「角色」固化成可复用资产。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>并行编排：fan-out / fan-in</h2>
+    <p>多个子代理可<strong>并发</strong>执行。最典型的真实范例是 <code class="inline">plugins/code-review</code>——它在审查阶段并行跑<strong>4 个代理</strong>（2 个 Sonnet 审 CLAUDE.md 合规 + 2 个 Opus 审 bug），各盯一个维度：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t75 d75">
+        <title id="t75">并行子代理 fan-out / fan-in</title>
+        <desc id="d75">主代理派出多个子代理并行，结果聚合</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <rect class="node core" x="350" y="20" width="200" height="50" rx="8"></rect>
+        <text class="lbl" x="450" y="50" text-anchor="middle">主代理（派遣）</text>
+
+        <path class="edge" d="M410 70 L150 120" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M440 70 L380 120" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M460 70 L620 120" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M490 70 L795 120" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="50" y="120" width="200" height="56" rx="8"></rect>
+        <text class="lbl sm" x="150" y="145" text-anchor="middle">CLAUDE.md 合规 #1（Sonnet）</text>
+        <rect class="node acc" x="280" y="120" width="200" height="56" rx="8"></rect>
+        <text class="lbl sm" x="380" y="145" text-anchor="middle">CLAUDE.md 合规 #2（Sonnet）</text>
+        <rect class="node acc" x="540" y="120" width="160" height="56" rx="8"></rect>
+        <text class="lbl sm" x="620" y="145" text-anchor="middle">bug 扫描（Opus）</text>
+        <rect class="node acc" x="720" y="120" width="150" height="56" rx="8"></rect>
+        <text class="lbl sm" x="795" y="145" text-anchor="middle">历史分析（Opus）</text>
+        <text class="lbl sm" x="450" y="200" text-anchor="middle">4 个子代理并行（各自独立窗口与循环）</text>
+
+        <path class="edge" d="M150 176 L400 220" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M380 176 L430 220" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M620 176 L470 220" marker-end="url(#arrow)"></path>
+        <path class="edge" d="M795 176 L500 220" marker-end="url(#arrow)"></path>
+        <rect class="node core" x="350" y="226" width="200" height="44" rx="8"></rect>
+        <text class="lbl" x="450" y="252" text-anchor="middle">主代理（聚合结论）</text>
+      </svg>
+      <div class="fig-cap">图 7.2：code-review 插件的并行审查——4 个代理同时跑，结论汇总。维度为真实插件配置。</div>
+    </div>
+    <div class="annotation"><b>为什么并行：</b> 两个收益。<strong>① 速度</strong>——4 个维度同时跑，墙钟时间约等于最慢的那个，而非四者之和。<strong>② 独立视角</strong>——每个子代理只盯一个维度、互不干扰，比一个代理「同时审四件事」更专注、更少遗漏。这种 fan-out/fan-in 是用子代理做复杂审查的标准招式。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.6</span>何时用子代理</h2>
+    <table class="tbl">
+      <tr><th>场景</th><th>用子代理？</th><th>理由</th></tr>
+      <tr><td>大范围探查（全仓库搜索、读一堆文件做调研）</td><td>✅</td><td>噪声大，隔离掉保护主线</td></tr>
+      <tr><td>可并行的独立维度（多角度审查）</td><td>✅</td><td>并行加速 + 独立视角</td></tr>
+      <tr><td>需要专家 persona（审查者、架构师）</td><td>✅</td><td>固化角色，产出更稳</td></tr>
+      <tr><td>会撑爆主窗口的脏活</td><td>✅</td><td>独立窗口消化</td></tr>
+      <tr><td>简单的顺序小改（改一处文案）</td><td>❌</td><td>派遣开销大于收益</td></tr>
+      <tr><td>需要完整可观测的逐步过程</td><td>❌</td><td>子代理内部过程被封装，不透明</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.7</span>对使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① 脏活累活派给子代理</strong>——保护主线上下文信噪比，这是最常用收益。<strong>② 并行独立维度</strong>——审查、调研类任务用 fan-out/fan-in 又快又全。<strong>③ 把可复用的角色固化成专职代理</strong>——配最小工具集、合适模型档位，既安全又省钱。<strong>④ 代价是不透明</strong>——子代理内部过程被封装，调试时记得让它把结论写详细些。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="06-permissions.html">← 上一页：权限模型</a>
+    <a href="08-hooks.html">下一步：Hooks 生命周期 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 07 子代理与并行 · 仓库实例路径以最新为准
+</footer>
+
+</body>
+</html>

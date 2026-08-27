@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>09 配置系统 — Codex CLI 学习站</title>
+  <link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <h1>09 · 配置系统：分层、合并与约束</h1>
+    <p class="lead">
+      Codex 既要满足单个开发者在笔记本上的轻量配置，又要支撑企业 MDM 托管、项目级策略、CI 无人值守等截然不同的场景。
+      它的解法不是「一个大 config 文件」，而是一套<b>分层合并（layered merge）</b>体系：
+      多个来源各贡献一层 TOML，按优先级叠加成「生效配置」；再用一套<b>约束（requirements）</b>机制保证托管层能锁死安全边界。
+    </p>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>配置层栈：ConfigLayerSource</h2>
+    <p>每一份配置都带「出处」。<code class="inline">ConfigLayerSource</code> 枚举穷举了所有可能的来源，并给每个来源一个<b>优先级数值</b>——数值大的覆盖数值小的。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/config_layer_source.rs:6</span>
+<span class="kw">pub enum</span> <span class="cl">ConfigLayerSource</span> {
+    <span class="cmt">/// 随安装包自带的默认配置。</span>
+    PackagedDefaults { file: <span class="cl">AbsolutePathBuf</span> },
+    <span class="cmt">/// MDM（移动设备管理）下发的托管偏好。</span>
+    Mdm { domain: <span class="kw">String</span>, key: <span class="kw">String</span> },
+    <span class="cmt">/// 主机级配置文件。</span>
+    System { file: <span class="cl">AbsolutePathBuf</span> },
+    <span class="cmt">/// 企业云 bundle 下发的配置。</span>
+    EnterpriseManaged { id: <span class="kw">String</span>, name: <span class="kw">String</span> },
+    <span class="cmt">/// 用户配置，可选叠加一个 profile。</span>
+    User { file: <span class="cl">AbsolutePathBuf</span>, profile: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt; },
+    <span class="cmt">/// 项目 .codex 目录里的配置。</span>
+    Project { dot_codex_folder: <span class="cl">AbsolutePathBuf</span> },
+    <span class="cmt">/// 本次会话的命令行 flag 覆盖。</span>
+    SessionFlags,
+    <span class="cmt">/// 旧式托管配置（文件 / MDM）。</span>
+    LegacyManagedConfigTomlFromFile { file: <span class="cl">AbsolutePathBuf</span> },
+    LegacyManagedConfigTomlFromMdm,
+}
+
+<span class="kw">pub fn</span> precedence(&amp;self) -&gt; i16 {
+    <span class="kw">match</span> self {
+        PackagedDefaults { .. } =&gt; -10,
+        Mdm { .. } =&gt; 0,
+        System { .. } =&gt; 10,
+        EnterpriseManaged { .. } =&gt; 15,
+        User { profile, .. } =&gt; <span class="kw">if</span> profile.is_some() { 21 } <span class="kw">else</span> { 20 },
+        Project { .. } =&gt; 25,
+        SessionFlags =&gt; 30,
+        LegacyManagedConfigTomlFromFile { .. } =&gt; 40,
+        LegacyManagedConfigTomlFromMdm =&gt; 50,
+    }
+}</pre>
+
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 620 380" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="配置层栈叠加">
+          <!-- layers bottom to top -->
+          <rect x="60" y="300" width="500" height="40" rx="6" fill="#1e293b" stroke="#475569"/>
+          <text x="80" y="325" fill="#94a3b8" font-size="12">PackagedDefaults  (优先级 -10)</text>
+
+          <rect x="80" y="255" width="460" height="40" rx="6" fill="#1e293b" stroke="#475569"/>
+          <text x="100" y="280" fill="#94a3b8" font-size="12">Mdm  (0)</text>
+
+          <rect x="100" y="210" width="420" height="40" rx="6" fill="#1e293b" stroke="#475569"/>
+          <text x="120" y="235" fill="#94a3b8" font-size="12">System  (10)</text>
+
+          <rect x="120" y="165" width="380" height="40" rx="6" fill="#0d7377"/>
+          <text x="140" y="190" fill="#fff" font-size="12">User (+ profile)  (20 / 21)</text>
+
+          <rect x="140" y="120" width="340" height="40" rx="6" fill="#0d7377"/>
+          <text x="160" y="145" fill="#fff" font-size="12">Project (.codex/)  (25)</text>
+
+          <rect x="160" y="75" width="300" height="40" rx="6" fill="#c2410c"/>
+          <text x="180" y="100" fill="#fff" font-size="12">SessionFlags (--flag)  (30)</text>
+
+          <rect x="180" y="30" width="260" height="40" rx="6" fill="#7f1d1d" stroke="#c2410c" stroke-width="2"/>
+          <text x="200" y="55" fill="#fed7aa" font-size="12">Legacy Managed (MDM)  (50)</text>
+
+          <!-- arrow -->
+          <path d="M570 320 L570 50" stroke="#14a098" stroke-width="2" fill="none" marker-end="url(#a2)"/>
+          <text x="582" y="190" fill="#14a098" font-size="11" transform="rotate(-90 582 190)">优先级递增 / 覆盖</text>
+
+          <defs><marker id="a2" markerWidth="8" markerHeight="8" refX="4" refY="7" orient="auto">
+            <path d="M0,0 L8,0 L4,8 z" fill="#14a098"/></marker></defs>
+        </svg>
+      </div>
+      <div class="fig-cap">图 9.1：配置层栈。底层是打包默认值，顶层是托管配置。每一层只覆盖同名字段，未覆盖的从下层继承。</div>
+    </div>
+
+    <div class="callout info">
+      <b class="tag">关键洞察</b>
+      <b>项目配置（Project, 25）优先级高于用户配置（User, 20）</b>。这意味着你 clone 一个仓库后，它的 <code class="inline">.codex/config.toml</code> 能覆盖你的全局设置——这正是「Untrusted 项目」机制存在的理由：陌生项目可能把 <code class="inline">sandbox_mode</code> 设成 <code class="inline">danger-full-access</code>，所以 Codex 默认对未声明信任的项目套紧策略。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>合并机制：overlay 叠加</h2>
+    <p>层与层之间不是「整体替换」，而是<b>字段级合并</b>。<code class="inline">merge_toml_values</code> 把 <code class="inline">overlay</code>（高优先级层）叠进 <code class="inline">base</code>（低优先级层）：表（table）递归合并，标量直接覆盖。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/merge.rs:57</span>
+<span class="cmt">/// Merge config `overlay` into `base`, giving `overlay` precedence.</span>
+<span class="kw">pub fn</span> merge_toml_values(base: &amp;<span class="kw">mut</span> <span class="cl">TomlValue</span>, overlay: &amp;<span class="cl">TomlValue</span>) {
+    merge_toml_values_at_path(base, overlay, &amp;<span class="kw">mut</span> Vec::new());
+}</pre>
+
+    <p>所以你在全局 <code class="inline">config.toml</code> 里设了 <code class="inline">model = "gpt-5"</code>，而项目配置只写了 <code class="inline">sandbox_mode = "workspace-write"</code>，合并结果是两者都生效——项目层没有提到的字段从用户层继承。这避免了「要么全配要么不配」的痛苦。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>ConfigToml：用户配置骨架</h2>
+    <p><code class="inline">ConfigToml</code> 是 <code class="inline">~/.codex/config.toml</code> 的反序列化目标。它几乎全用 <code class="inline">Option</code>——因为每个字段都可能「未设置」，从而让下层值透传上来。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/config_toml.rs:155</span>
+<span class="kw">pub struct</span> <span class="cl">ConfigToml</span> {
+    <span class="cmt">/// 模型选择覆盖。</span>
+    <span class="kw">pub</span> model: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">/// /review 功能用的评审模型。</span>
+    <span class="kw">pub</span> review_model: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">/// 从 model_providers map 里选用哪个 provider。</span>
+    <span class="kw">pub</span> model_provider: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">/// 上下文窗口大小（token 数）。</span>
+    <span class="kw">pub</span> model_context_window: <span class="kw">Option</span>&lt;i64&gt;,
+    <span class="cmt">/// 自动压缩的 token 触发阈值。</span>
+    <span class="kw">pub</span> model_auto_compact_token_limit: <span class="kw">Option</span>&lt;i64&gt;,
+    <span class="cmt">/// 审批策略。</span>
+    <span class="kw">pub</span> approval_policy: <span class="kw">Option</span>&lt;<span class="cl">AskForApproval</span>&gt;,
+    <span class="cmt">/// 沙箱模式。</span>
+    <span class="kw">pub</span> sandbox_mode: <span class="kw">Option</span>&lt;<span class="cl">SandboxMode</span>&gt;,
+    <span class="cmt">/// sandbox=workspace-write 时的可写根等细节。</span>
+    <span class="kw">pub</span> sandbox_workspace_write: <span class="kw">Option</span>&lt;<span class="cl">SandboxWorkspaceWrite</span>&gt;,
+    <span class="cmt">/// 默认权限 profile 名（: 开头是内置）。</span>
+    <span class="kw">pub</span> default_permissions: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">/// 命名权限 profile。</span>
+    <span class="kw">pub</span> permissions: <span class="kw">Option</span>&lt;<span class="cl">PermissionsToml</span>&gt;,
+    <span class="cmt">/// 系统指令（用户可自定义，但官方强烈不建议）。</span>
+    <span class="kw">pub</span> instructions: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">/// 作为 developer 角色插入的开发者指令。</span>
+    <span class="kw">pub</span> developer_instructions: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    <span class="cmt">// ... 还有 profile、mcp_servers、tools、hooks 等</span>
+}</pre>
+
+    <div class="callout warn">
+      <b class="tag">官方警告</b>
+      <code class="inline">instructions</code> 字段上方写着：「用户被强烈建议不要使用此字段，偏离 Codex 认可的指令会降低模型表现。」这说明系统提示词是经过大量调优的——自研 Agent 时也应克制随意改写系统提示，而优先用 <code class="inline">developer_instructions</code>（developer 角色）这类受控注入点。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>SandboxMode 与 profile</h2>
+    <p>配置层暴露给用户的沙箱概念是 <code class="inline">SandboxMode</code>，比第 8 章的 <code class="inline">SandboxPolicy</code> 更简化——它面向配置文件，不带可写根细节。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/config_types.rs:104</span>
+<span class="kw">pub enum</span> <span class="cl">SandboxMode</span> {
+    <span class="cmt">/// 默认：只读。</span>
+    ReadOnly,
+    <span class="cmt">/// 可写工作目录。</span>
+    WorkspaceWrite,
+    <span class="cmt">/// 无限制（危险）。</span>
+    DangerFullAccess,
+}</pre>
+
+    <p>而 <code class="inline">default_permissions</code> 指向一个<b>权限 profile</b>。名字以 <code class="inline">:</code> 开头的是内置 profile（<code class="inline">:read-only</code> / <code class="inline">:workspace</code> / <code class="inline">:danger-full-access</code>），否则从 <code class="inline">[permissions]</code> 表里按名解析。这与第 8 章的 <code class="inline">PermissionProfile</code>（Managed/External/Disabled）对接，把「配置里的名字」翻译成「运行时的权限结构」。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>约束系统：requirements.toml</h2>
+    <p>分层合并有个天然问题：如果企业想<b>强制</b>某个安全策略（比如「绝不允许 danger-full-access」），光靠覆盖是不够的——用户或项目层仍可能写回来。Codex 用一套独立的 <b>requirements</b> 机制解决：托管层不提供「配置值」，而是提供「约束」，约束会校验合并后的生效配置是否越界。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/config_requirements.rs</span>
+<span class="kw">pub enum</span> <span class="cl">RequirementSource</span> {
+    SystemRequirementsToml { file: <span class="cl">AbsolutePathBuf</span> },
+    <span class="cmt">// ... 其它托管来源</span>
+}
+
+<span class="cmt">/// 合并归一化后的 requirements。</span>
+<span class="kw">pub struct</span> <span class="cl">ConfigRequirements</span> {
+    <span class="kw">pub</span> computer_use: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">ComputerUseRequirementsToml</span>&gt;&gt;,
+    <span class="kw">pub</span> feature_requirements: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">FeatureRequirementsToml</span>&gt;&gt;,
+    <span class="kw">pub</span> managed_hooks: <span class="kw">Option</span>&lt;<span class="cl">ConstrainedWithSource</span>&lt;<span class="cl">ManagedHooksRequirementsToml</span>&gt;&gt;,
+    <span class="kw">pub</span> plugins: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">BTreeMap</span>&lt;<span class="kw">String</span>, <span class="cl">PluginRequirementsToml</span>&gt;&gt;&gt;,
+    <span class="kw">pub</span> marketplaces: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">MarketplaceRequirementsToml</span>&gt;&gt;,
+    <span class="kw">pub</span> exec_policy: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">RequirementsExecPolicy</span>&gt;&gt;,
+}</pre>
+
+    <p>注意 <code class="inline">ConstrainedWithSource</code> 这个类型名——它表示「带来源的约束」。约束的语义是「<b>能否设置</b>」而非「设成什么」。例如 <code class="inline">ApprovalsReviewer::User</code> 的约束可以是「禁止设成 AutoReview」，这样无论用户层怎么配，自动审核都开不了。这是企业安全治理的基石。</p>
+
+    <div class="callout tip">
+      <b class="tag">配置 vs 约束</b>
+      <b>配置（config）</b>回答「值是什么」，可被高优先级层覆盖；<b>约束（requirements）</b>回答「值允许是什么」，不可被覆盖，只能校验。这套分离让 Codex 既能给用户自由，又能让管理员画红线。自研企业级 Agent 时，这是必学模式——否则你的「安全默认」会被用户 config 一行覆盖掉。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>Profile：命名的配置预设</h2>
+    <p>当一个人在多个场景用 Codex（工作 / 个人 / 演示），反复改 config 很烦。<code class="inline">--profile</code> 机制允许命名预设：<code class="inline">$CODEX_HOME/&lt;name&gt;.config.toml</code>。选中某个 profile 时，User 层的优先级从 20 升到 21（见 9.1），相当于在用户基础配置之上再叠一层。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/config_types.rs</span>
+<span class="cmt">/// 校验过的 profile-v2 名，用于选择 $CODEX_HOME/&lt;name&gt;.config.toml。</span>
+<span class="kw">pub struct</span> <span class="cl">ProfileV2Name</span>(<span class="kw">String</span>);
+
+<span class="cmt">// 解析失败的提示：</span>
+<span class="st">"invalid --profile value `{}`; pass a plain name such as `work`"</span></pre>
+
+    <p>profile 是<b>纯加法</b>：它只在你已有的用户配置之上叠加，不替换。这让「切换工作场景」变成一条 flag，而非重写整个配置文件。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>配置全景：从文件到生效</h2>
+    <table class="tbl">
+      <thead><tr><th>概念</th><th>文件 / 类型</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td>用户配置</td><td><code>~/.codex/config.toml</code> → <code>ConfigToml</code></td><td>个人默认值</td></tr>
+        <tr><td>项目配置</td><td><code>.codex/config.toml</code></td><td>项目级覆盖（优先级更高）</td></tr>
+        <tr><td>Profile 预设</td><td><code>$CODEX_HOME/&lt;name&gt;.config.toml</code></td><td>命名场景叠加</td></tr>
+        <tr><td>系统约束</td><td><code>requirements.toml</code> → <code>ConfigRequirements</code></td><td>托管层画红线</td></tr>
+        <tr><td>会话 flag</td><td>CLI <code>--flag</code></td><td>本次运行临时覆盖</td></tr>
+        <tr><td>合并引擎</td><td><code>merge_toml_values</code></td><td>字段级叠加</td></tr>
+        <tr><td>权限 profile</td><td><code>default_permissions</code> → <code>PermissionProfile</code></td><td>沙箱构造方式</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.8</span>小结与对自研的启示</h2>
+    <div class="callout tip">
+      <b class="tag">自研 checklist</b>
+      配置系统是 Agent 的「治理骨架」，别等做大了再补。<strong>① 一开始就分层</strong>——默认值 / 用户 / 项目 / 会话 flag，每层带优先级。<strong>② 字段级合并</strong>而非整文件替换，用 <code class="inline">Option</code> 表示「未设置」。<strong>③ 配置与约束分离</strong>——企业场景必须有「不可被覆盖的红线」，否则安全默认形同虚设。<strong>④ 项目配置优先级高于用户配置</strong>是合理的（仓库自带策略），但必须配套「未信任项目默认收紧」机制。<strong>⑤ 提供 profile 预设</strong>——用户会感谢你能一键切场景。
+    </div>
+    <div class="callout info">
+      <b class="tag">一句话</b>
+      Codex 的配置哲学：<b>「自由叠加 + 不可逾越的约束」</b>。配置层让每个角色（开发者/项目/企业）都能表达偏好，约束层保证安全边界不被覆盖。二者合一，才让同一套二进制能在个人笔记本和企业集群里都安全运行。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="08-approvals-sandbox.html">← 08 审批与沙箱</a>
+    <a href="10-mcp-extensions.html">下一步：MCP 与扩展 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 09 配置系统 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>10 MCP 与扩展 — Codex CLI 学习站</title>
+  <link rel="stylesheet" href="assets/codex-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Codex CLI</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-protocol-model.html">协议模型</a>
+      <a href="03-turn-loop.html">Turn 循环</a>
+      <a href="04-session-rollout.html">会话/Rollout</a>
+      <a href="05-context.html">上下文</a>
+      <a href="06-compaction.html">压缩</a>
+      <a href="07-tools.html">工具</a>
+      <a href="08-approvals-sandbox.html">审批/沙箱</a>
+      <a href="09-config.html">配置</a>
+      <a href="10-mcp-extensions.html">MCP/扩展</a>
+      <a href="11-multi-agent.html">多 Agent</a>
+      <a href="12-tui-cli.html">TUI/CLI</a>
+      <a href="13-build-own-runtime.html">自制 Runtime</a>
+    </nav>
+  </div>
+</header>
+
+<div class="page">
+
+  <div class="page-header">
+    <span class="version-badge">rusty-v8-v150.4.0-1109-gd52478c52e</span>
+    <h1>10 · MCP 与扩展：让 Agent 的能力可插拔</h1>
+    <p class="lead">
+      内置工具（shell、apply_patch）只是底线。Codex 真正的扩展性来自三条线：<b>MCP（Model Context Protocol）</b>接外部工具服务器，
+      <b>Connectors / Plugins</b>封装「应用」为 Agent 可调用的能力，<b>Skills</b>提供可审批的脚本化工作流。
+      它们共享同一套 <code class="inline">ToolSpec</code> 暴露机制——对模型而言，内置工具和扩展工具没有分别。
+    </p>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>统一的工具暴露面：ToolSpec</h2>
+    <p>第 7 章我们见过 <code class="inline">ToolSpec</code>。这里重新审视它的五个变体，因为扩展系统正是通过这几个口子接入的：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/tools/src/tool_spec.rs:24</span>
+<span class="cmt">/// 序列化为 JSON 时，产出合法的 OpenAI Responses API "Tool"。</span>
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = <span class="st">"type"</span>)]
+<span class="kw">pub enum</span> <span class="cl">ToolSpec</span> {
+    <span class="cmt">/// 标准 function 工具（内置与 MCP 工具都走这个）。</span>
+    Function(<span class="cl">ResponsesApiTool</span>),
+    <span class="cmt">/// 命名空间工具（把一组工具归到一个 namespace 下）。</span>
+    Namespace(<span class="cl">ResponsesApiNamespace</span>),
+    <span class="cmt">/// 动态工具发现：模型先搜，再决定调哪个。</span>
+    ToolSearch {
+        execution: <span class="kw">String</span>,
+        description: <span class="kw">String</span>,
+        parameters: <span class="cl">JsonSchema</span>,
+    },
+    <span class="cmt">/// 内置网页搜索（OpenAI 服务端工具）。</span>
+    WebSearch { external_web_access: <span class="kw">Option</span>&lt;<span class="kw">bool</span>&gt;, .. },
+    <span class="cmt">/// 自由格式工具（如 apply_patch，非 JSON 参数）。</span>
+    Freeform(<span class="cl">FreeformTool</span>),
+}</pre>
+
+    <div class="callout info">
+      <b class="tag">设计要点</b>
+      所有扩展能力最终都坍缩成 <code class="inline">Function</code>（或 <code class="inline">Namespace</code>）变体塞进工具列表。模型看到的就是一个统一的 function 列表，不知道某个工具是内置 shell 还是远程 MCP 服务器提供的。这种<b>「接入面统一、后端多样」</b>的设计，让 Codex 的工具生态可以无限扩展而不污染核心。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>MCP：外部工具服务器协议</h2>
+    <p>MCP 是 Anthropic 牵头的开放协议，定义了「LLM 客户端如何从外部服务器发现并调用工具/资源」。Codex 作为 MCP 客户端，可以挂载任意 MCP 服务器——本地 stdio 进程或远程 HTTP 服务。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/mcp_types.rs:514</span>
+<span class="kw">pub enum</span> <span class="cl">McpServerTransportConfig</span> {
+    <span class="cmt">/// stdio 传输：Codex spawn 一个本地子进程，通过 stdin/stdout 通信。</span>
+    Stdio {
+        command: <span class="kw">String</span>,
+        args: <span class="kw">Vec</span>&lt;<span class="kw">String</span>&gt;,
+        env: <span class="kw">Option</span>&lt;<span class="kw">HashMap</span>&lt;<span class="kw">String</span>, <span class="kw">String</span>&gt;&gt;,
+        env_vars: <span class="kw">Vec</span>&lt;<span class="cl">McpServerEnvVar</span>&gt;,
+        cwd: <span class="kw">Option</span>&lt;<span class="cl">LegacyAppPathString</span>&gt;,
+    },
+    <span class="cmt">/// streamable-http 传输：连远程 HTTP 服务器。</span>
+    StreamableHttp {
+        url: <span class="kw">String</span>,
+        <span class="cmt">/// 读哪个环境变量拿 bearer token（密钥不写进配置）。</span>
+        bearer_token_env_var: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+        http_headers: <span class="kw">Option</span>&lt;<span class="kw">HashMap</span>&lt;<span class="kw">String</span>, <span class="kw">String</span>&gt;&gt;,
+        <span class="cmt">/// 值来自环境变量的 header（避免明文密钥）。</span>
+        env_http_headers: <span class="kw">Option</span>&lt;<span class="kw">HashMap</span>&lt;<span class="kw">String</span>, <span class="kw">String</span>&gt;&gt;,
+        <span class="cmt">/// 本地命令，输出动态 header 的 JSON（如临时 token）。</span>
+        http_headers_helper: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,
+    },
+}</pre>
+
+    <p>两种传输对应两种部署：stdio 用于本地工具（如一个查日历的脚本），HTTP 用于 SaaS 集成（如连企业内部 API）。注意安全细节——<code class="inline">bearer_token_env_var</code> 和 <code class="inline">env_http_headers</code> 把密钥隔离在环境变量里，配置文件只存「变量名」而非值，这是防泄密的标配。</p>
+
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MCP 工具接入">
+          <rect x="20" y="120" width="140" height="60" rx="10" fill="#0d7377"/>
+          <text x="90" y="148" fill="#fff" font-size="13" text-anchor="middle" font-weight="600">Codex 核心</text>
+          <text x="90" y="166" fill="#cfe9e8" font-size="11" text-anchor="middle">ToolRouter</text>
+
+          <rect x="260" y="40" width="160" height="50" rx="8" fill="#1e293b" stroke="#2563eb"/>
+          <text x="340" y="62" fill="#93c5fd" font-size="12" text-anchor="middle">MCP Server A (stdio)</text>
+          <text x="340" y="78" fill="#64748b" font-size="10" text-anchor="middle">git_tools, file_search</text>
+
+          <rect x="260" y="125" width="160" height="50" rx="8" fill="#1e293b" stroke="#c2410c"/>
+          <text x="340" y="147" fill="#fed7aa" font-size="12" text-anchor="middle">MCP Server B (HTTP)</text>
+          <text x="340" y="163" fill="#64748b" font-size="10" text-anchor="middle">jira, confluence</text>
+
+          <rect x="260" y="210" width="160" height="50" rx="8" fill="#1e293b" stroke="#14a098"/>
+          <text x="340" y="232" fill="#5eead4" font-size="12" text-anchor="middle">内置工具</text>
+          <text x="340" y="248" fill="#64748b" font-size="10" text-anchor="middle">shell, apply_patch</text>
+
+          <path d="M160 140 C 210 140, 210 65, 255 65" stroke="#2563eb" stroke-width="1.5" fill="none" marker-end="url(#m1)"/>
+          <path d="M160 150 C 210 150, 210 150, 255 150" stroke="#c2410c" stroke-width="1.5" fill="none" marker-end="url(#m1)"/>
+          <path d="M160 160 C 210 160, 210 235, 255 235" stroke="#14a098" stroke-width="1.5" fill="none" marker-end="url(#m1)"/>
+
+          <text x="340" y="20" fill="#94a3b8" font-size="11" text-anchor="middle">统一为 Function ToolSpec 暴露给模型</text>
+
+          <defs><marker id="m1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#94a3b8"/></marker></defs>
+        </svg>
+      </div>
+      <div class="fig-cap">图 10.1：MCP 服务器与内置工具走同一条 ToolRouter 路径。对模型而言，<code class="inline">jira_create_issue</code> 和 <code class="inline">shell</code> 没有分别。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>McpServerConfig：挂载点的全部控制</h2>
+    <p>一个 MCP 服务器不只是「连上去」，还有大量治理开关——这是 Codex 把扩展能力做成「企业可用」的关键。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/mcp_types.rs:181</span>
+<span class="kw">pub struct</span> <span class="cl">McpServerConfig</span> {
+    <span class="kw">pub</span> transport: <span class="cl">McpServerTransportConfig</span>,
+    <span class="kw">pub</span> auth: <span class="cl">McpAuth</span>,                          <span class="cmt">// 认证流程</span>
+    <span class="kw">pub</span> environment_id: <span class="kw">String</span>,               <span class="cmt">// 在哪个执行环境起</span>
+    <span class="kw">pub</span> enabled: <span class="kw">bool</span>,                          <span class="cmt">// 是否初始化</span>
+    <span class="kw">pub</span> required: <span class="kw">bool</span>,                         <span class="cmt">// codex exec 时失败是否报错退出</span>
+    <span class="kw">pub</span> supports_parallel_tool_calls: <span class="kw">bool</span>,   <span class="cmt">// 工具能否并行调用</span>
+    <span class="kw">pub</span> omit_tools_from: <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="cl">ToolExposureSurface</span>&gt;&gt;, <span class="cmt">// 从哪些模型面隐藏</span>
+    <span class="kw">pub</span> startup_timeout_sec: <span class="kw">Option</span>&lt;<span class="cl">Duration</span>&gt;,
+    <span class="kw">pub</span> tool_timeout_sec: <span class="kw">Option</span>&lt;<span class="cl">Duration</span>&gt;,     <span class="cmt">// 工具调用超时</span>
+    <span class="kw">pub</span> default_tools_approval_mode: <span class="kw">Option</span>&lt;<span class="cl">AppToolApproval</span>&gt;,
+    <span class="kw">pub</span> enabled_tools: <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="kw">String</span>&gt;&gt;,     <span class="cmt">// 工具白名单</span>
+    <span class="kw">pub</span> disabled_tools: <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="kw">String</span>&gt;&gt;,    <span class="cmt">// 工具黑名单</span>
+    <span class="kw">pub</span> scopes: <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="kw">String</span>&gt;&gt;,             <span class="cmt">// OAuth scopes</span>
+    <span class="kw">pub</span> oauth: <span class="kw">Option</span>&lt;<span class="cl">McpServerOAuthConfig</span>&gt;,
+    <span class="kw">pub</span> tools: <span class="kw">HashMap</span>&lt;<span class="kw">String</span>, <span class="cl">McpServerToolConfig</span>&gt;, <span class="cmt">// 逐工具审批设置</span>
+}</pre>
+
+    <p>这套字段体现了「细粒度治理」：<code class="inline">enabled_tools</code>/<code class="inline">disabled_tools</code> 让你只暴露一个 MCP 服务器里需要的几个工具；<code class="inline">default_tools_approval_mode</code> 与逐工具的 <code class="inline">tools</code> 覆盖，让审批策略可以精确到单个工具；<code class="inline">omit_tools_from</code> 能把某些工具从特定模型面（如某个子 Agent）隐藏。第 8 章的 <code class="inline">GranularApprovalConfig.mcp_elicitations</code> 也在此处生效——MCP 服务器的 elicitation 请求可以被整体关掉。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>Connectors：应用即工具</h2>
+    <p>Connectors（<code class="inline">connectors</code> crate）是 MCP 之上的更高层抽象：它把一个「应用」（如 GitHub、Slack）封装成有元数据、有缓存、有运行时上下文的可调用单元。ConnectorRuntimeManager 负责它们的生命周期与目录缓存。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/connectors/src/lib.rs</span>
+<span class="kw">pub struct</span> <span class="cl">ConnectorRuntimeManager</span> { .. }
+
+<span class="kw">pub struct</span> <span class="cl">DirectoryListResponse</span> {
+    apps: <span class="kw">Vec</span>&lt;<span class="cl">DirectoryApp</span>&gt;,
+    next_token: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,   <span class="cmt">// 分页游标</span>
+}
+
+<span class="kw">pub struct</span> <span class="cl">DirectoryApp</span> { .. }   <span class="cmt">// 目录里的一个应用</span>
+<span class="kw">pub struct</span> <span class="cl">AppInfo</span> { .. }        <span class="cmt">// 启用后解析出的应用信息</span>
+
+<span class="cmt">// 带缓存的目录查询，避免每次都去远端拉</span>
+<span class="kw">pub fn</span> cached_directory_connectors(cache_context) -&gt; <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="cl">AppInfo</span>&gt;&gt;</pre>
+
+    <p>Connectors 解决的是「应用生态」问题：一个企业可能有几十个内部系统，逐个写 MCP 服务器太重。Connector 框架提供统一的发现、缓存、路由机制——你可以把一组应用装进一个 marketplace，按需启用。这与第 11 章的多 Agent 协作紧密相关：某些 connector 本身就是「应用 Agent」。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>Plugins：可编程的扩展钩子</h2>
+    <p>Plugin（<code class="inline">plugin</code> + <code class="inline">core-plugins</code> crate）比 Connector 更底层，它提供<b>钩子（hooks）</b>——在 Agent 运行的特定时机插入自定义逻辑。一个 plugin 可以声明自己提供哪些能力。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/plugin/src/lib.rs</span>
+<span class="kw">pub struct</span> <span class="cl">PluginCapabilitySummary</span> { .. }   <span class="cmt">// 插件能力摘要</span>
+
+<span class="kw">pub struct</span> <span class="cl">PluginHookSource</span> { .. }        <span class="cmt">// 钩子来源</span>
+<span class="kw">pub struct</span> <span class="cl">ExecutorPluginHookSource</span> { .. } <span class="cmt">// 执行器侧钩子</span>
+
+<span class="lang-tag">codex-rs/core-plugins/src/lib.rs</span>
+<span class="kw">pub type</span> <span class="cl">LoadedPlugin</span> = codex_plugin::LoadedPlugin&lt;codex_config::McpServerConfig&gt;;
+<span class="cmt">// 一个 plugin 可以自带 MCP 服务器配置（overlay）</span></pre>
+
+    <p>关键设计在最后一行：一个 <code class="inline">LoadedPlugin</code> 参数化在 <code class="inline">McpServerConfig</code> 上，意味着<b>插件可以携带 MCP 服务器配置作为 overlay</b>。装一个 plugin，等于同时注入了它的钩子逻辑和它依赖的 MCP 工具服务器。这让插件成为一个自洽的能力包——这是 Codex 走向「应用市场」式分发的基石（<code class="inline">core-plugins</code> 里有 <code class="inline">manager</code> 模块管 <code class="inline">ConfiguredMarketplacePlugin</code>）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.6</span>Skills：可审批的脚本化工作流</h2>
+    <p>Skill 是面向「重复性操作」的扩展：把一套多步操作封装成脚本，模型按需调用。与普通工具不同，Skill 执行走<b>独立的审批通道</b>——这正是第 8 章 <code class="inline">GranularApprovalConfig.skill_approval</code> 的由来。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/skills/src/lib.rs</span>
+<span class="cmt">// 系统级 skill 安装到 codex_home 下的缓存目录</span>
+<span class="kw">pub fn</span> system_cache_root_dir(codex_home) -&gt; <span class="cl">AbsolutePathBuf</span>;
+<span class="kw">pub fn</span> install_system_skills(codex_home) -&gt; <span class="cl">Result</span>&lt;(), <span class="cl">SystemSkillsError</span>&gt;;
+
+<span class="kw">pub enum</span> <span class="cl">SystemSkillsError</span> { .. }</pre>
+
+    <p>Skill 的特殊性在于它执行的是<b>脚本</b>（可能是 shell、python），而脚本天然比单条命令更难静态审计。所以 Codex 给它单独的审批开关：<code class="inline">skill_approval: false</code> 时，skill 脚本的执行请求会被直接 Forbidden（而非弹窗），让自动审核场景不被挂起。这是「能力越强、管控越细」原则的体现。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.7</span>ToolSearch：动态工具发现</h2>
+    <p>当挂载的工具太多（几十个 MCP 服务器，上百个工具），把它们全塞进系统提示会爆上下文。<code class="inline">ToolSearch</code> 变体解决这个问题：模型不直接看到所有工具，而是先调用 <code class="inline">tool_search</code> 按需检索，再调用检索到的具体工具。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/tools/src/tool_spec.rs:27</span>
+<span class="cl">ToolSearch</span> {
+    execution: <span class="kw">String</span>,      <span class="cmt">// 检索执行方式</span>
+    description: <span class="kw">String</span>,    <span class="cmt">// 给模型看的说明</span>
+    parameters: <span class="cl">JsonSchema</span>, <span class="cmt">// 检索参数 schema</span>
+}</pre>
+
+    <div class="callout tip">
+      <b class="tag">为什么这很重要</b>
+      ToolSearch 是 Agent 处理「工具爆炸」的标准解法。想象一个接了 50 个企业系统的 Codex——不可能把 50 套工具的 schema 都塞进上下文。用 ToolSearch，模型只在需要 Jira 时搜出 <code class="inline">jira_*</code> 工具，用完即弃。这与第 5 章的上下文工程、第 6 章的压缩是一脉相承的「按需加载」哲学。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.8</span>三层扩展的关系</h2>
+    <table class="tbl">
+      <thead><tr><th>层</th><th>粒度</th><th>典型形态</th><th>审批通道</th></tr></thead>
+      <tbody>
+        <tr><td>MCP Server</td><td>单工具服务器</td><td>stdio/HTTP 进程</td><td>per-tool / default_tools_approval_mode</td></tr>
+        <tr><td>Connector</td><td>应用</td><td>带目录缓存的应用包</td><td>AppToolApproval</td></tr>
+        <tr><td>Plugin</td><td>能力包（hooks + MCP overlay）</td><td>marketplace 分发</td><td>requirements 约束</td></tr>
+        <tr><td>Skill</td><td>脚本工作流</td><td>多步脚本</td><td>skill_approval 独立开关</td></tr>
+      </tbody>
+    </table>
+
+    <p>四者并非互斥，而是<b>组合</b>：一个 plugin 可以带 MCP overlay，一个 connector 可以暴露多个 MCP 工具，一个 skill 可以调用任意工具。它们共同构成 Codex 的「能力长尾」——核心保持精简，长尾靠扩展。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.9</span>小结与对自研的启示</h2>
+    <div class="callout tip">
+      <b class="tag">自研 checklist</b>
+      扩展性要<b>早设计、晚实现</b>——先把接入面定下来。<strong>① 统一 ToolSpec</strong>——无论内置还是扩展，对外都是同一种 function 描述，模型不需要区分来源。<strong>② 传输分层</strong>——本地用 stdio，远程用 HTTP，密钥走环境变量不落配置。<strong>③ 细粒度治理</strong>——每个扩展点都要有白/黑名单、超时、审批模式、可见性控制，否则企业不敢用。<strong>④ 动态发现</strong>——工具多了就要 ToolSearch，别硬塞上下文。<strong>⑤ 能力打包</strong>——plugin 把「逻辑 + 依赖的 MCP 配置」打成一体，是分发能力的正确粒度。
+    </div>
+    <div class="callout info">
+      <b class="tag">一句话</b>
+      Codex 的扩展哲学：<b>「统一接入面 + 分层治理 + 按需发现」</b>。MCP/Connector/Plugin/Skill 四条线，最终都坍缩进同一个 ToolSpec，让 Agent 的能力可以无限生长，而核心循环一行不改。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="09-config.html">← 09 配置系统</a>
+    <a href="11-multi-agent.html">下一步：多 Agent 与协作 →</a>
+  </div>
+</div>
+
+<footer>
+  Codex CLI · 10 MCP 与扩展 · 版本 rusty-v8-v150.4.0-1109-gd52478c52e · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

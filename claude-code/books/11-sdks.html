@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · SDK 与程序化集成 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 SDK 与程序化集成</div>
+    <h1>SDK 与程序化集成：把内核当库用</h1>
+    <div class="subtitle">交互式 TUI 只是外壳之一。Claude Agent SDK 让你把同一个 agentic 内核当库嵌进自己的程序——无人值守、流式消费、注入自定义工具与 MCP。这一章拆 SDK 的查询/流式模型、headless 自动化，以及云网关部署。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">定位</span>
+    <span class="ep-quote">同一内核，SDK 外壳：驱动者是代码，结果是事件流。</span>
+    <span class="ep-arrow">→</span>
+    对应第 2 章架构图 L1 的 SDK 形态。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>一分钟版本</h2>
+    <p>Claude Agent SDK 把 agentic 内核暴露成<strong>可编程接口</strong>：你发一个 prompt，它返回一个<strong>异步迭代器</strong>，逐个 yield 出消息。背后就是第 3 章那套循环在转——SDK 自动执行工具、回灌结果、继续推进——你只管消费输出。</p>
+    <p>它和 TUI 的差别在四点：<strong>驱动者</strong>是代码而非人、<strong>确认</strong>通常跳过或自定义、<strong>输出</strong>是结构化事件而非终端打印、<strong>场景</strong>是 CI/脚本/批处理而非交互。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>查询与流式：消费事件流</h2>
+    <div class="code-title">SDK 概念示例：发起一次 agentic 查询并消费流（伪代码；包名 <code class="inline">@anthropic-ai/claude-agent-sdk</code>，旧入口 <code class="inline">@anthropic-ai/claude-code</code> 已移除）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">import</span> { query } <span class="kw">from</span> <span class="st">"@anthropic-ai/claude-agent-sdk"</span>;
+
+<span class="kw">const</span> conversation = query({
+  prompt: <span class="st">"修复 src/api 下所有失败的测试，跑通为止"</span>,
+  options: {
+    maxTurns: <span class="nu">20</span>,                  <span class="cmt">// 循环上限，防失控</span>
+    allowedTools: [<span class="st">"Bash"</span>, <span class="st">"Read"</span>, <span class="st">"Edit"</span>],  <span class="cmt">// 限定可用工具</span>
+    permissionMode: <span class="st">"bypassPermissions"</span>   <span class="cmt">// headless 自动化，按需</span>
+  }
+});
+
+<span class="kw">for await</span> (<span class="kw">const</span> message <span class="kw">of</span> conversation) {
+  <span class="kw">for</span> (<span class="kw">const</span> block <span class="kw">of</span> message.content) {
+    <span class="kw">if</span> (block.type === <span class="st">"text"</span>)
+      process.stdout.write(block.text);          <span class="cmt">// 文本增量</span>
+    <span class="kw">else if</span> (block.type === <span class="st">"tool_use"</span>)
+      console.log(<span class="st">`[工具] </span>${block.name}<span class="st">`</span>);    <span class="cmt">// 工具调用</span>
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 表面是 <code class="inline">for await</code>，背后是完整 agentic 循环。三个关键点：<strong>① <code class="inline">maxTurns</code></strong>——SDK 没有人在场按 Esc，必须设循环上限防失控（呼应第 3 章终止条件）。<strong>② <code class="inline">allowedTools</code></strong>——程序化场景应收窄工具集，最小权限。<strong>③ <code class="inline">permissionMode</code></strong>——无人值守要么跳过确认（仅限可信环境），要么自定义确认逻辑。你消费的是<strong>循环的输出流</strong>，循环本身被 SDK 封装。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>消息块类型</h2>
+    <p>流里 yield 出的 message，其 content 是若干块。常见的块类型：</p>
+    <table class="tbl">
+      <tr><th>块类型</th><th>含义</th></tr>
+      <tr><td><code class="inline">text</code></td><td>模型的文本回答（增量）</td></tr>
+      <tr><td><code class="inline">tool_use</code></td><td>模型声明要调某工具</td></tr>
+      <tr><td><code class="inline">tool_result</code></td><td>工具执行结果</td></tr>
+      <tr><td>thinking / 推理</td><td>模型的中间思考（若开启）</td></tr>
+    </table>
+    <p>程序按需过滤这些块——比如只关心 <code class="inline">tool_use</code> 做审计日志，或只取 <code class="inline">text</code> 拼最终答案。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>注入自定义工具与 MCP</h2>
+    <p>SDK 不只能用内置工具，还能注入<strong>自定义工具</strong>（你的函数）和<strong>MCP 服务器</strong>（第 12 章）。这让 Claude Code 成为「嵌进任意系统」的引擎：</p>
+    <ul>
+      <li><strong>自定义工具</strong>：注册一个函数，模型可以像调 Bash 一样调它——比如调你内部的部署 API。</li>
+      <li><strong>MCP 注入</strong>：接上 MCP 服务器，模型获得访问数据库 / 内部系统的新工具集。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">真实范本</b>
+      <code class="inline">plugins/agent-sdk-dev</code> 就是「用 SDK 搭应用」的开发套件——带 <code class="inline">/new-sdk-app</code> 命令交互式搭建新 Agent SDK 项目，还有 <code class="inline">agent-sdk-verifier-py/ts</code> 两个子代理校验你的 SDK 应用是否符合最佳实践。它本身就是 SDK 用法的产品级示范。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>headless 自动化场景</h2>
+    <table class="tbl">
+      <tr><th>场景</th><th>怎么用 SDK</th></tr>
+      <tr><td>CI 里自动修测试</td><td>失败时跑一次 query，<code class="inline">maxTurns</code> 限死，结束取结果</td></tr>
+      <tr><td>批量代码迁移</td><td>对一批文件循环调 query，脚本驱动</td></tr>
+      <tr><td>构建自定义助手</td><td>SDK 做内核，外面包你自己的 UI/CLI</td></tr>
+      <tr><td>GitHub 上 @claude</td><td>事件触发 SDK 跑，结果回写 PR 评论</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自动化的安全</b>
+      无人值守 = 没人拦。务必：<strong>① 收窄 <code class="inline">allowedTools</code></strong>；<strong>② 跑在隔离环境</strong>（容器/VM）；<strong>③ 设 <code class="inline">maxTurns</code> 防失控</strong>；<strong>④ 谨慎用 bypassPermissions</strong>，能用沙箱就用沙箱（第 6 章）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.6</span>云网关部署（examples/gateway）</h2>
+    <p>把 Claude Code 跑到云端、给团队共享，需要一道<strong>网关</strong>。本仓库 <code class="inline">examples/gateway/</code> 提供了 GCP 与 AWS 的真实部署工件：</p>
+    <table class="tbl">
+      <tr><th>云</th><th>工件</th><th>架构</th></tr>
+      <tr><td>GCP</td><td><code class="inline">Dockerfile</code> / <code class="inline">setup.sh</code> / <code class="inline">gateway.yaml.example</code> / <code class="inline">terraform/</code></td><td>Cloud Run 或 GKE + Cloud SQL + Secret Manager，上游接 Agent Platform</td></tr>
+      <tr><td>AWS</td><td>同上结构</td><td>对应的 AWS 资源 + Terraform</td></tr>
+    </table>
+    <p>网关把 <code class="inline">claude gateway</code> 二进制跑成服务，配上游 IdP 与模型供应方。这是「把 SDK 内核做成多用户服务」的工程化范本——适合组织内集中托管。</p>
+    <div class="annotation"><b>读法：</b> 这些是<strong>参考部署</strong>而非受支持的产品（README 原话：「working example rather than a supported production deployment」）。意思是结构可学、细节要按自己环境改——Terraform 两遍 apply 的注释就是典型「真实工程坑」的提示。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.7</span>对使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① SDK = 可编程的同一内核</strong>——交互能做的，程序化都能做，且更适合批处理。<strong>② 消费事件流而非死等</strong>——流式让你边跑边处理、随时 abort。<strong>③ 自动化要戴护具</strong>——限工具、限轮次、跑沙箱。<strong>④ 网关是团队化的下一步</strong>——从「单机 SDK」到「组织共享服务」，仓库的 gateway 示例是起点。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="10-plugins.html">← 上一页：插件与 Skills</a>
+    <a href="12-mcp.html">下一步：MCP 外接工具 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 11 SDK 与程序化集成 · 仓库实例路径以最新为准
+</footer>
+
+</body>
+</html>

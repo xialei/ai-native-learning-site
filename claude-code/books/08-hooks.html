@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Hooks 生命周期 — Claude Code 深入浅出</title>
+<link rel="stylesheet" href="assets/cc-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Claude Code 深入浅出</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-what-is.html">是什么</a>
+      <a href="02-architecture.html">架构</a>
+      <a href="03-agentic-loop.html">Agentic 循环</a>
+      <a href="04-context.html">上下文</a>
+      <a href="05-tools.html">工具</a>
+      <a href="06-permissions.html">权限</a>
+      <a href="07-subagents.html">子代理</a>
+      <a href="08-hooks.html">Hooks</a>
+      <a href="09-settings.html">配置体系</a>
+      <a href="10-plugins.html">插件</a>
+      <a href="11-sdks.html">SDK 与集成</a>
+      <a href="12-mcp.html">MCP</a>
+      <a href="13-workflows.html">实战工作流</a>
+      <a href="14-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 Hooks 生命周期</div>
+    <h1>Hooks 生命周期：把你的逻辑焊进循环</h1>
+    <div class="subtitle">★ 重点。循环的每个关节——工具调用前后、会话起止——都能挂你自己的脚本。这一章拆开 Hooks 的事件类型、stdin/stdout JSON 协议、退出码语义，并用仓库里真实的 Bash 命令校验器做范本。</div>
+  </div>
+
+  <div class="epigraph">
+    <span class="ep-tag">定位</span>
+    <span class="ep-quote">权限决定工具能不能跑，Hooks 决定跑前后插什么逻辑——拦危险、自动格式化、注入规范。</span>
+    <span class="ep-arrow">→</span>
+    它是循环的「焊点」。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一分钟版本</h2>
+    <p>Hooks 让你在 agentic 循环的生命周期点上运行<strong>任意脚本</strong>。脚本的通信契约很简单：<strong>从 stdin 收一段 JSON，用 stdout / 退出码回话</strong>。最强大的是 PreToolUse——它能在工具执行前<strong>拦截</strong>，甚至阻止调用并把原因告诉模型，让模型换路。</p>
+    <p>本仓库里有大量真实用法：<code class="inline">plugins/security-guidance</code> 用 PostToolUse（编辑文件后）+ Stop（提交/推送时）监测约 25 类安全问题；<code class="inline">plugins/explanatory-output-style</code> 与 <code class="inline">learning-output-style</code> 用 SessionStart 注入教学上下文；<code class="inline">plugins/ralph-wiggum</code> 用 Stop 拦截退出、让循环继续。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>钩子事件一览</h2>
+    <table class="tbl">
+      <tr><th>事件</th><th>何时触发</th><th>能做什么</th><th>真实范例</th></tr>
+      <tr><td>PreToolUse</td><td>工具执行前</td><td>拦截/阻止/改写命令</td><td>bash 校验器</td></tr>
+      <tr><td>PostToolUse</td><td>工具执行后</td><td>校验结果、自动格式化</td><td>security-guidance（编辑后内容审查）</td></tr>
+      <tr><td>SessionStart</td><td>会话开始</td><td>注入上下文/规范</td><td>explanatory/learning-output-style</td></tr>
+      <tr><td>SessionEnd</td><td>会话结束</td><td>清理/收尾</td><td>—</td></tr>
+      <tr><td>UserPromptSubmit</td><td>用户提交提示时</td><td>预处理/拦截输入</td><td>hookify 的 userpromptsubmit.py、security-guidance</td></tr>
+      <tr><td>PreCompact</td><td>上下文压缩前</td><td>注入压缩摘要</td><td>—</td></tr>
+      <tr><td>Stop</td><td>代理尝试结束</td><td>拦截退出、强制继续</td><td>ralph-wiggum 的 stop-hook.sh、security-guidance</td></tr>
+      <tr><td>SubagentStop</td><td>子代理结束</td><td>同上，针对子代理</td><td>—</td></tr>
+      <tr><td>Notification</td><td>需要通知用户时</td><td>自定义通知渠道</td><td>—</td></tr>
+    </table>
+    <div class="annotation"><b>覆盖面：</b> 从「会话级」（SessionStart/Stop）到「单次工具级」（Pre/PostToolUse）再到「输入级」（UserPromptSubmit），循环的每个关节都有挂载点。这意味着你能在<strong>不碰内核</strong>的前提下，重塑模型的行为——这正是扩展层（第 2 章 L2）的力量。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>stdin/stdout JSON 协议</h2>
+    <p>Hook 是一个被 Claude Code 拉起的进程。它从 stdin 读一段 JSON，包含会话与工具的上下文：</p>
+    <div class="code-title">概念示例：PreToolUse 收到的 stdin JSON</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"session_id"</span>: <span class="st">"abc123..."</span>,
+  <span class="st">"hook_event_name"</span>: <span class="st">"PreToolUse"</span>,
+  <span class="st">"tool_name"</span>: <span class="st">"Bash"</span>,            <span class="cmt">// 要调的工具</span>
+  <span class="st">"tool_input"</span>: {
+    <span class="st">"command"</span>: <span class="st">"grep -r foo src/"</span>   <span class="cmt">// 工具的参数</span>
+  },
+  <span class="st">"cwd"</span>: <span class="st">"/home/me/project"</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> Hook 拿到的是<strong>结构化的工具调用意图</strong>——工具名、参数、当前目录、会话 id。所以它能做精细判断：比如看到 <code class="inline">tool_name=="Bash"</code> 且 <code class="inline">command</code> 以 <code class="inline">grep</code> 开头，就建议改用 <code class="inline">rg</code>（这正是仓库范例做的事，见 §8.5）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>退出码语义：控制的核心</h2>
+    <p>Hook 怎么「回话」？靠<strong>退出码</strong>。这套语义是 Hooks 控制循环的核心：</p>
+    <table class="tbl">
+      <tr><th>退出码</th><th>含义</th><th>stdout/stderr 去向</th></tr>
+      <tr><td><code class="inline">0</code></td><td>成功放行，继续执行工具</td><td>stdout 给用户看（不给模型）</td></tr>
+      <tr><td><code class="inline">2</code></td><td><strong>阻止</strong>工具调用</td><td>stderr 给<strong>模型</strong>看（模型会据此调整）</td></tr>
+      <tr><td>其他非零</td><td>Hook 自身出错</td><td>给用户看，不阻止执行</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">最关键的一招：退出码 2</b>
+      <strong>退出码 2 不是简单拒绝，而是「教模型」</strong>——stderr 的内容会进入模型上下文，模型看到「为什么被拦」后会换策略。比如拦下 <code class="inline">rm -rf</code> 并写「禁止递归删除，请改用 <code class="inline">git clean</code>」，模型下一轮就真的会换。这让 Hook 成了<strong>可教学的护栏</strong>，而非死板的墙。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>真实范例：Bash 命令校验器</h2>
+    <p>本仓库 <code class="inline">examples/hooks/bash_command_validator_example.py</code> 是一个完整的 PreToolUse Hook，它把 <code class="inline">grep</code> 改写成 <code class="inline">rg</code>、把 <code class="inline">find -name</code> 改写成 <code class="inline">rg --files</code>。先看它怎么在配置里挂上去：</p>
+    <div class="code-title">settings.json — 挂载 PreToolUse Hook（来自范例文件头注释）</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"hooks"</span>: {
+    <span class="st">"PreToolUse"</span>: [
+      {
+        <span class="st">"matcher"</span>: <span class="st">"Bash"</span>,                 <span class="cmt">// 只匹配 Bash 工具</span>
+        <span class="st">"hooks"</span>: [
+          {
+            <span class="st">"type"</span>: <span class="st">"command"</span>,
+            <span class="st">"command"</span>: <span class="st">"python3 /path/to/bash_command_validator_example.py"</span>
+          }
+        ]
+      }
+    ]
+  }
+}</pre>
+    <p>再看脚本本身的核心逻辑：</p>
+    <div class="code-title">examples/hooks/bash_command_validator_example.py（真实仓库内容，节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> json, re, sys
+
+<span class="cmt"># 校验规则：(正则, 提示) —— 命中就建议改用更优命令</span>
+_VALIDATION_RULES = [
+    (r<span class="st">"^grep\b(?!.*\|)"</span>,
+     <span class="st">"Use 'rg' (ripgrep) instead of 'grep' ..."</span>),
+    (r<span class="st">"^find\s+\S+\s+-name\b"</span>,
+     <span class="st">"Use 'rg --files | rg pattern' instead of 'find -name' ..."</span>),
+]
+
+<span class="kw">def</span> <span class="fn">main</span>():
+    input_data = json.load(sys.stdin)            <span class="cmt"># 读 stdin JSON</span>
+    <span class="kw">if</span> input_data.get(<span class="st">"tool_name"</span>) != <span class="st">"Bash"</span>:
+        sys.exit(0)                              <span class="cmt"># 非 Bash，放行</span>
+    command = input_data.get(<span class="st">"tool_input"</span>, {}).get(<span class="st">"command"</span>, <span class="st">""</span>)
+    issues = [msg <span class="kw">for</span> pat, msg <span class="kw">in</span> _VALIDATION_RULES <span class="kw">if</span> re.search(pat, command)]
+    <span class="kw">if</span> issues:
+        <span class="kw">for</span> m <span class="kw">in</span> issues: print(f<span class="st">"• {m}"</span>, file=sys.stderr)
+        sys.exit(2)                              <span class="cmt"># 退出码 2：阻止 + 告知模型原因</span></pre>
+    <div class="annotation"><b>逐行读懂这段：</b> <strong>① 配置里 <code class="inline">matcher:"Bash"</code></strong>——只对 Bash 工具触发，别的工具不惊动。<strong>② <code class="inline">json.load(sys.stdin)</code></strong>——读入 §8.3 那段 JSON。<strong>③ 先判 <code class="inline">tool_name</code></strong>——双保险，非 Bash 直接 exit 0 放行。<strong>④ 正则匹配命令</strong>——命中 <code class="inline">grep</code>/<code class="inline">find -name</code> 就收集提示。<strong>⑤ <code class="inline">sys.exit(2)</code></strong>——阻止这次 Bash 调用，并把「该用 rg」写进 stderr 给模型。下一轮模型就会改用 <code class="inline">rg</code>。一个几十行的脚本，就在循环里焊进了一条「自动纠偏」规则。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>matcher 与作用域</h2>
+    <p>Hooks 用 <code class="inline">matcher</code> 按工具名匹配（如 <code class="inline">"Bash"</code>、<code class="inline">"Write"</code>，或多个）。更复杂的护栏可以监测命令内容——<code class="inline">plugins/security-guidance</code> 用 PostToolUse（matcher <code class="inline">Edit|Write|MultiEdit|NotebookEdit</code>）在文件写入后监测<strong>约 25 类安全模式</strong>：</p>
+    <ul>
+      <li>GitHub Actions 注入、<code class="inline">eval</code>、<code class="inline">dangerouslySetInnerHTML</code>、pickle 反序列化、<code class="inline">os.system</code>、<code class="inline">subprocess shell=True</code>、不安全 <code class="inline">yaml.load</code>、TLS 校验关闭、<code class="inline">torch.load</code>……</li>
+    </ul>
+    <p>它在编辑文件后做内容级提醒，并在 <code class="inline">git commit</code>/<code class="inline">git push</code> 与会话 Stop 时跑 diff 审查——说明 Hook 不只能拦 Bash，也能在文件写入后、提交时、退出前做内容级检查。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>Hooks 在循环里的位置</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t87 d87">
+        <title id="t87">Hooks 挂在循环的工具执行节点上</title>
+        <desc id="d87">PreToolUse 在执行前，PostToolUse 在执行后</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c5248"></path>
+          </marker>
+        </defs>
+        <rect class="node core" x="30" y="110" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="105" y="140" text-anchor="middle">模型 tool_use</text>
+        <path class="edge" d="M180 135 L240 135" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="240" y="110" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="315" y="135" text-anchor="middle">PreToolUse</text>
+        <text class="lbl sm" x="315" y="150" text-anchor="middle">可拦截/阻止</text>
+        <path class="edge" d="M390 135 L450 135" marker-end="url(#arrow)"></path>
+
+        <rect class="node" x="450" y="110" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="525" y="140" text-anchor="middle">执行工具</text>
+        <path class="edge" d="M600 135 L660 135" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="660" y="110" width="150" height="50" rx="8"></rect>
+        <text class="lbl" x="735" y="135" text-anchor="middle">PostToolUse</text>
+        <text class="lbl sm" x="735" y="150" text-anchor="middle">可校验结果</text>
+        <path class="edge" d="M735 160 L735 200 L525 200 L525 160" marker-end="url(#arrow)"></path>
+        <text class="lbl sm" x="560" y="220" text-anchor="middle">tool_result 回灌给模型</text>
+
+        <text class="lbl sm" x="30" y="255">权限（第 6 章）与 Hooks 都挂在「执行工具」前后——权限决定跑不跑，Hooks 决定跑前后做什么。</text>
+      </svg>
+      <div class="fig-cap">图 8.1：PreToolUse 与 PostToolUse 夹住「执行工具」节点。这条链把第 3/5/6/8 章串起来。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.8</span>企业可锁定 Hooks</h2>
+    <p>和权限一样，Hooks 也能被企业收口。<code class="inline">examples/settings/settings-strict.json</code> 里有 <code class="inline">allowManagedHooksOnly: true</code>——开了之后，用户和项目自己定义的 Hooks <strong>全部失效</strong>，只认企业下发的。</p>
+    <div class="callout info">
+      <b class="tag">为什么</b>
+      Hook 能拦工具、能注入上下文，能力很大——也可能被滥用（比如恶意 Hook 偷数据）。所以受监管环境会要求「只允许 IT 审过的 Hooks」。<code class="inline">allowManagedHooksOnly</code> 就是这道闸，和 <code class="inline">allowManagedPermissionRulesOnly</code> 配对，把扩展层的自由度也锁进企业策略。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.9</span>对使用的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      <strong>① Hooks 是循环的焊点</strong>——不碰内核就能重塑行为。<strong>② 退出码 2 是可教学的护栏</strong>——拦下并告诉模型原因，它会换路，比硬拒绝聪明。<strong>③ PreToolUse 做护栏</strong>、PostToolUse 做校验、SessionStart 做注入——按事件性质选。<strong>④ 企业用 allowManagedHooksOnly 锁定</strong>——能力越大，越要受控。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="07-subagents.html">← 上一页：子代理与并行</a>
+    <a href="09-settings.html">下一步：配置体系 →</a>
+  </div>
+</div>
+
+<footer>
+  Claude Code 深入浅出 · 08 Hooks 生命周期 · 仓库实例路径以最新为准
+</footer>
+
+</body>
+</html>
