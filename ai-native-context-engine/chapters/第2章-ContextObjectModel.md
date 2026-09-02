@@ -163,10 +163,16 @@ context:
   actions: []
   documents: []
   policy: {}
+  provenance: []    # 包级来源记录：本 Package 由哪些查询、种子对象、缓存条目构成
   trace: {}
   token_budget: 24000
   schema_version: "1.0"
 ```
+
+`provenance` 在两个层面出现，职责不同：
+
+- **对象级**（§2 通用元数据）：记录单个对象来自哪个源系统的哪条记录，服务于对象合并与置信度计算。
+- **包级**（本节）：记录整个 Package 的构成——原始查询、种子对象 ID、是否命中缓存、各阶段策略版本。它是第 10 章 Replay 与 Diff 的输入契约：没有包级 provenance，历史 Context 无法精确复现。
 
 Agent 只消费 Context Package，而不是直接消费 Prompt。
 
@@ -227,3 +233,17 @@ Agent
 ## 12. 本章小结
 
 Object 是 Context Engine 的一等公民，Document 是一种对象来源和证据载体。Knowledge Builder 负责生成对象，Retrieval 和 Expansion 负责发现对象，Ranking 和 Optimizer 负责选择表达方式，Agent 最终消费标准化 Context Package。
+
+## 13. 全书术语表
+
+| 术语 | 含义 |
+|------|------|
+| Context Engine | 本书设计的核心系统；位于 Hybrid Retrieval 与 Prompt Builder 之间的上下文构建引擎（第 1 章） |
+| AKR（AI Knowledge Runtime） | 平台层总称，Context Engine 是其核心引擎（第 14 章） |
+| Context Package | 本章 §8 定义的十一字段输出契约；写作上始终带空格，不写 ContextPackage |
+| Intent Planner | 第 1 章 §4 模块，决定 Retriever 路由、扩展方向、压缩取舍与 Ranking 因子偏置；"Intent" 单独出现时指其输出的意图信号 |
+| 评测器（verifier） | 判定任务成败的验证环节，第 10 章 §19 失败记录与第 14 章 §5 改进环使用同一称谓 |
+| 策略包（policy pack） | 可版本化、可评估的上下文管理策略配置单元（第 7 章 MCE） |
+| 编辑日志（Change Manifest） | 第 10 章 §19 定义的六字段可证伪配置变更日志 |
+| OAG | Palantir 的 Object Augmented Graph（对象增强图），对比用外部概念（第 14 章 §10） |
+| Domain Context Plugin | 领域插件（第 11/12 章的 Research/Business Context），只提供映射与参数，不新增平台对象类别 |

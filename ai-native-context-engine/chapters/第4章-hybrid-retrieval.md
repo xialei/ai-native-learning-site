@@ -1,6 +1,6 @@
 # 第4章 Context Retrieval Framework 技术架构设计
 
-> AI Knowledge Runtime（AKR）核心模块
+> Context Engine 核心模块
 >
 > Version：v1.0
 >
@@ -174,7 +174,9 @@ Semantic Search
 
 向量检索的工业落地路径固定：文本先分块，再 embedding，存进向量属性，最后做 KNN 近邻查询。分块尤其关键——embedding 模型有输入长度上限，整篇长文档一起嵌入语义会被"稀释"，切成更小片段区分度才高。Palantir Foundry 的语义搜索就是按这条链路走：文本转向量，存进 Ontology 的 vector 类型属性，再由 KNN 查询消费；它的 vector 属性只接受 KNN 查询、不能用在 Action 里、最大维度 2048。本书 Vector Retriever 应遵循"分块-嵌入-近邻"范式，而不是对整篇文档直接嵌入。<span class="src">来源：Foundry Ontology 文档，Ontology search</span>
 
----## 4.3 Graph Retriever
+---
+
+## 4.3 Graph Retriever
 
 适用于：
 
@@ -488,29 +490,16 @@ type Retriever interface {
 
 统一输出：
 
-```text
-ContextPackage
+Context Package，字段以第 2 章 §8 的契约为准（objects / relations / events / metrics / actions / documents / policy / provenance / trace / token_budget / schema_version），本章不重新定义。
 
-├── Objects
+两点说明：
 
-├── Relations
-
-├── Documents
-
-├── Events
-
-├── Metrics
-
-├── Actions
-
-├── Confidence
-
-└── Trace
-```
+- `confidence` 是第 2 章 §2 定义的**对象级**元数据，随 objects 内的每个对象携带，不是 Package 级字段。
+- Retrieval 阶段产出的包是**候选包**：token_budget 尚未经过第 7 章 Context Optimizer 的裁剪，objects 数量多于最终包。
 
 Context Engine 后续所有模块：
 
-均基于 ContextPackage 工作。
+均基于 Context Package 工作。
 
 ---
 
@@ -572,8 +561,6 @@ Hybrid Retrieval 的目标不是"检索文档"。
 而是：
 
 **从企业所有知识源中，统一检索对象（Object）、关系（Relation）、事件（Event）、指标（Metric）、动作（Action），最终构建 Agent 可直接消费的 Context。**
-
-```
 
 ---
 

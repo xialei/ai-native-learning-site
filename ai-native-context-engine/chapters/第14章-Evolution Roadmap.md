@@ -1,6 +1,6 @@
 # 第14章 Evolution Roadmap（演进路线）
 
-> AI Knowledge Runtime（AKR）
+> Context Engine（AKR）演进路线
 >
 > Version：v1.0
 >
@@ -10,7 +10,7 @@
 
 # 1. 产品愿景
 
-AI Knowledge Runtime（AKR）的最终目标不是构建一个更好的 RAG。
+AI Knowledge Runtime（AKR，本书平台层的总称；Context Engine 是其核心引擎，见第 2 章 §13 术语表）的最终目标不是构建一个更好的 RAG。
 
 而是：
 
@@ -70,7 +70,7 @@ AI Operating System
 
 每一个阶段：
 
-都是完整产品。
+都以"该阶段能力可独立交付、并支撑至少一个付费场景"为完成标准（验收指标见各 Phase 末行）。
 
 ---
 
@@ -96,9 +96,11 @@ AI Operating System
 
 企业知识助手。
 
+验收指标：Package 生成 P95 延迟、token_budget 命中率、检索召回@k。
+
 研发周期：
 
-3~4个月。
+3~4个月（里程碑 M1：Ontology + Knowledge Builder；M2：Hybrid Retrieval + Context Package + Prompt Builder）。
 
 ---
 
@@ -134,9 +136,11 @@ Business Copilot
 
 Coding Copilot
 
+验收指标：扩展命中率、缓存命中率、Trace 覆盖率。
+
 研发周期：
 
-4~6个月。
+4~6个月（里程碑 M3：Graph Expansion + Context Ranking；M4：Context Optimizer + Context Cache；M5：Context Runtime + Context Trace）。
 
 ---
 
@@ -170,9 +174,13 @@ Business Runtime。
 
 行业 Agent 平台。
 
+验收指标：多 Agent 合并冲突率、订阅端到端延迟、实时 Context 陈旧度上限。
+
 研发周期：
 
-6~9个月。
+6~9个月（里程碑 M6：领域插件 Research/Business Context；M7：Realtime Context + Workflow；M8：Multi-Agent Context + Event Bus）。
+
+依赖：Phase 2 的 Context Runtime（Version/Delta/Snapshot）与 Context Cache（Realtime 依赖缓存降延迟）、第 8 章的 Version/Lock/Merge（Multi-Agent 依赖）。
 
 ---
 
@@ -196,149 +204,34 @@ Context 成为企业 AI 操作系统。
 
 ✓ Autonomous Workflow
 
-最终：
+验收指标：协议跨租户兼容性、插件接入工时。
 
-形成：
+依赖：Phase 3 的 Multi-Agent Context（协议在本书中已由第 13 章定义雏形，本阶段做标准化与跨租户实现）、第 11/12 章的插件体系（Marketplace 依赖）。
 
-Enterprise AI OS。
+研发周期：
 
----
-
-# 3. MVP（6个月）
-
-第一阶段：
-
-重点：
-
-能够支撑：
-
-Research Agent。
-
-建议：
-
-```
-Hybrid Retrieval
-
-+
-
-Context Package
-
-+
-
-Graph Expansion
-
-+
-
-Context Ranking
-
-+
-
-Prompt Builder
-```
-
-暂时：
-
-不要：
-
-复杂 Workflow。
-
-不要：
-
-Distributed Runtime。
-
-保证：
-
-简单。
-
-稳定。
+9~12个月（里程碑 M9：Context Protocol 标准化 + 插件 Marketplace；M10：Scheduler / Federation，其中 Scheduler 与 Federation 本书只给出职责边界，详细设计超出本书范围）。
 
 ---
 
-# 4. V2（12个月）
+# 3. 时间线对照（MVP → V4）
 
-重点：
+上面四个 Phase 是**能力划分**；本节给一套按月份推进的**交付时间线**。二者不是两套路线图——时间线上的每个节点都是某个 Phase 的里程碑子集，能力只出现一次（标注所属 Phase），不再重复罗列。
 
-Business Context。
+| 时间点 | 交付内容 | 所属 Phase / 里程碑 |
+|--------|---------|--------------------|
+| 6个月（MVP） | Hybrid Retrieval + Context Package + Graph Expansion + Context Ranking + Prompt Builder，支撑 Research Agent | Phase 1 M2 + Phase 2 M3 |
+| 12个月（V2） | + Context Optimizer / Cache / Trace，+ Business & Research 领域插件，支撑多 Agent 只读场景 | Phase 2 M4~M5 + Phase 3 M6 |
+| 18个月（V3） | + Realtime Context / Workflow / Event Bus / Multi-Agent Context（Version / Delta / Snapshot 在此阶段随 Runtime 完整交付） | Phase 3 M7~M8 |
+| 24个月（V4） | + Context Protocol 标准化 + Plugin Marketplace | Phase 4 M9 |
 
-新增：
-
-```
-Business Context
-
-Research Context
-
-Realtime Context
-
-Context Cache
-
-Trace
-
-Debugger
-```
-
-支持：
-
-多个：
-
-Agent。
+MVP 阶段刻意不做的事：复杂 Workflow、Distributed Runtime、Multi-Agent 写入——保证简单稳定；这些能力在 V3 由 Phase 3 承接。Context Federation 与 Context Scheduler 属于 Phase 4 的 M10，超出 24 个月时间线的承诺范围。
 
 ---
 
-# 5. V3（18个月）
+# 4. 技术路线
 
-重点：
-
-Context Runtime。
-
-新增：
-
-```
-Context Version
-
-Context Delta
-
-Context Snapshot
-
-Context Share
-
-Context Event Bus
-```
-
-形成：
-
-Runtime。
-
----
-
-# 6. V4（24个月）
-
-目标：
-
-Enterprise AI Runtime。
-
-支持：
-
-```
-Multi-Agent
-
-Context Protocol
-
-Context Plugin
-
-Context Marketplace
-
-Context Federation
-```
-
-真正成为：
-
-企业 AI 基础设施。
-
----
-
-# 7. 技术路线
-
-建议：
+与 Phase / 时间线同一口径的三年视图（不再引入新的阶段划分）：
 
 第一年：
 
@@ -382,7 +275,7 @@ Enterprise AI OS
 
 ---
 
-# 8. Context Engine 自身如何迭代
+# 5. Context Engine 自身如何迭代
 
 前面十四章都在讲怎么给 Agent 造上下文。
 
@@ -467,10 +360,12 @@ harness 改进放大的是模型能力的部署效果。
 ```
 组件可观测性 → 第1章核心模块 + 第8章运行时组件
 
-经验可观测性 → 第10章 RCA + Trace 分层
+经验可观测性 → 第10章 Explain（§6–10）+ Timeline（第10章 §11）
 
-决策可观测性 → 第10章证据日志 + 第8章 Version
+决策可观测性 → 第10章 §4 Trace（Context Version 字段）+ 第8章 §9 Version
 ```
+
+本节的改进环与第 10 章是同一闭环的两面：失败轨迹收集→归因→编辑候选→held-in/held-out 验证→接受/回滚，其执行机制（Replay/Diff/Evaluation 门禁）与日志 schema（**编辑日志 Change Manifest** 六字段）在第 10 章 RCA（§19）与 §14A 定义，本章不重复，只讨论迭代机制与边界。
 
 三条支柱里最关键的不是怎么改。
 
@@ -484,7 +379,7 @@ runs 目录。
 
 tracer。
 
-verifier。
+verifier（评测器，见第 2 章 §13 术语表）。
 
 LLM 配置。
 
@@ -492,7 +387,7 @@ LLM 配置。
 
 这直接堵死了一大类 reward hacking。
 
-比如让 agent 偷偷关掉 verifier。
+比如让 agent 偷偷关掉评测器。
 
 换个更弱的模型。
 
@@ -538,29 +433,22 @@ Policy Engine 的 ACL 规则。
 
 但在每个 Phase 之上叠加一个持续改进环。
 
+```mermaid
+flowchart TD
+  A["收集失败轨迹<br/>（第10章 Trace）"] --> B["归因到具体组件<br/>（第10章 RCA）"]
+  B --> C["提出有边界的编辑候选<br/>（Change Manifest）"]
+  C --> D{"双数据集回归"}
+  D -- "held-in：弱点是否解决" --> E["两边都不退化才接受"]
+  D -- "held-out：是否引入新问题" --> E
+  E -- "接受 → 下一轮监控" -.-> A
+  E -- "拒绝 → 仅记录" --> F["被拒候选归档<br/>（不改变当前 harness）"]
+  style A fill:#f4e6e4,stroke:#b4332a
+  style C fill:#f4e6e4,stroke:#b4332a
+  style D fill:#eef4ee,stroke:#2f6b3a
+  style F fill:#f3f1ea,stroke:#9a978f,stroke-dasharray: 5 5
 ```
-收集失败轨迹
 
-↓
-
-归因到具体组件
-
-↓
-
-提出有边界的编辑候选
-
-↓
-
-held-in 验证弱点是否解决
-
-+
-
-held-out 检查是否引入新问题
-
-↓
-
-两边都不退化才接受
-```
+图例：红=读/写数据与编辑候选，绿=验证关卡，灰虚线框=只进档案不进 harness；虚线箭头=回到环入口的迭代回边。
 
 被拒绝的候选记录但不改变当前 harness。
 
@@ -572,7 +460,7 @@ AHE 是诊断后安全地改。
 
 ---
 
-# 9. 自我改进的风险与人的位置
+# 6. 自我改进的风险与人的位置
 
 把自动改进打开。
 
@@ -690,7 +578,7 @@ Trace schema。
 
 ---
 
-# 10. 与现有平台结合
+# 7. 与现有平台结合
 
 结合现有 AI Platform：
 
@@ -744,7 +632,7 @@ Deployment
 
 ---
 
-# 11. 产品矩阵
+# 8. 产品矩阵
 
 建议最终形成：
 
@@ -780,7 +668,7 @@ AI Knowledge Runtime
 
 ---
 
-# 12. 商业化路径
+# 9. 商业化路径
 
 建议产品化路线：
 
@@ -816,9 +704,9 @@ Context Marketplace
 
 ---
 
-# 13. 与 Palantir Foundry 的区别
+# 10. 与 Palantir Foundry 的区别
 
-Palantir：
+Palantir 的 OAG（Object Augmented Graph，对象增强图：Ontology 对象实例经关系链接构成的图，是 Foundry 消费层数据的组织形态）：
 
 ```
 Ontology
@@ -876,7 +764,7 @@ Context Protocol。
 
 ---
 
-# 14. 一句话总结
+# 11. 一句话总结
 
 AI Knowledge Runtime（AKR）的目标不是成为新的知识库，也不是新的 Agent 平台。
 

@@ -6,7 +6,7 @@
 
 # 1. 为什么需要 Knowledge Builder
 
-Knowledge Builder 是整个 Context Engine 的入口，也是整个 AI Knowledge Runtime 最重要的模块。
+Knowledge Builder 是整个 Context Engine 的入口，也是全书数据侧最重要的模块。
 
 它负责持续从企业各种数据源中自动构建 Ontology。
 
@@ -290,11 +290,13 @@ Model generated_by Notebook
 输出：
 
 ```yaml
-source: experiment
+source: exp-001        # 实例 ID（第 2 章 §4）
 
 relation: uses
 
-target: dataset
+target: dataset-1
+
+confidence: 0.98
 ```
 
 建议：
@@ -327,17 +329,7 @@ AlarmRaised
 RepairCompleted
 ```
 
-所有 Event：
-
-必须：
-
-- Timestamp
-
-- Actor
-
-- Object
-
-- Status
+所有 Event 字段以第 2 章 §5 的 Event 模型为准（`type / time / actor / object`），本章不另行定义；若业务确需额外状态字段（如 Status），须走第 2 章 §9 的 Schema 演进流程补充，不得在本章私加。
 
 支持：
 

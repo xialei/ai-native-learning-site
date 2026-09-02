@@ -1,6 +1,6 @@
-# Context Runtime 技术架构设计
+# 第8章 Context Runtime 技术架构设计
 
-> AI Knowledge Runtime（AKR）核心模块
+> Context Engine 核心模块
 >
 > Version：v1.0
 >
@@ -12,7 +12,7 @@
 
 # 1. 模块定位
 
-Context Runtime 是整个 AI Knowledge Runtime 的运行时核心。
+Context Runtime 是整个 Context Engine 的运行时核心。
 
 职责：
 
@@ -152,36 +152,26 @@ plan → execute → observe → improve → execute。
 
 # 3. Runtime 架构
 
+组件分三层——编排层（Runtime 自己）、构建层（Context Engine 调用链）、持久层（Store），外加三类并列的 Context 生产者（不是流水线的先后级）：
+
 ```
 User
-
-↓
-
+ ↓
 Agent
-
-↓
-
-Context Runtime
-
-↓
-
-Context Store
-
-↓
-
-Context Engine
-
-↓
-
-Tool Runtime
-
-↓
-
-Memory
-
-↓
-
-Realtime Context
+ ↓
+┌────────────────────────────────────────────┐
+│ Context Runtime（编排层）                     │
+│  生命周期 / Session / Snapshot / Lock / Event │
+│  └─ 调用 Context Engine 构建链（第4-7章）      │
+└────────────┬───────────────────────────────┘
+             │ Delta（§7）/ Merge（§8）
+┌────────────▼──────────────┐  ┌────────────────────────────┐
+│ Context Store（§14 持久层） │  │ Context 生产者（并列来源）     │
+│  Hot: Redis                │  │  Tool Runtime               │
+│  Warm: Paimon              │◄─│  Memory                     │
+│  Cold: Object Storage      │  │  Realtime Context           │
+└───────────────────────────┘  │  Retrieval（第4章）           │
+                               └────────────────────────────┘
 ```
 
 Context Runtime：
@@ -384,6 +374,14 @@ Context。
 
 "该覆盖哪个"不能含糊，必须有显式冲突解决策略。Palantir Foundry 的对象实例是典型：它既能被数据源更新，也能被用户 Action 编辑，同一对象（同一主键）同时收到两边数据时，平台需一套冲突解决策略决定最终值以谁为准。本书 Merge 也一样——Tool、记忆、实时、检索可能指向同一对象的不同值，Runtime 不能默认"后到覆盖先到"，要按来源优先级和业务规则明确裁决，否则上下文会出现自相矛盾的字段。<span class="src">来源：Foundry Ontology 文档，Action types</span>
 
+裁决规则（与上游两级衔接：候选级见第 6 章 §11、对象级见第 7 章 §6，本节管运行时级）：
+
+| 冲突类型 | 裁决 |
+|---------|------|
+| 来源优先级 | `tool_observed > realtime > memory > retrieval`（工具返回的是最新事实） |
+| 同优先级 | 按 `observed_at` 新者胜 |
+| 数值冲突 | 双值都进 trace，供第 10 章 Diff（§13） 展示与人工仲裁 |
+
 ---
 
 # 9. Context Version
@@ -454,6 +452,8 @@ Agent：
 
 重新读取。
 
+Diff 的格式契约（对象 ID 对齐、字段级变更、Relation 增删、JSON Patch 超集）由第 10 章 §13 统一定义，本章的运行时增量展示直接引用，两处保持同一实现。
+
 ---
 
 # 11. Context Share
@@ -510,7 +510,7 @@ Lock。
 
 避免：
 
-冲突。
+冲突。多 Agent 并发写的完整锁协议（TTL 锁、source_priority 裁决）见第 13 章 §10，本节不重复。
 
 ---
 
@@ -563,6 +563,27 @@ Object Storage
 支持：
 
 分层。
+
+---
+
+# 14A. Session Budget & Compaction
+
+第 7 章 Progressive Context 说 Context 随轮次扩展（Round1→Round2→Round3），第 7 章的压缩都是单轮内的。多轮累计之后，谁负责驱逐和压缩历史轮次？这是 Runtime 的职责，本节补齐——它也是 Progressive Context 能落地的必要条件。
+
+Session 级 token 记账：
+
+```
+session_tokens = Σ(每轮 ContextPackage 实际用量)
+窗口余量 = 模型窗口 − session_tokens − 本轮 token_budget − 预留输出
+```
+
+压缩触发与动作：
+
+- 触发：`session_tokens > 窗口 × 70%`（阈值起点，可按场景校准）；
+- 动作：对最旧轮次做 hierarchical summary——把该轮 Package 的 objects/events/documents 压缩为一条结构化摘要（复用第 7 章 §8/§9 的压缩算子），摘要替换原内容挂在新版本上；
+- 与 Snapshot/Version 联动：压缩前先打快照（§6），保证"压缩前的完整上下文"可随时回放（§9 Rollback）；压缩作为一次 Update（§7）记入 Delta 与 Trace。
+
+快照链自身的存储预算同样计入：快照用 delta 链存储（只存与父版本的 diff），长会话定期 compaction，避免每轮全量快照导致 O(n²) 存储。
 
 ---
 

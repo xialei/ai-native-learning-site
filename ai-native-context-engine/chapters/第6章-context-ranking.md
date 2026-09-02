@@ -1,3 +1,13 @@
+# 第6章 Context Ranking 技术架构设计
+
+> Context Engine 核心模块
+>
+> Version：v1.0
+>
+> Status：Draft
+
+---
+
 如果说：
 
 Hybrid Retrieval 决定 找到什么（Find）
@@ -6,16 +16,6 @@ Graph Expansion 决定 补充什么（Expand）
 那么：
 
 Context Ranking 决定最终把什么交给 LLM（Select）
-
-# 第6章 Context Ranking 技术架构设计
-
-> AI Knowledge Runtime（AKR）核心模块
->
-> Version：v1.0
->
-> Status：Draft
-
----
 
 # 1. 模块定位
 
@@ -51,6 +51,8 @@ Context Ranking 位于 Graph Expansion 之后。
 几十个 Metric
 ```
 
+（数字为经验估计，需按租户实测校准；以 200 个候选对象 ≈ 20K token 估算——对象约 100 token/个，关系与事件更小。）
+
 但：
 
 LLM 一次只能接收有限 Token。
@@ -62,6 +64,8 @@ LLM 一次只能接收有限 Token。
 而不是：
 
 全部发送。
+
+Ranking 的产出规模由 Top-N 决定：Top-N 按第 7 章 Token Allocation 下发的 `token_budget` 装载（装满即停），典型 N=50~100 个对象——这正是第 7 章 §2 "Optimizer 拿到 200 Objects" 数字的上游来源（Ranking 装载的候选 + 其关系/事件展开约 200 个条目）。
 
 ---
 
@@ -102,7 +106,7 @@ Ranking：
 统一输入：
 
 ```
-ContextPackage
+ContextPackage（= Context Package，下文用规范写法）
 ```
 
 包含：
@@ -116,21 +120,10 @@ ContextPackage
 
 每个对象：
 
-包含：
+字段以第 2 章 §2 的通用元数据契约为准（`id / type / schema_version / source / source_ref / provenance / confidence / valid_time / observed_at / tenant`），本章不重新定义。两点说明：
 
-```
-ID
-
-Type
-
-Metadata
-
-Source
-
-Timestamp
-
-Score
-```
+- Freshness（§7.2）读取的是 `observed_at`（同对象多源时取最新）与 `valid_time`（`valid_time.end` 已过的对象降权或过滤）——只用单一 "Timestamp" 无法区分业务有效时间和观测时间。
+- `Score` 是 Ranking 阶段追加的**派生字段**：只在本次 Ranking 结果与 trace 中存在，不回写 Ontology Store。
 
 ---
 
@@ -408,45 +401,48 @@ Event：
 
 # 8. Final Score
 
-建议：
-
-统一：
+七个因子的量纲不同（★ 为 1~5、Distance 是 1~3 跳、Token Cost 是 20~1000 token），不能直接相减——否则 Token Cost 一项会吞掉所有信号。可实现的做法是：先归一化到 [0,1]，再加权求和。
 
 ```
-Final Score
-
-=
-
-Relevance
-
-+
-
-Freshness
-
-+
-
-Importance
-
-+
-
-Authority
-
-+
-
-Business Priority
-
--
-
-Distance
-
--
-
-Token Cost
+score = w_r·R + w_f·F + w_i·I + w_a·A + w_b·B − w_d·log2(1+dist)
 ```
 
-最终：
+各因子归一化口径：
 
-排序。
+| 因子 | 归一化方式 |
+|------|-----------|
+| Relevance R | 检索器分数归一化到 [0,1]（各路 Retriever 分数先做 min-max） |
+| Freshness F | `exp(−λ_type·Δt)`，Δt 为距 `observed_at` 的小时数；λ 按对象类型配置（Event/Metric 小时级衰减，Document 周级） |
+| Importance I | 五星 ÷ 5；存于对象 `properties.importance`，由 Knowledge Builder 人工标注 + 默认值 3 |
+| Authority A | 源系统星级 ÷ 5；配置在 Retriever 路由表 |
+| Business Priority B | 对象 `properties.priority` ∈ {0, 0.5, 1}，由租户按业务对象配置（如"本租户核心资产的风机"= 1），默认 0 |
+| Distance dist | 第 5 章扩展的跳数（1~3），经 `log2(1+dist)` 压缩 |
+
+默认权重（起点，需按场景校准）：
+
+| 因子 | 默认权重 |
+|------|---------|
+| w_r（Relevance） | 0.40 |
+| w_f（Freshness） | 0.20 |
+| w_i（Importance） | 0.15 |
+| w_a（Authority） | 0.10 |
+| w_b（Business Priority） | 0.10 |
+| w_d（Distance） | 0.05 |
+
+端到端算例（300 个候选 → Top-N）：
+
+```
+候选：GPU-07（打分阶段）
+  R=0.85  F=exp(−0.05·2h)=0.90  I=4/5=0.80  A=5/5=1.0
+  B=0.5   dist=2 → log2(3)=1.58
+  score = 0.40·0.85 + 0.20·0.90 + 0.15·0.80
+        + 0.10·1.00 + 0.10·0.50 − 0.05·1.58
+        = 0.34 + 0.18 + 0.12 + 0.10 + 0.05 − 0.079 ≈ 0.71
+```
+
+Top-N 装载：按分数降序逐个装入，直到 `token_budget`（第 7 章 Token Allocation 下发）用尽。**Token Cost 不进分数**——它是装载阶段的次级排序键：分数相同的对象，优先装 Token 低的（与 §7.7 一致）。这样"价值排序"和"成本装载"各管一件事，互不污染。
+
+`Business Priority` 定义：来源字段 `properties.priority`，由租户管理员在业务对象上配置（风电场的核心机组、研发的核心实验），默认 0.5；它表达"这个对象对这类任务普遍重要"，与 Relevance（对当前 query 重要）互补。
 
 "价值接近时优先低 Token"在更上游有个工业对应物：按需索引。不是所有属性都值得进高成本的可搜索/可排序索引。Palantir Foundry 用 render hints 标记属性用途——Searchable 决定它能否被过滤/排序/聚合；不需要被搜索的属性取消提示就能显著减轻重建索引负担、加快索引速度。这和 Token Cost 精神一致：资源有限，只把"会被用到的"放进高成本通道。本书排序层用 Token Cost 选对象，Foundry 存储层用 render hints 选索引，本质都是按需加载。<span class="src">来源：Foundry Ontology 文档，Property metadata / Render hints</span>
 
@@ -555,6 +551,8 @@ Authority：
 保留：
 
 MLflow。
+
+本节只处理**候选级冲突**（同 ID 多路命中、检索期即可按 Authority 择优）。更下游的冲突不在本节范围：对象级跨源合并与裁决表见第 7 章 §6；运行时多 Producer 并发写的冲突归第 8 章 §8 Merge。
 
 ---
 
@@ -680,35 +678,33 @@ Debug。
 
 # 16. MVP
 
+（以下为交付计划，非已完成清单；各阶段完成标准见第 14 章对应 Phase 验收指标。）
+
 第一阶段：
 
-✓ Relevance
+计划 Relevance / Freshness / Importance 三因子打分
 
-✓ Freshness
+计划 Permission 硬过滤（§7.5，不参与打分）
 
-✓ Importance
+计划 Token Cost 次级排序键（§8）
 
-✓ Permission
-
-✓ Token Cost
-
-✓ Explain
+计划 Explain（§9）
 
 第二阶段：
 
-✓ Learning Ranking
+计划 Learning Ranking（用点击/采纳日志在线校准 §8 权重）
 
-✓ Diversity
+计划 Diversity（§10 的类型配额与 Set Cover 贪心）
 
-✓ Conflict Resolution
+计划 Conflict Resolution（§11）
 
 第三阶段：
 
-✓ Reinforcement Ranking
+计划 Reinforcement Ranking（把用户采纳/丢弃行为作为 reward 训练权重 w，机制详见第 14 章 Roadmap）
 
-✓ Adaptive Ranking
+计划 Adaptive Ranking（按 Intent 动态调权重，复用第 1 章 §4 Intent Planner 信号）
 
-✓ User Preference
+计划 User Preference（显式偏好叠加 Business Priority）
 
 ---
 

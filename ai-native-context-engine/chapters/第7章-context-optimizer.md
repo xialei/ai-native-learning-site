@@ -1,6 +1,6 @@
 # 第7章 Context Optimizer 技术架构设计
 
-> AI Knowledge Runtime（AKR）核心模块
+> Context Engine 核心模块
 >
 > Version：v1.0
 >
@@ -45,20 +45,14 @@ Context Ranking
 通常得到：
 
 ```
-200 Objects
+200 Objects        （含 Ranking 装载的候选 + 其关系/事件展开，约 20K Token）
 
-100 Relations
-
-30 Documents
+30 Documents       （每个约 1K Token，共 30K）
 
 50 Events
 ```
 
-总计：
-
-```
-250K Token
-```
+总计约 60K Token（口径与第 6 章 §2 一致：对象约 100 token/个；数字为经验估计，需按租户实测校准）。
 
 但是：
 
@@ -111,7 +105,7 @@ Token Allocation
 
 ↓
 
-→ Prompt Builder（交接，见 §14）
+→ Prompt Builder（交接，见 §13）
 
 ↓
 
@@ -163,7 +157,7 @@ Permission Filter
 
 ↓
 
-Duplicate Merge
+Duplicate Remove
 
 ↓
 
@@ -188,75 +182,28 @@ Prompt Builder
 
 ---
 
-# 6. Duplicate Remove
+# 6. Duplicate Remove 与 Object Merge
 
-不同 Retriever：
+去重和合并本质是同一件事的两级：先按精确标识去重，再做属性级融合。
 
-可能返回：
+**第一级：精确去重**。同一对象来自多个 Retriever（Graph/SQL/Vector 三路返回同一 Experiment），`id + source_ref` 相同的直接合并为一条。
 
-同一对象。
+**第二级：属性级合并**。不同 source_ref 但指向同一业务实体（如 GPU 的 hostname 一致），逐字段融合：GPU 的型号来自 Graph、利用率来自 Prometheus、所在 Node 来自 Kubernetes，最终融合成一个完整 GPU Object，而不是三份碎片。
 
-例如：
+冲突裁决表（数值类冲突双值都进 trace，供第 10 章 Diff（§13） 展示）：
 
-Experiment
+| 字段类型 | 裁决规则 |
+|---------|---------|
+| 数值/标量 | 取 Authority 高的源（Authority 见第 6 章 §7.4）；并保留双值进 trace |
+| 时序值 | 按 `observed_at` 新者为准 |
+| provenance | 合并去重 |
+| 关系 | 按 (source, relation, target) 三元组去重，权重取最大 |
 
-来自：
-
-Graph
-
-SQL
-
-Vector
-
-Merge：
-
-统一：
-
-Object。
-
-避免：
-
-重复。
+**三级分工**（全书统一）：候选级去重（同 ID 多路命中）在第 6 章 §11 Conflict Resolution 已处理；本章处理对象级合并（跨源融合）；运行时级冲突（多 Producer 并发写）归第 8 章 §8 Merge——三处幂等、各管一层。
 
 ---
 
-# 7. Object Merge
-
-多个 Object：
-
-信息：
-
-互补。
-
-例如：
-
-GPU：
-
-Graph：
-
-型号。
-
-Prometheus：
-
-利用率。
-
-Kubernetes：
-
-Node。
-
-最终：
-
-融合。
-
-生成：
-
-一个：
-
-GPU Object。
-
----
-
-# 8. Relation Compression
+# 7. Relation Compression
 
 Graph：
 
@@ -306,7 +253,7 @@ Relation。
 
 ---
 
-# 9. Document Compression
+# 8. Document Compression
 
 不是：
 
@@ -332,7 +279,7 @@ SOP：
 
 ---
 
-# 10. Event Compression
+# 9. Event Compression
 
 例如：
 
@@ -364,7 +311,7 @@ Timeline。
 
 ---
 
-# 11. Metric Compression
+# 10. Metric Compression
 
 例如：
 
@@ -390,7 +337,7 @@ Trend
 
 ---
 
-# 12. Token Allocation
+# 11. Token Allocation
 
 不同类型：
 
@@ -432,7 +379,7 @@ Actions
 
 ---
 
-# 13. Adaptive Budget
+# 12. Adaptive Budget
 
 根据：
 
@@ -466,7 +413,7 @@ Summary。
 
 ---
 
-# 14. Prompt Assembly（交接 Prompt Builder）
+# 13. Prompt Assembly（交接 Prompt Builder）
 
 Optimizer 的终点是把装配好的 Context Package 交给 Prompt Builder（第1章 §4）做最终结构化组装，而非 Optimizer 自己拼 Prompt。
 
@@ -518,7 +465,7 @@ Actions
 
 ---
 
-# 15. Explain
+# 14. Explain
 
 支持：
 
@@ -550,11 +497,11 @@ Debug。
 
 ---
 
-# 16. API
+# 15. API
 
 统一：
 
-```
+```go
 type ContextOptimizer interface {
 
     Optimize(
@@ -576,33 +523,13 @@ type ContextOptimizer interface {
 
 ---
 
-# 17. Cache
+# 16. Cache
 
-Summary：
-
-缓存。
-
-Graph：
-
-缓存。
-
-Object：
-
-缓存。
-
-Prompt：
-
-缓存。
-
-避免：
-
-重复：
-
-Summary。
+Optimizer 依赖四类构件级缓存：Document Summary 缓存（第 9 章 §7.3）、Graph Expansion 结果缓存（第 9 章 §7.2）、Embedding 缓存（第 9 章 §7.4）、Prompt Fragment 缓存（第 9 章 §7.5）。各自的失效策略统一见第 9 章 §10——例如文档更新后 Summary 缓存如何失效，那里有完整机制，本章不重复定义。
 
 ---
 
-# 18. MVP
+# 17. MVP
 
 第一阶段：
 
@@ -634,7 +561,7 @@ Summary。
 
 ---
 
-# 19. 与其他模块关系
+# 18. 与其他模块关系
 
 各模块在流水线中的职责与边界见第1章 §4。本章定位：在 Ranking 之后负责压缩与 Token 分配（Compress）。
 
@@ -843,7 +770,7 @@ MCE。
 
 Meta Context Engineering。
 
-一个策略就是一个 skill。
+一个策略就是一个**策略包（policy pack）**——可版本化、可评估、可回滚的配置单元（对应第 10 章 §19 的 Change Manifest 管理对象），而非 Agent 领域的 skill。
 
 有静态部分。
 

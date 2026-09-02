@@ -1,6 +1,6 @@
-# Graph Expansion 技术架构设计
+# 第5章 Graph Expansion 技术架构设计
 
-> AI Knowledge Runtime（AKR）核心模块
+> Context Engine 核心模块
 >
 > Version：v1.0
 >
@@ -394,7 +394,7 @@ Graph Expansion 不允许无限扩展。
 
 建议：
 
-## Hop
+## 7.1 Hop
 
 默认：
 
@@ -406,7 +406,7 @@ Graph Expansion 不允许无限扩展。
 
 ---
 
-## Node Limit
+## 7.2 Node Limit
 
 默认：
 
@@ -418,7 +418,7 @@ Graph Expansion 不允许无限扩展。
 
 ---
 
-## Relation White List
+## 7.3 Relation White List
 
 例如：
 
@@ -440,13 +440,15 @@ temporary_relation
 
 ---
 
-## Score Threshold
+## 7.4 Score Threshold
 
 Relation：
 
 低于阈值：
 
 不继续扩展。
+
+阈值作用于下节 §8 的 Expansion Score（遍历期先算分、再卡阈值，二者配合使用）。默认 0.3（经验起点：五档因子归一化加权后，低于 0.3 的邻居对最终 Context 的边际贡献通常抵不过其 Token 成本；实际取值应结合第 10 章 Explain 的扩展命中率校准）。
 
 ---
 
@@ -456,55 +458,41 @@ Relation：
 
 需要排序。
 
-建议：
+Expansion Score 只服务**遍历期剪枝**（决定"往哪扩、扩到哪停"）；扩展完成后哪些对象真正进入 Prompt，由第 6 章 Context Ranking 按其因子体系重新排序。两套分数不要混用。
 
-Score：
+各因子先归一化到 [0,1]，再加权（权重为默认起点，按场景校准）：
 
 ```
 Expansion Score
-
-=
-
-Relation Weight
-
-+
-
-Node Importance
-
-+
-
-Freshness
-
-+
-
-Business Priority
-
--
-
-Distance
+  = w_rw·RelationWeight      # 关系权重：白名单关系配置，0~1
+  + w_ni·NodeImportance      # 对象 properties.importance 五星 ÷ 5
+  + w_f ·Freshness           # exp(−λ_type·Δt)，同第6章 §7.2 口径
+  + w_bp·BusinessPriority    # 对象 properties.priority ∈ {0, 0.5, 1}
+  − w_d ·log2(1+dist)        # dist：距种子的跳数
 ```
 
-例如：
+默认权重：
 
-Dataset
+| 因子 | 权重 |
+|------|------|
+| w_rw（RelationWeight） | 0.35 |
+| w_ni（NodeImportance） | 0.25 |
+| w_f（Freshness） | 0.15 |
+| w_bp（BusinessPriority） | 0.15 |
+| w_d（Distance） | 0.10 |
 
-★★★★★
+`Business Priority` 取自对象 `properties.priority`（定义见第 6 章 §8），不是对象模型新增字段。
 
-Notebook
+算例（Dataset 邻居，dist=1）：
 
-★★★★★
+```
+RelationWeight=0.9  Importance=5/5=1.0  Freshness=0.8  Priority=0.5
+Expansion Score = 0.35·0.9 + 0.25·1.0 + 0.15·0.8 + 0.15·0.5 − 0.10·log2(2)
+                = 0.315 + 0.25 + 0.12 + 0.075 − 0.10 = 0.66
+0.66 > 阈值 0.3 → 该邻居继续扩展
+```
 
-GPU
-
-★★★★☆
-
-Owner
-
-★★☆☆☆
-
-历史实验
-
-★☆☆☆☆
+★ 直觉对照（非计算值）：Dataset/Notebook ★★★★★ 值得扩，Owner ★★☆☆☆ 通常止步于阈值附近，历史实验 ★☆☆☆☆ 会被剪掉。
 
 ---
 
@@ -707,7 +695,7 @@ trained_on。
 
 ---
 
-## 15. 与后续章节的关系
+# 15. 与后续章节的关系
 
 Graph Expansion 输出：
 
@@ -729,23 +717,9 @@ Token Budget：
 
 ---
 
-# 一句话总结
+# 16. 高级扩展策略
 
-Graph Expansion 的目标不是遍历图。
-
-而是：
-
-> **围绕当前业务对象，自动补全 Agent 完成推理所需的最小业务上下文（Minimum Sufficient Context）。**
-
-Graph 只是导航结构。
-
-真正的产品价值是：
-
-**Context Expansion。**
-
-## 16. 高级扩展策略
-
-### 16.1 Semantic Expansion（语义扩展）
+## 16.1 Semantic Expansion（语义扩展）
 
 Graph 只能扩展显式关系。
 
@@ -767,7 +741,7 @@ Virtual Relation
 
 它可以动态创建"虚拟关系"，再交给 Graph Expansion 继续扩展。
 
-### 16.2 Intent-aware Expansion（意图驱动扩展）
+## 16.2 Intent-aware Expansion（意图驱动扩展）
 
 Expansion 不应该固定。
 
@@ -785,3 +759,19 @@ Experiment
 也就是说，Expansion 的策略由 Intent Planner 决定，而不是固定的 Hop 规则。
 
 这会让整个 Context Engine 从固定图遍历升级为上下文规划（Context Planning）。两种策略都必须记录虚拟关系的来源、置信度和失效时间，并接受第1章定义的 Policy Filter。
+
+---
+
+# 一句话总结
+
+Graph Expansion 的目标不是遍历图。
+
+而是：
+
+> **围绕当前业务对象，自动补全 Agent 完成推理所需的最小业务上下文（Minimum Sufficient Context）。**
+
+Graph 只是导航结构。
+
+真正的产品价值是：
+
+**Context Expansion。**

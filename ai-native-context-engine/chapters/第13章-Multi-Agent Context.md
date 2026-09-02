@@ -1,6 +1,6 @@
 # 第13章 Multi-Agent Context 技术架构设计
 
-> AI Knowledge Runtime（AKR）核心模块
+> Context Engine 核心模块
 >
 > Version：v1.0
 >
@@ -92,25 +92,12 @@ Context Engine：
 
 统一输入：
 
-```
-ContextPackage
+Context Package，字段以第 2 章 §8 的契约为准（objects / relations / events / metrics / actions / documents / policy / provenance / trace / token_budget / schema_version），本章不重新定义。
 
-├── Objects
+多 Agent 场景的两点补充：
 
-├── Relations
-
-├── Events
-
-├── Metrics
-
-├── Actions
-
-├── Memory
-
-├── Metadata
-
-└── Trace
-```
+- **Memory 不是 Package 字段**：Agent 记忆是第 8 章 §5 Session 的附属，不进 Context Package；Agent 间需要传递的记忆内容应以对象/Delta 形式显式提交。
+- **按权限投影**：多个 Agent"共享统一 Context"指的是存储层事实；每个 Agent 实际拿到的 Package 是 Policy Engine 按其权限对同一事实的投影（policy 字段强制附加），并非每人一份手工维护的副本。
 
 Agent：
 
@@ -236,7 +223,7 @@ interrupt 强制中止失控或超时的子 agent
 
 这组原语补上了从共享 Context 到可调度执行之间缺的一环。
 
-前面 Ownership、Version、Lock 解决的是多个 agent 读写同一份 Context 时不打架。
+本章后面的 §8 Ownership、§9 Version、§10 Lock 解决的是多个 agent 读写同一份 Context 时不打架。
 
 这组原语解决的是主 agent 怎么把活派出去又怎么把结果收回来。
 
@@ -272,11 +259,7 @@ wait、list 让主 agent 能对自己的执行历史做推理。
 
 而不是只活在 chat context 里。
 
-这和第8章 Context 状态落盘而非只存快照。
-
-第10章 Trace 每条存一个文件。
-
-是同一条原则在不同层的体现。
+这和第8章 Context 状态落盘而非只存快照、第10章 Trace 逐 stage 结构化记录（含存储与保留策略）是同一条原则在不同层的体现。
 
 能落盘的不要留在内存里。
 
@@ -362,64 +345,50 @@ Agent C
 
 # 9. Context Version
 
-每次：
-
-Context：
-
-变化。
-
-生成：
-
-Version。
-
-例如：
+单 Agent 的版本机制（Version/Delta/Snapshot/Rollback/Replay）以第 8 章 §9 为准，本章不重复定义。多 Agent 场景的差异只有一条：**版本记录 actor**。
 
 ```
 v1
-
 ↓
-
-Research Agent
-
+Research Agent 提交 Delta（who: research-agent）
 ↓
-
 v2
-
 ↓
-
-Business Agent
-
+Business Agent 提交 Delta（who: business-agent）
 ↓
-
 v3
 ```
 
-支持：
-
-Rollback。
-
-Replay。
+每个版本带 actor 与其 ContextDelta 引用，Rollback/Replay 语义同第 8 章 §9。
 
 ---
 
-# 10. Context Lock
+# 10. Context Lock 与合并
 
-多个 Agent：
+多个 Agent 同时修改同一对象时的完整机制（单 Agent 场景的 Lock 见第 8 章 §12；本节是多 Agent 的锁协议，第 8 章 §12 引用本节）：
 
-同时修改：
+锁：**TTL 化的对象级锁**。
 
-同一对象。
+- 粒度：对象级（不是字段级——字段级锁管理成本高于收益；不是 Session 级——那会退化为串行）；
+- TTL：默认 30s，到期自动释放，避免 agent 崩溃留下孤儿锁；
+- 语义：写锁互斥；持锁期间其他 Agent 可读（读到的仍是当前已提交版本）。
 
-Runtime：
+合并：对象级 `source_priority` 表（挂在 Policy 上，租户可配）。
 
-负责：
+- 默认优先级：`tool_observed > realtime > memory > retrieval`（同第 8 章 §8）；
+- 同优先级按 `observed_at` 新者胜；
+- 数值冲突双值进 trace，供第 10 章 Diff（§13） 与人工仲裁。
+
+完整示例——Research Agent 与 Business Agent 同时更新风机的实时功率：
 
 ```
-Object Lock
-
-Version Check
-
-Merge Conflict
+t0  v7: power=1200kW（baseline）
+t1  Research Agent 写锁 turbine-07（TTL 30s）
+t2  Business Agent 请求写锁 → 等待
+t3  Research Agent 提交 Delta{power=1150} → v8（actor: research-agent）→ 释放锁
+t4  Business Agent 获锁，读到 v8，本地算出 power=1180（基于更新的风速）
+t5  裁决：同为 tool_observed，observed_at 较新者胜 → power=1180 → v9（actor: business-agent）
+    research 的 1150 保留在 trace（t5 时刻的双值记录）
 ```
 
 保证：
@@ -472,6 +441,8 @@ Alarm
 
 # 12. Context Event Bus
 
+事件名以第 8 章 §13 为准（ContextCreated / ContextExpanded / ContextUpdated / ContextMerged / ContextArchived），本章不另立分类——多 Agent 场景不新增事件种类，只新增"事件体的 actor"（哪个 Agent 触发）。对象删除在平台语义中是 Archive（第 8 章无 Delete 事件）。
+
 所有：
 
 Context：
@@ -485,20 +456,20 @@ Context Event Bus
 
 ↓
 
-Create
+ContextCreated
 
-Update
+ContextUpdated
 
-Delete
+ContextMerged
 
-Merge
-
-Snapshot
+ContextArchived
 ```
 
 支持：
 
 异步协作。
+
+投递语义：at-least-once（订阅方按 context_id + version 幂等去重）；topic 命名 `context/{context_id}/object/{type}`，§11 的订阅即对本 Bus 的 topic 过滤。
 
 ---
 
@@ -576,29 +547,14 @@ type ContextRuntime interface {
 
 # 15. Context 生命周期
 
-```
-Create
+多 Agent 的生命周期就是第 8 章 §4 的 8 状态（Create→Load→Update→…→Archive），本章不另立一套。唯一的差异在 Update/Merge 两步：单 Agent 是单方 Delta 直接生效，多 Agent 要经过 §10 的锁与裁决。对照表：
 
-↓
-
-Agent Read
-
-↓
-
-Agent Update
-
-↓
-
-Merge
-
-↓
-
-Snapshot
-
-↓
-
-Archive
-```
+| 阶段 | 单 Agent（第 8 章） | 多 Agent（本章） |
+|------|--------------------|-----------------|
+| Version | 单方记录 | 记录 actor + Delta 引用（§9） |
+| Lock | Session 级 | 对象级 TTL 锁（§10） |
+| Update | 单方 Delta | 多方 Delta 经 source_priority 裁决合并（§10） |
+| Merge | 单来源顺序合并 | 多 Producer 冲突裁决（§10） |
 
 整个生命周期：
 
@@ -714,7 +670,9 @@ Context 才是共享资产。
 
 Agent 只是不同角色的执行者。
 
-## Context Protocol（上下文协议）
+---
+
+## 19. Context Protocol（上下文协议）
 
 就像：
 
@@ -722,30 +680,16 @@ HTTP —— 页面通信
 SQL —— 数据查询
 Kubernetes API —— 容器编排
 
-ContextRequest
+协议消息类型与最小字段（跨租户标准化排期见第 14 章 Phase 4 M9）：
 
-↓
-
-ContextPackage
-
-↓
-
-ContextDelta
-
-↓
-
-ContextSnapshot
-
-↓
-
-ContextReference
-
-↓
-
-ContextEvent
-
-↓
-
-ContextResponse
+| 消息 | 最小字段 | 说明 |
+|------|---------|------|
+| ContextRequest | schema_version、tenant、goal、permission 声明 | 请求方身份与意图 |
+| ContextPackage（= Context Package） | 第 2 章 §8 十一字段 | 响应正文 |
+| ContextDelta | context_id、from_version、op、fields、observed_at、producer | 增量提交（§7） |
+| ContextSnapshot | context_id、version、snapshotRef | 历史状态引用（第 8 章 §6） |
+| ContextReference | context_id、version、object_ref | 跨 Agent 引用 |
+| ContextEvent | context_id、session_id、from_version、to_version、ts | 事件体（对齐第 8 章 §13） |
+| ContextResponse | schema_version（协商结果）、context_id、冲突时的 ContextDelta | 响应 |
 
 协议消息必须携带 `schema_version`、`context_id`、`tenant`、`provenance` 和权限声明；发生版本冲突时优先返回可合并的 ContextDelta，而不是静默覆盖。

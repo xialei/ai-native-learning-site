@@ -1,6 +1,6 @@
 # 第12章 Business Context 技术架构设计
 
-> AI Knowledge Runtime（AKR）领域上下文模型
+> Context Engine 领域上下文模型（Domain Context Plugin）
 >
 > Version：v1.0
 >
@@ -57,39 +57,14 @@ Agent 无法理解：
 
 实际上需要：
 
-风机
+```
+风机 --located_in--> 风电场 --downstream_of--> 电网限电（Event）
+风机 --monitored_by--> 测风塔 --calibrated_against--> ERA5（Dataset）
+风机 --drives--> 功率预测模型 --raises--> 告警（Event） --triggers--> 工单
+工单 --resolved_by--> 维修记录（Document）
+```
 
-↓
-
-测风塔
-
-↓
-
-ERA5
-
-↓
-
-功率预测模型
-
-↓
-
-告警
-
-↓
-
-工单
-
-↓
-
-维修记录
-
-↓
-
-天气变化
-
-↓
-
-电网限电
+（关系动词与 §5 的关系 Schema 一致。）
 
 Business Context：
 
@@ -118,6 +93,20 @@ Business Context
 
 └── Business Action
 ```
+
+领域章不新增平台对象类别：上图是业务视角的命名，全部映射到第 2 章 §2 的七类平台对象：
+
+| 业务视角 | 第 2 章 §2 对象类型 | 说明 |
+|---------|-------------------|------|
+| Business Object（风机、工单…） | Entity | 业务实体 |
+| Business Relation | Relation | 对象间关系 |
+| Business Event（限电、告警…） | Event | 状态变化 |
+| Business Metric（实时功率…） | Metric | 可量化指标 |
+| Business Rule（风速>25m/s 停机…） | Policy | 规则与约束部分映射为 Policy |
+| Business Action（创建工单…） | Action | 可执行动作 |
+| 检修 SOP、操作手册 | Document | 文档系统接入（§2 数据源），业务知识的重要证据载体 |
+
+Business Rule 与 Policy 的分工：参与推理的领域规则（如故障树）以 Entity 属性或 Relation 形式参与扩展与排序；具有约束/授权语义的规则（停机阈值、权限）映射为 Policy，由 Policy Engine 强制执行。
 
 所有业务知识：
 
@@ -152,14 +141,30 @@ Business Context
 
 拥有统一 ID。
 
-例如：
+ID 规约与第 11 章一致，以第 2 章 §2 为准（全局 `id` + `source_ref` 指向源系统）：
 
 ```
-windfarm://wf001
+id: wf001    source_ref: erp://assets/wf001
 
-turbine://wt102
+id: wt102    source_ref: scada://turbines/wt102
 
-forecast://forecast20260730
+id: forecast20260730    source_ref: mes://forecast/20260730
+```
+
+## 身份解析
+
+企业多源场景最难的一步：同一风机在 ERP 是资产编码、SCADA 是设备号、CRM 是服务对象。统一 ID 靠身份解析实现：
+
+- **命名空间注册**：每个源系统接入时在 Ontology 注册命名空间（`erp://`、`scada://`、`crm://`），由 Knowledge Builder 统一管理；
+- **跨系统映射表**：`(source, source_ref) → canonical id`，例如 `scada://turbines/wt102 → wt102`、`erp://assets/AS-88172 → wt102`、`crm://service-objects/SO-2209 → wt102`；映射规则由第 3 章 §12 Identity Resolution 的匹配键驱动（UUID > source_ref > 归一化名称+别名）；
+- **冲突合并**：同一 canonical id 的多源属性冲突，按第 2 章对象级 `provenance`/`confidence` 字段记录来源与置信度，裁决规则复用第 7 章 §6 的冲突裁决表。
+
+## 身份解析示例
+
+```
+ERP  erp://assets/AS-88172    ─┐
+SCADA scada://turbines/wt102   ├─►  canonical id: wt102
+CRM  crm://service/SO-2209    ─┘    （provenance: [erp, scada, crm]）
 ```
 
 ---
@@ -170,50 +175,16 @@ forecast://forecast20260730
 
 通过 Relation 建立联系。
 
-例如：
+例如（动词即本领域的关系白名单，方向为"源 --动词--> 目标"）：
 
 ```
-Wind Farm
-
-↓
-
-contains
-
-↓
-
-Turbine
-
-↓
-
-installed_with
-
-↓
-
-Sensor
-
-↓
-
-reports
-
-↓
-
-Metric
-
-↓
-
-trigger
-
-↓
-
-Alarm
-
-↓
-
-generate
-
-↓
-
-Work Order
+Wind Farm --contains--> Turbine
+Turbine --installed_with--> Sensor
+Sensor --reports--> Metric
+限电（Event） --triggers--> Alarm
+Alarm --generates--> Work Order
+风机 --monitored_by--> 测风塔
+测风塔 --calibrated_against--> ERA5（Dataset）
 ```
 
 所有 Relation：
@@ -328,6 +299,11 @@ Rule：
 
 Context Expansion。
 
+两种用途挂接的平台钩子不同（对象类别以 §3 的映射表为准）：
+
+- **参与推理**：作为对象属性/关系进入 Package，供 Agent 读取与排序参考。
+- **参与 Expansion**：作为第 5 章 §7.3 Relation White List 中的领域关系触发扩展（如告警 --triggered_by--> 工单）；具有约束语义的规则（停机阈值）映射为 Policy，由 Policy Engine 强制执行，不作为普通遍历节点。
+
 ---
 
 # 9. Business Action
@@ -400,7 +376,9 @@ Business Context Graph
 
 ---
 
-# 11. Context 生命周期
+# 11. 业务对象事件闭环示例
+
+本节展示的是业务对象的**业务闭环**（设备上线→维修→归档），不是平台级 Context 生命周期——那以第 2 章 §10 和第 8 章 §4 为准，每个业务阶段触发的 Context Event 与第 11 章 §7 的映射方式相同。Business Context 包（Package 级）的创建/更新/过期/归档同样遵循第 8 章 §4 的 8 状态，本章不重画。
 
 Business Context：
 
@@ -494,46 +472,17 @@ Context Package
 
 Context Engine：
 
-自动扩展：
+自动扩展（按第 5 章扩展策略，Hop 限制内输出带 relation 标注的 Top 子图，与 §2 对象链同一套 Schema）：
 
 ```
-风电场
-
-↓
-
-风机
-
-↓
-
-ERA5 数据
-
-↓
-
-测风塔
-
-↓
-
-预测模型
-
-↓
-
-最近训练
-
-↓
-
-模型评测
-
-↓
-
-天气变化
-
-↓
-
-设备状态
-
-↓
-
-历史误差
+风电场 --contains--> 风机
+风机 --calibrated_against--> ERA5 数据（Dataset，hop 1）
+风机 --monitored_by--> 测风塔（hop 1）
+风机 --drives--> 预测模型 --latest_training--> 最近训练（hop 2）
+预测模型 --has_evaluation--> 模型评测（hop 2）
+测风塔 --observes--> 天气变化（Event，hop 2）
+风机 --has_status--> 设备状态（Metric，hop 1）
+预测模型 --tracks--> 历史误差（Metric，hop 2）
 ```
 
 LLM：
@@ -599,35 +548,23 @@ Context Engine。
 
 # 16. MVP
 
+（以下为交付计划，非已完成清单；Marketplace 排期以第 14 章 Phase 4 为准。）
+
 第一阶段：
 
-✓ Business Object
-
-✓ Business Relation
-
-✓ Event
-
-✓ Metric
-
-✓ Action
+计划七类对象的业务映射（§3）+ Builder 接入（ERP/SCADA/IoT）
 
 第二阶段：
 
-✓ Rule Engine
-
-✓ Workflow
-
-✓ Plugin
-
-✓ 实时事件
+计划 Rule Engine / Workflow / Plugin 机制 / 实时事件
 
 第三阶段：
 
-✓ 多行业 Context
+计划 多行业 Context 扩展
 
-✓ 数字孪生
+计划 数字孪生（数字孪生引擎本身超出本书范围，此处只做 Context 侧的对象同步）
 
-✓ Context Marketplace
+Marketplace 排期以第 14 章 Phase 4 为准（本插件的 Marketplace 接入随 Phase 4 M9 交付）。
 
 ---
 
@@ -641,31 +578,25 @@ Business Context 不是业务数据库。
 
 > **企业业务世界在 AI Runtime 中的统一上下文模型（Business Context），让 Agent 能够理解对象、关系、事件、指标、规则和动作，并完成业务推理与业务执行。**
 
-# Business Runtime
+这个定位落成的整体形态（"Business Runtime" 一词在第 14 章 Phase 3 有明确排期，本章不另立名目）：
 
+```
 Enterprise Systems
 ERP / CRM / MES / IoT / SCADA / Git / MLflow
 
                 │
 
-         Context Builder
+         Knowledge Builder（第 3 章）+ Context Builder（第 4 章）
 
                 │
 
-       Business Runtime
-      （Context Engine）
+       Context Engine + Business Context Plugin（本章）
 
                 │
 
-Business Context Plugin
-Research Context Plugin
-Weather Context Plugin
-Energy Context Plugin
-
-                │
-
-     Business Agent Runtime
+     Context Runtime（第 8 章）
 
                 │
 
       Agent / Copilot / API
+```
