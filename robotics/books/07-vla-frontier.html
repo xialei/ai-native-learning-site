@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 VLA 前沿 — 深入浅出具身智能</title>
+<link rel="stylesheet" href="assets/robotics-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出具身智能</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-overview.html">全景</a>
+      <a href="02-hardware.html">硬件抽象</a>
+      <a href="03-teleop.html">遥操作</a>
+      <a href="04-dataset.html">数据集</a>
+      <a href="05-policy.html">策略</a>
+      <a href="06-smolvla.html">SmolVLA</a>
+      <a href="07-vla-frontier.html">VLA 前沿</a>
+      <a href="08-sim-isaaclab.html">仿真</a>
+      <a href="09-manager-based-env.html">环境</a>
+      <a href="10-rl-training.html">RL 训练</a>
+      <a href="11-sim2real.html">Sim2Real</a>
+      <a href="12-build-own.html">实战路线</a>
+      <a href="13-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 VLA 前沿</div>
+    <h1>VLA 前沿：π0、UnifoLM-VLA 与 Prismatic 底座</h1>
+    <div class="subtitle">SmolVLA 用 450M 证明了小模型可行；这一章往两端走——Physical Intelligence 的 π0（3B PaliGemma + 300M 专家，openpi 官方 PyTorch 移植）代表「预训练为王」的路线；NVIDIA 的 UnifoLM-VLA 用 DiT 做动作头代表「结构解耦」的路线；而 Stanford 的 Prismatic 展示这些模型的地基是怎么打出来的。读完你就有了给自研 VLA 选型的完整坐标系。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>π0：大 VLM + 小专家的「力量举」版</h2>
+    <p>π0 的移植版（modeling_pi0.py 注明「a direct port of the OpenPI implementation」）结构与 SmolVLA 同构，但两个骨干都换成了 Gemma 系（configuration_pi0.py:31）：</p>
+    <div class="code-title">src/lerobot/policies/pi0/modeling_pi0.py:404 — 核心模型组装（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PI0Pytorch</span>(nn.Module):  <span class="cmt"># see openpi `PI0Pytorch`</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config: PI0Config, rtc_processor=<span class="kw">None</span>):
+        paligemma_config = <span class="fn">get_gemma_config</span>(config.paligemma_variant)      <span class="cmt"># gemma_2b（2B VLM）</span>
+        action_expert_config = <span class="fn">get_gemma_config</span>(config.action_expert_variant)  <span class="cmt"># gemma_300m</span>
+
+        self.paligemma_with_expert = <span class="fn">PaliGemmaWithExpertModel</span>(
+            paligemma_config, action_expert_config,
+            use_adarms=[<span class="kw">False</span>, <span class="kw">False</span>],            <span class="cmt"># ADA-RMS 条件门控，π0 默认关</span>
+            precision=config.dtype, image_size=config.image_resolution[<span class="nu">0</span>],  <span class="cmt"># 224</span>
+            ...)
+
+        self.action_in_proj  = nn.Linear(config.max_action_dim, action_expert_config.width)
+        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        self.state_proj      = nn.Linear(config.max_state_dim, action_expert_config.width)</pre>
+    <div class="annotation"><b>与 SmolVLA 的三点不同：</b>①<strong>体量</strong>——PaliGemma 是 3B 级 VLM（SigLIP 400M 视觉塔 + Gemma 2B 语言塔），动作专家是 300M Gemma（gemma_300m：width=1024、depth=18，modeling_pi0.py:163），专家/VLM 比例约 1:10，比 SmolVLA 的 0.75 更「悬殊」——π0 的赌注是<strong>感知能力全部来自预训练，动作头不需要大</strong>。②<strong>逐层手工 attention</strong>——compute_layer_complete（:78）不用 transformers 的现成注意力，而是手动 QKV 投影、RoPE、eager attention，把两栈 token 拼在一起算注意力再切开：这样双栈的 K/V 可以直接互见（比 cross-attn 的注入更彻底）。③<strong>混合精度分割</strong>——整体 bfloat16，但视觉塔、多模态投影器、各 LayerNorm 强制留 float32（params_to_keep_float32，:258），防止冻结参数参与前向时的 dtype 抖动触发优化器报错。</div>
+    <p>训练目标与 SmolVLA 完全一致（:592）：</p>
+    <div class="code-title">src/lerobot/policies/pi0/modeling_pi0.py:592 — flow matching 训练（逐行同构）</div>
+    <pre class="code"><span class="lang-tag">python</span>time_expanded = time[:, <span class="kw">None</span>, <span class="kw">None</span>]
+x_t = time_expanded * noise + (<span class="nu">1</span> - time_expanded) * actions      <span class="cmt"># 直线插值</span>
+u_t = noise - actions                                            <span class="cmt"># 目标速度场</span>
+<span class="cmt"># prefix = 图像+语言（PaliGemma）；suffix = 状态+噪声动作+时间（专家）</span>
+suffix_out = ... <span class="cmt"># 双栈联合前向，取 suffix 最后 chunk_size 个 token</span>
+v_t = self.<span class="fn">_apply_checkpoint</span>(action_out_proj_func, suffix_out.to(dtype=torch.float32))
+<span class="kw">return</span> F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)</pre>
+    <div class="annotation"><b>一个细节体现血统：</b>π0 的 suffix 里 state 是单独 token 且另起 attention 段（att_masks += [1]，:548），前缀/后缀间靠掩码单向流动；推理时同样 prefix KV 缓存一次（:680，注意还 clone_past_key_values 了——每个去噪步克隆一份缓存，因为 π0 的手工 attention 会原地写入），欧拉 10 步（num_inference_steps=10）。默认微调超参也来自 openpi：lr=2.5e-5、cosine 衰减到 2.5e-6、warmup 1000 步（configuration_pi0.py:90）。如果你读过 SmolVLA 那章，「读 π0」只需对号入座——<strong>flow matching 部分两份代码逐行同源</strong>，差异全在骨干与工程细节。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>UnifoLM-VLA：把动作头换成一个 DiT</h2>
+    <p>lerobot 里的 VLA 把动作专家缝在 VLM 内部（共享层/互看 K/V）。UnifoLM-VLA（NVIDIA + 复旦贡献）走另一条路：<strong>VLM 只当特征提取器，动作生成完全外包给一个独立的 DiT</strong>（Diffusion Transformer）：</p>
+    <div class="code-title">src/unifolm_vla/model/framework/unifolm_vla.py:19 — 框架组装（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="meta">@FRAMEWORK_REGISTRY.register</span>(<span class="st">"unifolm_vla"</span>)
+<span class="kw">class</span> <span class="cl">Unifolm_VLA</span>(baseframework):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config=<span class="kw">None</span>, **kwargs):
+        self.qwen_vl_interface = <span class="fn">get_vlm_model</span>(config=self.config)   <span class="cmt"># Qwen2.5-VL</span>
+        <span class="cmt"># DiT 的 cross_attention_dim 跟着 VLM 隐藏宽度走 —— 两个模块解耦的唯一定点</span>
+        self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = \
+            self.qwen_vl_interface.model.config.hidden_size
+        self.action_model: FlowmatchingActionHead = <span class="fn">get_action_model</span>(config=self.config)</pre>
+    <div class="code-title">src/unifolm_vla/model/framework/unifolm_vla.py:37 — 训练 forward：VLM 出特征，DiT 出损失</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, qwen_inputs, **kwargs):
+    <span class="kw">with</span> torch.autocast(<span class="st">"cuda"</span>, dtype=torch.bfloat16):
+        qwenvl_outputs = self.qwen_vl_interface(input_ids=..., pixel_values=..., output_hidden_states=<span class="kw">True</span>)
+        last_hidden = qwenvl_outputs.hidden_states[-<span class="nu">1</span>]      <span class="cmt"># [B, L, H] —— 只要最后一层隐状态</span>
+
+    <span class="kw">with</span> torch.autocast(<span class="st">"cuda"</span>, dtype=torch.float32):
+        repeated = self.config.trainer.get(<span class="st">"repeated_diffusion_steps"</span>, <span class="nu">4</span>)
+        <span class="cmt"># 同一观测重复 4 次：4 个不同 (noise, t) 配对 —— 提升流匹配样本效率</span>
+        action_loss = self.action_model(
+            last_hidden.repeat(repeated, <span class="nu">1</span>, <span class="nu">1</span>),
+            actions.repeat(repeated, <span class="nu">1</span>, <span class="nu">1</span>),
+            state.repeat(repeated, <span class="nu">1</span>, <span class="nu">1</span>),
+        )
+    <span class="kw">return</span> {<span class="st">"action_loss"</span>: action_loss}</pre>
+    <div class="code-title">src/unifolm_vla/model/modules/action_model/DiT_ActionHeader.py:190 — FlowmatchingActionHead.forward（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span>noise = torch.randn(actions.shape, ...)
+t = self.<span class="fn">sample_time</span>(batch, ...)                 <span class="cmt"># Beta(1.5, 1.0)，s=0.999</span>
+noisy_trajectory = (<span class="nu">1</span> - t) * noise + t * actions <span class="cmt"># 注意方向与 π0 相反：t=1 动作，t=0 噪声</span>
+velocity = actions - noise
+
+t_discretized = (t[:, <span class="nu">0</span>, <span class="nu">0</span>] * self.num_timestep_buckets).<span class="fn">long</span>()  <span class="cmt"># 1000 桶离散时间</span>
+action_features = self.action_encoder(noisy_trajectory, t_discretized)
+
+<span class="cmt"># [状态特征, 32 个可学习 future_tokens, 噪声动作特征] 拼 sequence</span>
+future_tokens = self.future_tokens.weight.unsqueeze(<span class="nu">0</span>).expand(...)
+sa_embs = torch.cat((state_features, future_tokens, action_features), dim=<span class="nu">1</span>)
+
+model_output = self.model(hidden_states=sa_embs,
+                          encoder_hidden_states=vl_embs,    <span class="cmt"># VLM 特征做 cross-attn 的 K/V</span>
+                          timestep=t_discretized)
+pred_actions = self.action_decoder(model_output)[:, -actions.shape[<span class="nu">1</span>] :]
+loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t11 d11">
+        <title id="t11">UnifoLM-VLA 的解耦架构</title>
+        <desc id="d11">Qwen2.5-VL 只输出最后一层隐状态作为条件；独立 DiT 动作头带 state/future_tokens/noisy-action 三段序列做 cross-attention 去噪，两者仅以 hidden_size 相接</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">VLM = 冻结的特征服务器；DiT = 可训练的动作引擎</text>
+
+        <g>
+          <rect class="node" x="40" y="60" width="200" height="110" rx="8"></rect>
+          <text class="lbl sm" x="140" y="84" text-anchor="middle">Qwen2.5-VL (3B/7B)</text>
+          <text class="lbl sm" x="140" y="104" text-anchor="middle">input_ids + pixel_values</text>
+          <text class="lbl sm" x="140" y="126" text-anchor="middle">→ hidden_states[-1]</text>
+          <text class="lbl sm" x="140" y="128" text-anchor="middle"></text>
+          <text class="lbl sm" x="140" y="146" text-anchor="middle">[B, seq_len, H]</text>
+        </g>
+
+        <g>
+          <rect class="node acc" x="330" y="46" width="260" height="150" rx="8"></rect>
+          <text class="lbl" x="460" y="70" text-anchor="middle">DiT 动作头（B/L 档）</text>
+          <text class="lbl sm" x="460" y="94" text-anchor="middle">序列 = [state, future_tokens×32,</text>
+          <text class="lbl sm" x="460" y="112" text-anchor="middle">噪声动作 ×horizon]</text>
+          <text class="lbl sm" x="460" y="136" text-anchor="middle">每层 cross-attn 读 VLM 特征</text>
+          <text class="lbl sm" x="460" y="156" text-anchor="middle">离散时间：1000 桶</text>
+          <text class="lbl sm" x="460" y="176" text-anchor="middle">→ action_decoder MLP</text>
+        </g>
+
+        <g>
+          <rect class="node" x="680" y="80" width="180" height="70" rx="8"></rect>
+          <text class="lbl sm" x="770" y="106" text-anchor="middle">velocity 预测</text>
+          <text class="lbl sm" x="770" y="124" text-anchor="middle">欧拉 10 步积分</text>
+        </g>
+
+        <line class="edge" x1="240" y1="115" x2="328" y2="115"></line>
+        <text class="lbl sm" x="284" y="106" text-anchor="middle">vl_embs</text>
+        <line class="edge" x1="590" y1="115" x2="678" y2="115"></line>
+        <line class="edge back" x1="770" y1="152" x2="770" y2="240"></line>
+        <line class="edge back" x1="770" y1="240" x2="460" y2="240"></line>
+        <line class="edge back" x1="460" y1="240" x2="460" y2="198"></line>
+        <text class="lbl sm" x="560" y="256">每步重跑 DiT（VLM 特征不变，复用）</text>
+
+        <text class="lbl sm" x="40" y="284">唯一接口：cross_attention_dim = VLM hidden_size —— 换 VLM 骨干只需改一处；VLM 可整体冻结</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw"></span>模块组件</span>
+        <span class="lg-item"><span class="sw acc"></span>动作引擎（可从零训练）</span>
+      </div>
+      <div class="fig-cap">图 7.1：UnifoLM-VLA 的「特征服务器 + 动作引擎」解耦。VLM 整体（含语言塔）都可作为冻结底座，DiT 头从零训练；repeated_diffusion_steps=4 让每个样本贡献 4 组流匹配监督。</div>
+    </div>
+    <div class="annotation"><b>读法：</b>与 π0/SmolVLA 的「VLM 层内互看」相比，这种解耦有得有失——得到的是<strong>模块自由度</strong>（DiT-B 768 宽 12 头 / DiT-L 1536 宽 32 头两档任选，DiTConfig，DiT_ActionHeader.py:130；换 VLM 骨干只需对齐一个 hidden_size）与<strong>训练便宜</strong>（VLM 前向一次缓存特征，DiT 反复迭代不碰它）；失去的是端到端联合微调时的深度耦合。还有两处独特的工程选择：①时间不连续采样，而是 <code class="inline">t×1000</code> 离散成桶号再进正弦编码（:205）——继承自 GR00T N1.5 的动作头血统（文件头注明）；②<strong>future_tokens</strong>——32 个可学习 token 混进序列，给 DiT 一组「任务占位符」，推理时与训练时行为一致。方向约定注意：它的插值是 (1-t)·noise + t·actions，t=1 是动作、t=0 是噪声——与 π0 的记号恰好相反，读代码时别绕晕。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>Prismatic：VLM 本身怎么炼成</h2>
+    <p>上面两节的 VLM 底座（PaliGemma、Qwen2.5-VL、SmolVLM2）都来自预训练。但「VLM 怎么预训练」值得一章体量的好奇——Prismatic VLMs（Stanford，OpenVLA 的视觉-语言底座）把这个过程做成了可复现的实验矩阵：</p>
+    <div class="code-title">prismatic/models/vlms/prismatic.py:38 — 三件套结构（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PrismaticVLM</span>(VLM):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model_id, vision_backbone, llm_backbone,
+                 enable_mixed_precision_training=<span class="kw">True</span>, arch_specifier=<span class="st">"gelu-mlp"</span>):
+        <span class="cmt"># 视觉塔：CLIP / DINOv2 / SigLIP，或双塔融合（prismatic/models/backbones/vision/__init__.py）</span>
+        <span class="cmt"># 语言塔：LLaMA / Vicuña / Mistral …（LLMBackbone）</span>
+        <span class="kw">if</span> arch_specifier == <span class="st">"linear"</span>:
+            self.projector = <span class="fn">LinearProjector</span>(vision_backbone.embed_dim, llm_backbone.embed_dim)
+        <span class="kw">elif</span> arch_specifier.endswith(<span class="st">"fused-gelu-mlp"</span>):
+            self.projector = <span class="fn">FusedMLPProjector</span>(...)     <span class="cmt"># 双塔特征拼接后的 MLP</span>
+        <span class="kw">elif</span> arch_specifier.endswith(<span class="st">"gelu-mlp"</span>):
+            self.projector = <span class="fn">MLPProjector</span>(...)          <span class="cmt"># 2 层 GELU MLP</span>
+        self.all_module_keys = [<span class="st">"vision_backbone"</span>, <span class="st">"llm_backbone"</span>, <span class="st">"projector"</span>]</pre>
+    <div class="code-title">prismatic/models/vlms/prismatic.py:122 — 两阶段训练的冻结策略（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">freeze_backbones</span>(self, stage: <span class="cl">str</span>) -&gt; <span class="kw">None</span>:
+    <span class="cmt"># "align"    → 冻视觉塔 + 冻语言塔，只训 projector（1 层 MLP 学「翻译」）</span>
+    <span class="kw">if</span> stage == <span class="st">"align"</span>:
+        self.vision_backbone.requires_grad_(<span class="kw">False</span>)
+        self.llm_backbone.requires_grad_(<span class="kw">False</span>)
+        self.projector.requires_grad_(<span class="kw">True</span>)
+    <span class="cmt"># "finetune" → 视觉塔仍冻；projector + 语言塔一起训</span>
+    <span class="kw">elif</span> stage == <span class="st">"finetune"</span>:
+        self.vision_backbone.requires_grad_(<span class="kw">False</span>)
+        self.llm_backbone.requires_grad_(<span class="kw">True</span>)
+        self.projector.requires_grad_(<span class="kw">True</span>)</pre>
+    <div class="annotation"><b>为什么给机器人书写这一节：</b>①OpenVLA——机器人圈最有名的开源 VLA——的动作模型就是一个 7B Prismatic VLM 加动作头，其「双塔视觉」（DINOv2+SigLIP 融合）正是从 Prismatic 的对照实验里选出来的；②<strong>双塔的直觉值得记住</strong>：CLIP/SigLIP 的特征「像语言」（语义对齐），DINOv2 的特征「像眼睛」（空间结构好）——机器人既要知道「这是个杯子」也要知道「杯子在哪几像素」，融合两塔（FusedMLPProjector 把 2×embed_dim 拼接投影，nn_utils.py:37）在 VQA 上小胜单塔，这就是 OpenVLA 选它的原因。③两阶段训练配方（align 只训投影层 → finetune 解冻语言塔）就是后来所有 VLA（含 π0 的 finetune 模式）默认遵从的成本结构：<strong>视觉塔永远冻结，贵的部分不动</strong>。models/registry.py 里 20+ 组配方可查（CLIP 单塔/DINOCLIP/DINOSigLIP × Vicuña 7B/13B × 一阶段/多阶段）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>三种 VLA 路线对比与选型</h2>
+    <table class="tbl">
+      <tr><th></th><th>SmolVLA（第 6 章）</th><th>π0</th><th>UnifoLM-VLA</th></tr>
+      <tr><td>VLM 底座</td><td>SmolVLM2-500M 截 16 层</td><td>PaliGemma 3B（SigLIP+Gemma 2B）</td><td>Qwen2.5-VL 3B/7B</td></tr>
+      <tr><td>动作专家</td><td>Gemma 式 0.75× 宽度，与 VLM 层数对齐</td><td>Gemma 300M，手工逐层互见 attention</td><td>独立 DiT-B/L，cross-attn 读 VLM</td></tr>
+      <tr><td>耦合方式</td><td>逐层 K/V 注入（半耦合）</td><td>拼 token 联合 attention（全耦合）</td><td>特征后处理（完全解耦）</td></tr>
+      <tr><td>动作生成</td><td>flow matching，连续时间</td><td>flow matching，连续时间</td><td>flow matching，1000 桶离散时间</td></tr>
+      <tr><td>插值方向</td><td colspan="3">t=0 动作 → t=1 噪声（π0/SmolVLA）｜t=0 噪声 → t=1 动作（UnifoLM，反向记号）</td></tr>
+      <tr><td>训练技巧</td><td>Beta(1.5,1) 时间采样</td><td>同左 + 梯度检查点</td><td>+ repeated_diffusion_steps=4</td></tr>
+      <tr><td>适合场景</td><td>单卡微调、真机部署</td><td>大数据集、追求泛化上限</td><td>换底座/做消融的研究场景</td></tr>
+    </table>
+    <div class="annotation"><b>选型心得：</b>三者共享同一数学内核（直线流匹配 + MSE 学速度场），差别全在「VLM 与动作头绑得多紧、谁负责感知、预训练借多少力」。经验法则：<strong>数据少 → 冻结面大</strong>（SmolVLA/π0 的 train_expert_only）；<strong>数据多 → 全耦合端到端</strong>（π0 全量微调模式）；<strong>想换骨干做研究 → 解耦</strong>（UnifoLM）。lerobot 的 policies/ 里还有 pi05、groot、wall_x、xvla 等后来者，接口一致，读完本章源码迁移成本都很低。</div>
+    <div class="callout info">
+      <b class="tag">回顾</b>
+      三章模型线到此收束：第 5 章的接口卡（forward / select_action / predict_action_chunk）+ 第 4 章的数据 schema + 本章的三种架构 = 具身智能「学习侧」的完整拼图。接下来换到「环境侧」：不是让机器人在真机上试错，而是在 Isaac Lab 里并行跑 4096 个世界。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>小结</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>一句话</th></tr>
+      <tr><td>π0</td><td>PaliGemma 3B + Gemma 300M 专家，token 级联合 attention，openpi 官方移植</td></tr>
+      <tr><td>ADA-RMS</td><td>π0 结构预留的逐层条件门控（use_adarms），默认关闭</td></tr>
+      <tr><td>UnifoLM-VLA</td><td>Qwen2.5-VL 特征 + 独立 DiT 动作头，cross_attention_dim 一点相接</td></tr>
+      <tr><td>future_tokens</td><td>32 个可学习占位 token，让 DiT 序列有「任务槽」</td></tr>
+      <tr><td>Prismatic</td><td>CLIP/DINOv2/SigLIP（可双塔融合）+ LLM + 投影层，两阶段预训练范式</td></tr>
+      <tr><td>选型法则</td><td>数据少冻结面大；数据多全耦合；做研究选解耦</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      数据与模型都已就位，还缺一个「便宜的世界」供机器人大规模练习。Isaac Lab 提供的就是这个世界：GPU 并行仿真、六大脑室（Manager）驱动的一步步环境。这是<a href="08-sim-isaaclab.html">第 8 章：Isaac Lab 全景</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="06-smolvla.html">← 上一步：SmolVLA</a>
+    <a href="08-sim-isaaclab.html">下一步：Isaac Lab 全景 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出具身智能 · 07 VLA 前沿 · 基于 lerobot（3f2c29ef7e）、unifolm-vla（ff6c39a）、prismatic-vlms（874c5bb）· 行号随版本演进可能偏移，以仓库最新代码为准
+</footer>
+
+</body>
+</html>

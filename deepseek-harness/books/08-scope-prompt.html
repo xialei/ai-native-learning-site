@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · System Prompt 组装与 Scope — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 Prompt/Scope</div>
+    <h1>System Prompt 组装与 Scope：谁在哪个作用域里说了什么</h1>
+    <div class="subtitle">系统提示词不是一段写死的字符串，而是每次模型请求前由注册表动态组装的产物；而决定「这条注册只影响这一个 agent」的机制，是 dsh 自己的 Scope 原语。这一章把两个半场（prompt 组装 / scope 机制）讲透。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一分钟版本</h2>
+    <ul>
+      <li><code class="inline">ctx.systemPrompt</code>（<code class="inline">packages/core/system-prompt</code>）是注册表服务：插件往里塞<strong>四类输入</strong>——sections（系统提示词段落）、contexts（动态运行时上下文）、tool providers（工具 schema）、variables（<code class="inline">{{变量}}</code>）。</li>
+      <li>每次 pre-step 调 <code class="inline">assemble()</code>：合并全局层与该 agent 的 scope 层 → 排序 → 跑 <code class="inline">system-prompt/assemble</code> waterfall → 得到 <code class="inline">PromptAssembly</code>。</li>
+      <li>段落顺序由中央常量表 SECTION_ORDERS 分配——所有插件共享一张「哪里放什么」的地图，避免两插件抢位置。</li>
+      <li>动态上下文<strong>不进 system prompt</strong>，而是作为 plugin 来源的 user/message 快照追加进历史——所以 KV 缓存前缀保持稳定，只有变化时才追加新快照。</li>
+      <li>Scope 是不透明对象 + 父链：注册视图沿链<strong>向下</strong>继承（子 scope 看得见祖先的层），事件准入门沿链<strong>向上</strong>（祖先的监听器收得到子孙的事件，反之不行）。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>四类输入与 PromptAssembly</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:53 — PromptSection / PromptContext / PromptAssembly</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">PromptSection</span> {
+  <span class="cmt">/** 唯一名字——重复注册直接抛错 */</span>
+  <span class="kw">readonly</span> name: <span class="kw">string</span>
+  <span class="cmt">/** 段落按 order 升序拼接；同 order 按名字码元序 */</span>
+  <span class="kw">readonly</span> order: <span class="kw">number</span>
+  <span class="cmt">/** 静态文本或每次组装时求值的 provider；文本可含 {{变量}} */</span>
+  <span class="kw">readonly</span> text: <span class="kw">string</span> | ((context: <span class="cl">AssembleContext</span>) =&gt; <span class="kw">string</span>)
+  <span class="cmt">/** 视为完整系统提示词：组装照跑（工具/变量仍解析），随后恢复本段为唯一段落 */</span>
+  <span class="kw">readonly</span> complete?: <span class="kw">boolean</span>
+}
+
+<span class="kw">export interface</span> <span class="cl">PromptContext</span> {
+  name: <span class="kw">string</span>
+  <span class="cmt">/** 动态上下文也按 order 升序拼接 */</span>
+  order: <span class="kw">number</span>
+  text: <span class="kw">string</span> | ((context: <span class="cl">AssembleContext</span>) =&gt; <span class="kw">string</span>)
+}
+
+<span class="kw">export interface</span> <span class="cl">PromptAssembly</span> {
+  sections: <span class="cl">AssembledSection</span>[]      <span class="cmt">// 渲染成 system prompt</span>
+  contexts: <span class="cl">AssembledContext</span>[]      <span class="cmt">// 渲染成 user/message 快照</span>
+  tools: <span class="cl">ToolSchema</span>[]               <span class="cmt">// 已按 toolOrder 排成规范顺序</span>
+  variables: <span class="cl">Record</span>&lt;<span class="kw">string</span>, <span class="kw">string</span> | <span class="kw">undefined</span>&gt;
+}</pre>
+    <div class="annotation"><b>system prompt 与 runtime context 是两条管道</b>：sections 渲染进每次请求的 system 字段；contexts 渲染成一条特殊的 user 消息——「Current runtime context. This snapshot supersedes earlier runtime-context snapshots.」——追加到会话历史里。为什么分开？system prompt 改一个字就击穿前缀缓存；而快照追加只会<strong>延长</strong>历史，旧消息永不变。这是第 11 章 warm-prefix 缓存的先决条件。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>SECTION_ORDERS：中央分配的版面</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:121 — SECTION_ORDERS（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">SECTION_ORDERS</span> = {
+  HARNESS_IDENTITY: -<span class="nu">1000</span>,      <span class="cmt">// "You are an AI agent powered by DeepSeek Harness."</span>
+  HARNESS_SOURCE: -<span class="nu">900</span>,
+  WEB_SURFACE: -<span class="nu">800</span>,
+  DEPLOYMENT_PERSONA: <span class="nu">0</span>,        <span class="cmt">// 部署方人格——可被 preset 遮蔽</span>
+  PLAN_POLICY: <span class="nu">500</span>,
+  TEAM_POLICY: <span class="nu">600</span>,
+  PTC_ONLY: <span class="nu">800</span>,                <span class="cmt">// 第 6 章的 PTC 指令</span>
+  FILE_REFERENCE: <span class="nu">900</span>,
+  TOOL_BASH: <span class="nu">1000</span>,              <span class="cmt">// 每个工具的说明书各占一段</span>
+  TOOL_READ: <span class="nu">1100</span>, TOOL_WRITE: <span class="nu">1200</span>, TOOL_EDIT: <span class="nu">1300</span>, …
+  TOOL_WEB_SEARCH: <span class="nu">2000</span>, TOOL_SUBAGENT: <span class="nu">2800</span>,
+  TOOLS_SDK: <span class="nu">5000</span>,
+  DELIVERABLE_FILE_REFERENCES: <span class="nu">9000</span>,
+  STRUCTURED_OUTPUT: <span class="nu">9900</span>,
+} <span class="kw">as const</span></pre>
+    <p>三个「政策快照」context 同样中央分配（<code class="inline">CONTEXT_ORDERS</code>），注册者各自归位：</p>
+    <table class="tbl">
+      <tr><th>context 名</th><th>order</th><th>注册者</th><th>内容</th></tr>
+      <tr><td><code class="inline">sandbox:policy</code></td><td>110</td><td>dsh-sandbox-policy</td><td>当前沙箱模式与 workspace 边界（由 session 事件投影）</td></tr>
+      <tr><td><code class="inline">approval:policy</code></td><td>115</td><td>dsh-user-approval</td><td>一句话：approval 是 ask 还是 never</td></tr>
+      <tr><td><code class="inline">subagent:delegation</code></td><td>120</td><td>dsh-subagent</td><td>委派边界说明，挂在子 agent 的 scope 上</td></tr>
+    </table>
+    <div class="code-title">packages/interaction/user-approval/src/index.ts:152 — 审批政策作为动态上下文</div>
+    <pre class="code"><span class="lang-tag">typescript</span>ctx.<span class="fn">inject</span>([<span class="st">'systemPrompt'</span>], (scope: <span class="cl">Context</span>) =&gt; {
+  scope.systemPrompt.<span class="fn">context</span>({
+    name: <span class="st">'approval:policy'</span>,
+    order: scope.systemPrompt.<span class="fn">getContextOrder</span>(<span class="st">'APPROVAL_POLICY'</span>),
+    text: (context) =&gt; {
+      <span class="kw">const</span> agent = context.agent
+      <span class="kw">if</span> (agent === <span class="kw">undefined</span>) <span class="kw">return</span> <span class="st">''</span>
+      <span class="kw">const</span> policy = <span class="fn">effective</span>(agent)
+      <span class="kw">return</span> policy === <span class="st">'never'</span> ? NEVER_SENTENCE : ASK_SENTENCE
+    },
+  })
+})</pre>
+    <div class="callout info">
+      <b class="tag">看懂这个设计</b>
+      审批政策的注释点破动机：「完整当前值跟随在保留历史之后，切换政策时不必重写稳定的 system-prompt 缓存前缀」。凡是会<strong>中途变化</strong>的事实（沙箱模式、审批开关、委派状态）都走 user 快照；只有部署期固定的事实（身份、人格、工具说明书）才进 system prompt。注册者用 <code class="inline">getContextOrder()</code> 而非裸数字，就是为了让中央表成为唯一的版面权威。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>PERSONA_SECTION：用「同名遮蔽」实现身份替换</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:166 — PERSONA_SECTION</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * The deployment persona's section name. Exported because a
+ * composition can replace this slot — an agent preset shadows the
+ * deployment's persona with its own — and both sides naming the same section
+ * is what makes the replacement work rather than duplicate.
+ */</span>
+<span class="kw">export const</span> <span class="cl">PERSONA_SECTION</span> = <span class="st">'deployment:persona'</span></pre>
+    <p>遮蔽机制在 <code class="inline">assemble()</code> 里：同层重复注册抛错，<strong>跨层同名则 scope 层遮蔽全局层</strong>：</p>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:552 — assemble() 的合并（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// Scoped sections shadow globals before the deterministic order sort.</span>
+<span class="kw">const</span> sectionByName = <span class="kw">this</span>.layers.<span class="fn">merge</span>(scope, layer =&gt; layer.sections)
+<span class="cmt">// Scope-chain variables, farthest first, so the nearest scope wins a name.</span>
+<span class="kw">for</span> (<span class="kw">const</span> layer <span class="kw">of</span> scopeLayers) {
+  <span class="kw">for</span> (<span class="kw">const</span> [name, provider] <span class="kw">of</span> layer.variables.<span class="fn">entries</span>()) {
+    variables[name] = <span class="fn">provider</span>(context)
+  }
+}</pre>
+    <p>消费方是 persona 行（<code class="inline">packages/preset/persona</code>）——它<strong>只允许挂 scope 层</strong>：</p>
+    <div class="code-title">packages/preset/persona/src/index.ts — 模块注释与 apply()</div>
+    <pre class="code"><span class="lang-tag">text</span>dsh-system-prompt 拥有全局 persona（自己的 config），无条件注册那段——
+所以本行是 scope-only：挂进 agent preset 时遮蔽该会话的部署人格；
+挂到全局则与注册表自己的注册同名冲突，fail loud。
+这个约束正是本行存在的理由：agent preset 无法挂载 prompt 注册表本身，
+没有这一行，preset 能改工具却永远改不了身份。
+
+<span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">apply</span>(ctx: <span class="cl">Context</span>, config: <span class="cl">Config</span>): <span class="kw">void</span> {
+  ctx.<span class="fn">effect</span>(() =&gt; ctx.systemPrompt.<span class="fn">section</span>({
+    name: PERSONA_SECTION,
+    order: ctx.systemPrompt.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA'</span>),
+    text: config.text,
+    ...config.complete ? { complete: <span class="kw">true</span> } : {},
+  }))
+}</pre>
+    <div class="annotation"><b>两种「换人格」</b>：<code class="inline">text</code> 替换 persona 段，其余段落照常；<code class="inline">complete: true</code> 把整条系统提示词换成这段话（组装仍跑 waterfall 以解析工具/变量，然后恢复该段为唯一段落；两个 complete 同时生效直接抛错）。子 agent 的 <code class="inline">applyChildComposition</code> 用同一招给每个孩子装 <code class="inline">deployment:persona</code>——同名字段是替换而非重复的全部机关。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>渲染与严格插值</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:263 — renderPrompt / renderContextSnapshot</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">renderPrompt</span>(assembly: <span class="cl">PromptAssembly</span>): <span class="kw">string</span> {
+  <span class="kw">return</span> assembly.sections
+    .<span class="fn">map</span>(section =&gt; <span class="fn">interpolate</span>(section, assembly.variables, <span class="st">'section'</span>))
+    .<span class="fn">filter</span>(text =&gt; text.length &gt; <span class="nu">0</span>)
+    .<span class="fn">join</span>(<span class="st">'\n\n'</span>)
+}
+
+<span class="kw">export function</span> <span class="fn">joinContextSections</span>(sections: <span class="kw">readonly</span> <span class="cl">ContextSnapshotSection</span>[]): <span class="kw">string</span> {
+  <span class="kw">const</span> body = sections.<span class="fn">map</span>(section =&gt; section.text).<span class="fn">join</span>(<span class="st">'\n\n'</span>)
+  <span class="kw">if</span> (body.length === <span class="nu">0</span>) <span class="kw">return</span> <span class="st">''</span>
+  <span class="kw">return</span> `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${body}`
+}</pre>
+    <div class="annotation"><b>插值是严格的</b>：变量名必须匹配 <code class="inline">/^[a-z][a-z0-9_]*$/</code>；未注册的名字抛错（并打印全部已注册变量）；注册了但本次组装无值的也抛错——<code class="inline">{{name}}</code> 拼错不是静默留白，而是启动即炸。替换后的值不再二次扫描，孤立的 <code class="inline">{{</code> 若后文无 <code class="inline">}}</code> 视为字面散文。工具顺序同理严格：<code class="inline">toolOrder</code> 必须恰好含一个 <code class="inline">&lt;unlisted-tools&gt;</code> 哨兵（未列出的工具按字典序插在那儿），列出未注册的名字在组装时抛错。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>快照投影：只在变化时追加</h2>
+    <p>快照消息的提交由循环侧的 <code class="inline">RuntimeContextProjection</code> 跟踪（<code class="inline">packages/core/agent-loop/src/runtime-context.ts</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/runtime-context.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> SOURCE = <span class="st">'@deepseek-ai/dsh-system-prompt'</span>
+<span class="kw">const</span> CLEARED = <span class="st">'Current runtime context: none. Earlier runtime-context snapshots no longer apply.'</span>
+
+<span class="kw">function</span> <span class="fn">isOwned</span>(message: <span class="cl">UserMessage</span>): <span class="kw">boolean</span> {
+  <span class="kw">return</span> message.source.kind === <span class="st">'plugin'</span> &amp;&amp; message.source.plugin === SOURCE
+}
+
+<span class="kw">export class</span> <span class="cl">RuntimeContextProjection</span> {
+  <span class="cmt">/** undefined = 从未有快照；null = 当前无保留快照 */</span>
+  <span class="kw">private</span> retained: { seq: <span class="cl">SessionSeq</span>; text: <span class="kw">string</span> | <span class="kw">undefined</span> } | <span class="kw">null</span> | <span class="kw">undefined</span>
+
+  <span class="fn">project</span>(current: <span class="kw">string</span>, sections: <span class="kw">readonly</span> <span class="cl">ContextSnapshotSection</span>[]): <span class="cl">UserMessage</span> | <span class="kw">undefined</span> {
+    <span class="kw">if</span> (<span class="kw">this</span>.retained === <span class="kw">undefined</span> &amp;&amp; current.length === <span class="nu">0</span>) <span class="kw">return</span>
+    <span class="kw">const</span> snapshot = current.length === <span class="nu">0</span> ? CLEARED : current
+    <span class="kw">if</span> (<span class="kw">this</span>.retained?.text === snapshot) <span class="kw">return</span>   <span class="cmt">// 内容没变 → 不追加</span>
+    <span class="kw">return</span> <span class="fn">createUserMessage</span>({
+      content: [{ type: <span class="st">'text'</span>, text: snapshot }],
+      <span class="cmt">// 清空标记没有可归属的贡献了</span>
+      source: sections.length === <span class="nu">0</span>
+        ? { kind: <span class="st">'plugin'</span>, plugin: SOURCE }
+        : { kind: <span class="st">'plugin'</span>, plugin: SOURCE, form: <span class="st">'snapshot'</span>, sections },
+    })
+  }
+}</pre>
+    <div class="annotation"><b>三个细节</b>：① 归属权靠 <code class="inline">source.plugin</code> 标记——投影只认自己来源的消息，重启时倒序扫日志即可恢复 <code class="inline">retained</code>；② surface 替换事件（第 2 章 SurfaceOp.replace）引用了保留快照的 seq 时，<code class="inline">retained</code> 置 null，下轮会补一条新快照；③ 变空时不是静默消失，而是写一句 CLEARED——模型永远能「看见」上下文被撤销这件事。这与第 2 章「model-visible means logged」一脉相承。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>图 8-1：一次 assemble 的数据流</h2>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="assemble 数据流">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L9,3 L0,6 Z" fill="#4156c8"/>
+            </marker>
+          </defs>
+          <rect x="20" y="30" width="180" height="240" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="110" y="55" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e2a6e">注册表各层</text>
+          <rect x="35" y="70" width="150" height="34" rx="6" fill="#fff" stroke="#6a7fe8"/>
+          <text x="95" y="92" font-size="11" fill="#333" text-anchor="middle">全局层</text>
+          <text x="95" y="132" font-size="11" fill="#333" text-anchor="middle">父 scope 层</text>
+          <rect x="35" y="166" width="150" height="34" rx="6" fill="#fff" stroke="#6a7fe8"/>
+          <text x="95" y="188" font-size="11" fill="#333" text-anchor="middle">本 agent scope 层</text>
+          <text x="110" y="240" font-size="10" fill="#666" text-anchor="middle">sections/contexts/tools/variables</text>
+
+          <rect x="300" y="80" width="200" height="130" rx="10" fill="#12142b"/>
+          <text x="400" y="112" text-anchor="middle" font-size="13" font-weight="bold" fill="#8ea2ff">assemble(scope)</text>
+          <text x="400" y="138" text-anchor="middle" font-size="10" fill="#c8cfef">merge: scope 遮蔽全局同名</text>
+          <text x="400" y="158" text-anchor="middle" font-size="10" fill="#c8cfef">sort: SECTION_ORDERS → 名字</text>
+          <text x="400" y="178" text-anchor="middle" font-size="10" fill="#c8cfef">waterfall: system-prompt/assemble</text>
+          <text x="400" y="198" text-anchor="middle" font-size="10" fill="#c8cfef">complete 段落最后恢复</text>
+
+          <rect x="560" y="30" width="170" height="90" rx="10" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="645" y="62" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">sections</text>
+          <text x="645" y="82" text-anchor="middle" font-size="10" fill="#2d5a40">renderPrompt → system</text>
+          <text x="645" y="100" text-anchor="middle" font-size="10" fill="#2d5a40">部署期固定 · 缓存友好</text>
+
+          <rect x="560" y="140" width="170" height="90" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="645" y="168" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">contexts</text>
+          <text x="645" y="188" text-anchor="middle" font-size="10" fill="#7a4a08">joinContextSections → user 快照</text>
+          <text x="645" y="206" text-anchor="middle" font-size="10" fill="#7a4a08">运行期可变 · 只追加</text>
+
+          <rect x="770" y="60" width="160" height="130" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="850" y="90" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">tools + variables</text>
+          <text x="850" y="112" text-anchor="middle" font-size="10" fill="#444">toolOrder 排序</text>
+          <text x="850" y="130" text-anchor="middle" font-size="10" fill="#444">restrict 过滤后的可见集</text>
+          <text x="850" y="150" text-anchor="middle" font-size="10" fill="#444">{{name}} 严格插值</text>
+
+          <line x1="200" y1="120" x2="295" y2="120" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="500" y1="115" x2="555" y2="80" stroke="#2d8a56" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="500" y1="150" x2="555" y2="180" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="500" y1="180" x2="765" y2="125" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <text x="725" y="250" font-size="11" fill="#666" text-anchor="middle">绿=进 system 字段 · 橙=进消息历史 · 蓝=进请求结构</text>
+        </svg>
+      </div>
+      <div class="svg-legend">图 8-1 · assemble() 把三层注册合并成一份 PromptAssembly，再分流到请求的三个位置</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.8</span>Scope 原语：一个 WeakMap 撑起两个方向</h2>
+    <div class="code-title">packages/core/scope/src/index.ts:15 — ScopeKey 与父链</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** An opaque, identity-compared scope key. */</span>
+<span class="kw">export type</span> <span class="cl">ScopeKey</span> = <span class="kw">object</span>
+
+<span class="cmt">/**
+ * The enclosing scope of each key. One relation powers both directions of
+ * scope nesting: registration views inherit DOWN the chain (a child scope
+ * sees its ancestors' layers — ScopedLayers), and event admission
+ * extends UP it (a listener tagged with an ancestor receives events dispatched
+ * to a descendant key — scopeTarget).
+ */</span>
+<span class="kw">const</span> scopeParents = <span class="kw">new</span> <span class="cl">WeakMap</span>&lt;<span class="cl">ScopeKey</span>, <span class="cl">ScopeKey</span>&gt;()</pre>
+    <div class="code-title">packages/core/scope/src/index.ts:137 — createScope / scopeTarget（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">createScope</span>(ctx: <span class="cl">Context</span>, key: <span class="cl">ScopeKey</span>, options?: <span class="cl">CreateScopeOptions</span>): <span class="cl">Scope</span> {
+  <span class="kw">if</span> (options?.parent !== <span class="kw">undefined</span>) <span class="fn">bindScopeParent</span>(key, options.parent)
+  <span class="kw">const</span> fiber = ctx.<span class="fn">plugin</span>(scope)
+  <span class="kw">const</span> scoped: <span class="cl">Context</span> = fiber.ctx.<span class="fn">extend</span>({ [kScope]: key })
+  <span class="kw">return</span> {
+    ctx: scoped,
+    rawDispose: fiber.dispose,
+    dispose: () =&gt; (disposing ??= <span class="fn">quiesceFiber</span>(fiber)),
+  }
+}
+
+<span class="kw">export function</span> <span class="fn">scopeTarget</span>&lt;<span class="cl">T</span> <span class="kw">extends</span> <span class="kw">object</span>&gt;(base: T, key: <span class="cl">ScopeKey</span> | <span class="kw">undefined</span>): <span class="cl">Scoped</span>&lt;T&gt; {
+  <span class="cmt">// …过滤器：未打标的全局监听器放行；打了标的监听器，</span>
+  <span class="cmt">//   仅当其 key 位于派发 key 的祖先链上时放行（事件只向上流，不向下）</span>
+}</pre>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="scope 双向语义">
+          <rect x="40" y="40" width="240" height="60" rx="8" fill="#eceffe" stroke="#4156c8"/>
+          <text x="160" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">根 ctx（全局）</text>
+          <text x="160" y="86" text-anchor="middle" font-size="10" fill="#666">harness:identity · deployment:persona</text>
+          <rect x="360" y="40" width="240" height="60" rx="8" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="480" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">team scope（父）</text>
+          <text x="480" y="86" text-anchor="middle" font-size="10" fill="#2d5a40">team persona · delegation context</text>
+          <rect x="680" y="40" width="240" height="60" rx="8" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="800" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">child scope（子）</text>
+          <text x="800" y="86" text-anchor="middle" font-size="10" fill="#7a4a08">自己的 persona · restrict 工具</text>
+
+          <text x="480" y="150" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e2a6e">注册视图：沿链向下继承</text>
+          <text x="480" y="170" text-anchor="middle" font-size="11" fill="#444">child 组装时看见 全局 + 父 + 自己 的全部注册；同名时最近者遮蔽</text>
+          <line x1="280" y1="70" x2="355" y2="70" stroke="#2d8a56" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="600" y1="70" x2="675" y2="70" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+
+          <text x="480" y="215" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e2a6e">事件准入：沿链向上冒泡</text>
+          <text x="480" y="235" text-anchor="middle" font-size="11" fill="#444">挂在 team scope 的监听器收得到 child 的事件；反向不成立</text>
+          <line x1="720" y1="105" x2="610" y2="200" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+          <line x1="540" y1="200" x2="430" y2="105" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+          <text x="120" y="235" font-size="11" fill="#666">bindScopeParent 一次性绑定父链，</text>
+          <text x="120" y="253" font-size="11" fill="#666">rebind 仅限原始 binder 持有的通行证</text>
+        </svg>
+      </div>
+      <div class="svg-legend">图 8-2 · 一条 parent 链同时定义「看见什么注册」（向下）与「收到什么事件」（向上）</div>
+    </div>
+    <div class="annotation"><b>父子如何接上</b>：第 4 章讲过 agent 构造时 <code class="inline">createScope(loopCtx, this)</code>；子 agent 由 <code class="inline">applyChildComposition</code> 先 <code class="inline">composeFrom(childCtx, parent.ctx)</code> 继承父 preset 的注册，再挂自己的 persona / delegation 上下文 / 工具限制。cycle 检查、一次性绑定、rebind 需要原始通行证——这三道闸保证 scope 祖先链不可能被运行期偷改。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.9</span>tools.restrict：按 scope 收工具</h2>
+    <div class="code-title">packages/core/tools/src/index.ts:1062 — restrict()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="fn">restrict</span>(filter: <span class="cl">ToolRestriction</span>): () =&gt; <span class="kw">void</span> {
+  <span class="kw">const</span> scope = <span class="fn">scopeOf</span>(<span class="kw">this</span>.ctx)
+  <span class="kw">if</span> (scope === <span class="kw">undefined</span>) {
+    <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">'tools.restrict() requires a scoped context (agent.ctx): '</span>
+      + <span class="st">'a context-global restriction would mask every agent — '</span>
+      + <span class="st">'deny the tool for the intended agent instead'</span>)
+  }
+  <span class="kw">if</span> (allow === <span class="kw">undefined</span> &amp;&amp; deny === <span class="kw">undefined</span>) {
+    <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">'tools.restrict({}) is a no-op: pass `allow` and/or `deny` '</span>
+      + <span class="st">'(an empty filter is almost always a materialized-empty-config bug)'</span>)
+  }
+  <span class="cmt">// run_code 是 PTC 的展示传输，不能点名限制——要限就限终端能力工具</span>
+  <span class="cmt">// 未知名字抛错；多条限制相交（allow 收紧 ∩ deny 移除），scoped 注册仍可见</span>
+}</pre>
+    <div class="callout warn">
+      <b class="tag">三个 fail-loud</b>
+      ① 全局上下文调用直接拒绝——「mask every agent」不是能力是事故；② 空过滤器拒绝——多半是配置物化成空对象的 bug；③ 点名 <code class="inline">run_code</code> 拒绝——它是 PTC 模式的展示传输，限制它不等于限制能力，正确做法是限制真正的终端能力工具。限制是<strong>相交</strong>语义：多层叠加只会更紧，谁也不能用一层 allow 复活另一层 deny 掉的工具。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.10</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 系统提示词是组装产物不是常量——四类输入（sections/contexts/tools/variables）各有管道；② 版面由中央 SECTION_ORDERS 表权威分配，插件只报名字不抢数字；③ 会变的政策走 user 快照，保住 KV 缓存前缀；④ persona 靠同名遮蔽替换，complete 靠恢复机制独占；⑤ Scope 用一条 parent 链同时定义注册继承（向下）与事件准入（向上）。下一步看这些机制最敏感的应用：<a href="09-security.html">第 9 章：沙箱与审批</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="07-llm.html">← 上一章：LLM 层</a>
+    <a href="09-security.html">下一步：安全 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -1,4 +1,4 @@
-# vLLM 引擎学习站
+# 深入浅出vLLM
 
 一套**纯静态、自包含**的 HTML 学习站点，用于系统学习 vLLM 的推理引擎实现，并为**自研推理引擎**提供路线图。无需任何构建工具，双击 `index.html` 即可浏览。
 
@@ -28,6 +28,7 @@ open /Users/lei.xia/workspace/github/vllm/learning-site/index.html
 | `10-distributed.html` | 分布式 | TP/PP/DP/EP、Executor（uniproc/ray/multiproc） |
 | `11-build-own-engine.html` | 自研路线图 | 六个里程碑：从单请求到多卡 |
 | `12-model-weights.html` | 实战·模型权重加载 | 注册表→loader→load_weights 重映射→量化/稀疏调优；以 DeepSeek-V4 / GLM-5.2 / Kimi-K2 为例；附三个真实 checkpoint 仓库目录结构对照 |
+| `13-agentic-gateway.html` | 实战·Agentic 网关 | 拆解 vllm-project/agentic-api（Rust）：previous_response_id 注水、服务端工具循环、工具所有权路由、SSE 缝合、compaction；vLLM 前的有状态编排层 |
 
 共享样式：`assets/vllm-learn.css`。所有架构图/流程图均为**内联 SVG**。
 
@@ -39,7 +40,7 @@ open /Users/lei.xia/workspace/github/vllm/learning-site/index.html
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 12 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
 - 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
 - 代码片段：务必从真实源码摘录并标注路径，不要凭记忆杜撰函数签名。
 - 如需在 `index.html` 的 `pathgrid` 增删卡片，同步调整对应页面即可。

@@ -67,7 +67,7 @@
     <div class="dim-card">
       <h3>Pi：流程是第一公民<span class="vs-pill vs-pi">固化流程</span></h3>
       <p>Pi 的核心抽象是 <strong>Harness</strong>——把 LLM 循环、会话存储、上下文、压缩、工具、持久化、恢复收口成<strong>一个对象</strong>。但这个对象怎么跑？第 8 章看过：<code class="inline">AgentSession.prompt()</code> 就是一条<strong>写死的顺序方法体</strong>（命令解析 → 钩子 → 展开 → 校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>），韧性（重试/压缩/续跑）硬编码在 <code class="inline">_handlePostAgentRun</code> 的 while 里。系统提示词只决定「模型怎么想」，<strong>这段流程才决定「运行时怎么跑」</strong>。</p>
-      <p>状态不是字典，而是一棵 <strong>append-only 会话树</strong>（Lanes / Entries / Records）。控制流不靠你拼边，而靠 harness 提供的<strong>三种操作</strong>：<code class="inline">run</code>（往后长对话）/ <code class="inline">compaction</code>（折叠历史）/ <code class="inline">navigation</code>（挪指针到别的叶子）。契约层（<code class="inline">AgentHarness</code>）全是抛 <code class="inline">HarnessNotImplemented</code> 的 stub，真正能跑的是 <code class="inline">AgentSession</code>——它<strong>不继承</strong>基类，而是按同一套 <code class="inline">AgentLane</code> 契约重新实现。</p>
+      <p>状态不是字典，而是一棵 <strong>append-only 会话树</strong>（Entry 树 + lane 簿记值）。控制流不靠你拼边，而靠 harness 提供的<strong>三种操作</strong>：<code class="inline">run</code>（往后长对话）/ <code class="inline">compaction</code>（折叠历史）/ <code class="inline">navigation</code>（挪指针到别的叶子）。契约层（<code class="inline">AgentHarness</code>）是一个 interface + <code class="inline">{ create: createAgentHarness }</code> 工厂，实现在同包的 <code class="inline">runtime/harness.ts</code>；生产层的 <code class="inline">AgentSession</code> 则<strong>不实现</strong>这套接口，而是直接组合 <code class="inline">Agent</code> 类 + SessionManager 另起一条实现线。</p>
     </div>
     <div class="callout">
       <strong>根分歧：</strong>LangGraph 让你「声明结构，框架负责跑」；Pi 让你「读一段流程，它就那么跑、你按需改」。前者把复杂度交给<strong>图的拓扑设计</strong>，后者把复杂度交给<strong>流程的编排代码</strong>。哪条更顺手，取决于你要的 Agent 是「很多条分叉的流程」还是「一条主干 + 大量扩展点」。
@@ -99,7 +99,7 @@
         </tr>
         <tr>
           <td><strong>持久化</strong></td>
-          <td class="pi">LaneRecord append-only 日志 + <code class="inline">reduceLaneState()</code> 纯函数重放（第 7 章 §7.4）。现场可从日志重算，非快照。</td>
+          <td class="pi">append-only Entry 树 + lane 簿记值（tip/config/state/op.meta/op.state 逐次落盘），崩溃后从存储恢复（<code class="inline">restoreSession</code> → <code class="inline">restoreLaneState</code> 校验 meta/state 一致性）（第 7 章 §7.4）。运行中快照另有 <code class="inline">reduceLaneSnapshot</code> 纯函数增量维护（事件→快照），非全量存档。</td>
           <td class="lg">Checkpointer 每 superstep 存<strong>完整状态快照</strong>，按 <code class="inline">thread_id</code> 分桶。InMemory/Sqlite/Postgres 后端。</td>
         </tr>
         <tr>
@@ -197,14 +197,14 @@
     <div class="dim-card">
       <h3>Pi：读一段流程，改一个点<span class="vs-pill vs-pi">流程可读</span></h3>
       <p>Pi 的上手不是「拼图」而是「读流程」。你打开 <code class="inline">agent-session.ts</code>，<code class="inline">prompt()</code> 是一条从上到下的方法体——没有图的拓扑要脑补，控制流就是你读到的顺序。想加行为？挂钩子（<code class="inline">beforeToolCall</code>/<code class="inline">afterToolCall</code>/<code class="inline">before_agent_start</code>…）或写扩展，不动主干。</p>
-      <p>契约/实现分层也利于学习：第 7 章的 <code class="inline">AgentHarness</code> 是<strong>全是 stub 的虚线框</strong>，告诉你「运行时该长什么样」；第 8 章的 <code class="inline">AgentSession</code> 才是实心实现。读虚线框建立心智模型，读实心框看落地，路径清晰。代价是：<strong>想改主干流程本身</strong>（比如插入一个全新的操作类型）要动 <code class="inline">prompt()</code> 的硬编码，比加一个 LangGraph 节点重。</p>
+      <p>契约/实现分层也利于学习：第 7 章的 <code class="inline">AgentHarness</code> 是<strong>接口契约的虚线框</strong>（interface + 工厂，告诉你「运行时该长什么样」），同包 <code class="inline">runtime/</code> 里就有实心实现，第 8 章的 <code class="inline">AgentSession</code> 是生产层的另一条实心实现线（不走 runtime/）。读虚线框建立心智模型，读实心框看落地，路径清晰。代价是：<strong>想改主干流程本身</strong>（比如插入一个全新的操作类型）要动 <code class="inline">prompt()</code> 的硬编码，比加一个 LangGraph 节点重。</p>
     </div>
     <table class="tbl">
       <thead><tr><th>维度</th><th>Pi</th><th>LangGraph</th></tr></thead>
       <tbody>
         <tr><td>第一个能跑的 Agent</td><td>装好即用（TUI 开箱），但要理解 harness 分层</td><td><code class="inline">create_react_agent</code> 三行</td></tr>
         <tr><td>从简单到复杂的路径</td><td>挂扩展点（横向），主干不变</td><td>prebuilt→StateGraph→多智能体（纵向），原语共享</td></tr>
-        <tr><td>核心心智模型</td><td>一条流程 + 三操作 + 会话树 + 日志重放</td><td>图 + 状态/reducer + 边/条件边 + checkpoint</td></tr>
+        <tr><td>核心心智模型</td><td>一条流程 + 三操作 + 会话树 + durable 操作状态</td><td>图 + 状态/reducer + 边/条件边 + checkpoint</td></tr>
         <tr><td>最常见的坑</td><td>改主干要碰硬编码流程</td><td>reducer 写错→状态静默丢失；循环无终止→GraphRecursionError</td></tr>
         <tr><td>语言/生态</td><td>TypeScript，monorepo，<code class="inline">pi install</code> 装包</td><td>Python（也有 JS SDK），langchain 生态，LangSmith 可观测</td></tr>
       </tbody>
@@ -221,7 +221,7 @@
     </div>
     <div class="dim-card">
       <h3>Pi：直改的控制<span class="vs-pill vs-pi">流程可改</span></h3>
-      <p>Pi 的赢面在<strong>直改</strong>：因为流程是写死的方法体，你能在任意两步之间插入逻辑——它就在 <code class="inline">prompt()</code> 那行代码的位置，看得见、改得动。钩子系统（<code class="inline">UnavailableRegistry</code> 让未实现钩子「注册即报错」而非静默失效）把可变策略移出主干，但主干本身对你是<strong>完全可读可改</strong>的源码。Pi 狂热追求可扩展，是为了「不必替你规定工作流」：别的工具烤进内核的（子 Agent、计划模式、权限弹窗、MCP），你都能自己搭或装包。</p>
+      <p>Pi 的赢面在<strong>直改</strong>：因为流程是写死的方法体，你能在任意两步之间插入逻辑——它就在 <code class="inline">prompt()</code> 那行代码的位置，看得见、改得动。钩子系统（<code class="inline">HookMap</code> 全量类型化映射，未注册的事件名在编译期就过不了类型检查；handler 出错转成 <code class="inline">handler_error</code> 事件而非静默失效）把可变策略移出主干，但主干本身对你是<strong>完全可读可改</strong>的源码。Pi 狂热追求可扩展，是为了「不必替你规定工作流」：别的工具烤进内核的（子 Agent、计划模式、权限弹窗、MCP），你都能自己搭或装包。</p>
       <p>代价是<strong>组合的灵活度低</strong>：没有原生的多智能体拓扑、没有 <code class="inline">Send</code> 式并行扇出、子图嵌套要靠 tmux 或扩展自己组织。要拼一张「研究员→写手→审稿」的多角色图，Pi 不如 LangGraph 顺手——它更擅长「一个 Agent 把一件事跑深」。</p>
     </div>
     <div class="callout">
@@ -237,7 +237,7 @@
       <tbody>
         <tr>
           <td><strong>崩溃恢复机制</strong></td>
-          <td class="pi"><strong>append-only 日志 + 纯函数重放</strong>。每步先写 <code class="inline">LaneRecord</code>（operation_started/step_attempt/tool_started/…）再动手；崩溃后 <code class="inline">reduceLaneState()</code> 重放日志算出「上次停在哪」，从那接着跑。「先写日志再动手 = 崩了也不丢现场」（第 7 章 §7.4）。</td>
+          <td class="pi"><strong>append-only 会话树 + durable 操作状态</strong>。每个动作先以事务写入 JSONL（entries + lane 簿记 + op.meta/op.state）再动手；崩溃后 <code class="inline">restoreSession</code> 读回各 lane 的 tip/config/state，校验 <code class="inline">op.meta</code> 意图与 <code class="inline">op.state</code> 相位一致后，从「上次停在哪个 boundary」接着跑（drive 的 checkpoint/resume 状态机）。「先写日志再动手 = 崩了也不丢现场」（第 7 章 §7.4）。</td>
           <td class="lg"><strong>每步完整状态快照</strong>。Checkpointer 在每个 superstep 后存整个 state（channel 值 + 版本 + pending writes），按 <code class="inline">thread_id</code> 分桶。崩溃后从最近 checkpoint 恢复。HITL 的 <code class="inline">interrupt()</code> 也依赖它跨进程续跑。</td>
         </tr>
         <tr>
@@ -247,7 +247,7 @@
         </tr>
         <tr>
           <td><strong>恢复粒度</strong></td>
-          <td class="pi">动作级——重放告诉你「停在某次 step_attempt 之后、工具还没开始」，精确续跑。<code class="inline">suspended</code> + <code class="inline">DeferredHandle</code> 支持主动挂起后 <code class="inline">resume()</code>。</td>
+          <td class="pi">动作级——13 个持久化操作状态叶子精确记录「停在哪一步」（如 <code class="inline">tools</code>、<code class="inline">deferred.suspended</code>），drive 状态机按相位续跑。<code class="inline">SuspendedRun</code> + <code class="inline">DeferredHandle</code> 支持主动挂起后 <code class="inline">resume()</code>。</td>
           <td class="lg">节点级——从某 superstep 的完整快照恢复，<code class="inline">interrupt()</code> 恢复时节点会从头重跑（故铁律：interrupt 必须在副作用之前）。</td>
         </tr>
         <tr>
@@ -269,7 +269,7 @@
     </table>
     <div class="callout info">
       <b class="tag">两种「稳」的哲学</b>
-      <strong>Pi 的稳靠「日志重放」</strong>——现场不在内存里凭空维护，而是可从 append-only 日志重算，所以「先写日志再动手」是它的铁律，崩在哪都能精确接回。<strong>LangGraph 的稳靠「快照存档」</strong>——每步存完整状态，恢复即读档，时间旅行还能回到任意历史点分叉。两者都做到了生产级崩溃恢复，但路径相反：Pi 重算（轻量、动作级精确），LangGraph 存档（重量、节点级完整）。选哪个，看你更信任「重放确定性」还是「快照完备性」。
+      <strong>Pi 的稳靠「先写日志再动手」</strong>——每个动作先以事务写入 append-only 的 JSONL（entry + op.meta/op.state），崩溃后从存储恢复到「上次停在哪」的 boundary 精确接回，现场不在内存里凭空维护。<strong>LangGraph 的稳靠「快照存档」</strong>——每步存完整状态，恢复即读档，时间旅行还能回到任意历史点分叉。两者都做到了生产级崩溃恢复，但路径相反：Pi 逐事务写日志（轻量、boundary 级精确），LangGraph 存档（重量、节点级完整）。选哪个，看你更信任「日志确定性」还是「快照完备性」。
     </div>
   </section>
 
@@ -284,7 +284,7 @@
         <tr><td><strong>适用场景</strong></td><td class="pi">单 Agent 长跑稳跑、CLI/可嵌入内核、编码助手</td><td class="lg">多角色分工、并行扇出、有结构的复杂流程</td></tr>
         <tr><td><strong>开发体验</strong></td><td class="pi">读一段可改流程；改主干较重</td><td class="lg">三行起手、平缓升级；心智模型多、reducer 易踩坑</td></tr>
         <tr><td><strong>灵活性</strong></td><td class="pi">直改控制强（源码可读可改）；组合灵活度低</td><td class="lg">组合灵活强（拓扑可拼）；单点控制要绕到节点</td></tr>
-        <tr><td><strong>生产就绪</strong></td><td class="pi">日志重放恢复（动作级精确）+ 并发秩序工程细节</td><td class="lg">快照存档恢复（节点级完整）+ tracing/Store 生态</td></tr>
+        <tr><td><strong>生产就绪</strong></td><td class="pi">事务日志 + durable 操作状态恢复（boundary 级精确）+ 并发秩序工程细节</td><td class="lg">快照存档恢复（节点级完整）+ tracing/Store 生态</td></tr>
       </tbody>
     </table>
     <div class="callout warn">
@@ -300,7 +300,7 @@
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理 · LangGraph 对照基于 <code>github.com/langchain-ai/langgraph</code> 学习站</p>
+  <p>Pi Agent Harness · 15 Pi vs LangGraph 逐项对比 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准 · LangGraph 对照基于 <code>github.com/langchain-ai/langgraph</code> 学习站</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a> · <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>
 

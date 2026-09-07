@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 沙箱与审批 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 安全</div>
+    <h1>沙箱与审批：fail-closed 的两种形态</h1>
+    <div class="subtitle">dsh 的安全模型由两条正交的轴组成：文件沙箱（进程能写哪里）与审批（人是否点头）。两条轴各自 fail-closed，还共享同一套升级编排。这一章看政策解析、后端选择、审批审计对，以及把三者缝起来的 escalation 协议。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>一分钟版本</h2>
+    <ul>
+      <li><strong>沙箱</strong>：<code class="inline">ctx.sandboxPolicy</code> 是唯一政策之家（默认 <code class="inline">read-only</code>），<code class="inline">ctx.sandbox</code> 是执行缝（<code class="inline">confine(argv, policy)</code> 返回包过的 argv 或 fail-closed 抛错）。政策与执行分家——一个解析事实，一个做本地进程限制。</li>
+      <li>三种模式 read-only / workspace-write / danger-full-access 只管<strong>文件效果</strong>；网络与进程可见性明确排除在词汇表外。</li>
+      <li><strong>审批</strong>：<code class="inline">ctx.approval</code>，政策 ask/never；结果封闭联合 allowed-once / rejected / cancelled / unavailable——<strong>唯一授权是 allowed-once</strong>，且只授权本次调用。</li>
+      <li>每次 ask 在日志里留下 approval/asked + approval/decided <strong>审计对</strong>；必须在 open turn 内（turn 是日志的重放边界）。</li>
+      <li>模型否认不了沙箱：拒绝统一为 <code class="inline">[sandbox: file access denied under …]</code> 标记 + 同轮升级提示，模型可以带着 <code class="inline">sandbox_permissions + justification</code> 原样重试一次，由 approveEscalation 严格加宽并先过审批。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>政策之家：resolve() 的三层优先级</h2>
+    <div class="code-title">packages/sandbox/sandbox-policy/src/index.ts:163 — SandboxPolicyService.resolve()</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="fn">resolve</span>(request: <span class="cl">SandboxPolicyRequest</span> = {}): <span class="cl">SandboxExecutionPolicy</span> {
+  <span class="kw">const</span> { session } = request
+  <span class="kw">return</span> {
+    <span class="cmt">// 已批准的显式模式 &gt; 会话日志里最后一次 sandbox/mode 事件 &gt; 部署默认</span>
+    mode: request.mode
+      ?? (session === <span class="kw">undefined</span> ? <span class="kw">undefined</span> : <span class="kw">this</span>.<span class="fn">overrideOf</span>(session))
+      ?? <span class="kw">this</span>.defaultMode,
+    <span class="cmt">// 会话 cwd 是其 workspace-write 边界；配置根仅是 agentless 调用的后备</span>
+    workspaceRoot: <span class="fn">resolveWorkspaceRoot</span>(session?.header.cwd ?? <span class="kw">this</span>.workspaceRoot),
+    ...session === <span class="kw">undefined</span> ? {} : { sessionId: session.id },
+  }
+}</pre>
+    <div class="annotation"><b>读法</b>：<code class="inline">mode: 'read-only'</code> 是配置默认（注释：「fail-safe default; a deployment that wants a workspace-writable agent opts in explicitly」——想要可写必须显式选入）。会话覆盖以 <code class="inline">sandbox/mode</code> 事件形式追加进日志，由 <code class="inline">sandboxMode</code> 投影折叠（stateVersion 1）。每次执行边界（工具执行前）重新 resolve 一次——executors 和 providers 保持 session-free，事实读取集中在政策之家。</div>
+    <div class="code-title">packages/sandbox/sandbox-policy/src/index.ts:41 — renderPolicyContext（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">case</span> <span class="st">'workspace-write'</span>:
+  <span class="kw">return</span> `Current DSH file policy: workspace-write. … may modify files under the session workspace: ${<span class="cl">JSON</span>.<span class="fn">stringify</span>(policy.workspaceRoot)}. Some platform temporary areas may also be writable.`
+<span class="kw">case</span> <span class="st">'danger-full-access'</span>:
+  <span class="kw">return</span> <span class="st">'Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.'</span></pre>
+    <div class="annotation"><b>提示词也 fail-safe</b>：read-only 的渲染文案特意告诉模型「Do not refuse a required modification from this policy alone: try an available tool normally and follow any denial and escalation guidance it returns」——政策文案不替工具层预判失败，只陈述事实并指向升级通道。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>执行缝：confine() 返回 argv，不许静默放行</h2>
+    <div class="code-title">packages/sandbox/sandbox/src/index.ts:154 — SandboxProvider 抽象类</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export abstract class</span> <span class="cl">SandboxProvider</span> <span class="kw">extends</span> <span class="cl">Service</span> {
+  <span class="cmt">/**
+   * Wrap `argv` so it executes confined under `policy` on this host; the
+   * caller spawns the returned argv in place of its own.
+   */</span>
+  <span class="kw">abstract</span> <span class="fn">confine</span>(argv: <span class="kw">readonly</span> <span class="kw">string</span>[], policy: <span class="cl">SandboxPolicy</span>): <span class="cl">ConfinedArgv</span>
+}</pre>
+    <p><code class="inline">ConfinedArgv</code> 不只返回 argv，还返回<strong>三条自描述事实</strong>：</p>
+    <div class="code-title">packages/sandbox/sandbox/src/index.ts:101 — ConfinedArgv（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">ConfinedArgv</span> {
+  argv: <span class="kw">string</span>[]                            <span class="cmt">// runner, profile, 分隔符, 原始 argv</span>
+  <span class="cmt">/** full | partial —— partial 不得当作 full 用 */</span>
+  enforcement: <span class="cl">SandboxEnforcement</span>
+  <span class="cmt">/** 本后端的拒绝方言：EROFS(bwrap)/EACCES(Landlock)/EPERM(Seatbelt) */</span>
+  denialSignatures: <span class="kw">readonly</span> <span class="kw">string</span>[]
+  <span class="cmt">/** runner 自身失败的证据规则（区分「没跑成」与「被沙箱挡下」） */</span>
+  runnerFailureRules: <span class="kw">readonly</span> <span class="cl">RunnerFailureRule</span>[]
+}</pre>
+    <div class="annotation"><b>为什么返回方言</b>：消费者的失败分类分两步——先排除 informationalLines、核对 allowedExitCodes 识别 <strong>runner 自身失败</strong>（命令根本没跑），再匹配 denialSignatures 识别<strong>沙箱拒绝</strong>（confinement 生效且挡下了它）。「Exit status alone never proves runner failure」。每个后端报告自己的方言，而不是让消费者匹配跨后端联合——「the union claims denials a given backend never produces」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>后端链：探针仲裁，fail-closed 兜底</h2>
+    <p>dsh-sandbox-local 按平台选择 runner 链（<code class="inline">packages/sandbox/sandbox-local/src/index.ts</code> 模块注释）：Linux 先 bwrap 后 Landlock；macOS 用 Seatbelt（sandbox-exec）；Windows 用 ACL restricted-token runner。两个关键行为：</p>
+    <ul>
+      <li><strong>功能探针</strong>：候选后端先跑一次真实探针（如 bwrap 用 read-only profile 跑 <code class="inline">true</code>；Seatbelt 通过 <code class="inline">sandbox-exec -p</code> 应用真实 profile），结果有界缓存——「Functional probes arbitrate multi-runner chains and may be skipped for a sole candidate, whose own refusal remains the fail-closed end」。</li>
+      <li><strong>fail-closed</strong>：「Missing or unusable confinement fails closed rather than returning the original argv」——confine 不出 enforcing argv 就抛 <code class="inline">SandboxUnavailableError</code>（码 <code class="inline">SANDBOX_UNAVAILABLE</code>），错误文本直接给出各平台修法建议（装 bubblewrap / Landlock 内核 / sandbox-exec / ACL runner）。</li>
+    </ul>
+    <p>Windows 后端还有一套精密的 SID 设计：写权限 SID 是<strong>按 workspace 路径派生的 per-workspace 身份</strong>（workspaceWriteSid），其 ACE 每 workspace 一次物化并长存（跨会话复用缓存）；而每个活跃会话有<strong>随机私有临时目录 + 自己的 SID</strong>（tempWriteSid），dispose 时撤销。该 rung 主动上报 partial enforcement——「WRITE_RESTRICTED must retain Everyone in its restricting list and NTFS hard links alias one file object across paths」。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>审批：政策 → answerer 瀑布 → 审计对</h2>
+    <div class="code-title">packages/interaction/user-approval/src/index.ts:207 — ApprovalService.request()</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">async</span> <span class="fn">request</span>(req: <span class="cl">ApprovalRequest</span>): <span class="cl">Promise</span>&lt;<span class="cl">ApprovalOutcome</span>&gt; {
+  <span class="kw">const</span> session = req.agent.session
+  <span class="kw">if</span> (!<span class="fn">hasOpenTurn</span>(session)) {
+    <span class="kw">throw new</span> <span class="cl">Error</span>(
+      <span class="st">'approval.request() outside an open turn: the approval/asked + approval/decided audit pair '</span>
+      + <span class="st">'must be turn-enclosed (a bare event between turns is crash-tail garbage on reload). '</span>
+      + <span class="st">'Ask from inside the turn that needs the decision.'</span>,
+    )
+  }
+  <span class="kw">const</span> id = <span class="cl">ApprovalRequestId</span>(<span class="fn">randomUUID</span>())
+  session.<span class="fn">append</span>(<span class="st">'approval/asked'</span>, { id, toolName, ...callId, ...reason })
+  <span class="kw">const</span> outcome = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">decide</span>(req, session)
+  session.<span class="fn">append</span>(<span class="st">'approval/decided'</span>, { id, outcome })
+  <span class="kw">return</span> outcome
+}</pre>
+    <p><code class="inline">decide()</code> 的顺序就是安全不变量：</p>
+    <div class="code-title">packages/interaction/user-approval/src/index.ts:258 — decide()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">if</span> (signal?.aborted) <span class="kw">return</span> <span class="st">'cancelled'</span>
+<span class="cmt">// 'never' 在任何派发之前在此地决定：prepend 监听器不能抢跑——</span>
+<span class="cmt">// 只有服务自己的请求路径能保证 'never' 无视注册顺序确定性拒绝</span>
+<span class="kw">if</span> (<span class="kw">this</span>.<span class="fn">effectivePolicy</span>(session) === <span class="st">'never'</span>) <span class="kw">return</span> <span class="st">'rejected'</span>
+<span class="kw">const</span> answer: <span class="cl">Promise</span>&lt;<span class="cl">ApprovalOutcome</span>&gt; = <span class="cl">Promise</span>.<span class="fn">resolve</span>().<span class="fn">then</span>(() =&gt;
+  <span class="kw">this</span>.ctx.<span class="fn">waterfall</span>(<span class="fn">scopeTarget</span>(req.agent, req.agent), <span class="st">'approval/request'</span>, req,
+    () =&gt; <span class="cl">Promise</span>.<span class="fn">resolve</span>&lt;<span class="cl">ApprovalOutcome</span>&gt;(<span class="st">'unavailable'</span>)))
+  .<span class="fn">then</span>(
+    outcome =&gt; OUTCOMES.<span class="fn">includes</span>(outcome) ? outcome : <span class="st">'unavailable'</span>,  <span class="cmt">// 野值归一化</span>
+    () =&gt; <span class="st">'unavailable'</span>,                                              <span class="cmt">// 抛错也归 unavailable</span>
+  )</pre>
+    <div class="annotation"><b>四个 fail-closed 细节</b>：① 'never' 政策在派发前短路——注释点明这是为了防 prepend 监听器抢跑，把「never 必然拒绝」的承诺保留在服务自己的路径上；② 无 answerer 时 waterfall 默认值就是 unavailable；③ answerer 返回词汇表之外的野值归一化为 unavailable；④ answerer 抛错同样归 unavailable（「A throwing answerer must fail the QUESTION closed, not the caller's tool call open — the seam contains its callbacks」）。另外两个实现细节值得学：审计对必须在 open turn 内（否则重载时被当成 crash-tail 丢弃）；先进入 Promise 链再派发，同步抛错的监听器也落进同一收容路径。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>图 9-1：一次被拒的 bash 调用如何升级</h2>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="升级流程">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L9,3 L0,6 Z" fill="#4156c8"/>
+            </marker>
+          </defs>
+          <rect x="20" y="20" width="200" height="70" rx="10" fill="#12142b"/>
+          <text x="120" y="48" text-anchor="middle" font-size="12" font-weight="bold" fill="#8ea2ff">模型调用 bash</text>
+          <text x="120" y="70" text-anchor="middle" font-size="10" fill="#c8cfef">rm /tmp/data.csv（read-only 模式）</text>
+
+          <rect x="290" y="20" width="200" height="70" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="390" y="44" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">confine() 包装 argv</text>
+          <text x="390" y="64" text-anchor="middle" font-size="10" fill="#444">bwrap / Landlock / Seatbelt / ACL</text>
+
+          <rect x="560" y="20" width="180" height="70" rx="10" fill="#fbeaea" stroke="#c84848"/>
+          <text x="650" y="44" text-anchor="middle" font-size="12" font-weight="bold" fill="#8a2020">内核拒绝写</text>
+          <text x="650" y="64" text-anchor="middle" font-size="10" fill="#8a2020">EROFS / EACCES / EPERM</text>
+
+          <rect x="800" y="20" width="140" height="70" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="870" y="44" text-anchor="middle" font-size="11" font-weight="bold" fill="#9a5a06">tool/result 标记</text>
+          <text x="870" y="62" text-anchor="middle" font-size="10" fill="#7a4a08">[sandbox: file access</text>
+          <text x="870" y="76" text-anchor="middle" font-size="10" fill="#7a4a08">denied under read-only]</text>
+
+          <rect x="290" y="140" width="200" height="90" rx="10" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="390" y="168" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">模型重试 + 升级参数</text>
+          <text x="390" y="190" text-anchor="middle" font-size="10" fill="#2d5a40">sandbox_permissions: workspace-write</text>
+          <text x="390" y="208" text-anchor="middle" font-size="10" fill="#2d5a40">justification: "需要删除产物文件"</text>
+
+          <rect x="560" y="140" width="180" height="90" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="650" y="165" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">approveEscalation</text>
+          <text x="650" y="185" text-anchor="middle" font-size="10" fill="#444">① 严格加宽检查</text>
+          <text x="650" y="203" text-anchor="middle" font-size="10" fill="#444">② 无审批服务→抛错</text>
+          <text x="650" y="221" text-anchor="middle" font-size="10" fill="#444">③ approval.request()</text>
+
+          <rect x="800" y="140" width="140" height="90" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="870" y="168" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e2a6e">人点头</text>
+          <text x="870" y="188" text-anchor="middle" font-size="10" fill="#444">allowed-once → 授权模式</text>
+          <text x="870" y="206" text-anchor="middle" font-size="10" fill="#444">仅对本次调用生效</text>
+          <text x="870" y="222" text-anchor="middle" font-size="10" fill="#444">rejected/cancelled/</text>
+          <text x="870" y="238" text-anchor="middle" font-size="10" fill="#444">unavailable → 抛错</text>
+
+          <rect x="290" y="270" width="650" height="40" rx="10" fill="#12142b"/>
+          <text x="615" y="295" text-anchor="middle" font-size="11" fill="#8ea2ff">审计对持久化：approval/asked {id, toolName, callId?, reason} → approval/decided {id, outcome}</text>
+
+          <line x1="220" y1="55" x2="285" y2="55" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="490" y1="55" x2="555" y2="55" stroke="#c84848" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="740" y1="55" x2="795" y2="55" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="870" y1="95" x2="490" y2="140" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+          <line x1="490" y1="185" x2="555" y2="185" stroke="#2d8a56" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="740" y1="185" x2="795" y2="185" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="655" y1="231" x2="655" y2="265" stroke="#4156c8" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+        </svg>
+      </div>
+      <div class="svg-legend">图 9-1 · 拒绝 → 标记 + 升级提示 → 带 sandbox_permissions 重试 → approveEscalation 严格加宽 + 审批 → 审计对落日志</div>
+    </div>
+    <div class="code-title">packages/sandbox/sandbox/src/escalation.ts:160 — approveEscalation 的判定顺序</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export async function</span> <span class="fn">approveEscalation</span>&lt;<span class="cl">A</span>, <span class="cl">C</span>&gt;(request: <span class="cl">EscalationRequest</span>, approval: <span class="cl">EscalationApproval</span>&lt;A, C&gt;): <span class="cl">Promise</span>&lt;<span class="cl">SandboxMode</span>&gt; {
+  <span class="cmt">// ① 严格加宽是 EXECUTION 检查——schema enum 只是封闭目标词汇表，</span>
+  <span class="cmt">//    生效模式是每次调用的真相</span>
+  <span class="kw">if</span> (!(<span class="cl">WIDER_MODES</span>[effectiveMode] ?? []).<span class="fn">includes</span>(mode <span class="kw">as</span> <span class="cl">SandboxMode</span>)) {
+    <span class="kw">throw new</span> <span class="cl">Error</span>(`sandbox escalation to "${mode}" is not strictly wider than this call's current "${effectiveMode}" mode`)
+  }
+  <span class="kw">if</span> (approval.approver === <span class="kw">undefined</span>) <span class="kw">throw</span> …  <span class="cmt">// ② 无审批服务 → 抛错</span>
+  <span class="kw">if</span> (approval.agent === <span class="kw">undefined</span>) <span class="kw">throw</span> …    <span class="cmt">// ③ agentless → 抛错</span>
+  <span class="kw">const</span> outcome = <span class="kw">await</span> approval.approver.<span class="fn">request</span>({
+    …,
+    reason: `escalate sandbox to ${mode}: ${justification}`,
+  })
+  <span class="kw">switch</span> (outcome) {
+    <span class="kw">case</span> <span class="st">'allowed-once'</span>: <span class="kw">return</span> mode <span class="kw">as</span> <span class="cl">SandboxMode</span>
+    <span class="cmt">// rejected / cancelled / unavailable 各有逐字错误文本，什么都没执行</span>
+  }
+}</pre>
+    <div class="annotation"><b>结构学但不依赖</b>：EscalationApprover 是<strong>最小结构形状</strong>（只有 request 方法），不是 ApprovalService 类型——「the tool layer … closes over <code class="inline">ctx.approval.request(...)</code> and hands the closure down, so this package never depends on the approval or agent packages」。WIDER_MODES 阶梯是 read-only→{workspace-write, danger-full-access}、workspace-write→{danger-full-access}；schema enum 固定为完整 ESCALATION_TARGETS 而非按默认模式裁剪——否则一个 danger-full-access 默认部署会让窄模式会话失去升级杠杆。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>权限预设：两个旋钮一个选择器</h2>
+    <p>dsh-permission-presets（<code class="inline">packages/interaction/permission-presets</code>）把两个独立旋钮打包成命名预设：</p>
+    <table class="tbl">
+      <tr><th>预设</th><th>sandbox 模式</th><th>approval 政策</th></tr>
+      <tr><td><code class="inline">workspace-write</code></td><td>workspace-write</td><td>ask</td></tr>
+      <tr><td><code class="inline">danger-full-access</code></td><td>danger-full-access</td><td>never</td></tr>
+      <tr><td><code class="inline">custom</code></td><td colspan="2">不匹配任何预设的组合<strong>只读回</strong>为 custom——「which clients may display but never select」</td></tr>
+    </table>
+    <div class="annotation"><b>bundler 不是 owner</b>：README 明说「It bundles the knobs; execution and approval keep their own values, so removing the package later leaves the last selection in effect」——预设包只是把两件事写进各自的事件，它不拥有任何执行语义；卸掉它，最后的模式与政策原样生效。这就是第 1 章「能力缝」判别法的活例子：打包面（UI 概念）与能力面（enforcement）分开。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.8</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 政策与执行分家：resolve() 三层优先级（显式批准 &gt; 会话事件 &gt; 部署默认），confine() 只认完全指定的政策；② 词汇表刻意小：沙箱只管文件效果，网络/进程可见性排除在外；③ 审批唯一授权是 allowed-once，且 always 一次调用；'never' 在派发前短路；④ 审计对必须 turn-enclosed；⑤ 升级是共享编排：严格加宽 + 结构化审批接口 + 逐字错误文本，两个执行家族（bash/fs）共用同一套。下一步看其他能力缝的实例：<a href="10-seams.html">第 10 章：能力缝实战</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="08-scope-prompt.html">← 上一章：Prompt/Scope</a>
+    <a href="10-seams.html">下一步：能力缝 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 09 安全 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

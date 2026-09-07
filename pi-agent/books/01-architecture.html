@@ -132,7 +132,7 @@
 
     <div class="annotation"><b>关键映射（按目录）：</b>
       <code class="inline">packages/ai/src/</code> → L0；<code class="inline">packages/agent/src/agent.ts</code>、<code class="inline">agent-loop.ts</code>、<code class="inline">harness/session/</code>、<code class="inline">harness/compaction/</code> → L1；
-      <code class="inline">packages/coding-agent/src/core/</code>（agent-session、tools、modes/、skills、telemetry）→ L2。
+      <code class="inline">packages/coding-agent/src/core/</code>（agent-session、tools、modes/、skills、telemetry、extensions/）→ L2。
     </div>
   </section>
 
@@ -163,18 +163,27 @@ agent.subscribe(<span class="kw">(event</span>) =&gt; {
   </section>
 
   <section class="block">
-    <h2><span class="num">1.4</span>基础层 vs 生产 harness：谁是「正主」</h2>
-    <p>可能让你意外的是：<code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里那个 <code class="inline">AgentHarness</code> 类<strong>只是一个接口基类</strong>——大部分方法直接抛 <code class="inline">HarnessNotImplemented</code>。真正可用的实现住在 <code class="inline">coding-agent/src/core/agent-session.ts</code>。</p>
-    <div class="code-title">packages/agent/src/harness/agent-harness.ts — 基类 vs 实现的分工（节选）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export class</span> <span class="cl">AgentHarness</span> <span class="kw">implements</span> <span class="cl">AgentLane</span> {
-  <span class="cmt">// 定义好"一条会话车道"该有什么能力（接口契约）</span>
-  async prompt(text: string): Promise&lt;<span class="cl">RunResult</span>&gt; {
-    <span class="kw">return</span> <span class="kw">this</span>.unavailable(<span class="st">"prompt"</span>);   <span class="cmt">// 基类：抛 HarnessNotImplemented</span>
-  }
-  async compact(): Promise&lt;<span class="cl">CompactionResult</span>&gt; { <span class="kw">return</span> <span class="kw">this</span>.unavailable(<span class="st">"compact"</span>); }
-  <span class="cmt">// ... 大量方法都是基类占位，真正的逻辑在 coding-agent 的 agent-session</span>
+    <h2><span class="num">1.4</span>契约与实现：AgentHarness 是接口，实现在 runtime/</h2>
+    <p><code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 现在是<strong>一个 interface + 一个工厂</strong>：接口定义「一条会话车道该有什么能力」（<code class="inline">AgentLane</code>：prompt / compact / navigate / resume / steer / followUp…），工厂负责校验参数、装载会话并造出真正能跑的实现。实现类住在隔壁的 <code class="inline">harness/runtime/harness.ts</code>。</p>
+    <div class="code-title">packages/agent/src/harness/agent-harness.ts — 契约 + 工厂（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">AgentHarness</span>&lt;TContext&gt; {
+  <span class="cmt">// 多车道 + 全局操作的完整契约（lane/lanes/hooks/events/watchSession/close…）</span>
+}
+<span class="kw">export interface</span> <span class="cl">AgentLane</span> {
+  <span class="cmt">// 单条车道的能力面：prompt / compact / navigate / resume / steer / followUp / wait…</span>
+  <span class="fn">prompt</span>(text: <span class="kw">string</span>, context: Context): Promise&lt;<span class="cl">RunResult</span>&gt;;
+  <span class="cmt">// ...</span>
+}
+
+<span class="cmt">// 工厂：名字与接口同名（JS 惯例「既是类型又是构造入口」）</span>
+<span class="kw">export const</span> <span class="cl">AgentHarness</span> = { <span class="fn">create</span>: createAgentHarness } satisfies AgentHarnessConstructor;</pre>
+    <div class="code-title">packages/agent/src/harness/runtime/harness.ts — 真正的实现（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export</span> <span class="kw">async function</span> <span class="fn">createAgentHarness</span>(options, context) {
+  <span class="cmt">// 校验配置 → 种下 LaneConfiguration → restoreSession 从存储恢复各车道</span>
+  <span class="kw">const</span> harness = <span class="kw">new</span> <span class="cl">Harness</span>(...);              <span class="cmt">// class Harness implements AgentHarness</span>
+  <span class="kw">return</span> { harness, <span class="fn">open</span> };
 }</pre>
-    <div class="annotation"><b>为什么这么设计：</b> 把「运行时该长什么样」的<strong>契约</strong>放在最核心、最不依赖平台的地方（<code class="inline">agent-harness.ts</code> 定义了 <code class="inline">AgentLane</code> 接口、操作状态机、Outcome 类型），而把<strong>实现</strong>留给更上层的包。这也是你自研时的范本：先定接口契约，再分层实现。第 7、8 章会彻底拆开这条线。</div>
+    <div class="annotation"><b>为什么这么设计：</b> 把「运行时该长什么样」的<strong>契约</strong>放在最核心、最不依赖平台的地方（<code class="inline">agent-harness.ts</code> 定义了 <code class="inline">AgentLane</code> 接口、操作状态机、Result 类型），而<strong>实现</strong>同包但独立在 <code class="inline">runtime/</code> 子目录——契约与实现互不 import 实现，测试与二次实现都可以只对着接口写。这也是你自研时的范本：先定接口契约，再分层实现。第 7 章会彻底拆开这条线；第 8 章讲生产层的 <code class="inline">AgentSession</code>——它是<strong>另一条自主实现线</strong>（直接组合 <code class="inline">Agent</code> 类 + SessionManager），不走 runtime/。</div>
   </section>
 
   <section class="block">
@@ -189,7 +198,8 @@ agent.subscribe(<span class="kw">(event</span>) =&gt; {
       <tr><td>pi-protocol</td><td>packages/protocol</td><td>RPC 协议定义（远程会话契约）</td><td>需要远程时才看</td></tr>
       <tr><td>pi-client / pi-server</td><td>packages/client · packages/server</td><td>RPC 客户端/服务端（远程会话的两端实现）</td><td>需要远程时才看</td></tr>
       <tr><td>pi-evals</td><td>packages/evals</td><td>评测套件</td><td>可选</td></tr>
-      <tr><td>—（模块，非发布包）</td><td>packages/session-backends</td><td>SQLite 会话后端（node:sqlite）</td><td>持久化后端示例</td></tr>
+      <tr><td>chord</td><td>packages/chord</td><td>传输中立的服务原语（facet service），agent 的存储/值模型构建其上</td><td>持久化抽象参考</td></tr>
+      <tr><td>—（模块，非发布包）</td><td>packages/session-backends/sqlite-node</td><td>SQLite 会话后端（<code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>）</td><td>持久化后端示例</td></tr>
     </table>
   </section>
 
@@ -209,7 +219,7 @@ agent.subscribe(<span class="kw">(event</span>) =&gt; {
 </div>
 
 <footer>
-  Pi Agent Harness · 01 整体架构 · 版本 v0.84.3-4-gdcd461925 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 01 整体架构 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · 编排与多 Agent — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 编排</div>
+    <h1>编排与多 Agent：委派缝、工作流、Ralph</h1>
+    <div class="subtitle">一个 agent 够用，一群 agent 才叫 harness。dsh 的编排栈三层：委派缝（ctx.subagents，多 provider 注册表）、工作流（模型写的 JS 脚本在 worker thread 里 fan out 子 agent）、以及固定策略工具 ralph。每一层都建立在第 4 章的循环之上——子 agent 就是又一个 ReactLoopAgent。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>一分钟版本</h2>
+    <ul>
+      <li><code class="inline">ctx.subagents</code> 是命名 provider 注册表：spawn（新子）/ fork（继承父已完成历史）/ acp / codex / claude-code / dsh-sdk 可共存，按名字选择。</li>
+      <li>两种子 agent 形态：<strong>one-shot run</strong>（provider 全权建立→发布→所有权转移）与 <strong>continuable child</strong>（durable，续聊走消息与冷恢复）。</li>
+      <li>continuable 子 agent 的全部运行时（身份、组合、turn、teardown、冷恢复）归 continuation manager——provider 只贡献「是否带父历史」这一个创建参数，<strong>永远看不见子 agent 本体</strong>。</li>
+      <li>工作流 = 模型写的纯 JS 编排脚本，跑在每 run 一个的 worker thread 里，<code class="inline">agent()/parallel()/pipeline()/phase()/log()</code> 经 typed 协议调回宿主；「containment, not a security boundary」。</li>
+      <li>ralph 是固定前台循环：每轮一个<strong>全新</strong>子 agent（无对话种子），跨轮只传一份有界结构化报告（maxRounds 默认 256），共享 workspace 是长期记忆。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>委派缝：多 provider 注册表</h2>
+    <div class="code-title">packages/subagent/subagent/src/index.ts:1 — 模块注释（节选）</div>
+    <pre class="code"><span class="lang-tag">text</span>Service Definition for the subagent capability seam (ctx.subagents): a
+named-provider registry plus a capability-validating asynchronous start API.
+Providers establish a child before returning its run, so fulfillment is the
+single publication and ownership-transfer boundary.
+
+Multiple providers coexist: each registers under a unique name and callers
+select one by name.
+
+Same-process providers are trusted typed collaborators. Requests, provider
+descriptors, results, and lifecycle payloads are borrowed immutable values;
+serialization and hostile-input validation belong at real process, worker,
+persistence, and model boundaries.</pre>
+    <table class="tbl">
+      <tr><th>provider</th><th>形态</th><th>特点</th></tr>
+      <tr><td><code class="inline">subagent-spawn-in-process</code>（spawn）</td><td>进程内新子</td><td>从零开始的全新 agent</td></tr>
+      <tr><td><code class="inline">subagent-fork-in-process</code>（fork）</td><td>进程内 fork</td><td>以父会话<strong>已完成历史</strong>为种子（inheritsParentContext: true）</td></tr>
+      <tr><td><code class="inline">subagent-acp</code></td><td>跨进程</td><td>经 Agent Client Protocol 与外部 agent 通信</td></tr>
+      <tr><td><code class="inline">subagent-codex / claude-code</code></td><td>跨进程</td><td>驱动真实安装的 Codex / Claude Code</td></tr>
+      <tr><td><code class="inline">subagent-dsh-sdk</code></td><td>跨进程</td><td>完整 Harness 运行时经 TypeScript SDK</td></tr>
+    </table>
+    <div class="code-title">packages/subagent/subagent/src/types.ts:300 — SubagentProvider</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">SubagentProvider</span> {
+  name: <span class="kw">string</span>                       <span class="cmt">// 唯一注册名（'spawn' | 'fork' | 'acp'…）</span>
+  capabilities: <span class="cl">SubagentCapabilities</span>  <span class="cmt">// 启动期能力声明</span>
+  <span class="cmt">/** 子 agent 是否看到父的已完成 turn 前缀——纯描述性，</span>
+<span class="cmt">      模型工具由此生成真实措辞，不谈工具/服务继承 */</span>
+  <span class="kw">readonly</span> inheritsParentContext: <span class="kw">boolean</span>
+  agentRouteDefaults?: { provider: <span class="kw">string</span>; model: <span class="kw">string</span> }
+
+  <span class="cmt">/**
+   * Establish a ONE-SHOT child and return its handle after publication.
+   * Before fulfillment, the provider owns setup and cleans any unpublished
+   * partial resources before rejecting. Ownership transfers on fulfillment.
+   */</span>
+  start(request: <span class="cl">ResolvedSubagentStartRequest</span>): <span class="cl">Promise</span>&lt;<span class="cl">SubagentRun</span>&gt;
+
+  <span class="cmt">/**
+   * OPTIONAL (continuable-creation capability). 方法存在即能力：
+   * 服务在无此方法的 provider 上拒绝 continuable 启动。
+   * 这是 provider 对 continuable 子的唯一参与——continuation manager
+   * 独占身份预留、组合、Agent 创建、prompt 送达、冷恢复、所有权与销毁，
+   * provider 永远看不见子的 Agent、handle、turn 或 teardown。
+   */</span>
+  prepareContinuable?(request: <span class="cl">ContinuableCreateRequest</span>): <span class="cl">Promise</span>&lt;<span class="cl">ContinuableCreateSpec</span>&gt;
+}</pre>
+    <div class="annotation"><b>「方法存在即能力」</b>：optional prepareContinuable 的有无就是 capability 位——不需要额外的 capability 枚举。one-shot 的责任分界画在「发布」这一刻：发布前 provider 全责（含清理半成品），发布后所有权与失败结算归返回的 SubagentRun。这与第 1 章「fulfillment is the single publication and ownership-transfer boundary」的设计一脉相承。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>continuable 子 agent：durable、可续聊、可冷恢复</h2>
+    <div class="code-title">packages/subagent/subagent/src/index.ts:221 — 注册表上的三个操作</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 建立一个 durable continuable child 并送达初始 prompt。
+    在子 inbox 接受 prompt 时即 resolve——不等 turn 开始、不等消息落日志。 */</span>
+<span class="kw">async</span> <span class="fn">startContinuable</span>(spec: <span class="cl">ContinuableStartSpec</span>): <span class="cl">Promise</span>&lt;<span class="cl">ContinuableStart</span>&gt;
+
+<span class="cmt">/** 向直接父或直接 continuable 子发送模型撰写的消息。
+    运行中的目标在最近 step 边界接纳；idle 目标启动一个 turn；
+    不在场的直接子从持久化冷恢复。 */</span>
+<span class="kw">async</span> <span class="fn">sendMessage</span>(sender: <span class="cl">Agent</span>, targetId: <span class="cl">SessionId</span>, content: <span class="cl">ContentBlock</span>[], options): <span class="cl">Promise</span>&lt;<span class="cl">MessageId</span>&gt;
+
+<span class="cmt">/** 在人类父授权下打断一个活跃 continuable 子的当前 turn */</span>
+<span class="kw">async</span> <span class="fn">interrupt</span>(…)</pre>
+    <div class="annotation"><b>与第 4 章的钩子严丝合缝</b>：sendMessage 的三种目标状态（running → 最近 step 边界 / idle → 启动 turn / absent → 冷恢复）分别对应第 4 章的 inbox 待处理注入、whenIdle/wakeDriver 路径、以及第 5 章的持久化重载。子 agent 的会话是独立的 Session log，parentSession 记录父 session id——发现与时序由两个 session 投影（subagentTimingProjection / subagentIdentityProjection）从日志折叠。 Adjacency（只许直系父子互发）由服务从「exact live sender」派生——模型不能伪造发送者。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>工作流：worker thread 里的编排脚本</h2>
+    <p>dsh-workflow 运行模型写的纯 JS 编排脚本，返回一个 run，其结果 resolve 为脚本最终 JSON 值。脚本可用的原语：</p>
+    <table class="tbl">
+      <tr><th>原语</th><th>作用</th></tr>
+      <tr><td><code class="inline">agent(prompt, opts)</code></td><td>fan out 一个子 agent（可带 schema 强制结构化输出）</td></tr>
+      <tr><td><code class="inline">parallel(thunks)</code></td><td>并发并全部完成（barrier）</td></tr>
+      <tr><td><code class="inline">pipeline(items, ...stages)</code></td><td>逐项穿过多阶段，无 barrier</td></tr>
+      <tr><td><code class="inline">phase(title) / log(msg)</code></td><td>进度分组与叙述行</td></tr>
+    </table>
+    <div class="code-title">packages/workflow/workflow-worker-thread/README.md — 隔离立场（摘要）</div>
+    <pre class="code"><span class="lang-tag">text</span>每个 run 一个 Node worker thread：编排脚本在全新 worker 里执行，
+其 agent() 调用经 typed host/worker 协议到达宿主的 subagents。
+同步脚本循环不会卡住 harness 事件循环；忽略取消的脚本
+可以连 worker 一起终止。
+
+The isolation is containment, not a security boundary —
+模型写的脚本与模型既有的 bash 访问同一信任前提，
+逃出 node:vm 上下文即恢复 worker 的进程权限。
+不要把 worker thread 当真正不受信脚本的沙箱——
+敌意代码需要独立进程或容器引擎。</pre>
+    <div class="annotation"><b>两层隔离声明</b>：worker thread 解决的是<strong>可用性</strong>（死循环脚本不卡宿主、可强制终止）而非<strong>安全性</strong>——README 明确划界。安全性走的是第 9 章的沙箱与审批。dsh-workflow 自身不执行任何脚本（「The package ships no execution engine」），dsh-workflow-worker-thread 是当前引擎——换一个隔离策略（独立进程、容器）不需要改 callers 或模型所见。这与 LLM 层（第 7 章）「协议与适配器分离」完全同构。agent() 的每次调用作为 published child run 归属到发起 agent（lifecycle 事件成对：established / settled），父 agent 因此能在会话日志里审计整棵 fan-out 树。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.5</span>ralph：新鲜 agent 循环</h2>
+    <p>dsh-tool-ralph 是一个<strong>模型可调用的固定策略工具</strong>，实现在 workflow 脚本 API 之上（<code class="inline">packages/workflow/tool-ralph/src/index.ts</code>）：</p>
+    <div class="code-title">packages/workflow/tool-ralph/src/index.ts:151 — Ralph 循环脚本（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>phase(<span class="st">'Fresh-agent rounds'</span>)
+<span class="kw">for</span> (<span class="kw">let</span> round = <span class="nu">1</span>; round &lt;= args.maxRounds; round += <span class="nu">1</span>) {
+  <span class="kw">const</span> prior = previous === <span class="kw">undefined</span> ? <span class="st">'(none — this is the first round)'</span> : <span class="cl">JSON</span>.<span class="fn">stringify</span>(previous)
+  <span class="kw">const</span> prompt = [
+    <span class="st">'You are one fresh worker in a foreground Ralph loop. You receive no parent '</span>
+    + <span class="st">'conversation and no prior child session. Do not call the ralph tool…'</span>,
+    <span class="st">'Immutable objective:\n'</span> + args.objective,
+    <span class="st">'Ralph round: '</span> + round + <span class="st">' of '</span> + args.maxRounds + <span class="st">'.'</span>,
+    <span class="st">'The shared workspace and its current working tree are the long-term memory '</span>
+    + <span class="st">'and source of truth. Inspect them before acting… Treat the previous report '</span>
+    + <span class="st">'only as a bounded handoff; confirm it against the workspace.'</span>,
+    <span class="st">'Previous structured handoff:\n'</span> + prior,
+    <span class="st">'Return one report with exact normalized strings…'</span>,
+  ].<span class="fn">join</span>(<span class="st">'\n\n'</span>)
+  <span class="kw">const</span> rawReport = <span class="kw">await</span> <span class="fn">agent</span>(prompt, { schema: reportSchema })
+  <span class="kw">if</span> (report.status === <span class="st">'complete'</span>) <span class="kw">return</span> { status: <span class="st">'complete'</span>, roundsStarted: round, report }
+  <span class="kw">if</span> (report.status === <span class="st">'blocked'</span>) <span class="kw">return</span> { status: <span class="st">'blocked'</span>, roundsStarted: round, report }
+  previous = report
+}
+<span class="kw">return</span> { status: <span class="st">'budget-limited'</span>, roundsStarted: args.maxRounds, report: previous }</pre>
+    <div class="annotation"><b>四个防呆</b>：① 每轮子 agent 是<strong>全新</strong>的——「no parent conversation and no prior child session」，杜绝上下文腐化在轮间累积；② 跨轮只有一份 bounded 结构化报告（summary/evidence/nextSteps/blocker，超 maxHandoffChars 直接抛错）——记忆外置到共享 workspace，报告只是交接信；③ 报告校验极严：complete 必须有 evidence 且无 nextSteps 且 blocker 为空，blocked 必须有具体 blocker，continue 必须有 nextSteps——「completion and blockers are worker reports, not independent certification」（完成声明不是独立认证，人仍需复核）；④ maxRounds schema 默认 256（非传闻的 64），配 budget-limited 出口。README 明确划定适用场景：「Use it only when the direct human explicitly asks for a Ralph loop… ordinary long-running objectives belong to goal tools, and bounded delegation belongs to subagents or workflows」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.6</span>图 12-1：编排栈全景</h2>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="编排栈">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L9,3 L0,6 Z" fill="#4156c8"/>
+            </marker>
+          </defs>
+          <rect x="20" y="20" width="280" height="280" rx="10" fill="#12142b"/>
+          <text x="160" y="50" text-anchor="middle" font-size="13" font-weight="bold" fill="#8ea2ff">父 Agent（ReactLoopAgent）</text>
+          <text x="160" y="74" text-anchor="middle" font-size="10" fill="#c8cfef">模型在一步里调用 subagent / workflow / ralph 工具</text>
+          <rect x="40" y="95" width="240" height="60" rx="8" fill="#1c2040" stroke="#4a5aa0"/>
+          <text x="160" y="118" text-anchor="middle" font-size="11" fill="#aebcff">tool-subagent · tool-subagent-control</text>
+          <text x="160" y="140" text-anchor="middle" font-size="10" fill="#8890c0">delegation · 相邻消息 · 打断 · 列表</text>
+          <rect x="40" y="170" width="240" height="60" rx="8" fill="#1c2040" stroke="#4a5aa0"/>
+          <text x="160" y="193" text-anchor="middle" font-size="11" fill="#aebcff">tool-workflow · tool-ralph</text>
+          <text x="160" y="215" text-anchor="middle" font-size="10" fill="#8890c0">编排脚本 · 新鲜 agent 循环</text>
+          <text x="160" y="262" text-anchor="middle" font-size="10" fill="#8890c0">会话日志记录 lifecycle 事件对</text>
+          <text x="160" y="282" text-anchor="middle" font-size="10" fill="#8890c0">（established / settled）</text>
+
+          <rect x="360" y="20" width="270" height="130" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="495" y="46" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">ctx.subagents 注册表</text>
+          <text x="380" y="72" font-size="10.5" fill="#444">spawn（新子）· fork（继承已完成历史）</text>
+          <text x="380" y="92" font-size="10.5" fill="#444">acp · codex · claude-code · dsh-sdk</text>
+          <text x="380" y="118" font-size="10.5" fill="#444">one-shot：发布=所有权转移边界</text>
+          <text x="380" y="138" font-size="10.5" fill="#444">continuable：continuation manager 独占</text>
+
+          <rect x="360" y="170" width="270" height="130" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="495" y="196" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">ctx.workflowEngine</text>
+          <text x="380" y="222" text-anchor="middle" font-size="10.5" fill="#444">每 run 一个 worker thread</text>
+          <text x="380" y="242" text-anchor="middle" font-size="10.5" fill="#444">agent()/parallel()/pipeline()</text>
+          <text x="380" y="262" text-anchor="middle" font-size="10.5" fill="#444">typed host/worker 协议回调宿主</text>
+          <text x="380" y="282" text-anchor="middle" font-size="10.5" fill="#444">containment，非安全边界</text>
+
+          <rect x="680" y="60" width="260" height="220" rx="10" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="810" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">子 Agent = 又一个 ReactLoopAgent</text>
+          <rect x="700" y="105" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
+          <text x="810" y="122" text-anchor="middle" font-size="10" fill="#333">自己的 Session log（parentSession</text>
+          <text x="810" y="136" text-anchor="middle" font-size="10" fill="#333">记录父 id）· 自己的 Scope</text>
+          <rect x="700" y="153" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
+          <text x="810" y="170" text-anchor="middle" font-size="10" fill="#333">自己的 persona / restrict（第 8 章）</text>
+          <text x="810" y="184" text-anchor="middle" font-size="10" fill="#333">approval=never（委派种子）</text>
+          <rect x="700" y="201" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
+          <text x="810" y="218" text-anchor="middle" font-size="10" fill="#333">idle 可被 sendMessage 唤醒</text>
+          <text x="810" y="232" text-anchor="middle" font-size="10" fill="#333">不在场可冷恢复（第 5 章）</text>
+          <text x="810" y="262" text-anchor="middle" font-size="10" fill="#444">运行时与父完全同构——</text>
+          <text x="810" y="280" text-anchor="middle" font-size="10" fill="#444">没有第二种 agent 运行时</text>
+
+          <line x1="300" y1="85" x2="355" y2="85" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="300" y1="200" x2="355" y2="215" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="630" y1="85" x2="675" y2="115" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="630" y1="235" x2="675" y2="200" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+        </svg>
+      </div>
+      <div class="svg-legend">图 12-1 · 三层编排栈：模型工具 → 委派缝/工作流引擎 → 子 agent（复用同一运行时）</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.7</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 委派缝是注册表不是单实现：进程内与跨进程 provider 共存，模型工具不感知差异；② one-shot 与 continuable 分开建模，continuation manager 独占子的全部运行时，provider 只出创建参数；③ 工作流脚本隔离是 containment 不是 security，安全语义走沙箱/审批；④ ralph 用「新鲜 agent + 有界报告 + 外置记忆」对抗上下文腐化，报告校验与轮数上限防止无限循环。下一步是全书的收束：<a href="13-roadmap.html">第 13 章：自制 Harness 路线图</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="11-compaction.html">← 上一章：Compaction</a>
+    <a href="13-roadmap.html">下一步：自制 Harness →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <h1>整体架构：没有「内核」的 Agent 运行时</h1>
+    <div class="subtitle">dsh 最反直觉的一点是它没有特权核心——LLM 适配器、会话存储、工具、甚至 Agent 循环本身，都是挂在同一个插件容器上的插件。这一章我们把整台机器拆开：先看插件框架 Cordis，再看一个进程如何被装配出来。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <ul>
+      <li><code class="inline">dsh</code> = <strong>Cordis 插件框架</strong> + 一组<strong>插件</strong> + 一个<strong>装配器</strong>（profiles/bundles）。</li>
+      <li>Cordis 只提供三件事：服务仓库（<code class="inline">ctx.&lt;key&gt;</code>）、类型化事件总线、可逆副作用（<code class="inline">ctx.effect()</code>）。</li>
+      <li>每个产品能力都是一个插件，通过声明 <code class="inline">inject</code> 依赖别的服务、通过事件与别人通信，卸载时副作用自动回卷。</li>
+      <li>启动 = 按层叠加配置行：bundle（按序）→ profile patch → home patch → <code class="inline">--patch</code>，同 id 后写者整行替换。</li>
+      <li>想让 dsh 长出新能力？不是 fork 内核，而是「在别人旁边再挂一个插件」。</li>
+    </ul>
+    <div class="annotation"><b>为什么这样设计</b>：Agent 运行时的需求变化极快（新工具、新模型、新沙箱、新 UI），fork 内核的扩展方式会让每次升级都变成合并冲突。把「机制」全部下沉到插件框架，「策略」全部放到插件里，升级就变成重新装配。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>Cordis：五个核心想法</h2>
+    <p>Cordis 是 vendor 进仓库的插件框架（<code class="inline">docs/cordis-primer.md</code>），它把插件系统压缩成五个想法：</p>
+    <table class="tbl">
+      <tr><th>想法</th><th>含义</th><th>dsh 里的例子</th></tr>
+      <tr><td>插件即服务</td><td>插件是带 <code class="inline">inject</code>/<code class="inline">apply(ctx)</code> 的对象，向上下文贡献能力</td><td>dsh-llm、dsh-tool-fs、dsh-compaction-basic</td></tr>
+      <tr><td>上下文即仓库</td><td>服务认领稳定的 <code class="inline">ctx.&lt;key&gt;</code>，消费者按 key 找服务而不是 import 具体实现</td><td><code class="inline">ctx.tools</code>、<code class="inline">ctx.llm</code>、<code class="inline">ctx.sessions</code></td></tr>
+      <tr><td>声明式依赖</td><td><code class="inline">inject: ['tools']</code> 等到服务存在才激活，代替手工启动顺序</td><td>工具插件等待 <code class="inline">tools</code> 注册表</td></tr>
+      <tr><td>类型化事件</td><td>通过 TS declaration merging 声明事件名，5 种派发模式</td><td><code class="inline">agent/pre-step</code>（waterfall）、<code class="inline">session/event</code>（emit）</td></tr>
+      <tr><td>可逆副作用</td><td>Prompt 段、工具 schema、适配器、监听器都经 <code class="inline">ctx.effect()</code>/<code class="inline">ctx.on()</code> 安装，卸载即回卷</td><td>热重载插件时提示词与工具目录同步消失</td></tr>
+    </table>
+
+    <h3>五种事件派发模式</h3>
+    <p>派发模式是事件公共契约的一部分（源码用 <code class="inline">@mode</code> 标签标注，生成目录会校验声明与派发点一致）：</p>
+    <table class="tbl">
+      <tr><th>模式</th><th>是否等待</th><th>顺序</th><th>返回值</th><th>dsh 中的用途</th></tr>
+      <tr><td><code class="inline">emit</code></td><td>否</td><td>按注册顺序观察</td><td>无</td><td><code class="inline">session/event</code> 广播、<code class="inline">tool/result</code></td></tr>
+      <tr><td><code class="inline">waterfall</code></td><td>否（顺序）</td><td>按注册顺序</td><td>有</td><td><code class="inline">agent/pre-step</code>、<code class="inline">agent/request</code>、<code class="inline">tools/pre-execute</code></td></tr>
+      <tr><td><code class="inline">parallel</code></td><td>是（并发）</td><td>并行</td><td>无</td><td>遥测、副作用广播</td></tr>
+      <tr><td><code class="inline">serial</code></td><td>是（顺序）</td><td>按注册顺序</td><td>有</td><td><code class="inline">agent/turn-stopping</code></td></tr>
+      <tr><td><code class="inline">bail</code></td><td>否</td><td>按注册顺序，直到有人 bail</td><td>有</td><td>短路型策略判断</td></tr>
+    </table>
+
+    <div class="callout info">
+      <b class="tag">关键</b>
+      waterfall 是<strong>环绕中间件</strong>：监听器拿到 <code class="inline">(...args, next)</code>，调用 <code class="inline">next()</code> 把（可包装的）结果委托给下一个服务，不调用直接返回即短路。对「单一决策」类事件，短路就是设计意图——策略监听器可以独占决策，只观察的监听器必须委托。<code class="inline">prepend: true</code> 只在必须先于普通注册执行时使用。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>用代码看：一个插件长什么样</h2>
+    <p>插件可以是「带可选字段的函数」，也可以是 <code class="inline">Service</code> 子类。下面是 dsh-base 装配里典型的行（<code class="inline">packages/bundle/base/cordis.patch.yml</code>）——注意 <code class="inline">!!js</code> 表达式：config 在插件上下文中求值，<code class="inline">disabled</code> 在每次挂载决策时对 loader 上下文求值：</p>
+    <div class="code-title">packages/bundle/base/cordis.patch.yml</div>
+    <pre class="code"><span class="lang-tag">yaml</span>- <span class="fn">insert</span>:
+    <span class="cmt"># 沙箱模式默认由环境变量决定，回退 workspace-write</span>
+    - id: sandbox-policy
+      name: <span class="st">'@deepseek-ai/dsh-sandbox-policy'</span>
+      config:
+        mode: <span class="fn">!!js</span> process.env.<span class="cl">DSH_PERMISSION_MODE</span> ?? <span class="st">'workspace-write'</span>
+        workspaceRoot: <span class="fn">!!js</span> process.<span class="fn">cwd</span>()
+
+    <span class="cmt"># 平台差异用 disabled 表达：同一行代码，Windows 上换 pwsh</span>
+    - id: bash-sandbox
+      name: <span class="st">'@deepseek-ai/dsh-bash-sandbox'</span>
+      disabled: <span class="fn">!!js</span> process.platform === <span class="st">'win32'</span>
+      config:
+        timeoutMs: <span class="nu">60000</span>
+
+    - id: pwsh-sandbox
+      name: <span class="st">'@deepseek-ai/dsh-pwsh-sandbox'</span>
+      disabled: <span class="fn">!!js</span> process.platform !== <span class="st">'win32'</span>
+
+    <span class="cmt"># 审批策略与沙箱模式联动：全放开时不再询问</span>
+    - id: approval
+      name: <span class="st">'@deepseek-ai/dsh-user-approval'</span>
+      config:
+        policy: <span class="fn">!!js</span> <span class="st">"(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"</span></pre>
+    <div class="annotation"><b>读法</b>：每一行 <code class="inline">{id, name, config}</code> 就是一次插件挂载。patch 按 <code class="inline">id</code> 定位并<strong>整行替换 config</strong>（不合并）——所以「按模式取值不同」的行不属于共享 base，而属于各自的 mode bundle。这就是后面 profiles 一节「层与层只谈 id」的物理基础。</div>
+
+    <p>插件本体则藏在 <code class="inline">name</code> 指向的 npm 包里。下面是权限预设插件注册的三档预设，同一个文件再往下几十行（<code class="inline">packages/bundle/base/cordis.patch.yml</code>）：</p>
+    <div class="code-title">packages/bundle/base/cordis.patch.yml — permission presets</div>
+    <pre class="code"><span class="lang-tag">yaml</span>    - id: permission
+      name: <span class="st">'@deepseek-ai/dsh-permission-presets'</span>
+      config:
+        presets:
+          read-only:
+            sandbox: read-only
+            approval: ask
+          workspace-write:
+            sandbox: workspace-write
+            approval: ask
+          danger-full-access:
+            sandbox: danger-full-access
+            approval: never</pre>
+    <div class="annotation"><b>注意</b>：沙箱模式（文件影响范围）与审批策略（问不问人）是两个正交维度，预设把它们打包成一条配置。第 9 章安全篇会展开这两个维度各自的机制。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>Profiles 与 bundles：一个进程的装配过程</h2>
+    <p>dsh 所有形态都从同一个 CLI 启动（<code class="inline">apps/cli/package.json</code> 中 <code class="inline">"bin": {"dsh": "lib/bin.js"}</code>），差别只在 <code class="inline">--profile</code>：</p>
+    <table class="tbl">
+      <tr><th>命令</th><th>用途</th><th>在 dsh-base 之上追加</th></tr>
+      <tr><td><code class="inline">dsh web</code></td><td>本地 Web UI（<code class="inline">--profile web</code> 的别名）</td><td>dsh-web-app：浏览器应用 + HTTP 服务</td></tr>
+      <tr><td><code class="inline">dsh --profile headless "任务"</code></td><td>一次性运行器，无服务器</td><td>dsh-headless</td></tr>
+      <tr><td><code class="inline">dsh --profile sdk</code></td><td>SDK JSON-RPC 服务器（TS/Python SDK 连这里）</td><td>dsh-sdk-app</td></tr>
+      <tr><td><code class="inline">dsh --profile sdk-minimal</code></td><td>独立精简 SDK 树（唯一不用 dsh-base 的形态）</td><td>dsh-sdk-minimal（自带完整树）</td></tr>
+      <tr><td><code class="inline">dsh --profile acp</code></td><td>仅自动化场景的 ACP 服务器</td><td>dsh-acp-app</td></tr>
+    </table>
+
+    <p>装配顺序固定为（<code class="inline">docs/architecture.md</code>）：</p>
+    <ol>
+      <li>profile 的 <code class="inline">package.json</code> 里 <code class="inline">dsh.profile.bundles</code> 列出的每个 bundle，按声明顺序；</li>
+      <li>profile 自己的 <code class="inline">cordis.patch.yml</code>；</li>
+      <li>home 级 <code class="inline">cordis.patch.yml</code>；</li>
+      <li>命令行 <code class="inline">--patch</code> 覆盖层。</li>
+    </ol>
+    <div class="annotation"><b>两层 patchReload</b>：自定义 profile 默认 live 热重载；<code class="inline">web</code> 也是 live。而 <code class="inline">headless/sdk/sdk-minimal/acp</code> 只在启动时应用所有层——一次性或 stdio 应用在接活之后再换依赖，生命周期就作废了。</div>
+
+    <p><code class="inline">dsh-base</code> 是 web/headless/sdk/acp 共享的第一层。它的 patch 文件头注释把这一层的自我定位讲得很清楚（<code class="inline">packages/bundle/base/cordis.patch.yml</code> 开头）：</p>
+    <div class="code-title">packages/bundle/base/cordis.patch.yml（文件头注释）</div>
+    <pre class="code"><span class="lang-tag">yaml</span><span class="cmt"># The dsh-base bundle patch: the shared core of each base-backed profile, applied as
+# ONE insert over the empty profile root. Later bundle patches and the user's
+# profile cordis.patch.yml address these rows by id, with the last write
+# winning per row.
+#
+# A patch replaces the targeted row's whole `config` rather than merging into
+# it, so a row whose value differs by mode does NOT live here: it belongs to
+# each mode bundle, keeping any single row down to one bundle layer plus the
+# user's. Mode-specific rows appear below only with shared plugin identity and
+# neutral defaults; each mode bundle restates its complete configuration.
+#
+# Row order carries no load semantics (activation is service-availability
+# driven); the grouping is for readers.</span></pre>
+    <div class="annotation"><b>三件事</b>：① 整个 base 是<strong>一次 insert</strong>；② 后续层按 id 寻址、<strong>同 id 整行替换</strong>（last write wins per row）；③ <strong>行顺序不承载加载语义</strong>——激活由服务可用性驱动，分组只是给读者看的。</div>
+
+    <p>装配完成后，可以用一条命令看到自己机器上真实的插件树：</p>
+    <div class="code-title">shell</div>
+    <pre class="code"><span class="fn">dsh</span> --profile web --dump-config</pre>
+    <div class="annotation"><b>审计入口</b>：打印出的任何一行都可以被你自己的 patch 替换。排查「我的配置为什么没生效」时，第一件事就是 dump-config 看该行的最终 config 是谁写的。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>packages/ 目录地图</h2>
+    <p>仓库 60+ 个顶层包，都遵循「按能力缝分组」的命名。挑重要的看（目录：<code class="inline">packages/</code>）：</p>
+    <table class="tbl">
+      <tr><th>目录</th><th>拥有什么</th><th>ctx 键 / 角色</th></tr>
+      <tr><td><code class="inline">core/session</code></td><td>append-only <code class="inline">SessionEvent</code> 日志与内存存储</td><td><code class="inline">ctx.sessions</code></td></tr>
+      <tr><td><code class="inline">core/system-prompt</code></td><td>Prompt 段与工具 schema 装配</td><td><code class="inline">ctx.systemPrompt</code></td></tr>
+      <tr><td><code class="inline">core/tools</code></td><td>带 scope 的工具注册表与守卫执行管线</td><td><code class="inline">ctx.tools</code></td></tr>
+      <tr><td><code class="inline">core/agent</code></td><td><code class="inline">Agent</code> 接口、live 注册表、<code class="inline">agent/*</code> 事件</td><td><code class="inline">ctx.agents</code></td></tr>
+      <tr><td><code class="inline">core/agent-loop</code></td><td>该接口的默认驱动实现</td><td><code class="inline">ctx.agentLoop</code></td></tr>
+      <tr><td><code class="inline">core/scope</code></td><td>per-agent 作用域注册原语</td><td>库，无 ctx 键</td></tr>
+      <tr><td><code class="inline">llm/llm</code></td><td>消息/流式词汇表 + 适配器缝</td><td><code class="inline">ctx.llm</code></td></tr>
+      <tr><td><code class="inline">sandbox/</code>、<code class="inline">interaction/user-approval</code></td><td>沙箱后端与审批策略</td><td>能力缝（第 9 章）</td></tr>
+      <tr><td><code class="inline">bundle/</code></td><td>base / web-app / headless / sdk-app / sdk-minimal / acp-app 六个 bundle</td><td>装配层</td></tr>
+      <tr><td><code class="inline">preset/agent-presets</code></td><td>cordis/minimal/ptc/standard 四个内置代理预设</td><td>第 8 章</td></tr>
+      <tr><td><code class="inline">boot/app-boot</code></td><td>profile 合成机制（bundles → patch 叠层）</td><td>启动器</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">阅读建议</b>
+      想读懂任意能力，先找它的 <strong>ctx 键</strong>（grep <code class="inline">ctx.&lt;key&gt;</code>），再看三个角色：谁声明接口、谁提供实现、谁消费。这个「三角色」就是下一节的能力缝。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.6</span>三种事件域：扩展点坐标系</h2>
+    <p>改任何东西之前，先决定事件落在哪个域（<code class="inline">docs/architecture.md</code>）：</p>
+    <table class="tbl">
+      <tr><th>域</th><th>特征</th><th>何时用</th><th>例子</th></tr>
+      <tr><td>会话事件</td><td>持久事实，追加进日志，经 <code class="inline">session/event</code> 广播</td><td>事实必须在重载后依然成立</td><td><code class="inline">turn/start</code>、<code class="inline">tool/result</code>、<code class="inline">todo/write</code></td></tr>
+      <tr><td>Agent 事件</td><td>携带 live Agent（inbox、step、status、request）</td><td>观察或拦截进行中的工作</td><td><code class="inline">agent/pre-step</code>、<code class="inline">agent/request-error</code></td></tr>
+      <tr><td>能力事件</td><td>把策略/适配器接到缝上，不 import 循环</td><td>给某条能力缝加策略</td><td><code class="inline">fs/*</code>、<code class="inline">tools/*</code>、<code class="inline">telemetry/*</code></td></tr>
+    </table>
+    <div class="annotation"><b>判别法</b>：需要重启后还在 → 会话事件；需要拿到 Agent 对象本身 → Agent 事件；只是把实现接到某个接口上 → 能力事件（往往连监听器都不用写，注册服务即可）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.7</span>能力缝：三角色模型</h2>
+    <p><strong>缝（seam）</strong>是带三个角色的可替换能力（<code class="inline">docs/architecture.md</code>）：</p>
+    <ul>
+      <li><strong>Service Definition</strong>：声明接口（类型与事件）；</li>
+      <li><strong>Service Provider</strong>：实现它；</li>
+      <li><strong>Consumer</strong>：使用它——通常是模型可见的工具。</li>
+    </ul>
+    <p>一个包可以兼任多个角色，但<strong>单个角色不构成缝</strong>；新增一个能力意味着把三个角色都设计出来。规范示例是 shell 执行：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="40" width="240" height="70" rx="9"/>
+        <text class="lbl" x="150" y="68" text-anchor="middle">Service Definition</text>
+        <text class="lbl sm" x="150" y="88" text-anchor="middle">shell 执行接口 + ctx.shell 键</text>
+
+        <rect class="node core" x="330" y="40" width="240" height="70" rx="9"/>
+        <text class="lbl" x="450" y="68" text-anchor="middle">Service Provider ×N</text>
+        <text class="lbl sm" x="450" y="88" text-anchor="middle">dsh-bash-local / 沙箱实现 / 远程实现</text>
+
+        <rect class="node acc" x="630" y="40" width="240" height="70" rx="9"/>
+        <text class="lbl" x="750" y="68" text-anchor="middle">Consumer</text>
+        <text class="lbl sm" x="750" y="88" text-anchor="middle">dsh-tool-bash（模型可见工具）</text>
+
+        <line class="edge" x1="270" y1="75" x2="328" y2="75"/>
+        <line class="edge" x1="570" y1="75" x2="628" y2="75"/>
+        <text class="lbl sm" x="300" y="66" text-anchor="middle">接口契约</text>
+        <text class="lbl sm" x="598" y="66" text-anchor="middle">按 key 解析</text>
+
+        <text class="lbl sm" x="450" y="160" text-anchor="middle">换 Provider 不动另外两方：把 shell 指向远程沙箱，</text>
+        <text class="lbl sm" x="450" y="180" text-anchor="middle">Bash、PTY、LSP 一起迁移（filesystem 与 subprocess 共享同一执行世界）。</text>
+        <text class="lbl sm" x="450" y="212" text-anchor="middle">同理：子代理 Provider 从「新起一个子 Agent」到「委托给另一个产品的 turn」，接口不变。</text>
+      </svg>
+      <div class="fig-cap">图 1-1 — 能力缝三角色：定义声明接口，提供者实现，消费者（通常是工具）使用。产品级替换发生在中列。</div>
+    </div>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      「新行为去哪」在 dsh 里有对照表（<code class="inline">docs/architecture.md</code> 的 Where new behavior goes 表）：加模型提供者 → 在 <code class="inline">ctx.llm</code> 注册适配器；加模型可见能力 → 在 <code class="inline">ctx.tools</code> 注册工具；拦截请求/工具/回合 → 用对应 <code class="inline">agent/*</code> 或 <code class="inline">tools/*</code> 事件；加持久会话状态 → 扩展 <code class="inline">SessionEventMap</code> 并从日志渲染。这些入口全部不需要动循环代码。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.8</span>对「自研 Harness」的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      自研 Harness 的 MVP 只需要两块：<strong>① 一个能从「模型回复 → 工具调用 → 结果回填」走通的循环；② 一个 append-only 的事件日志作为唯一事实源。</strong> Cordis 的服务仓库、事件域、能力缝是 dsh 为「可扩展性」付出的复杂度——先跑通最小闭环，再决定要不要这么切。下一步进入 <a href="02-session-log.html">第 2 章：会话日志</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-session-log.html">下一步：会话日志 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 01 整体架构 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

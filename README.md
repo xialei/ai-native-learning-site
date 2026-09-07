@@ -12,7 +12,8 @@
 - **Pi Agent Harness** —— 拆解 TypeScript Agent 运行时 [pi](https://github.com/earendil-works/pi):Agent 循环、会话存储、上下文投影、压缩 Compaction、Harness 骨架、工具层、AI 多供应商抽象、安全边界与本地集成,并对照 LangGraph(15 章)。
 - **Claude Code** —— 拆解 Anthropic 终端 agentic 编码工具 [claude-code](https://github.com/anthropics/claude-code):基于官方仓库的插件 / Hooks / Settings / SDK 实例 + 官方文档,讲透 Agentic 循环、上下文构建、权限模型、Hooks 生命周期、插件与 Skills、MCP 外接工具(14 章)。
 - **Codex CLI** —— 拆解 OpenAI 用 Rust 写的编码 Agent [codex](https://github.com/openai/codex):从 Cargo workspace 分层到 Turn 循环、会话与 Rollout、上下文工程、压缩、工具系统、审批与沙箱,最后给出自研 Agent Runtime 路线图(13 章)。
-- **LangGraph / vLLM** —— 规划中的拆解,源码已就位。
+- **DeepSeek Harness** —— 拆解 TypeScript Agent 运行时 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`):一切皆插件(cordis)、append-only 会话日志、Agent 循环、持久化与冷恢复、工具调度、LLM 适配层、Prompt 组装与 Scope、沙箱与审批、五条能力缝、Compaction、多 Agent 编排,最后给出自制 Harness 路线图(13 章)。
+- **深入浅出具身智能** —— 拆解具身智能全栈：HuggingFace [lerobot](https://github.com/huggingface/lerobot)（真机/数据/模仿策略）、NVIDIA [IsaacLab](https://github.com/isaac-sim/IsaacLab)（仿真/RL）、[prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) 与 unifolm-vla（VLA 模型）——硬件抽象、数据集、ACT/Diffusion/SmolVLA/π0、并行仿真与 RL 训练、Sim2Real 部署,附六里程碑实战路线(13 章)。
 
 ## 适合谁读
 
@@ -32,8 +33,10 @@
 | [`pi-agent/`](pi-agent/) | [earendil-works/pi](https://github.com/earendil-works/pi) | [`../pi`](../pi) |
 | [`claude-code/`](claude-code/) | [anthropics/claude-code](https://github.com/anthropics/claude-code) | [`../claude-code`](../claude-code) |
 | [`codex/`](codex/) | [openai/codex](https://github.com/openai/codex) | [`../codex`](../codex) |
+| [`deepseek-harness/`](deepseek-harness/) | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [`../deepseek-harness`](../deepseek-harness) |
 | [`langgraph/`](langgraph/) | [langchain-ai/langgraph](https://github.com/langchain-ai/langgraph) | [`../langgraph`](../langgraph) |
 | [`vllm-engine/`](vllm-engine/) | [vllm-project/vllm](https://github.com/vllm-project/vllm) | [`../vllm`](../vllm) |
+| [`robotics/`](robotics/) | [huggingface/lerobot](https://github.com/huggingface/lerobot) · [isaac-sim/IsaacLab](https://github.com/isaac-sim/IsaacLab) · [TRI-ML/prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) · unifolm-vla | [`../robotics`](../robotics) |
 
 ## 阅读方式
 

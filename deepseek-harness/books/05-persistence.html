@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 持久化与崩溃恢复 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 持久化</div>
+    <h1>持久化与崩溃恢复：把日志安全地放到磁盘上</h1>
+    <div class="subtitle">第 2 章说会话日志是唯一事实——这一章回答两个工程问题：这条日志如何可靠地落到磁盘（写所有权、代际文件、迁移链），以及进程在任意一行代码处被 kill 后，重启如何把「撕裂的尾巴」缝合成供应商可接受的历史。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>一分钟版本</h2>
+    <ul>
+      <li>存储缝是 <code class="inline">SessionPersistence</code>（create/open/stat/list/export），返回 <code class="inline">SessionHandle</code>；JSONL 后端实现它（<code class="inline">packages/session/session-persistence-jsonl</code>）。</li>
+      <li><strong>单写者</strong>：写所有权由内核仲裁——POSIX 用 <code class="inline">flock(2)</code>，Windows 用命名内核信号量；竞争映射为 <code class="inline">SessionAlreadyOwnedError</code>。</li>
+      <li><strong>append 尽力而为，flush 才是持久性屏障</strong>——检查点策略插件（dsh-session-checkpoint-policy）决定在哪些语义边界 flush。</li>
+      <li>格式版本 vN 文件不可变：<code class="inline">session.v2.jsonl[.zstd]</code>；迁移链 vN→vN+1 逐级静态组合，成功后<strong>独占发布</strong>新代际文件，原文件永不改名/替换/删除。</li>
+      <li>崩溃恢复 = <code class="inline">interruptedTurnClosers()</code>：给未完成的工具调用合成确定的错误结果 + 补 step/end + <code class="inline">turn/end {reason:'interrupted'}</code>。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>SessionHandle 契约</h2>
+    <p>所有后端共用的句柄接口（<code class="inline">packages/session/session-persistence/src/handle.ts</code>）。注释把每条契约写得极精确：</p>
+    <div class="code-title">packages/session/session-persistence/src/handle.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * Log access granted by an open. `write` is read-write: the session's single
+ * mutator, which also reads its own log. `read` only observes — it never
+ * takes ownership and works while another handle or process holds `write`.
+ */</span>
+<span class="kw">export type</span> <span class="cl">SessionAccess</span> = <span class="st">'read'</span> | <span class="st">'write'</span>
+
+<span class="kw">export interface</span> <span class="cl">SessionHandle</span> <span class="kw">extends</span> <span class="cl">AsyncDisposable</span> {
+  <span class="kw">readonly</span> id: <span class="cl">SessionId</span>
+  <span class="cmt">/** The immutable stored header, fixed at create/open. */</span>
+  <span class="kw">readonly</span> header: <span class="cl">SessionHeader</span>
+  <span class="cmt">/** Fork 继承前缀的精确事件数；非 seeded 为 0。存储元数据，不进可重放日志。 */</span>
+  <span class="kw">readonly</span> inheritedEventCount: <span class="cl">SessionLogOffset</span>
+  <span class="kw">readonly</span> access: <span class="cl">SessionAccess</span>
+
+  <span class="cmt">/**
+   * Read a slice of the valid contiguous logical log. The slice is a legal
+   * log prefix segment: a torn physical tail is NEVER returned, and repeated
+   * reads on this handle never observe an older state than a prior read.
+   */</span>
+  <span class="fn">read</span>(offset?: <span class="kw">number</span>, length?: <span class="kw">number</span>, options?): <span class="cl">Promise</span>&lt;<span class="kw">readonly</span> <span class="cl">SessionEvent</span>[]&gt;
+
+  <span class="cmt">/**
+   * Append a contiguous batch continuing the current logical end. The first
+   * event's seq MUST equal the stored next-seq; committed events are never
+   * rewritten. Persistence is best-effort: on resolution the batch is
+   * accepted, ordered, and visible to reads on this backend instance, but
+   * only a resolved flush promises it survives a crash.
+   */</span>
+  <span class="fn">append</span>(events: <span class="kw">readonly</span> <span class="cl">SessionEvent</span>[], options?): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt;
+
+  <span class="cmt">/**
+   * The durability barrier — the one operation that promises storage: on
+   * resolution every acknowledged append is durable and the session is
+   * materialized for other processes.
+   */</span>
+  <span class="fn">flush</span>(options?): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt;
+
+  <span class="cmt">/**
+   * Release the handle. Idempotent, asynchronous, deliberately not cancellable.
+   */</span>
+  <span class="fn">close</span>(): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt;
+}</pre>
+    <div class="annotation"><b>新鲜度契约</b>：一旦 write 句柄上的 append/flush 兑现，之后在同一后端实例上<strong>开始</strong>的任何读（任何句柄、或经 stat/list）至少能看到该前缀；与写并发的读只保证「合法连续前缀」。<code class="inline">read</code> 永不回退、永不返回撕裂的物理尾巴。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>单写者：内核仲裁的写锁</h2>
+    <p>「同一会话只能有一个写者」不是靠应用层约定，而是靠操作系统（<code class="inline">packages/session/session-persistence-jsonl/src/lease.ts</code> 文档注释）：</p>
+    <div class="code-title">packages/session/session-persistence-jsonl/src/lease.ts — SessionWriteLease（文档注释）</div>
+    <pre class="code"><span class="lang-tag">text</span><span class="cmt">/**
+ * Cross-process write-ownership lock for one session's artifact directory,
+ * held for the whole life of a write handle. The arbiter is the kernel:
+ * POSIX takes a non-blocking flock(2) on `session.lock` beside the log, and
+ * Windows holds a named kernel semaphore derived from that path — never a
+ * file lock or handle, so readers, searches, and directory removal proceed
+ * freely while the lock is held. Contention maps to SessionAlreadyOwnedError;
+ * the kernel releases the lock when the holder's descriptor or last object
+ * handle closes, including on any process death, so a crashed holder never
+ * blocks a successor. A live but wedged holder keeps the lock until its
+ * process exits: there is deliberately no expiry that could expropriate a
+ * stalled writer whose resumed appends would tear the log.
+ *
+ * A POSIX lock names an inode, not a path, so after locking the holder
+ * verifies the locked inode is still the file at the lock path and retries
+ * otherwise: an unlinked-and-recreated lock file carries a fresh inode, and
+ * a lock on the orphaned one proves nothing.
+ */</span></pre>
+    <div class="callout info">
+      <b class="tag">设计取舍</b>
+      <strong>故意没有锁过期</strong>：一个卡死的持有者会把锁保留到进程退出——因为收回锁可能让「唤醒后继续追加」的旧写者撕碎日志。崩溃进程的锁由内核自动释放（描述符关闭），所以“崩溃的持有者永不阻塞后来者”与“活着的卡死持有者保留锁”同时成立。POSIX 侧锁的是 inode 而非路径，持锁后还要验证 inode 未被换掉。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>检查点策略：flush 的语义边界</h2>
+    <p>检查点不是循环的职责，而是一个独立插件（<code class="inline">packages/session/session-checkpoint-policy/src/index.ts</code>）。整个插件只有三个监听器，全部实现为「先 flush，再放行下游」：</p>
+    <div class="code-title">packages/session/session-checkpoint-policy/src/index.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> name = <span class="st">'session-checkpoint-policy'</span>
+<span class="kw">export const</span> inject = [<span class="st">'llm'</span>, <span class="st">'sessionPersistence'</span>, <span class="st">'sessions'</span>, <span class="st">'tools'</span>]
+
+<span class="cmt">/** 延迟构造下游模型流，直到完整已记录的请求前缀持久化。检查点失败则阻止适配器派发。 */</span>
+<span class="kw">function</span> <span class="fn">afterCheckpoint</span>(ctx: <span class="cl">Context</span>, session: <span class="cl">Session</span>, next: () =&gt; <span class="cl">AsyncIterable</span>&lt;<span class="cl">StreamChunk</span>&gt;): <span class="cl">AsyncIterable</span>&lt;<span class="cl">StreamChunk</span>&gt; {
+  <span class="kw">return</span> (<span class="kw">async function*</span> (): <span class="cl">AsyncIterable</span>&lt;<span class="cl">StreamChunk</span>&gt; {
+    <span class="kw">await</span> ctx.sessions.<span class="fn">flush</span>(session)
+    <span class="kw">yield</span>* next()
+  })()
+}
+
+<span class="kw">export function</span> <span class="fn">apply</span>(ctx: <span class="cl">Context</span>): <span class="kw">void</span> {
+  <span class="cmt">// ① llm/stream：模型请求派发前，持久化完整请求前缀</span>
+  ctx.<span class="fn">on</span>(<span class="st">'llm/stream'</span>, (options, next) =&gt; {
+    <span class="kw">if</span> (options.sessionId === <span class="kw">undefined</span>) <span class="kw">return</span> next()
+    <span class="kw">const</span> session = ctx.sessions.<span class="fn">get</span>(options.sessionId)
+    <span class="kw">return</span> session === <span class="kw">undefined</span> ? next() : <span class="fn">afterCheckpoint</span>(ctx, session, next)
+  })
+
+  <span class="cmt">// ② tools/execute：仅顶层调用（exec.agent 存在且无 parent）持久化 tool/call</span>
+  <span class="cmt">//    嵌套派发复用外层的持久化；中止则返回合成结果而非执行。</span>
+  ctx.<span class="fn">on</span>(<span class="st">'tools/execute'</span>, <span class="kw">async</span> (exec, next) =&gt; {
+    <span class="kw">if</span> (exec.agent === <span class="kw">undefined</span> || exec.parent !== <span class="kw">undefined</span>) <span class="kw">return</span> next()
+    <span class="kw">await</span> ctx.sessions.<span class="fn">flush</span>(exec.agent.session)
+    <span class="kw">if</span> (exec.signal.aborted) <span class="kw">return</span> <span class="fn">abortedBeforeDispatchResult</span>()
+    <span class="kw">return</span> next()
+  })
+
+  <span class="cmt">// ③ agent/pre-step：每个请求边界前，持久化前一步提交的全部内容。</span>
+  ctx.<span class="fn">on</span>(<span class="st">'agent/pre-step'</span>, <span class="kw">async</span> ({ agent }, next) =&gt; {
+    <span class="kw">await</span> ctx.sessions.<span class="fn">flush</span>(agent.session)
+    <span class="kw">return</span> next()
+  })
+}</pre>
+    <div class="annotation"><b>语义</b>：三个 flush 点分别保证「派发给模型前，请求已持久」「工具副作用开始前，tool/call 已持久」「下一个请求前，上一步的一切已持久」。全部 fail-closed——检查点失败时下游适配器/工具体<strong>不会被调用</strong>。被中止的顶层调用返回合成错误结果（code <code class="inline">TOOL_ABORTED_BEFORE_DISPATCH</code>，文本 "Error: tool call aborted before dispatch"）。注意回合边界（turn/end）<strong>不</strong> flush——读存储的消费者在 <code class="inline">whenIdle()</code> 后自行 flush（第 2 章 turn/end 事件的注释）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>JSONL 后端：不可变代际与迁移链</h2>
+    <p>JSONL 后端把一个会话存为「一个目录 + 若干不可变代际文件」：<code class="inline">session.v2.jsonl[.zstd]</code>（v0 时代是 <code class="inline">session.jsonl[.zstd]</code>）。关键机制（<code class="inline">packages/session/session-persistence-jsonl/src/index.ts</code>）：</p>
+    <div class="code-title">packages/session/session-persistence-jsonl/src/index.ts — 代际选择与发布（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/** Select the numerically highest canonical generation in one Session directory. */</span>
+  <span class="kw">private</span> <span class="fn">selectGeneration</span>(...) {
+    <span class="kw">const</span> generations: <span class="cl">Array</span>&lt;{ path: <span class="kw">string</span>; version: <span class="kw">number</span> }&gt; = []
+    <span class="cmt">// …扫描目录，解析 session.vN.jsonl 文件名中的 N…</span>
+    <span class="kw">const</span> latest = generations.<span class="fn">sort</span>((l, r) =&gt; r.version - l.version)[<span class="nu">0</span>]
+    <span class="cmt">// …返回最高代际；缺失时用 catalog.currentVersion 构造新文件名…</span>
+  }
+
+  <span class="cmt">/** Select and, when required, publish one immutable current generation. */</span>
+  <span class="kw">private async</span> <span class="fn">ensureCurrentLog</span>(id, signal?, resolved?) {
+    <span class="kw">const</span> selected = resolved ?? <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">findLog</span>(id, signal)
+    <span class="kw">try</span> {
+      <span class="kw">return await</span> <span class="fn">ensureJsonlGenerationCurrent</span>({
+        sourcePath: selected.sourcePath,
+        sourceVersion: selected.sourceVersion,
+        currentPath: selected.currentPath,
+        compression: <span class="kw">this</span>.compression,
+        format: <span class="kw">this</span>.generationFormat,          <span class="cmt">// 相邻迁移 vN→vN+1 的静态组合</span>
+        validateHistoricalHeader: header =&gt; <span class="kw">this</span>.<span class="fn">validateSourceIdentity</span>(...),
+      })
+    } <span class="kw">catch</span> (error) {
+      <span class="kw">if</span> (error <span class="kw">instanceof</span> <span class="cl">JsonlGenerationNewerVersionError</span>) {
+        <span class="cmt">// 存储的版本比运行时新 → 拒绝打开（fail-loud）</span>
+        <span class="kw">throw new</span> <span class="cl">SessionFormatUnsupportedError</span>(...)
+      }
+      <span class="cmt">// 迁移失败：源 vN 产物保持不变，错误信息带 raw log 路径</span>
+    }
+  }</pre>
+    <p>迁移链是构建期静态组合的——目录里每个相邻迁移包只负责一步（<code class="inline">packages/session/session-format-catalog/src/generated.ts</code>）：</p>
+    <div class="code-title">packages/session/session-format-catalog/src/generated.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  migrations: [sessionFormatV0ToV1, sessionFormatV1ToV2]</pre>
+    <div class="annotation"><b>规则回顾</b>（docs/architecture.md + <code class="inline">SESSION_FORMAT_VERSION</code> 注释）：header-only 的 stat/list 只扫目录、选最高代际、翻译历史头，<strong>不读事件体也不发布后继</strong>；只有真正的 body 读才在内存中组合迁移链、校验最终结果、并<strong>独占发布</strong>版本命名的后继文件。已提交的代际路径永不重命名、替换或删除；被拒绝的未来版本（比运行时新）会带 raw log 路径 fail-loud。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 210" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="40" width="180" height="64" rx="9"/>
+        <text class="lbl sm" x="120" y="66" text-anchor="middle">session.jsonl (v0)</text>
+        <text class="lbl sm" x="120" y="86" text-anchor="middle">不可变，永不删除</text>
+        <rect class="node" x="290" y="40" width="180" height="64" rx="9"/>
+        <text class="lbl sm" x="380" y="66" text-anchor="middle">session.v1.jsonl</text>
+        <text class="lbl sm" x="380" y="86" text-anchor="middle">迁移一次后发布</text>
+        <rect class="node core" x="550" y="40" width="180" height="64" rx="9"/>
+        <text class="lbl sm" x="640" y="66" text-anchor="middle">session.v2.jsonl</text>
+        <text class="lbl sm" x="640" y="86" text-anchor="middle">当前代际（写到这里）</text>
+        <rect class="node acc" x="780" y="40" width="130" height="64" rx="9"/>
+        <text class="lbl sm" x="845" y="66" text-anchor="middle">session.lock</text>
+        <text class="lbl sm" x="845" y="86" text-anchor="middle">flock 仲裁</text>
+        <line class="edge" x1="210" y1="72" x2="288" y2="72"/>
+        <line class="edge" x1="470" y1="72" x2="548" y2="72"/>
+        <text class="lbl sm" x="250" y="62" text-anchor="middle">v0→v1</text>
+        <text class="lbl sm" x="510" y="62" text-anchor="middle">v1→v2</text>
+        <text class="lbl sm" x="470" y="150" text-anchor="middle">每个相邻迁移包只负责一步；链在构建期静态组合；发布是独占的（已存在则直接用）。</text>
+      </svg>
+      <div class="fig-cap">图 5-1 — 一个会话目录的内容：按版本命名的不可变代际 + 一把内核锁。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>崩溃恢复：interruptedTurnClosers()</h2>
+    <p>进程在任何时刻死掉，日志都会留下「开口的 turn、开口的 step、未结算的 tool/call」。恢复代码扫描整条日志、合成确定性闭包（<code class="inline">packages/core/session/src/repair.ts</code>）：</p>
+    <div class="code-title">packages/core/session/src/repair.ts — interruptedTurnClosers()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">TOOL_NOT_STARTED</span> = <span class="st">'TOOL_NOT_STARTED'</span>
+<span class="kw">export const</span> <span class="cl">TOOL_OUTCOME_UNKNOWN</span> = <span class="st">'TOOL_OUTCOME_UNKNOWN'</span>
+
+<span class="kw">export function</span> <span class="fn">interruptedTurnClosers</span>(events: <span class="kw">readonly</span> <span class="cl">SessionEvent</span>[]): <span class="cl">SessionEvent</span>[] {
+  <span class="kw">let</span> openTurn: <span class="kw">number</span> | <span class="kw">null</span> = <span class="kw">null</span>
+  <span class="kw">let</span> openStep: <span class="kw">number</span> | <span class="kw">null</span> = <span class="kw">null</span>
+  <span class="cmt">// 每个回合边界重置；assistant 块登记调用，tool/call 事件补充 seq。</span>
+  <span class="kw">const</span> pendingCalls = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="cl">ToolCallId</span>, { step: <span class="kw">number</span>; callSeq?: <span class="cl">SessionSeq</span> }&gt;()
+  <span class="kw">for</span> (<span class="kw">const</span> event <span class="kw">of</span> events) {
+    <span class="kw">switch</span> (event.type) {
+      <span class="kw">case</span> <span class="st">'turn/start'</span>: openTurn = event.data.turn; openStep = <span class="kw">null</span>; pendingCalls.<span class="fn">clear</span>(); <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'turn/end'</span>:   openTurn = <span class="kw">null</span>; openStep = <span class="kw">null</span>; pendingCalls.<span class="fn">clear</span>(); <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'step/start'</span>: openStep = event.data.step; <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'step/end'</span>:   pendingCalls.<span class="fn">clear</span>(); openStep = <span class="kw">null</span>; <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'assistant/message'</span>:
+        <span class="cmt">// assistant 消息携带 tool-call 块；在出现同 callId 的 tool/result 前都是 pending</span>
+        <span class="kw">for</span> (<span class="kw">const</span> block <span class="kw">of</span> event.data.message.content) {
+          <span class="kw">if</span> (block.type === <span class="st">'tool-call'</span>) pendingCalls.<span class="fn">set</span>(block.id, { step: event.data.step })
+        }
+        <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'tool/call'</span>:  <span class="cmt">/* 记录 callSeq 供合成结果引用 */</span> <span class="kw">break</span>
+      <span class="kw">case</span> <span class="st">'tool/result'</span>: pendingCalls.<span class="fn">delete</span>(event.data.message.source.callId); <span class="kw">break</span>
+    }
+  }
+  <span class="cmt">// 平衡的日志：无需缝合。开口的 turn ⇒ events 非空 ⇒ last 存在。</span>
+  <span class="kw">const</span> last = events.<span class="fn">at</span>(-<span class="nu">1</span>)
+  <span class="kw">if</span> (openTurn === <span class="kw">null</span> || last === <span class="kw">undefined</span>) <span class="kw">return</span> []
+
+  <span class="cmt">// 合成事件沿用最后真实事件的 seq 基点与时间戳（确定性、不发明未来时间）。</span>
+  <span class="kw">let</span> seq = last.seq + <span class="nu">1</span>
+  <span class="kw">const</span> time = last.time
+  <span class="kw">const</span> closers: <span class="cl">SessionEvent</span>[] = []
+  <span class="cmt">// ① 先给未决调用补结果（供应商拒绝悬挂的 assistant 调用）</span>
+  <span class="kw">for</span> (<span class="kw">const</span> [callId, { step, callSeq }] <span class="kw">of</span> pendingCalls) {
+    <span class="kw">const</span> started = callSeq !== <span class="kw">undefined</span>
+    <span class="cmt">/* …合成 ToolResultMessage：isError: true，文案区分两种情况… */</span>
+    closers.<span class="fn">push</span>({
+      type: <span class="st">'tool/result'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time,
+      data: { turn: openTurn, step, message, error: started
+        ? { name: <span class="st">'ToolOutcomeUnknownError'</span>, code: <span class="cl">TOOL_OUTCOME_UNKNOWN</span> }
+        : { name: <span class="st">'ToolNotStartedError'</span>, code: <span class="cl">TOOL_NOT_STARTED</span> } },
+      surfaceOp: <span class="st">'append'</span>,
+      ...started ? { sourceEventSeqs: [callSeq] } : {},
+    })
+  }
+  <span class="cmt">// ② 再补 step/end —— 开着 step 写 turn/end 是不变量违例</span>
+  <span class="kw">if</span> (openStep !== <span class="kw">null</span>) {
+    closers.<span class="fn">push</span>({ type: <span class="st">'step/end'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time, data: { turn: openTurn, step: openStep } })
+  }
+  <span class="cmt">// ③ 最后以 interrupted 结束回合</span>
+  closers.<span class="fn">push</span>({ type: <span class="st">'turn/end'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time, data: { turn: openTurn, reason: { kind: <span class="st">'interrupted'</span> } } })
+  <span class="kw">return</span> closers
+}</pre>
+    <div class="annotation"><b>两种错误码的语义差</b>（合成结果正文明确写给模型看）：已开始但结果未知（<code class="inline">TOOL_OUTCOME_UNKNOWN</code>）→ 模型被告知「仅当只读或幂等才重试；可能有副作用时先核实外部状态或询问用户，不要盲目重试」；未记录为已开始（<code class="inline">TOOL_NOT_STARTED</code>）→「若仍需要就重试」。缝合顺序固定为：先结果、再 step/end、最后 turn/end——因为供应商 API 拒绝悬挂的调用，且 turn/end 出现在开口 step 上是重建不变量违例。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 190" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <text class="lbl sm" x="60" y="40">崩溃前的日志尾部：</text>
+        <rect class="node" x="30" y="60" width="105" height="40" rx="7"/><text class="lbl sm" x="82" y="84" text-anchor="middle">assistant/message</text>
+        <rect class="node warn" x="145" y="60" width="95" height="40" rx="7"/><text class="lbl sm" x="192" y="84" text-anchor="middle">tool/call (未结果)</text>
+        <rect class="node warn" x="250" y="60" width="90" height="40" rx="7"/><text class="lbl sm" x="295" y="84" text-anchor="middle">…开口 step</text>
+        <rect class="node warn" x="350" y="60" width="90" height="40" rx="7"/><text class="lbl sm" x="395" y="84" text-anchor="middle">…开口 turn</text>
+        <text class="lbl sm" x="470" y="40">重启后追加的合成闭包：</text>
+        <rect class="node acc" x="470" y="60" width="120" height="40" rx="7"/><text class="lbl sm" x="530" y="84" text-anchor="middle">tool/result (错误)</text>
+        <rect class="node acc" x="600" y="60" width="100" height="40" rx="7"/><text class="lbl sm" x="650" y="84" text-anchor="middle">step/end</text>
+        <rect class="node acc" x="710" y="60" width="160" height="40" rx="7"/><text class="lbl sm" x="790" y="84" text-anchor="middle">turn/end {interrupted}</text>
+        <line class="edge" x1="440" y1="80" x2="468" y2="80"/>
+        <text class="lbl sm" x="470" y="140" text-anchor="middle">三种合成事件沿用最后真实事件的 seq 与时间戳 —— 恢复是确定性的：同样的事故日志，永远缝出同样的尾巴。</text>
+      </svg>
+      <div class="fig-cap">图 5-2 — 崩溃尾巴的确定性缝合。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.7</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 存储是缝不是单体：SessionPersistence 接口 + JSONL 后端，换后端（对象存储、SQLite）不动核心；② 持久性分两级——append 可见、flush 耐崩溃，检查点策略插件把 flush 挂在模型/工具/step 三个语义边界上，且全部 fail-closed；③ 格式演进靠不可变代际 + 静态迁移链 + 独占发布，旧文件是永久的时间胶囊；④ 崩溃恢复不求「完美还原」，只求「供应商可接受 + 模型可决策」——错误码和正文都在教模型下一步怎么做。下一步进入 <a href="06-tools.html">第 6 章：工具系统与并行调度</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="04-agent-loop.html">← 上一章：Agent 循环</a>
+    <a href="06-tools.html">下一步：工具系统 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 05 持久化 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

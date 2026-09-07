@@ -54,15 +54,17 @@ python3 -m http.server
 
 各章引用的 Pi 关键源码位置：
 
-- 消息/循环/基础 harness：`packages/agent/src/`（`types.ts`、`agent.ts`、`agent-loop.ts`、`harness/`）
-  - 会话存储：`packages/agent/src/harness/session/`
-  - 上下文：`packages/agent/src/harness/session/context.ts`
+- 消息/循环：`packages/agent/src/`（`types.ts`、`agent.ts`、`agent-loop.ts`）
+- Harness 契约：`packages/agent/src/harness/agent-harness.ts`（纯类型契约；Result 类型在 `result.ts`）
+- Harness 运行时：`packages/agent/src/harness/runtime/`（`harness.ts`、`lane.ts`、`drive.ts` + `drive/`、`reducer.ts`、`restore.ts`）
+  - 会话存储：`packages/agent/src/harness/session/`（`session.ts`、`values.ts`、`context.ts`、`jsonl/`）
   - 压缩：`packages/agent/src/harness/compaction/compaction.ts`
-- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`
+- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`（experimental 的 Harness 消费方在 `packages/coding-agent/src/experimental/session-worker.ts`）
 - 工具：`packages/coding-agent/src/core/tools/`
 - AI 层：`packages/ai/src/`（`types.ts`、`providers/*.ts`）
 
 ## 备注
 
 - 内容基于当前仓库源码整理（章节内标注了具体文件与行号附近的要点，随版本演化可能略有出入，以源码为准）。
+- 当前审核版本：`v0.85.1-4-g9767ba275`（2026-09-06 全站核对）。
 - 配色沿用 Pi 的 teal / indigo 品牌色调（`assets/pi-learn.css`），结构上借鉴了此前自建的 vLLM 学习站模板。

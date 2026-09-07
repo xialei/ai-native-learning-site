@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Agent 循环实现 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 Agent 循环</div>
+    <h1>Agent 循环实现：ReactLoopAgent 的并发模型</h1>
+    <div class="subtitle">第 3 章沿时间轴走了一遍 turn/step；这一章换个视角，看循环的「操作系统层」：三态 Phase 状态机、三种消息注入、唤醒闩锁、维护窗口，以及每个 Agent 独享的 Scope——这些机制让 steer/inject/cancel 在任何时刻都语义明确。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>一分钟版本</h2>
+    <ul>
+      <li>循环类是 <code class="inline">ReactLoopAgent</code>（<code class="inline">packages/core/agent-loop/src/agent.ts</code>），实现 <code class="inline">Agent</code> 接口，ctx 键 <code class="inline">ctx.agentLoop</code>。</li>
+      <li>Phase 三态：<strong>idle</strong>（无活动）→ <strong>running</strong>（kick 驱动中，有 AbortController + turn/step 计数）→ <strong>maintenance</strong>（维护任务独占）。</li>
+      <li>三种注入 API：<code class="inline">followup</code>（next-turn + 唤醒）、<code class="inline">steer</code>（next-step + 唤醒）、<code class="inline">inject</code>（next-step、不唤醒）。</li>
+      <li>唤醒不丢失：running/maintenance/aborted 期间到达的 wake 被闩锁（<code class="inline">wakeRequested</code>），收敛后重放。</li>
+      <li>每个 Agent 有自己的 <code class="inline">Scope</code>（<code class="inline">createScope(loopCtx, this)</code>），scope 级注册在驱动器退出后被回卷。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>Phase 状态机</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:39</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">type</span> <span class="cl">Phase</span> =
+  | { kind: <span class="st">'idle'</span>; lastTurn: <span class="kw">number</span> }
+  | {
+    kind: <span class="st">'maintenance'</span>
+    abort: <span class="cl">AbortController</span>
+    lastTurn: <span class="kw">number</span>
+    wakeRequested: <span class="kw">boolean</span>
+  }
+  | { kind: <span class="st">'running'</span>; abort: <span class="cl">AbortController</span>; turn: <span class="kw">number</span>; step: <span class="kw">number</span>; wakeRequested: <span class="kw">boolean</span> }</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="80" width="170" height="64" rx="9"/>
+        <text class="lbl" x="115" y="106" text-anchor="middle">idle</text>
+        <text class="lbl sm" x="115" y="126" text-anchor="middle">lastTurn 记住进度</text>
+
+        <rect class="node core" x="330" y="80" width="230" height="64" rx="9"/>
+        <text class="lbl" x="445" y="106" text-anchor="middle">running</text>
+        <text class="lbl sm" x="445" y="126" text-anchor="middle">AbortController + turn/step + wakeRequested</text>
+
+        <rect class="node acc" x="690" y="80" width="190" height="64" rx="9"/>
+        <text class="lbl" x="785" y="106" text-anchor="middle">maintenance</text>
+        <text class="lbl sm" x="785" y="126" text-anchor="middle">维护任务独占（compaction 等）</text>
+
+        <line class="edge" x1="200" y1="100" x2="328" y2="100"/>
+        <text class="lbl sm" x="264" y="90" text-anchor="middle">wakeDriver() 唤醒</text>
+        <line class="edge" x1="360" y1="142" x2="205" y2="172"/>
+        <text class="lbl sm" x="278" y="180" text-anchor="middle">kick() finally：队列空 → idle</text>
+        <line class="edge" x1="200" y1="92" x2="688" y2="60"/>
+        <text class="lbl sm" x="440" y="46" text-anchor="middle">runMaintenance(job)（仅 idle 允许）</text>
+        <line class="edge" x1="690" y1="140" x2="205" y2="158"/>
+        <text class="lbl sm" x="440" y="196" text-anchor="middle">finally → idle；wakeRequested 且有排队 → 立即重放唤醒</text>
+        <text class="lbl sm" x="620" y="200" text-anchor="middle"></text>
+      </svg>
+      <div class="fig-cap">图 4-1 — Phase 状态机。状态经 setPhase() 变更，对外只发布一次 agent/status 事件（状态未变则不发布）。</div>
+    </div>
+    <div class="annotation"><b>关键不变量</b>：驱动器（kick）在进入前拥有 running phase、退出后才交还 idle；<code class="inline">status</code> getter 把 maintenance 也归为对外可见的 <code class="inline">'idle'</code>——维护中不接活，但也不算「在跑 turn」。取消（cancel）通过 AbortController 传递 cause，AbortController 由每次唤醒<strong>新建</strong>，因此取消天然限定在当前活动内。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>用代码看：send() 与三种注入</h2>
+    <p>三个公开 API 都是同一个 <code class="inline">send</code> 原语的便捷形式。注意 <code class="inline">wakingAfterAbort</code> 的捕获点——在 splice 之前，这样 splice 观察者里的重入 cancel 无法改写分类（<code class="inline">packages/core/agent-loop/src/agent.ts:127</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="fn">send</span>(message: <span class="cl">UserMessage</span>, target: <span class="cl">InboxTarget</span>, wakeup: <span class="kw">boolean</span>): <span class="kw">void</span> {
+    <span class="cmt">// 唤醒型输入不能加入已被中止的活动，所以改投下一回合。</span>
+    <span class="cmt">// 在插入前捕获，避免 splice 观察者里的重入 cancel 重新分类。</span>
+    <span class="kw">const</span> wakingAfterAbort = wakeup && <span class="kw">this</span>.phase.kind !== <span class="st">'idle'</span> && <span class="kw">this</span>.phase.abort.signal.aborted
+    <span class="kw">const</span> resolvedTarget = wakingAfterAbort ? <span class="st">'next-turn'</span> : target
+    <span class="kw">this</span>.inbox.<span class="fn">splice</span>(resolvedTarget, <span class="cl">Infinity</span>, <span class="nu">0</span>, [message])
+    <span class="kw">if</span> (wakeup) <span class="kw">this</span>.<span class="fn">wakeDriver</span>(wakingAfterAbort)
+  }
+
+  <span class="fn">followup</span>(input: <span class="cl">UserMessage</span>): <span class="kw">void</span> {
+    <span class="kw">this</span>.<span class="fn">send</span>(input, <span class="st">'next-turn'</span>, <span class="kw">true</span>)
+  }
+
+  <span class="fn">steer</span>(input: <span class="cl">UserMessage</span>): <span class="kw">void</span> {
+    <span class="kw">this</span>.<span class="fn">send</span>(input, <span class="st">'next-step'</span>, <span class="kw">true</span>)
+  }
+
+  <span class="fn">inject</span>(input: <span class="cl">UserMessage</span>): <span class="kw">void</span> {
+    <span class="kw">this</span>.<span class="fn">send</span>(input, <span class="st">'next-step'</span>, <span class="kw">false</span>)
+  }
+
+  <span class="fn">cancel</span>(cause: <span class="cl">AgentCancelCause</span>, options: <span class="cl">CancelOptions</span> = {}): <span class="kw">void</span> {
+    <span class="kw">if</span> (!options.keepInbox) {
+      <span class="kw">this</span>.inbox.<span class="fn">clear</span>()
+      <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'idle'</span>) <span class="kw">this</span>.phase.wakeRequested = <span class="kw">false</span>
+    }
+    <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'idle'</span>) <span class="kw">this</span>.phase.abort.<span class="fn">abort</span>(cause)
+  }</pre>
+    <table class="tbl">
+      <tr><th>API</th><th>target</th><th>唤醒？</th><th>语义</th></tr>
+      <tr><td><code class="inline">followup</code></td><td>next-turn</td><td>是</td><td>本回合结束后开启新回合（对话的下一句）</td></tr>
+      <tr><td><code class="inline">steer</code></td><td>next-step</td><td>是</td><td>下一步立刻看到（用户打断纠正方向）</td></tr>
+      <tr><td><code class="inline">inject</code></td><td>next-step</td><td>否</td><td>安静排队，等别的消息来唤醒（文件变更通知、skill 内容等）</td></tr>
+    </table>
+    <div class="annotation"><b>为什么 abort 后要重分类</b>：唤醒型消息若落在一个已中止的 running 活动里，它不会被消费——放到 next-turn 保证它在<strong>下一个</strong>回合边界出现，而不是消失在旧活动的收尾里。而 <code class="inline">cancel({keepInbox: true})</code> 保留队列只中止活动，正是「打断当前动作、保留排队输入」的组合拳。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>用代码看：wakeDriver() 的闩锁</h2>
+    <p>唤醒在「没人在听」时会丢吗？不会——被闩住等重放（<code class="inline">packages/core/agent-loop/src/agent.ts:191</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts — wakeDriver()</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/**
+   * Start one driver, or latch its wake behind maintenance or an aborted
+   * activity. A wake sent while idle always opens its turn boundary, even
+   * when its message was cleared; only a latched replay is suppressed when
+   * the queue no longer holds the wake.
+   */</span>
+  <span class="kw">private</span> <span class="fn">wakeDriver</span>(wakeAfterAbort = <span class="kw">false</span>): <span class="kw">void</span> {
+    <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'idle'</span>) {
+      <span class="cmt">// Maintenance 与 aborted 驱动器无法送达唤醒：闩起来在收敛点重放。</span>
+      <span class="cmt">// 存活中的驱动器自己认领排队工作；disposal 永不闩锁，</span>
+      <span class="cmt">// 因此 teardown 不必等待任何模型回合。</span>
+      <span class="kw">const</span> reason = <span class="kw">this</span>.phase.abort.signal.reason <span class="kw">as</span> <span class="cl">AgentCancelCause</span> | <span class="kw">undefined</span>
+      <span class="kw">if</span> (reason?.kind !== <span class="st">'disposed'</span> && (<span class="kw">this</span>.phase.kind === <span class="st">'maintenance'</span> || wakeAfterAbort)) {
+        <span class="kw">this</span>.phase.wakeRequested = <span class="kw">true</span>
+      }
+      <span class="kw">return</span>
+    }
+    <span class="kw">const</span> driver = <span class="cl">Promise</span>.<span class="fn">withResolvers</span>&lt;<span class="kw">void</span>&gt;()
+    <span class="kw">this</span>.activityDone = driver.promise
+    <span class="kw">this</span>.<span class="fn">setPhase</span>({
+      kind: <span class="st">'running'</span>,
+      abort: <span class="kw">new</span> <span class="cl">AbortController</span>(),
+      turn: <span class="kw">this</span>.phase.lastTurn,
+      step: <span class="nu">0</span>,
+      wakeRequested: <span class="kw">false</span>,
+    })
+    <span class="kw">this</span>.loopCtx.agents.<span class="fn">withInitiator</span>(<span class="kw">this</span>, () =&gt; <span class="kw">this</span>.<span class="fn">kick</span>()).<span class="fn">then</span>(driver.resolve, driver.reject)
+  }
+
+  <span class="kw">async</span> <span class="fn">whenIdle</span>(): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt; {
+    <span class="kw">let</span> activity: <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt;
+    <span class="kw">do</span> {
+      <span class="kw">await</span> (activity = <span class="kw">this</span>.activityDone)
+    } <span class="kw">while</span> (activity !== <span class="kw">this</span>.activityDone)   <span class="cmt">// 等待期间又有新活动？继续等</span>
+  }</pre>
+    <div class="annotation"><b>三个细节</b>：① 闩锁只在 maintenance 或「唤醒落在已中止活动」时设置，且 disposed 原因永不闩锁——卸载不等模型回合；② <code class="inline">whenIdle()</code> 的 do-while 是防竞态写法：等待期间 <code class="inline">activityDone</code> 被换成新活动的 Promise，就继续等新的那个；③ 每次唤醒都新建 AbortController + 新 running phase，phase.turn 从 lastTurn 续起。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>用代码看：kick() 与驱动的收尾</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:222</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">kick</span>(): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt; {
+    <span class="kw">try</span> {
+      <span class="kw">while</span> (<span class="kw">await</span> <span class="kw">this</span>.<span class="fn">turn</span>()) {}      <span class="cmt">// turn() 返回 true = 还有排队输入，继续</span>
+    } <span class="kw">catch</span> (_error) {
+      <span class="cmt">// 已报告的失败与取消在驱动器边界被收纳。</span>
+    } <span class="kw">finally</span> {
+      <span class="kw">if</span> (<span class="kw">this</span>.phase.kind === <span class="st">'running'</span>) {
+        <span class="kw">const</span> { turn, wakeRequested } = <span class="kw">this</span>.phase
+        <span class="kw">this</span>.<span class="fn">setPhase</span>({ kind: <span class="st">'idle'</span>, lastTurn: turn })
+        <span class="kw">if</span> (wakeRequested && <span class="kw">this</span>.inbox.hasPending) <span class="kw">this</span>.<span class="fn">wakeDriver</span>()  <span class="cmt">// 闩锁重放</span>
+      }
+    }
+  }</pre>
+    <p>失败如何「在活体边界被报告」？<code class="inline">throwError</code> 先以 <code class="inline">agent/error</code>（emit，不等待）发布，再重新抛出交给 kick 的 catch：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts — throwError()</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private</span> <span class="fn">throwError</span>(error: <span class="kw">unknown</span>): <span class="kw">never</span> {
+    <span class="kw">const</span> turn = <span class="kw">this</span>.phase.kind === <span class="st">'running'</span> ? <span class="kw">this</span>.phase.turn : <span class="kw">this</span>.phase.lastTurn
+    <span class="kw">const</span> step = <span class="kw">this</span>.phase.kind === <span class="st">'running'</span> ? <span class="kw">this</span>.phase.step : <span class="nu">0</span>
+    <span class="kw">this</span>.dispatch.<span class="fn">emit</span>(<span class="st">'agent/error'</span>, { turn, step, error })
+    <span class="kw">throw</span> error
+  }</pre>
+    <div class="annotation"><b>containment 三层</b>：错误先变成 <code class="inline">turn/end {reason: error}</code> 的持久事实，再变成 <code class="inline">agent/error</code> 的 live 广播，最后在 kick 边界被吞掉（不再向上炸栈）——驱动器永不因为一次失败而死亡，<code class="inline">whenIdle()</code> 的等待者也总能等到收敛。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>Agent 级 Scope：每个循环实例自己的注册边界</h2>
+    <p>构造函数里两行决定了「每个 Agent 是一个隔离的注册世界」（<code class="inline">packages/core/agent-loop/src/agent.ts:106</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts — 构造函数（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>    <span class="kw">this</span>.dispatch = <span class="fn">agentEvents</span>(loopCtx, <span class="kw">this</span>)   <span class="cmt">// 融合派发器：热路径零分配</span>
+    <span class="kw">this</span>.inbox = <span class="kw">new</span> <span class="cl">Inbox</span>(session, {
+      inserted: (message) =&gt; { <span class="kw">this</span>.dispatch.<span class="fn">emit</span>(<span class="st">'agent/inbox/inserted'</span>, { message }) },
+      discarded: (message) =&gt; { <span class="kw">this</span>.dispatch.<span class="fn">emit</span>(<span class="st">'agent/inbox/discarded'</span>, { message }) },
+      claimed: (message, turn) =&gt; { <span class="kw">this</span>.dispatch.<span class="fn">emit</span>(<span class="st">'agent/inbox/claimed'</span>, { message, turn }) },
+    })
+    <span class="kw">const</span> lastTurn = <span class="kw">this</span>.loopCtx.sessionProjections.<span class="fn">stateOf</span>(session, <span class="st">'turnBoundary'</span>)?.lastTurn ?? <span class="nu">0</span>
+    <span class="kw">this</span>.phase = { kind: <span class="st">'idle'</span>, lastTurn }    <span class="cmt">// ← 从持久投影恢复回合计数</span>
+    <span class="kw">this</span>.scope = <span class="fn">createScope</span>(loopCtx, <span class="kw">this</span>)
+    <span class="kw">this</span>.ctx = <span class="kw">this</span>.scope.ctx.<span class="fn">extend</span>({ agent: <span class="kw">this</span> })
+    <span class="kw">this</span>.runtimeContext = <span class="kw">new</span> <span class="cl">RuntimeContextProjection</span>(<span class="kw">this</span>.ctx, session)</pre>
+    <div class="annotation"><b>三个事实</b>：① 热路径派发器 <code class="inline">agentEvents(loopCtx, this)</code> 构造一次、复用终生（注释原话：hot-path dispatches never allocate）；② 回合计数 <code class="inline">lastTurn</code> 不是内存猜的，而是从 <code class="inline">turnBoundary</code> 持久投影单元读的——重启后回合号继续递增；③ <code class="inline">this.ctx</code> 在 scope 的 ctx 上扩展了 <code class="inline">agent: this</code>，所以工具、pre-step 监听器拿到的 <code class="inline">exec.agent</code> / payload.agent 就是这个实例。scope 的注册（第 8 章详述）在驱动器退出后被生命周期所有者回卷。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>事件派发点全景</h2>
+    <p>循环自身派发的事件（grep <code class="inline">this.dispatch</code>，均在 <code class="inline">packages/core/agent-loop/src/agent.ts</code>）：</p>
+    <table class="tbl">
+      <tr><th>事件</th><th>模式</th><th>派发点</th></tr>
+      <tr><td><code class="inline">agent/inbox/inserted|discarded|claimed</code></td><td>emit</td><td>Inbox 回调（进程内观察，不持久——持久版是 <code class="inline">agent/inbox/spliced</code>）</td></tr>
+      <tr><td><code class="inline">agent/status</code></td><td>emit</td><td>setPhase() 中状态实际变化时</td></tr>
+      <tr><td><code class="inline">agent/pre-step</code></td><td>waterfall</td><td>preStep()——决策点（reject | enter）</td></tr>
+      <tr><td><code class="inline">agent/assistant-stream</code></td><td>emit</td><td>AssistantStreamAttempt 的帧回调（start/chunk/end）</td></tr>
+      <tr><td><code class="inline">agent/request-error</code></td><td>waterfall</td><td>step() 流失败后——只有 <code class="inline">{kind:'retry'}</code> 触发重试</td></tr>
+      <tr><td><code class="inline">agent/request</code></td><td>waterfall</td><td>buildRequest()——插件可改写请求配置（provider/model/effort…）</td></tr>
+      <tr><td><code class="inline">agent/turn-stopping</code></td><td>serial</td><td>turn() 收尾——无 next() 的最后拦截点</td></tr>
+      <tr><td><code class="inline">agent/error</code></td><td>emit</td><td>throwError()——活体失败广播</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">记忆法</b>
+      想拦截「请求长什么样」→ <code class="inline">agent/request</code>；想拦截「模型看见什么输入」→ <code class="inline">agent/pre-step</code>；想接管失败恢复 → <code class="inline">agent/request-error</code>；想在回合收口前做最后审查 → <code class="inline">agent/turn-stopping</code>。四个事件覆盖了循环的全部可插点。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.8</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① Phase 三态 + 每活动独立 AbortController = 取消语义可推理；② followup/steer/inject 三个 API 是同一 send 原语的坐标组合，abort 后的唤醒自动重分类；③ 唤醒闩锁保证「没有任何输入会静默丢失」（除 disposed）；④ 错误被三层收容：持久 turn/end → live agent/error → 驱动器边界吞掉。下一步进入 <a href="05-persistence.html">第 5 章：持久化与崩溃恢复</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="03-agent-lifecycle.html">← 上一章：生命周期</a>
+    <a href="05-persistence.html">下一步：持久化 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 04 Agent 循环 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

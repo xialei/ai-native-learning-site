@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 LeRobotDataset — 深入浅出具身智能</title>
+<link rel="stylesheet" href="assets/robotics-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出具身智能</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-overview.html">全景</a>
+      <a href="02-hardware.html">硬件抽象</a>
+      <a href="03-teleop.html">遥操作</a>
+      <a href="04-dataset.html">数据集</a>
+      <a href="05-policy.html">策略</a>
+      <a href="06-smolvla.html">SmolVLA</a>
+      <a href="07-vla-frontier.html">VLA 前沿</a>
+      <a href="08-sim-isaaclab.html">仿真</a>
+      <a href="09-manager-based-env.html">环境</a>
+      <a href="10-rl-training.html">RL 训练</a>
+      <a href="11-sim2real.html">Sim2Real</a>
+      <a href="12-build-own.html">实战路线</a>
+      <a href="13-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 LeRobotDataset</div>
+    <h1>LeRobotDataset：机器人数据的通用容器</h1>
+    <div class="subtitle">NLP 有 Text，CV 有 ImageNet，机器人学一直没有等价物——直到各实验室自创格式互不相通。LeRobotDataset 用「parquet + mp4 + 元数据」把异构机器人数据统一成一种能放 Hub、能流式读、能直接喂策略的格式。这一章从目录结构读到 <code class="inline">__getitem__</code>，读完你就知道一份训练数据到底由什么构成。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>目录结构：一切按 chunk 分片</h2>
+    <p>先约定全书最重要的数据单位——<strong>episode</strong>：机器人<strong>从头到尾做完一次任务</strong>的一段连续记录（比如「抓起方块→放进盒子」的 30 秒），包含这段时间所有的相机帧和关节读数。一个数据集就是许多 episode 的集合——对应视频里的「一集」。v3.0 格式的磁盘布局由一组路径模板决定（src/lerobot/datasets/utils.py:89-149）：</p>
+    <div class="code-title">src/lerobot/datasets/utils.py — v3.0 布局常量（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span>DEFAULT_CHUNK_SIZE = <span class="nu">1000</span>          <span class="cmt"># 每个 chunk 最多 1000 个文件</span>
+DEFAULT_DATA_FILE_SIZE_IN_MB = <span class="nu">100</span>  <span class="cmt"># 单个 parquet 文件上限</span>
+DEFAULT_VIDEO_FILE_SIZE_IN_MB = <span class="nu">200</span>
+
+INFO_PATH = <span class="st">"meta/info.json"</span>
+STATS_PATH = <span class="st">"meta/stats.json"</span>
+EPISODES_DIR = <span class="st">"meta/episodes"</span>
+DATA_DIR = <span class="st">"data"</span>
+VIDEO_DIR = <span class="st">"videos"</span>
+
+CHUNK_FILE_PATTERN = <span class="st">"chunk-{chunk_index:03d}/file-{file_index:03d}"</span>
+DEFAULT_TASKS_PATH = <span class="st">"meta/tasks.parquet"</span>
+DEFAULT_EPISODES_PATH = EPISODES_DIR + <span class="st">"/"</span> + CHUNK_FILE_PATTERN + <span class="st">".parquet"</span>
+DEFAULT_DATA_PATH = DATA_DIR + <span class="st">"/"</span> + CHUNK_FILE_PATTERN + <span class="st">".parquet"</span>
+DEFAULT_VIDEO_PATH = VIDEO_DIR + <span class="st">"/{video_key}/"</span> + CHUNK_FILE_PATTERN + <span class="st">".mp4"</span>
+DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png"</span></pre>
+    <p>一份录制完的数据集在磁盘上长这样：</p>
+    <div class="code-title">目录树（以 30fps 录制 3 集的 so101 数据为例）</div>
+    <pre class="code"><span class="lang-tag">text</span>you/so101_pick/
+├── meta/
+│   ├── info.json              # 版本、fps、features 定义、分片参数、计数器
+│   ├── stats.json             # 每个特征的统计量（训练归一化用，4.5）
+│   ├── tasks.parquet          # 任务表：task_index → 任务描述文本
+│   └── episodes/              # 每集元数据：帧数、起止时间、文件位置
+│       └── chunk-000/file-000.parquet
+├── data/
+│   └── chunk-000/
+│       └── file-000.parquet   # 数值帧：state/action/timestamp/index…
+└── videos/
+    ├── observation.images.laptop/
+    │   └── chunk-000/file-000.mp4
+    └── observation.images.phone/
+        └── chunk-000/file-000.mp4</pre>
+    <div class="annotation"><b>为什么要分片（chunk）：</b>50 集 × 60 秒 × 30fps ≈ 9 万帧，全塞一个 parquet/一个 mp4 既难流式读、又超出上传工具的单文件习惯。v3.0 按「每 1000 个文件或 100/200 MB」滚动开新文件，<code class="inline">chunk_index/file_index</code> 两级寻址让<strong>数据集可以无限增长而文件数保持可控</strong>。Hub 上的下载也按需拉取单个 chunk——这是「数据集即仓库」的工程基础。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t4 d4">
+        <title id="t4">LeRobotDataset v3.0 存储布局</title>
+        <desc id="d4">meta 元数据、data 数值 parquet、videos 相机 mp4 三区，episode 元数据把三者对齐</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">一份 episode 的三份存储（靠 episode_index/frame_index/timestamp 对齐）</text>
+
+        <rect class="node" x="40" y="45" width="240" height="90" rx="8"></rect>
+        <text class="lbl" x="160" y="66" text-anchor="middle">data/chunk-000/file-000.parquet</text>
+        <text class="lbl sm" x="160" y="86" text-anchor="middle">index · episode_index · frame_index</text>
+        <text class="lbl sm" x="160" y="102" text-anchor="middle">timestamp · task_index</text>
+        <text class="lbl sm" x="160" y="118" text-anchor="middle">observation.state (float32×6)</text>
+        <text class="lbl sm" x="160" y="132" text-anchor="middle">action (float32×6)</text>
+
+        <rect class="node" x="330" y="45" width="240" height="90" rx="8"></rect>
+        <text class="lbl" x="450" y="66" text-anchor="middle">videos/…/chunk-000/file-000.mp4</text>
+        <text class="lbl sm" x="450" y="86" text-anchor="middle">每个相机键一个视频流</text>
+        <text class="lbl sm" x="450" y="102" text-anchor="middle">帧号 = frame_index</text>
+        <text class="lbl sm" x="450" y="118" text-anchor="middle">取帧 = 按 timestamp 定位</text>
+        <text class="lbl sm" x="450" y="134" text-anchor="middle">（容忍 1e-4 秒误差）</text>
+
+        <rect class="node acc" x="620" y="45" width="240" height="90" rx="8"></rect>
+        <text class="lbl" x="740" y="66" text-anchor="middle">meta/</text>
+        <text class="lbl sm" x="740" y="86" text-anchor="middle">info.json — schema 与全局计数</text>
+        <text class="lbl sm" x="740" y="102" text-anchor="middle">episodes/*.parquet — 每集起止</text>
+        <text class="lbl sm" x="740" y="118" text-anchor="middle">tasks.parquet — 文本→task_index</text>
+        <text class="lbl sm" x="740" y="134" text-anchor="middle">stats.json — 归一化统计</text>
+
+        <line class="edge" x1="280" y1="90" x2="328" y2="90"></line>
+        <text class="lbl sm" x="304" y="82" text-anchor="middle">帧号对齐</text>
+        <line class="edge" x1="620" y1="75" x2="572" y2="75"></line>
+        <text class="lbl sm" x="596" y="67" text-anchor="middle">查询</text>
+
+        <text class="lbl sm" x="40" y="185">读取一个训练样本 = 按全局 index 查 episode 元数据 → 定位 parquet 行 → 按 timestamp 从 mp4 解码相机帧</text>
+        <text class="lbl sm" x="40" y="203">→ 按 delta_timestamps 展开「过去若干帧 + 未来动作块」（4.4）</text>
+        <text class="lbl sm" x="40" y="227">写路径：add_frame 只进内存缓冲，save_episode 一次性写 parquet + 编码 mp4 + 更新 meta（4.3）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw node"></span>目录 / 文件区</span>
+        <span class="lg-item"><span class="sw acc"></span>数据实体（parquet / mp4）</span>
+      </div>
+      <div class="fig-cap">图 4.1：v3.0 的三区存储。数值走 parquet（可列裁剪、可算统计），像素走 mp4（体积省 10 倍以上），元数据把两边缝合。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>特征命名：全栈的「通用语言」</h2>
+    <p>第 2 章的硬件键名（<code class="inline">shoulder_pan.pos</code>）在进数据集时被加上前缀并整理成标准 schema。<code class="inline">hw_to_dataset_features</code>（utils/feature_utils.py:47）是转换点：</p>
+    <div class="code-title">src/lerobot/utils/feature_utils.py:63 — 硬件特征 → 数据集 schema（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> joint_fts <span class="kw">and</span> prefix == OBS_STR:
+    features[<span class="st">f"{prefix}.state"</span>] = {
+        <span class="st">"dtype"</span>: <span class="st">"float32"</span>, <span class="st">"shape"</span>: (len(joint_fts),), <span class="st">"names"</span>: list(joint_fts),
+    }  <span class="cmt"># → "observation.state"</span>
+
+<span class="kw">if</span> joint_fts <span class="kw">and</span> prefix == ACTION:
+    features[prefix] = { <span class="st">"dtype"</span>: <span class="st">"float32"</span>, ... }  <span class="cmt"># → "action"</span>
+
+<span class="kw">for</span> key, shape <span class="kw">in</span> cam_fts.items():
+    dtype = <span class="st">"video"</span> <span class="kw">if</span> use_video <span class="kw">else</span> <span class="st">"image"</span>
+    features[<span class="st">f"{prefix}.images.{key}"</span>] = { <span class="st">"dtype"</span>: dtype, <span class="st">"shape"</span>: shape, ... }
+    <span class="cmt"># → "observation.images.laptop" 等</span></pre>
+    <div class="code-title">一份 SO-101 数据集 features 的实际样子（info.json 内）</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"observation.state"</span>: { <span class="st">"dtype"</span>: <span class="st">"float32"</span>, <span class="st">"shape"</span>: [<span class="nu">6</span>], <span class="st">"names"</span>: [<span class="st">"shoulder_pan.pos"</span>, ..., <span class="st">"gripper.pos"</span>] },
+  <span class="st">"observation.images.laptop"</span>: { <span class="st">"dtype"</span>: <span class="st">"video"</span>, <span class="st">"shape"</span>: [<span class="nu">480</span>, <span class="nu">640</span>, <span class="nu">3</span>] },
+  <span class="st">"action"</span>: { <span class="st">"dtype"</span>: <span class="st">"float32"</span>, <span class="st">"shape"</span>: [<span class="nu">6</span>] }
+}</pre>
+    <div class="annotation"><b>命名约定就是接口约定：</b><code class="inline">observation.state</code> / <code class="inline">observation.images.*</code> / <code class="inline">action</code> / <code class="inline">task</code> 这几个键名贯穿<strong>数据集 → DataLoader → 策略 forward → 异步部署协议</strong>（第 11 章 gRPC 的 Observation 消息同样按此组织）。dtype 还区分 <code class="inline">"video"</code> 与 <code class="inline">"image"</code>（datasets/feature_utils.py:64）：前者按时间戳从 mp4 解码，后者按文件读 png——同一套代码透明处理两种存储。此外每帧自动带五个标准列：index、episode_index、frame_index、timestamp、task_index（dataset_writer.py:223 自动补齐）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>写入路径：add_frame 与 save_episode 的分工</h2>
+    <p><code class="inline">LeRobotDataset</code> 有两种模式：写模式（<code class="inline">create/resume</code>）与读模式。第 3 章录制时走的写路径，核心是两个方法：</p>
+    <div class="code-title">src/lerobot/datasets/lerobot_dataset.py:475 / dataset_writer.py:213 — add_frame（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">add_frame</span>(self, frame: <span class="cl">dict</span>) -&gt; <span class="kw">None</span>:
+    <span class="cmt">"""加入当前 episode 缓冲区。除图片临时落盘外，什么都不写。"""</span>
+    <span class="kw">for</span> name <span class="kw">in</span> frame:
+        <span class="kw">if</span> isinstance(frame[name], torch.Tensor):
+            frame[name] = frame[name].numpy()
+
+    validate_frame(frame, self._meta.features)   <span class="cmt"># schema 校验：键齐、形状对</span>
+    <span class="kw">if</span> self.episode_buffer <span class="kw">is</span> <span class="kw">None</span>:
+        self.episode_buffer = self._create_episode_buffer()
+
+    <span class="cmt"># frame_index 与 timestamp 自动补齐——调用方不用管节拍</span>
+    frame_index = self.episode_buffer[<span class="st">"size"</span>]
+    timestamp = frame_index / self._meta.fps
+    self.episode_buffer[<span class="st">"frame_index"</span>].append(frame_index)
+    self.episode_buffer[<span class="st">"timestamp"</span>].append(timestamp)
+    self.episode_buffer[<span class="st">"task"</span>].append(frame.pop(<span class="st">"task"</span>))
+    ...</pre>
+    <div class="code-title">src/lerobot/datasets/lerobot_dataset.py:491 — save_episode</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">save_episode</span>(self, episode_data: <span class="cl">dict</span> | <span class="kw">None</span> = <span class="kw">None</span>, parallel_encoding: <span class="cl">bool</span> = <span class="kw">True</span>) -&gt; <span class="kw">None</span>:
+    <span class="cmt">"""把缓冲区落盘：编码视频、写 parquet、更新元数据，然后清空缓冲区。"""</span>
+    self._require_writer(<span class="st">"save_episode"</span>)
+    self.writer.save_episode(episode_data, parallel_encoding)</pre>
+    <div class="annotation"><b>这个分工是「实时性」与「完整性」的折中：</b>add_frame 在 30 Hz 循环里被调用，所以它只做校验 + 追加内存数组（相机帧先以 png 丢进临时目录，由第 3 章的写盘线程池异步处理）；save_episode 在 episode 结束才跑，做所有「贵」的事——视频编码（可并行，<code class="inline">parallel_encoding</code>）、parquet 写出、meta 计数器更新。<strong>录制循环里的任何一次 add_frame 都不该阻塞超过几毫秒</strong>，这是 3.2 节 fps 稳定的前提。若某集录坏了，<code class="inline">clear_episode_buffer</code> 直接丢弃缓冲（3.4 的 r 键）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>读取路径：__getitem__ 与 delta_timestamps（重点）</h2>
+    <p>训练时 DataLoader 每次要的不只是「当前帧」——策略要<strong>历史观测 + 未来动作块</strong>（action chunk）。这是靠 <code class="inline">delta_timestamps</code> 实现的：</p>
+    <div class="code-title">src/lerobot/datasets/lerobot_dataset.py:53 — 构造时传入 delta_timestamps（摘录 docstring）</div>
+    <pre class="code"><span class="lang-tag">python</span>delta_timestamps: <span class="cl">dict</span>[<span class="cl">str</span>, <span class="cl">list</span>[<span class="cl">float</span>]] | <span class="kw">None</span> = <span class="kw">None</span>
+<span class="cmt"># 例：观测取过去 2 帧（-0.1s、-0.05s、0s），动作取未来 0.5 秒的动作块
+# {
+#   "observation.state": [-0.1, -0.05, 0.0],
+#   "action": [t / fps for t in range(50)],   # 30fps 下 ≈ 未来 1.67 秒
+# }
+# 每个 key 是相对当前帧的时间偏移列表；数据集负责把这些偏移换算成
+# 绝对索引、越界裁剪、并从视频解码对应帧。</span>
+
+<span class="kw">def</span> <span class="fn">__getitem__</span>(self, idx: <span class="cl">int</span> | <span class="cl">slice</span>) -&gt; <span class="cl">dict</span> | <span class="cl">list</span>[<span class="cl">dict</span>]:
+    <span class="cmt">"""返回一帧（或切片），所有变换已应用：delta-timestamps 展开、
+    视频解码、图像变换。核心逻辑委托给 DatasetReader。"""</span>
+    <span class="kw">return</span> self._ensure_reader().get_item(idx)</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t5 d5">
+        <title id="t5">delta_timestamps 展开示意</title>
+        <desc id="d5">以当前帧为中心，观测取过去 3 帧，动作取未来 15 帧组成 action chunk</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">一个训练样本 = 一小段时间轴（30fps，t=100 帧处）</text>
+
+        <line class="edge" x1="60" y1="120" x2="840" y2="120"></line>
+        <text class="lbl sm" x="855" y="124">t</text>
+
+        <g>
+          <rect class="node" x="120" y="95" width="60" height="50" rx="6"></rect>
+          <text class="lbl sm" x="150" y="116" text-anchor="middle">-0.1s</text>
+          <text class="lbl sm" x="150" y="132" text-anchor="middle">state[t-3]</text>
+        </g>
+        <g>
+          <rect class="node" x="210" y="95" width="60" height="50" rx="6"></rect>
+          <text class="lbl sm" x="240" y="116" text-anchor="middle">-0.05s</text>
+          <text class="lbl sm" x="240" y="132" text-anchor="middle">state[t-2]</text>
+        </g>
+        <g>
+          <rect class="node" x="300" y="95" width="60" height="50" rx="6"></rect>
+          <text class="lbl sm" x="330" y="116" text-anchor="middle">-0.0s</text>
+          <text class="lbl sm" x="330" y="132" text-anchor="middle">state[t-1]</text>
+        </g>
+        <g>
+          <rect class="node" x="440" y="95" width="60" height="50" rx="6"></rect>
+          <text class="lbl sm" x="470" y="116" text-anchor="middle">+0.0s</text>
+          <text class="lbl sm" x="470" y="132" text-anchor="middle">当前帧</text>
+        </g>
+        <g>
+          <rect class="node acc" x="520" y="95" width="300" height="50" rx="6"></rect>
+          <text class="lbl sm" x="670" y="116" text-anchor="middle">action[t+1 .. t+15] —— action chunk</text>
+          <text class="lbl sm" x="670" y="132" text-anchor="middle">未来 0.5 秒的 15 个动作目标</text>
+        </g>
+
+        <line class="edge" x1="180" y1="145" x2="180" y2="93"></line>
+        <line class="edge" x1="270" y1="145" x2="270" y2="93"></line>
+        <line class="edge" x1="360" y1="145" x2="360" y2="93"></line>
+        <line class="edge core" x1="470" y1="145" x2="470" y2="93"></line>
+        <line class="edge acc" x1="520" y1="145" x2="520" y2="93"></line>
+
+        <text class="lbl sm" x="60" y="190">观测 delta：[-0.1, -0.05, 0.0] → 3 帧状态历史（含当前）</text>
+        <text class="lbl sm" x="60" y="210">动作 delta：[0, 1/fps, 2/fps, …] → 未来 N 帧动作块，一次预测一段轨迹</text>
+        <text class="lbl sm" x="60" y="230">越界（episode 边界外）自动裁剪；视频键按各 delta 时间戳从 mp4 定位解码</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw"></span>时间轴 / 单帧</span>
+        <span class="lg-item"><span class="sw acc"></span>被取进样本的帧</span>
+      </div>
+      <div class="fig-cap">图 4.4：delta_timestamps 把「单帧样本」变成「时间窗样本」。观测往回看，动作往前看——这正是第 5 章 ACT / 第 6 章 flow matching 输出 action chunk 的数据基础。</div>
+    </div>
+    <div class="annotation"><b>为什么 action chunk 如此重要：</b>单步动作预测会让误差逐帧累积（分布漂移：模型见过自己的错误状态后不知道怎么办）。输出一整段动作再执行，相当于把「决策频率」降到 chunk 长度的倒数，给模型留了抗漂移的缓冲。数据集用 delta_timestamps 支持它，策略接口（第 5 章 <code class="inline">predict_action_chunk</code>）暴露它，部署层（第 11 章 action queue）消费它——三处串成一条线。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>stats.json：归一化从这里来</h2>
+    <p>第 2 章标定解决了「跨机器坐标统一」，但不同特征量纲仍差几个数量级（夹爪 0-100，关节 ±100，图像 0-255）。训练前的归一化不能临时算——必须<strong>落盘成元数据</strong>，让推理时能精确反变换：</p>
+    <div class="code-title">src/lerobot/datasets/compute_stats.py:31 — 流式分位数统计（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">RunningQuantileStats</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, quantile_list: <span class="cl">list</span>[<span class="cl">float</span>] | <span class="kw">None</span> = <span class="kw">None</span>, num_quantile_bins: <span class="cl">int</span> = <span class="nu">5000</span>):
+        ...  <span class="cmt"># 直方图近似分位数：一遍扫完百万帧也算得动</span>
+
+    <span class="kw">def</span> <span class="fn">update</span>(self, batch: np.ndarray) -&gt; <span class="kw">None</span>: ...
+    <span class="kw">def</span> <span class="fn">get_statistics</span>(self) -&gt; <span class="cl">dict</span>[<span class="cl">str</span>, np.ndarray]:
+        ...  <span class="cmt"># {min, max, mean, std, q01, q99} 每个特征一份</span></pre>
+    <div class="annotation"><b>读法：</b>save_episode 时对整个数据集算一遍，结果存 <code class="inline">meta/stats.json</code>。min/max 分位数（q01/q99）用来抗离群值——直接用全局 min/max 会被一帧「关节飞了」的坏数据毁掉归一化。训练时 processor 链（3.5 的 <code class="inline">normalize_processor</code>）读取 stats 把输入压到 [-1,1]；部署时同一份 stats 从 checkpoint 加载，把策略输出反归一化回真实关节量。<strong>数据集的 stats 与模型权重必须配套</strong>——它们是同一个「坐标系」的两半。</div>
+    <div class="callout info">
+      <b class="tag">延伸</b>
+      Hugging Face 生态里官方数据集（如 <code class="inline">lerobot/aloha_sim</code>）都是这个格式，<code class="inline">LeRobotDataset("lerobot/aloha_sim")</code> 一行代码即下载即用。<code class="inline">push_to_hub</code>（lerobot_dataset.py:619）会上传全部文件、生成数据卡，并打上 <code class="inline">codebase_version</code> 标签——加载端据此校验格式兼容性，v2.1 旧数据会提示用 <code class="inline">convert_dataset_v21_to_v30</code> 迁移（utils.py 的 V30_MESSAGE）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>LeRobotDataset 对比 Isaac Lab 的「数据从哪来」</h2>
+    <p>真机数据贵（50 集 = 一个人一天），仿真数据便宜（4096 个并行环境同时跑）。两条线的数据格式在 LeRobot 栈里是统一的：</p>
+    <table class="tbl">
+      <tr><th></th><th>真机（lerobot-record）</th><th>仿真（Isaac Lab，第 9-10 章）</th></tr>
+      <tr><td>数据来源</td><td>遥操作示范（人）</td><td>RL 探索或运动规划（脚本）</td></tr>
+      <tr><td>帧率</td><td>30 fps 固定节拍</td><td>sim.dt=0.01 × decimation=2 → 50 Hz 控制</td></tr>
+      <tr><td>每帧内容</td><td>state + 相机 mp4 + action + task</td><td>观测张量（joint_pos/object_position…）+ reward</td></tr>
+      <tr><td>数量级</td><td>几十~几百集</td><td>百万步/小时（4096 envs 并行）</td></tr>
+      <tr><td>用途</td><td>模仿学习（第 5-7 章）</td><td>RL 训练、域随机化数据（第 10 章）</td></tr>
+      <tr><td>汇合点</td><td colspan="2">都能转成 LeRobotDataset → 都能喂 SmolVLA/π0 训练（第 6-7 章）</td></tr>
+    </table>
+    <div class="annotation"><b>一句话记住：</b>LeRobotDataset 的设计把「机器人数据」变成了「可版本管理、可流式读取、可跨策略复用」的一等公民。理解了它的 schema（4.2）与 delta_timestamps（4.4），后面所有策略章节的输入输出就都有了坐标参照。</div>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      数据就位，该让模型从数据里学策略了。先从经典三件套（ACT / Diffusion / 时序集成）读起，看清 PreTrainedPolicy 的统一接口与 action chunking 的实现。这是<a href="05-policy.html">第 5 章：策略动物园</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="03-teleop.html">← 上一步：遥操作与数据采集</a>
+    <a href="05-policy.html">下一步：策略动物园 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出具身智能 · 04 LeRobotDataset · 基于 huggingface/lerobot（3f2c29ef7e，数据格式 v3.0）· 行号随版本演进可能偏移，以仓库最新代码为准
+</footer>
+
+</body>
+</html>

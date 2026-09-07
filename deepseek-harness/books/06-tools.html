@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 工具系统与并行调度 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 工具系统</div>
+    <h1>工具系统与并行调度：一次调用的完整管线</h1>
+    <div class="subtitle">模型说「调用 read(file.txt)」之后发生了什么？走 pre-execute 审批、通过单调守卫、被包装派发、执行、再走 post-execute 与内容定稿——最后按模型顺序结算。这一章拆开这条五段管线，并看 dsh 如何安全地把多个工具调用并行化。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>一分钟版本</h2>
+    <ul>
+      <li>工具 = <code class="inline">ToolDefinition</code>：schema + <strong>强制的 canonical output 声明</strong> + <code class="inline">execute(args, exec)</code> + 可选 finalize/timeout/并发分类/呈现回调。</li>
+      <li>管线五段（全是事件）：<code class="inline">tools/pre-execute</code>（waterfall 决定放行）→ 单调守卫 → <code class="inline">tools/execute</code>（around 包装：超时、信号替换）→ 工具体 → <code class="inline">tools/post-execute</code> → finalizeContent → 冻结的 <code class="inline">tool/result</code>。</li>
+      <li>并发模型：每个调用被分类为 <strong>parallel-safe</strong>（<code class="inline">isConcurrencySafe(args) === true</code>）或 <strong>exclusive</strong>；同组 parallel-safe 调用进滚动窗口池（默认 <code class="inline">maxParallelToolCalls = 10</code>），exclusive 是栅栏。</li>
+      <li>结算与追加永远按<strong>模型顺序</strong>提交——即使完成顺序乱序，日志里结果顺序与模型请求一致。</li>
+      <li>中止：已开始的调用排空并提交，未开始的补合成错误结果（<code class="inline">TOOL_ABORTED_BEFORE_DISPATCH</code>）。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>用代码看：defineTool 与一个真实工具</h2>
+    <p><code class="inline">read</code> 工具（<code class="inline">packages/fs/tool-fs/src/read.ts</code>）是定义样板的范本——注意输出 schema 是强制的、<code class="inline">isConcurrencySafe</code> 是纯同步分类器：</p>
+    <div class="code-title">packages/fs/tool-fs/src/read.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 默认与单次 read 调用返回的最大行数（readLimit 配置）。 */</span>
+<span class="kw">export const</span> <span class="cl">READ_LIMIT</span> = <span class="nu">2000</span>
+<span class="cmt">/** 大于等于该尺寸的文件走流式读取（readStreamMinSize 配置）。 */</span>
+<span class="kw">export const</span> <span class="cl">STREAM_MIN_SIZE</span> = <span class="nu">10</span> * <span class="nu">1024</span> * <span class="nu">1024</span>   <span class="cmt">// 10 MB</span>
+
+ctx.tools.<span class="fn">register</span>(<span class="fn">defineTool</span>({
+  name: <span class="st">'read'</span>,
+  description: <span class="st">'Read a UTF-8 text file and return line-numbered content.'</span>,
+  parameters: {
+    file_path: { type: <span class="st">'string'</span>, required: <span class="kw">true</span>, description: <span class="st">'Path to read, resolved by the filesystem backend.'</span> },
+    offset:   { type: <span class="st">'number'</span>, description: <span class="st">'1-based first line to return. Defaults to 1.'</span> },
+    limit:    { type: <span class="st">'number'</span>, description: `Maximum number of lines to return. Defaults to ${caps.limit}.` },
+  },
+  <span class="cmt">// 强制的 canonical 输出声明：无损 JSON schema + UI 渲染</span>
+  output: {
+    schema: {
+      type: <span class="st">'object'</span>,
+      properties: {
+        path: { type: <span class="st">'string'</span>, required: <span class="kw">true</span> },
+        offset: { type: <span class="st">'integer'</span>, required: <span class="kw">true</span> },
+        lines: { type: <span class="st">'array'</span>, required: <span class="kw">true</span>, items: { <span class="cmt">/* {number, text} */</span> } },
+        totalLines: { type: <span class="st">'integer'</span>, required: <span class="kw">true</span> },
+      },
+    },
+    render: (args, value) =&gt; <span class="cmt">/* 模型可见文本的行号窗口渲染 */</span> [...],
+  },
+  <span class="cmt">// 纯同步分类器：read 只读，永远可并行</span>
+  isConcurrencySafe: () =&gt; <span class="kw">true</span>,
+  <span class="kw">async</span> <span class="fn">execute</span>(args, exec) {
+    <span class="cmt">// 一次 provider stat → 大文件流式 / 小文件整读 → 构造行号窗口</span>
+    <span class="cmt">// → ctx.emit('fs/observed', target, {kind:'present', version}, exec)</span>
+    <span class="cmt">//   （读观察被记录，供 write/edit 前的 read-before-write 策略校验）</span>
+  },
+}))</pre>
+    <div class="annotation"><b>ToolDefinition 的可选成员</b>（<code class="inline">packages/core/tools/src/index.ts:214</code>）：① <code class="inline">finalizeContent(exec, result)</code> ——模型可见内容的同步末段变换，即使管线失败路径也恰被调用一次；② <code class="inline">timeoutMs</code> ——协作超时预算，由独立的 tool-call-timeout-policy 插件经 <code class="inline">tools/execute</code> around 包装强制，<strong>永不发给模型</strong>（schemas() 白名单只有 name/description/parameters）；③ <code class="inline">isConcurrencySafe(args)</code> ——只有返回 <code class="inline">true</code> 才加入并行组，省略/异常/非 true 一律独占；④ <code class="inline">presentCall/presentResult</code> ——UI 卡片渲染，纯函数、可在流式与重放两处调用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>五段管线</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="30" width="130" height="56" rx="9"/>
+        <text class="lbl sm" x="85" y="54" text-anchor="middle">模型 tool-call</text>
+        <rect class="node core" x="180" y="30" width="150" height="56" rx="9"/>
+        <text class="lbl sm" x="255" y="50" text-anchor="middle">tools/pre-execute</text>
+        <text class="lbl sm" x="255" y="70" text-anchor="middle">waterfall·审批/策略</text>
+        <rect class="node core" x="360" y="30" width="130" height="56" rx="9"/>
+        <text class="lbl sm" x="425" y="50" text-anchor="middle">单调守卫</text>
+        <text class="lbl sm" x="425" y="70" text-anchor="middle">monotonic guards</text>
+        <rect class="node core" x="520" y="30" width="140" height="56" rx="9"/>
+        <text class="lbl sm" x="590" y="50" text-anchor="middle">tools/execute</text>
+        <text class="lbl sm" x="590" y="70" text-anchor="middle">around·超时包装</text>
+        <rect class="node" x="690" y="30" width="110" height="56" rx="9"/>
+        <text class="lbl sm" x="745" y="54" text-anchor="middle">工具体</text>
+        <rect class="node core" x="820" y="30" width="110" height="56" rx="9"/>
+        <text class="lbl sm" x="875" y="50" text-anchor="middle">tools/post</text>
+        <text class="lbl sm" x="875" y="70" text-anchor="middle">-execute</text>
+        <rect class="node acc" x="330" y="150" width="300" height="56" rx="9"/>
+        <text class="lbl sm" x="480" y="172" text-anchor="middle">finalizeContent → 无损物化 → 冻结 tool/result 事件</text>
+        <text class="lbl sm" x="480" y="190" text-anchor="middle">meta 由工具私有，JSON 可序列化（Session.append 校验）</text>
+        <line class="edge" x1="150" y1="58" x2="178" y2="58"/>
+        <line class="edge" x1="330" y1="58" x2="358" y2="58"/>
+        <line class="edge" x1="490" y1="58" x2="518" y2="58"/>
+        <line class="edge" x1="660" y1="58" x2="688" y2="58"/>
+        <line class="edge" x1="800" y1="58" x2="818" y2="58"/>
+        <line class="edge back" x1="875" y1="88" x2="630" y2="150"/>
+        <text class="lbl sm" x="85" y="130" text-anchor="middle">任一段拒绝 → 合成错误结果（仍是一条 tool/result）</text>
+        <text class="lbl sm" x="480" y="240" text-anchor="middle">execute 的取消信号可在 around 包装中被替换/融合（超时后 abort 工具体）</text>
+      </svg>
+      <div class="fig-cap">图 6-1 — 工具调用管线。pre-execute 与 post-execute 是 waterfall，execute 是 around 中间件；失败与拒绝都终到同一种持久事实：tool/result。</div>
+    </div>
+    <div class="annotation"><b>PreToolDecision</b>：pre-execute 的监听器（审批 UI、沙箱策略）返回决策；拒绝发生在这一段。通过后由<strong>单调守卫</strong>（monotonic guards，<code class="inline">packages/core/tools/src/index.ts:697</code>）做注册层拒绝——守卫在扩展性 policy 之后评估，第一个拒绝生效且不可被后续注册复活。<code class="inline">tools/execute</code> 是 around：<code class="inline">next()</code> 返回下一段结果，监听器可替换信号（超时策略就是这样融合 abort 的）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>调度器：并行组与独占栅栏</h2>
+    <p>核心在 <code class="inline">packages/core/agent-loop/src/tool-calls.ts</code> 的 <code class="inline">executeToolCalls</code>。分组规则只有三行：</p>
+    <div class="code-title">packages/core/agent-loop/src/tool-calls.ts — 分组</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">let</span> next = <span class="nu">0</span>
+  <span class="kw">let</span> concluded = <span class="kw">false</span>
+  <span class="kw">while</span> (next &lt; planned.length) {
+    <span class="cmt">// 先提交再重新分类，让注册表变更影响尚未开始的调用。</span>
+    <span class="kw">const</span> first = planned[next]!
+    <span class="kw">const</span> mode = ctx.tools.<span class="fn">executionMode</span>(first.exec).kind
+    <span class="kw">const</span> group = mode === <span class="st">'parallel'</span> ? planned.<span class="fn">slice</span>(next) : [first]   <span class="cmt">// ← 独占调用自成一组（栅栏）</span>
+    <span class="kw">const</span> outcome = <span class="kw">await</span> <span class="fn">runGroup</span>(ctx, turn, step, group, mode, signal, acceptContext)
+    next += outcome.consumed
+    concluded ||= outcome.concluded
+    <span class="kw">if</span> (outcome.aborted) {
+      <span class="kw">for</span> (<span class="kw">const</span> call <span class="kw">of</span> planned.<span class="fn">slice</span>(next)) <span class="fn">appendSkippedToolCall</span>(session, turn, step, call.block)
+      <span class="kw">return</span> { concluded }
+    }
+  }</pre>
+    <p>组内是一个<strong>滚动窗口池</strong>：<code class="inline">fillPool</code> 把 in-flight 数量顶到上限，<code class="inline">Promise.race</code> 逐个收割，每次收割后尝试按序提交：</p>
+    <div class="code-title">packages/core/agent-loop/src/tool-calls.ts — runGroup 核心（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">const</span> { maxParallelToolCalls } = ctx.agentLoop.config   <span class="cmt">// 默认 10（constants.ts）</span>
+  <span class="kw">const</span> slots: (<span class="cl">Slot</span> | <span class="kw">undefined</span>)[] = group.<span class="fn">map</span>(() =&gt; <span class="kw">undefined</span>)
+  <span class="kw">const</span> callSeqs: <span class="cl">Array</span>&lt;<span class="cl">SessionSeq</span> | <span class="kw">undefined</span>&gt; = group.<span class="fn">map</span>(() =&gt; <span class="kw">undefined</span>)
+  <span class="kw">let</span> nextToStart = <span class="nu">0</span>, committed = <span class="nu">0</span>, started = <span class="nu">0</span>
+  <span class="kw">let</span> aborted = signal.aborted
+
+  <span class="cmt">// committed 只沿「连续的模型顺序」推进。</span>
+  <span class="kw">const</span> <span class="fn">commitReady</span> = <span class="kw">async</span> (): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt; =&gt; {
+    <span class="kw">while</span> (committed &lt; group.length) {
+      <span class="kw">const</span> slot = slots[committed]
+      <span class="kw">if</span> (slot === <span class="kw">undefined</span>) <span class="kw">break</span>        <span class="cmt">// 前面的还没完成 → 停在此处等待</span>
+      <span class="kw">const</span> call = group[committed]
+      <span class="kw">const</span> result = slot.needsPost
+        ? <span class="kw">await</span> ctx.tools[TOOL_RUNTIME_SCHEDULER].<span class="fn">finalize</span>(slot.exec, slot.result)
+        : ctx.tools[TOOL_RUNTIME_SCHEDULER].<span class="fn">finish</span>(slot.exec, slot.result)
+      <span class="fn">appendToolResult</span>(session, turn, step, call!.block, result, callSeqs[committed]!)
+      <span class="kw">for</span> (<span class="kw">const</span> context <span class="kw">of</span> result.additionalContexts ?? []) <span class="fn">acceptContext</span>(context)
+      concluded ||= result.concludesTurn === <span class="kw">true</span>
+      committed++
+    }
+  }
+
+  <span class="kw">const</span> <span class="fn">fillPool</span> = <span class="kw">async</span> (): <span class="cl">Promise</span>&lt;<span class="kw">void</span>&gt; =&gt; {
+    <span class="kw">while</span> (!aborted && nextToStart &lt; group.length && inFlight.size &lt; maxParallelToolCalls) {
+      <span class="cmt">// 有序提交后重读后续模式：注册表变更可以制造栅栏。</span>
+      <span class="kw">const</span> nextCall = group[nextToStart]!
+      <span class="kw">if</span> (nextToStart &gt; <span class="nu">0</span> && mode === <span class="st">'parallel'</span>
+        && ctx.tools.<span class="fn">executionMode</span>(nextCall.exec).kind !== <span class="st">'parallel'</span>) <span class="kw">break</span>
+      <span class="kw">await</span> <span class="fn">startCall</span>(nextToStart)
+      nextToStart++
+      <span class="kw">await</span> <span class="fn">commitReady</span>()
+      <span class="kw">if</span> (signal.aborted) aborted = <span class="kw">true</span>
+    }
+  }
+
+  <span class="kw">try</span> {
+    <span class="kw">await</span> <span class="fn">fillPool</span>()
+    <span class="kw">while</span> (inFlight.size &gt; <span class="nu">0</span>) {
+      <span class="kw">const</span> settledIndex = <span class="kw">await</span> <span class="cl">Promise</span>.<span class="fn">race</span>(inFlight.<span class="fn">values</span>())
+      inFlight.<span class="fn">delete</span>(settledIndex)
+      <span class="kw">await</span> <span class="fn">commitReady</span>()
+      <span class="kw">if</span> (signal.aborted) aborted = <span class="kw">true</span>
+      <span class="kw">await</span> <span class="fn">fillPool</span>()
+    }
+  } <span class="kw">catch</span> (error) {
+    schedulerFailure ??= { error }
+    <span class="kw">await</span> <span class="cl">Promise</span>.<span class="fn">allSettled</span>(inFlight.<span class="fn">values</span>())   <span class="cmt">// 内部失败：排空已派发，不伪造结果，向上抛</span>
+    <span class="kw">throw</span> schedulerFailure.error
+  }</pre>
+    <div class="annotation"><b>三个精妙之处</b>：① <strong>提交先于分类</strong>——「重新分类前先提交」保证注册表变更（scope 收紧、插件卸载）能影响未开始的调用；② <strong>模型序结算</strong>——<code class="inline">commitReady</code> 只推进连续槽位，慢的调用挡住后面所有的结算，但绝不乱序；③ <strong>失败策略二分</strong>——内部调度器失败：排空已派发、不伪造结果、向上抛；用户中止：排空已开始 + 给未开始的补合成结果（如下）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.5</span>中止时的合成结果</h2>
+    <div class="code-title">packages/core/agent-loop/src/tool-calls.ts:250</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">appendSkippedToolCall</span>(session: <span class="cl">Session</span>, turn: <span class="kw">number</span>, step: <span class="kw">number</span>, block: <span class="cl">ToolCallBlock</span>): <span class="kw">void</span> {
+  <span class="kw">const</span> callSeq = <span class="fn">appendToolCall</span>(session, turn, step, block)
+  <span class="fn">appendToolResult</span>(session, turn, step, block, {
+    content: [{ type: <span class="st">'text'</span>, text: <span class="st">'Error: tool call aborted before dispatch'</span> }],
+    isError: <span class="kw">true</span>,
+    error: {
+      message: <span class="st">'tool call aborted before dispatch'</span>,
+      info: { name: <span class="st">'AbortError'</span>, code: <span class="cl">TOOL_ABORTED_BEFORE_DISPATCH</span> },
+    },
+  }, callSeq)
+}</pre>
+    <div class="annotation"><b>为什么连「没执行」也要落日志</b>：第 2 章的 Model-visible means logged——模型请求了这些调用，历史里必须出现它们的结局（否则供应商 API 在下一轮会拒绝悬挂的 tool_call）。与第 5 章崩溃恢复的合成结果一样，文本本身在教模型如何继续。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.6</span>PTC：程序化工具调用</h2>
+    <p>dsh 的杀手级模式之一：<code class="inline">mode: 'native' | 'ptc' | 'both'</code>（<code class="inline">packages/core/tools/src/index.ts:784</code>）。PTC 模式下模型不再直接调用工具，而是调用<strong>唯一的</strong> <code class="inline">run_code</code>，在代码里编排所有工具：</p>
+    <div class="code-title">packages/core/tools/src/index.ts — PTC 约束</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">PTC_ONLY_INSTRUCTION</span> = `\`${RUN_CODE_NAME}\` is the only tool you can call directly
+— a tool call naming any other tool fails. Reach every tool the SDK declares
+below from inside the program.`</pre>
+    <table class="tbl">
+      <tr><th>要素</th><th>事实</th></tr>
+      <tr><td>保留传输</td><td><code class="inline">run_code</code>（RUN_CODE_NAME）是保留名，参数 {code, description}；不受任何可过滤层（scope/restrict）影响</td></tr>
+      <tr><td>子调用全管线</td><td>run_code 里的每次工具调用都走完整五段管线（含审批），携带 <code class="inline">parent</code> 令牌标记为子派发</td></tr>
+      <tr><td>持久事件</td><td><code class="inline">tool/code-dispatch-start</code> 与 <code class="inline">tool/code-dispatch</code>（waterfall，监听器可重塑持久副本）；子调用 id 形如 <code class="inline">&lt;parent&gt;:code:&lt;n&gt;</code></td></tr>
+      <tr><td>并发上限</td><td>maxParallelSubCalls（默认 10），代码里的并行派发进有界队列</td></tr>
+      <tr><td>执行后端</td><td>code-runtime 缝（<code class="inline">ctx.codeRuntime</code>），生产后端为 worker_threads；信任姿态与 bash 等价</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">为什么</b>
+      PTC 把「N 次模型往返」压缩成「1 次往返 + 1 段程序」：模型写一段脚本同时 read 5 个文件再 grep，延迟与 token 都显著下降，而权限模型不变——因为子调用 traverse 同一条审批管线。代价是信任边界与 run_code 代码执行环境等同 bash（第 9 章回到这一点）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.7</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 工具定义的 output schema 是强制的——「无损 JSON 结果 + 渲染」分离让日志、UI、模型各取所需；② 五段管线把审批/超时/守卫全部外置为事件监听器，工具体本身零策略；③ 并行调度的全部智慧浓缩为「parallel-safe 进池、exclusive 成栅栏、按模型序结算」；④ 中止与失败的合成结果都是持久事件，模型永远面对完整的调用-结果配对。下一步进入 <a href="07-llm.html">第 7 章：LLM 适配层与流式</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="05-persistence.html">← 上一章：持久化</a>
+    <a href="07-llm.html">下一步：LLM 层 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 06 工具系统 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

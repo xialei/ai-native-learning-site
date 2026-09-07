@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 会话与存储模型</div>
     <h1>会话与存储模型：一颗 append-only 的会话树</h1>
-    <div class="subtitle">Pi 的 Session 不是简单的「消息数组」，而是一片由 <code class="inline">Lane / Entry / Record / Fact</code> 构成的、可分叉、可恢复的树。下面展开这套模型的词汇表与不可变追加的纪律，是第 5～7 章的基石。</div>
+    <div class="subtitle">Pi 的 Session 不是简单的「消息数组」，而是一片 append-only 的 <code class="inline">Entry</code> 树，外加一组带类型地址的簿记值（branch tip、lane 配置/状态、操作元数据、usage 行）。下面展开这套模型与事务追加的纪律，是第 5～7 章的基石。</div>
   </div>
 
   <div class="epigraph">
@@ -50,10 +50,10 @@
     <p>普通 Agent 用一个 <code class="inline">AgentMessage[]</code> 当历史。Pi 把它升级成一片<strong>追加式（append-only）有向树</strong>，原因是它要满足三个硬需求：</p>
     <ul>
       <li><strong>分叉（fork）与多分支</strong>：一次「转向」（navigation）可能开出新分支，旧分支仍完整保留。</li>
-      <li><strong>崩溃恢复</strong>：每一步都落盘，进程死了能从最后一条 <code class="inline">Record</code> 精确恢复。</li>
+      <li><strong>崩溃恢复</strong>：每一步都落盘，进程死了能从最后一条 <code class="inline">op.state</code> 精确恢复。</li>
       <li><strong>元数据与消息解耦</strong>：模型换了、思考级别改了、操作开始了——这些不是「消息」，但要可查询、可审计。</li>
     </ul>
-    <p>所以它把「会话里发生的一切」分成两个名字空间：<strong>Entries（可进 LLM 的内容）</strong>与 <strong>Records（不可进 LLM 的运行簿记）</strong>，外加<strong>Lanes（车道指针）</strong>与<strong>Facts（全局事实）</strong>。</p>
+    <p>所以它把「会话里发生的一切」分成两个名字空间：<strong>Entry 树（可进 LLM 的内容，四个 type）</strong>与<strong>带类型地址的簿记值（不进 LLM：branch tip、lane 配置/状态、op.meta/op.state、usage 行、pending 产物）</strong>。所有写入都在一个事务里按 <code class="inline">seq</code> 严格递增提交。</p>
   </section>
 
   <style>
@@ -86,9 +86,8 @@
     .sd-log .sd-lseq{color:var(--code-num);flex:0 0 26px;text-align:right}
     .sd-log .sd-lk{flex:0 0 52px;font-weight:700}
     .sd-log .k-entry{color:#86e0a3}
-    .sd-log .k-record{color:#7cc4ff}
-    .sd-log .k-lane{color:#f59e0b}
-    .sd-log .k-fact{color:#ffbb7a}
+    .sd-log .k-usage{color:#7cc4ff}
+    .sd-log .k-value{color:#f59e0b}
     .sd-log .sd-ld{color:var(--code-comment)}
     .sd-log li.sd-active{background:rgba(124,196,255,.12)}
     /* 树节点 */
@@ -115,15 +114,15 @@
 
   <section class="block sd-demo">
     <h2><span class="num">4.1b</span>交互沙盘：让会话树长起来</h2>
-    <p class="sd-intro">下面是一颗<strong>真实的最小 Session</strong>（复刻了 <code class="inline">state.ts</code> 的 seq / lane / parentId / log / walkToRoot / fork 语义）。按钮触发的每一步都是真实的 mutation——<strong>追加消息</strong>让节点挂在 <code class="inline">main</code> 车道的叶子上、<strong>追加 record</strong>只进簿记轨道不进树、<strong>回溯</strong>把叶子指针拨回历史节点（再追加即长出新分支）、<strong>fork</strong>复制一条路径长出第二棵树且 seq 从 1 重排。右侧 <code class="inline">LogItem[]</code> 是四种 kind 混排的同一本账本。</p>
+    <p class="sd-intro">下面是一颗<strong>真实的最小 Session</strong>（复刻了 <code class="inline">commit.ts</code> + <code class="inline">in-memory-storage-state.ts</code> 的 seq / branch tip / parentId 语义，以及 <code class="inline">fork.ts</code> 的 fork 语义）。按钮触发的每一步都是真实的写入——<strong>追加消息</strong>让节点挂在 <code class="inline">main</code> 分支的叶子上、<strong>追加 usage</strong>只进簿记轨道不进树、<strong>回溯</strong>把 tip 指针拨回历史节点（再追加即长出新分支）、<strong>fork</strong>复制一条路径长出第二棵树、继承源 seq。右侧账本是 entry / usage / value / lane 四种写入混排的同一本账。</p>
 
     <div class="sd-controls">
       <button class="sd-btn sd-b-msg" id="sd-msg">＋ 追加 message</button>
-      <button class="sd-btn sd-b-rec" id="sd-rec">＋ 追加 record</button>
-      <button class="sd-btn sd-b-mdl" id="sd-mdl">＋ 切换模型</button>
+      <button class="sd-btn sd-b-rec" id="sd-rec">＋ 追加 usage</button>
+      <button class="sd-btn sd-b-mdl" id="sd-mdl">＋ 写 lane.config</button>
       <span class="sd-sep"></span>
       <select class="sd-select" id="sd-target"><option value="">— 选回溯目标 —</option></select>
-      <button class="sd-btn sd-b-move" id="sd-move">↩ moveLane 回溯</button>
+      <button class="sd-btn sd-b-move" id="sd-move">↩ tip 回溯</button>
       <button class="sd-btn sd-b-fork" id="sd-fork">⎇ fork(branch)</button>
       <span class="sd-sep"></span>
       <button class="sd-btn sd-b-rst" id="sd-rst">重置</button>
@@ -142,155 +141,203 @@
         </svg>
       </div>
       <div class="sd-log-wrap">
-        <div class="sd-log-head">this.log&nbsp;·&nbsp;LogItem[]&nbsp;（seq↑）</div>
+        <div class="sd-log-head">事务写入流&nbsp;·&nbsp;CommittedWrite[]&nbsp;（seq↑）</div>
         <ol class="sd-log" id="sd-log"></ol>
       </div>
     </div>
-    <div class="fig-cap" style="margin-top:8px">绿框=message、橙框=model_change、蓝框=record（簿记轨道，无 parentId）、粗框=当前 main 叶子。fork 出的新树序号从 1 重排、不带 record。</div>
+    <div class="fig-cap" style="margin-top:8px">绿框=message、蓝框=usage 行（无 parentId、不进树）、粗框=当前 main tip。fork 出的副本继承源树 seq、lane 状态重置为空闲。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.2</span>四个词汇 + 一条纪律</h2>
+    <h2><span class="num">4.2</span>一棵 Entry 树 + 一组簿记值 + 一条纪律</h2>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t4 d4">
-        <title id="t4">Session 四类对象</title>
-        <desc id="d4">Entry / Record / Lane / Fact</desc>
+        <title id="t4">Session 两类状态</title>
+        <desc id="d4">Entry 树 / 簿记值</desc>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
           </marker>
         </defs>
         <rect class="node" x="20" y="30" width="400" height="170" rx="10"></rect>
-        <text class="lbl" x="45" y="58" font-weight="bold" fill="#0f7d7a">Entries（内容，进得了 LLM）</text>
-        <text class="lbl sm" x="45" y="80">type: message / compaction / branch_summary</text>
-        <text class="lbl sm" x="45" y="98">      / model_change / thinking_level_change</text>
-        <text class="lbl sm" x="45" y="116">      / active_tools_change / custom</text>
-        <text class="lbl sm" x="45" y="140">共同字段：id · seq · parentId · timestamp</text>
-        <text class="lbl sm" x="45" y="162">parentId 串成树；seq 全局单调</text>
-        <text class="lbl sm" x="45" y="184">（压缩/分支摘要见第 6 章）</text>
+        <text class="lbl" x="45" y="58" font-weight="bold" fill="#0f7d7a">Entry 树（内容，进得了 LLM）</text>
+        <text class="lbl sm" x="45" y="80">EntryType = "message" / "compaction"</text>
+        <text class="lbl sm" x="45" y="98">             / "branch_summary" / "custom"</text>
+        <text class="lbl sm" x="45" y="120">共同字段：id · parentId · seq · timestamp</text>
+        <text class="lbl sm" x="45" y="142">parentId 串成树；seq 全局单调</text>
+        <text class="lbl sm" x="45" y="164">（压缩/分支摘要见第 6 章）</text>
 
         <rect class="node core" x="480" y="30" width="400" height="170" rx="10"></rect>
-        <text class="lbl" x="505" y="58" font-weight="bold" fill="#2563eb">Records（簿记，不进 LLM）</text>
-        <text class="lbl sm" x="505" y="80">operation_started / operation_finished</text>
-        <text class="lbl sm" x="505" y="98">step_attempt / tool_started / usage</text>
-        <text class="lbl sm" x="505" y="116">queue_enqueued / abort_requested / ...</text>
-        <text class="lbl sm" x="505" y="140">共同字段：lane · seq · timestamp</text>
-        <text class="lbl sm" x="505" y="162">同样 append-only，供恢复与审计</text>
-        <text class="lbl sm" x="505" y="184">（详见第 7 章 harness）</text>
+        <text class="lbl" x="505" y="58" font-weight="bold" fill="#2563eb">簿记值（不进 LLM，带类型地址）</text>
+        <text class="lbl sm" x="505" y="80">pi.branch.tip/{branch}     → 分支叶子指针</text>
+        <text class="lbl sm" x="505" y="98">pi.lane.config/{lane}      → 模型/思考级/激活工具</text>
+        <text class="lbl sm" x="505" y="116">pi.lane.state/{lane}       → 可恢复的 lane 状态</text>
+        <text class="lbl sm" x="505" y="134">pi.op.meta / pi.op.state / pi.result</text>
+        <text class="lbl sm" x="505" y="152">pi.pending.* / pi.session.name / pi.entry.label</text>
+        <text class="lbl sm" x="505" y="174">（详见第 7 章 harness）</text>
 
         <rect class="node acc" x="20" y="215" width="190" height="40" rx="8"></rect>
-        <text class="lbl" x="115" y="238" text-anchor="middle">Lane：命名的分支指针</text>
+        <text class="lbl" x="115" y="238" text-anchor="middle">usage 行：token 统计</text>
         <rect class="node acc" x="230" y="215" width="190" height="40" rx="8"></rect>
-        <text class="lbl" x="325" y="238" text-anchor="middle">Fact：name / label 全局事实</text>
+        <text class="lbl" x="325" y="238" text-anchor="middle">list 值：如流式帧暂存</text>
       </svg>
-      <div class="fig-cap">图 4.2：Session 的四类对象。核心纪律——一切都是追加写入，靠 <code class="inline">seq</code> 严格递增保证顺序与可恢复性。</div>
+      <div class="fig-cap">图 4.2：Session 的两类状态 + 两种附属写入。核心纪律——所有写入（entry/usage/value/list）在同一个事务里提交，靠 <code class="inline">seq</code> 严格递增保证顺序与可恢复性。</div>
     </div>
     <div class="code-title">packages/agent/src/harness/session/types.ts — Entry 的基类与种类</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">EntryBase</span> {
-  type: <span class="cl">string</span>;
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">EntryType</span> = <span class="st">"message"</span> | <span class="st">"compaction"</span> | <span class="st">"branch_summary"</span> | <span class="st">"custom"</span>;
+
+<span class="kw">export interface</span> <span class="cl">EntryBase</span> {
   id: <span class="cl">string</span>;
+  parentId: <span class="cl">string</span> | <span class="kw">null</span>; <span class="cmt">// 追加时的分支叶子 id（由事务写入方给出）</span>
   seq: <span class="cl">number</span>;        <span class="cmt">// 共享单调递增序号（由存储分配）</span>
-  parentId: <span class="cl">string</span> | <span class="kw">null</span>; <span class="cmt">// 追加那条 lane 的叶子 id（存储分配）</span>
-  timestamp: <span class="cl">number</span>;  <span class="cmt">// Unix 毫秒（存储分配）</span>
+  timestamp: <span class="cl">number</span>;  <span class="cmt">// Unix 毫秒（由存储分配）</span>
+  type: <span class="cl">EntryType</span>;
+  customType?: <span class="cl">string</span>;
 }
 <span class="kw">export type</span> <span class="cl">Entry</span> =
-  | <span class="cl">MessageEntry</span>        <span class="cmt">// type: "message"   —— 真正的对话消息</span>
-  | <span class="cl">ModelChangeEntry</span>   <span class="cmt">// type: "model_change"</span>
-  | <span class="cl">ThinkingLevelEntry</span> <span class="cmt">// type: "thinking_level_change"</span>
-  | <span class="cl">ActiveToolsEntry</span>   <span class="cmt">// type: "active_tools_change"</span>
-  | <span class="cl">CompactionEntry</span>    <span class="cmt">// type: "compaction"</span>
-  | <span class="cl">BranchSummaryEntry</span> <span class="cmt">// type: "branch_summary"</span>
-  | <span class="cl">CustomEntry</span>;        <span class="cmt">// type: "custom" + customType</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">seq</code> 是全局共享的（不是 per-type），由存储分配，保证「事件的先后」唯一可判定。<code class="inline">parentId</code> 指向「追加那条 lane 当时的叶子」，从而把一个个 entry 串成树的分支。模型切换、思考级别切换都被记成 <code class="inline">Entry</code>——这样第 5 章的上下文构建才能「读到当前模型/思考级别」。</div>
+  | <span class="cl">MessageEntry</span>        <span class="cmt">// type: "message"        —— 真正的对话消息</span>
+  | <span class="cl">CompactionEntry</span>    <span class="cmt">// type: "compaction"     —— summary + retainedTail</span>
+  | <span class="cl">BranchSummaryEntry</span> <span class="cmt">// type: "branch_summary" —— 分支导航摘要</span>
+  | <span class="cl">CustomEntry</span>;        <span class="cmt">// type: "custom" + customType + data</span></pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">seq</code> 是全局共享的（不是 per-type），由存储在事务里分配，保证「事件的先后」唯一可判定。<code class="inline">parentId</code> 指向「追加时那个分支的叶子」，从而把一个个 entry 串成树的分支。<strong>旧版的 model_change / thinking_level_change / active_tools_change 已不再是 Entry</strong>：模型、思考级别、激活工具现在住在 <code class="inline">pi.lane.config/{lane}</code> 这个簿记值里（见 4.3），第 5 章的上下文构建直接读它拿到「当前模型/思考级别」。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.3</span>Lane：命名分支 + 叶子指针</h2>
-    <p>Lane 是一个「分支怎么长」的指针。默认只有 <code class="inline">main</code>。每个 lane 指向当前叶子 <code class="inline">leafId</code>；追加新 entry 时，<code class="inline">parentId</code> 自动取该 lane 的叶子。</p>
-    <div class="code-title">packages/agent/src/harness/session/state.ts — lane 的初始化与追加校验</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private readonly</span> lanes = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="cl">string</span>, <span class="cl">string</span> | <span class="kw">null</span>&gt;([[<span class="st">"main"</span>, <span class="kw">null</span>]]);
-
-<span class="cmt">// applyMutation 对 "entry" 的校验：必须链到 lane 的叶子</span>
-<span class="kw">case</span> <span class="st">"entry"</span>: {
-  <span class="kw">if</span> (mutation.lane !== <span class="kw">undefined</span>) {
-    <span class="kw">const</span> leafId = <span class="kw">this</span>.lanes.get(mutation.lane);
-    <span class="kw">if</span> (mutation.entry.parentId !== leafId)
-      invalid(<span class="st">"does not chain to the lane leaf"</span>);   <span class="cmt">// 必须接到叶子</span>
-  }
-  <span class="cmt">// 通过后：推进 lane 叶子 + 写入全局 log</span>
-  <span class="kw">if</span> (mutation.lane !== <span class="kw">undefined</span>) <span class="kw">this</span>.lanes.set(mutation.lane, mutation.entry.id);
-  <span class="kw">this</span>.log.push({ kind: <span class="st">"entry"</span>, seq, entry: mutation.entry });
-  <span class="kw">break</span>;
+    <h2><span class="num">4.3</span>Branch：命名分支 + 叶子指针（就是 lane）</h2>
+    <p>Lane 是一个「分支怎么长」的指针，存储层叫 <code class="inline">Branch</code>，运行层叫 <code class="inline">AgentLane</code>。每个 lane 的叶子存在簿记值 <code class="inline">pi.branch.tip/{lane}</code> 里；追加新 entry 时，<code class="inline">parentId</code> 取该 lane 的当前 tip，并在<strong>同一个事务</strong>里推进 tip。</p>
+    <div class="code-title">packages/agent/src/harness/session/session.ts — 追加 = 插入 entry + 推进 tip（一个事务）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">async</span> appendToBranch(name, entry, context): Promise&lt;<span class="cl">string</span>&gt; {
+  <span class="kw">const</span> id = <span class="kw">this</span>.idGenerator.next();
+  <span class="kw">await this</span>.mutate(<span class="kw">async</span> (mutator) =&gt; {
+    <span class="kw">const</span> tip = <span class="kw">await</span> mutator.getValue(branchTip(name), context);
+    <span class="kw">if</span> (tip === <span class="kw">undefined</span>) <span class="kw">throw new</span> <span class="cl">SessionInvariantError</span>(<span class="st">`Unknown branch: ${name}`</span>);
+    <span class="kw">await</span> mutator.commit(
+      [
+        insertEntry({ id, parentId: tip.value, type: <span class="st">"message"</span>, message: entry.message }),
+        setValueWrite(branchTip(name), id),      <span class="cmt">// 推进叶子指针</span>
+      ],
+      context,
+    );
+  }, context);
+  <span class="kw">return</span> id;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 「追加 = 更新 lane 叶子」是一体的。<code class="inline">moveLane(lane, to)</code> 可以把一个 lane 的叶子<strong>移到已有 entry</strong>（等价于把「指针」拨回历史某点）——这是实现「回溯/分叉」的原语，而不是把历史删掉。第 7 章的 navigation 就靠它。</div>
+    <div class="annotation"><b>读懂这段：</b> 「追加 = 更新分支 tip」在<strong>同一个事务</strong>里完成，不存在「插了 entry 但 tip 没动」的中间态。把一个 lane 的 tip <strong>移到已有 entry</strong>（等价于把「指针」拨回历史某点）就是实现「回溯/分叉」的原语——历史数据一条不删，第 7 章的 navigation 就靠它。lane 首次创建时（runtime/harness.ts），runtime 会用<strong>三个 value 写</strong>把 lane 落盘：<code class="inline">pi.branch.tip/{lane}</code> + <code class="inline">pi.lane.config/{lane}</code>（模型/思考级/激活工具种子）+ <code class="inline">pi.lane.state/{lane}</code>（空闲 lane 状态）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.4</span>不可变追加的纪律与日志</h2>
-    <p>所有写入都必须满足 <code class="inline">seq === sequence + 1</code>（严格连续），这是恢复时「我到底写到哪了」的唯一依据。同时每个 mutation 都会 <code class="inline">log.push(...)</code>，形成一条可审计的 <code class="inline">LogItem[]</code>。</p>
-    <div class="code-title">packages/agent/src/harness/session/state.ts — 追加纪律 + log</div>
-    <pre class="code"><span class="lang-tag">typescript</span>applyMutation(mutation: <span class="cl">SessionMutation</span>): <span class="kw">void</span> {
-  <span class="kw">const</span> seq = <span class="cmt">/* 从 mutation 里取 seq */</span>;
-  <span class="kw">if</span> (seq !== <span class="kw">this</span>.sequence + <span class="nu">1</span>)
-    invalid(<span class="st">`has non-consecutive seq ${seq}</span>`);   <span class="cmt">// 必须严格 +1</span>
-  <span class="cmt">// ...按 kind 应用，并 this.log.push(...)</span>
-}
-<span class="cmt">// log 的条目种类：entry / record / lane / fact（名册），全部有序</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这套「严格递增 seq + 全量 log」把 Session 变成了一本<strong>只增不改的账本</strong>。崩溃后重放 log 就能重建任意时刻的状态，也能算出每个操作的 usage 与 token 统计（<code class="inline">SessionStats</code>）。你自研时若需要「可恢复、可审计」，这套基调值得直接照抄。</div>
+    <h2><span class="num">4.4</span>事务提交的纪律：单调 seq、唯一 id、父必须存在</h2>
+    <p>每个事务里的写入按顺序分配 <code class="inline">seq</code>（从存储的 <code class="inline">nextSeq</code> 起），提交前统一校验：<strong>seq 严格单调</strong>、<strong>entry/usage id 全局唯一</strong>（含同事务内）、<strong>entry 的父必须已存在</strong>（含同事务内先写入的）。这是恢复时「我到底写到哪了」的唯一依据。</p>
+    <div class="code-title">packages/agent/src/harness/session/commit.ts — validateCommittedWrites（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> validateCommittedWrites(writes, firstSeq, state): <span class="kw">void</span> {
+  <span class="kw">let</span> previousSeq = firstSeq - <span class="nu">1</span>;
+  <span class="kw">const</span> transactionIds = <span class="kw">new</span> <span class="cl">Set</span>&lt;<span class="cl">string</span>&gt;();
+  <span class="kw">const</span> transactionEntryIds = <span class="kw">new</span> <span class="cl">Set</span>&lt;<span class="cl">string</span>&gt;();
+  <span class="kw">for</span> (<span class="kw">const</span> write <span class="kw">of</span> writes) {
+    <span class="kw">if</span> (write.seq &lt;= previousSeq)
+      <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Non-monotonic storage sequence: ${write.seq}`</span>);  <span class="cmt">// 必须严格递增</span>
+    previousSeq = write.seq;
+    <span class="kw">if</span> (write.kind !== <span class="st">"entry"</span> &amp;&amp; write.kind !== <span class="st">"usage"</span>) <span class="kw">continue</span>;
+    <span class="kw">if</span> (state.hasEntryOrUsageId(write.id) || transactionIds.has(write.id))
+      <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Duplicate entry or usage id: ${write.id}`</span>);       <span class="cmt">// id 全局唯一</span>
+    <span class="kw">if</span> (write.kind === <span class="st">"entry"</span> &amp;&amp; write.parentId !== <span class="kw">null</span> &amp;&amp;
+        !state.hasEntryId(write.parentId) &amp;&amp; !transactionEntryIds.has(write.parentId))
+      <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Missing parent entry: ${write.parentId}`</span>);        <span class="cmt">// 父必须存在</span>
+    transactionIds.add(write.id);
+    <span class="kw">if</span> (write.kind === <span class="st">"entry"</span>) transactionEntryIds.add(write.id);
+  }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 写入只有四种 <code class="inline">kind</code>：<code class="inline">entry</code>（树节点）、<code class="inline">usage</code>（token 统计行）、<code class="inline">value</code>（set/delete 一个带类型地址的簿记值）、<code class="inline">list</code>（append/delete 一个列表值）。一个事务 = 一批写入共享连续 seq、一起成功一起失败。这套「单调 seq + 提交前校验」把 Session 变成了一本<strong>只增不改的账本</strong>：崩溃后从 JSONL 逐行重放事务即可重建任意时刻的状态，也能算出每个操作的 usage（<code class="inline">SessionStats</code>）。你自研时若需要「可恢复、可审计」，这套基调值得直接照抄。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.5</span>Fork：从一棵树长出另一棵</h2>
-    <p>fork 有两种 scope：<code class="inline">tree</code>（整树克隆，适合「保存副本」）与 <code class="inline">branch</code>（只复制到某个 entry 为止的路径，开一条新主线）。它通过「产出该状态的全部 mutation 序列」再在副本里重放来实现。</p>
-    <div class="code-title">packages/agent/src/harness/session/state.ts — fork 时产出 mutations</div>
-    <pre class="code"><span class="lang-tag">typescript</span>createForkMutations(options: <span class="cl">ForkOptions</span>): <span class="cl">SessionMutation</span>[] {
-  <span class="kw">let</span> copiedEntries, forkLanes;
-  <span class="kw">if</span> (options.scope === <span class="st">"tree"</span>) {
-    copiedEntries = <span class="kw">this</span>.findEntries({ order: <span class="st">"oldestFirst"</span> });  <span class="cmt">// 全树</span>
-  } <span class="kw">else</span> {
-    <span class="cmt">// branch：找到起点 entry，沿 parentId 一路往上收集路径</span>
-    copiedEntries = <span class="kw">this</span>.findEntriesOnBranch({ start: targetId, order: <span class="st">"oldestFirst"</span> });
+    <p>fork 有两种 scope：<code class="inline">tree</code>（整树克隆，适合「保存副本」）与 <code class="inline">branch</code>（只复制到某个 entry 为止的路径，开一条新主线）。它不再「产出 mutation 序列再重放」，而是先<strong>捕获一个源快照</strong>（全部 entries + 全部簿记值），再纯函数地算出<strong>目标快照</strong>，最后把目标快照一次性写成新存储。</p>
+    <div class="code-title">packages/agent/src/harness/session/fork.ts — createForkSnapshot（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> createForkSnapshot(source: <span class="cl">ForkSourceSnapshot</span>, options: <span class="cl">ForkOptions</span>): <span class="cl">ForkDestinationSnapshot</span> {
+  <span class="kw">const</span> sourceTips = storedValuesInNamespace(source.scalarValues, branchTip(<span class="st">""</span>));  <span class="cmt">// 所有分支 tip</span>
+  <span class="kw">const</span> { entryIds, destinationTips } = selectForkContents(sourceEntries, sourceTips, options);
+  <span class="cmt">// branch scope：从 tip 沿 parentId 走到 entryId（position "before" 则停在它的父）</span>
+  <span class="kw">for</span> (<span class="kw">const</span> [branch, tipId] <span class="kw">of</span> destinationTips) {
+    <span class="kw">const</span> configuration = findStoredValue(source.scalarValues, laneConfig(branch));
+    store(branchTip(branch), tipId);                     <span class="cmt">// 复制分支 tip</span>
+    <span class="kw">if</span> (configuration !== <span class="kw">undefined</span>) {
+      store(laneConfig(branch), configuration.value);    <span class="cmt">// 复制 lane 配置</span>
+      store(laneState(branch), { currentOperationId: <span class="kw">null</span>, lastOperationId: <span class="kw">null</span>, inbox: [] });
+    }                                                    <span class="cmt">// lane 状态一律重置为空闲</span>
   }
-  <span class="cmt">// 依次产出：entry mutations（重排 seq）→ lane mutations → name → labels</span>
-  <span class="kw">return</span> mutations;   <span class="cmt">// 新存储用同样的 applyMutation 重放，得到一棵独立树</span>
+  <span class="kw">for</span> (<span class="kw">const</span> stored <span class="kw">of</span> source.scalarValues) {
+    <span class="kw">switch</span> (classifyForkAddress(stored.address, options.scope, (entryId) =&gt; entryIds.has(entryId))) {
+      <span class="kw">case</span> <span class="st">"copy"</span>: store(stored.address, stored.value); <span class="kw">break</span>;
+      <span class="kw">case</span> <span class="st">"exclude"</span>:  <span class="kw">case</span> <span class="st">"reconstruct"</span>: <span class="kw">break</span>;   <span class="cmt">// op/pending/result 状态不带过去</span>
+    }
+  }
+  <span class="kw">return</span> { entries, scalarValues, nextSeq };
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> fork 的关键技巧是<strong>「把状态编码成 mutation 序列」，而不是复制内部字段</strong>——这保证了「任何存储后端都能用同一套 mutation 语义来 fork」。新副本的 seq 从 1 重新排，parentId 重新连锁。<strong>会话从父会话继承 parentSessionId</strong>，形成家谱。</div>
+    <div class="annotation"><b>读懂这段：</b> fork 的关键分界是 <code class="inline">classifyForkAddress</code> 的三分类：<code class="inline">copy</code>（数据类值：session name、entry label 跟过去）、<code class="inline">exclude</code>（操作现场：<code class="inline">pi.op.*</code>、<code class="inline">pi.pending.*</code>、<code class="inline">pi.result.*</code> 不带——新会话必须从「空闲」开始）、<code class="inline">reconstruct</code>（lane 状态：上面已用「空闲初始值」重建）。配置（<code class="inline">pi.lane.config</code>）跟着 lane 走，所以 fork 出的会话保留你的模型选择。<strong>会话从父会话继承 parentSessionId</strong>，形成家谱。seq 不重排——副本从源树继承 seq，<code class="inline">nextSeq</code> 取自最大值 +1。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.6</span>存储后端：内存 vs SQLite</h2>
-    <p><code class="inline">Session</code> 只是一个门面，真正读写靠 <code class="inline">SessionStorage</code>。核心包自带 <code class="inline">InMemorySessionStorage</code>（测试/示范用）；生产用 SQLite 后端（独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>，避免核心包硬依赖 node:sqlite）。</p>
-    <div class="code-title">packages/agent/src/harness/session/memory.ts — in-memory 追加</div>
-    <pre class="code"><span class="lang-tag">typescript</span>async appendEntry(newEntry: <span class="cl">ProvisionedEntry</span>, lane: <span class="cl">string</span>): Promise&lt;TEntry&gt; {
-  <span class="kw">const</span> parentId = <span class="kw">this</span>.state.requireLane(lane);   <span class="cmt">// 取 lane 叶子当父</span>
-  <span class="kw">const</span> entry = {
-    ...structuredClone(newEntry),
-    parentId,
-    seq: <span class="kw">this</span>.state.nextSequence,
-    timestamp: <span class="cl">Date</span>.now(),
-  };
-  <span class="kw">this</span>.state.applyMutation({ kind: <span class="st">"entry"</span>, lane, entry });
-  <span class="kw">return</span> structuredClone(entry);
+    <h2><span class="num">4.6</span>存储后端：内存 / JSONL / SQLite，共用一个 Storage 接口</h2>
+    <p><code class="inline">StorageBackedSession</code> 是门面，真正读写靠 <code class="inline">Storage</code> 接口（commit/getEntries/getValue/scanBranch/scanEntries/scanUsage/...）。核心包自带两个实现：<code class="inline">MemoryStorage</code>（测试/示范用）与 <code class="inline">JsonlStorage</code>（生产默认）；SQLite 是独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>（<code class="inline">packages/session-backends/sqlite-node</code>），避免核心包硬依赖 node:sqlite。</p>
+    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — applyValidated（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * Complete materialized session state for MemoryStorage and JsonlStorage.
+ * This is intentionally unsuitable for database backends and long-running sessions
+ * that may not fit in memory. Those backends should query indexed durable state
+ * and update durable aggregates within each commit transaction.
+ */</span>
+<span class="kw">export class</span> <span class="cl">InMemoryStorageState</span> {
+  applyValidated(writes: <span class="kw">readonly</span> <span class="cl">CommittedWrite</span>[]): <span class="cl">SessionStats</span> {
+    <span class="kw">for</span> (<span class="kw">const</span> write <span class="kw">of</span> writes) {
+      <span class="kw">switch</span> (write.kind) {
+        <span class="kw">case</span> <span class="st">"entry"</span>:
+          <span class="kw">this</span>.entries.set(entry.id, entry);
+          <span class="kw">this</span>.entriesBySeq.push(entry);            <span class="cmt">// seq 有序数组，供 scanEntries</span>
+          <span class="kw">if</span> (entry.type === <span class="st">"message"</span>) <span class="kw">this</span>.stats.messageCount++;
+          <span class="kw">break</span>;
+        <span class="kw">case</span> <span class="st">"value"</span>: {
+          <span class="kw">const</span> key = physicalKey(write.namespace, write.key);  <span class="cmt">// namespace +   + key</span>
+          <span class="kw">if</span> (write.op === <span class="st">"delete"</span>) <span class="kw">this</span>.scalarValues.delete(key);
+          <span class="kw">else this</span>.scalarValues.set(key, { address, value: write.value, seq: write.seq });
+          <span class="kw">break</span>;
+        }
+        <span class="cmt">// usage / list 同理……</span>
+      }
+      <span class="kw">this</span>.nextSeq = write.seq + <span class="nu">1</span>;               <span class="cmt">// 高水位推进</span>
+    }
+    <span class="kw">return this</span>.stats;
+  }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 注意「<code class="inline">ProvisionedEntry</code>」——调用方只提供「内容」（<code class="inline">type/id/内容字段</code>），而 <code class="inline">seq/parentId/timestamp</code> 这三个关键字段<strong>一律由存储分配</strong>，杜绝了「谁改了 seq」的作弊可能。SQLite 后端实现同一个 <code class="inline">SessionStorage</code> 接口，于是核心逻辑与后端解耦。</div>
+    <div class="annotation"><b>读懂这段：</b> 注意注释里的<strong>自我定位</strong>：<code class="inline">InMemoryStorageState</code> 故意不适合数据库后端——真数据库应该「查索引 + 在事务里更新聚合」，而不是把整棵树 materialize 进内存。JSONL 后端（<code class="inline">jsonl/storage.ts</code>）复用同一个 <code class="inline">InMemoryStorageState</code>，但把每个事务序列化成<strong>一行 JSON 追加到文件</strong>（原子写：先写 <code class="inline">.tmp</code> 再 rename），启动时逐行重放恢复。SQLite 后端实现同一个 <code class="inline">Storage</code> 接口，核心逻辑与后端解耦。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.7</span>查询：分支视角 vs 全局视角</h2>
-    <p><code class="inline">Session</code> 提供两类查询：全局 <code class="inline">findEntries</code>（整片树，按 seq）与分支 <code class="inline">findEntriesOnBranch</code>（从某个叶子沿 <code class="inline">parentId</code> 一路走到根）。</p>
-    <div class="code-title">packages/agent/src/harness/session/state.ts — 分支行走</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private</span> *walkToRoot(start, bounds) {   <span class="cmt">// 生成器：叶子 → 根</span>
-  <span class="kw">const</span> visited = <span class="kw">new</span> <span class="cl">Set</span>&lt;<span class="cl">string</span>&gt;();
-  <span class="kw">let</span> current = <span class="kw">this</span>.entriesById.get(start);
-  <span class="kw">while</span> (current) {
-    <span class="kw">if</span> (visited.has(current.id)) <span class="kw">throw new</span> <span class="cl">SessionError</span>(<span class="st">"..."</span>, <span class="st">"Session branch contains a cycle"</span>);
-    visited.add(current.id);
-    <span class="kw">yield</span> current;
-    <span class="kw">if</span> (current.id === bounds?.stopAtId || current.type === bounds?.stopAtType) <span class="kw">break</span>;
-    current = <span class="kw">this</span>.entriesById.get(current.parentId);  <span class="cmt">// 沿 parent 上溯</span>
+    <p><code class="inline">Session</code> 提供两类查询：全局 <code class="inline">findEntries</code>（整片树，按 seq）与分支 <code class="inline">branch(name).findEntries</code>（从某个叶子沿 <code class="inline">parentId</code> 一路走到根）。分支行走落在存储的 <code class="inline">scanBranch</code> 里：</p>
+    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — scanBranch（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>scanBranch(query: <span class="cl">StorageBranchScan</span>): <span class="cl">Entry</span>[] {
+  <span class="kw">const</span> path: <span class="cl">Entry</span>[] = [];
+  <span class="kw">let</span> entry = <span class="kw">this</span>.entries.get(query.start);
+  <span class="kw">if</span> (entry === <span class="kw">undefined</span>) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Unknown branch start: ${query.start}`</span>);
+  <span class="kw">while</span> (entry !== <span class="kw">undefined</span>) {                <span class="cmt">// 叶子 → 根</span>
+    path.push(entry);
+    <span class="kw">if</span> (entry.parentId === <span class="kw">null</span>) <span class="kw">break</span>;
+    entry = <span class="kw">this</span>.entries.get(entry.parentId);
+    <span class="kw">if</span> (entry === <span class="kw">undefined</span>) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">"Corrupt branch: missing parent"</span>);
   }
+  <span class="kw">if</span> (query.order === <span class="st">"oldestFirst"</span>) path.reverse();
+  <span class="kw">const</span> stopped = [];
+  <span class="kw">for</span> (<span class="kw">const</span> candidate <span class="kw">of</span> path) {
+    stopped.push(candidate);
+    <span class="kw">if</span> (candidate.id === query.stopAtId || candidate.type === query.stopAtType) <span class="kw">break</span>;
+  }
+  <span class="kw">return</span> stopped
+    .filter((c) =&gt; query.type === <span class="kw">undefined</span> || c.type === query.type)
+    .filter((c) =&gt; query.customType === <span class="kw">undefined</span> || c.customType === query.customType)
+    .filter((c) =&gt; query.cursor === <span class="kw">undefined</span> || c.seq &gt; query.cursor.seq)
+    .slice(<span class="nu">0</span>, query.limit);   <span class="cmt">// （示意：limit/顺序分支略）</span>
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 有环检测、可停在指定 <code class="inline">id</code> 或 <code class="inline">type</code>（例如「停在最近的 compaction」）。这个「分支行走」正是 <strong>第 5 章上下文构建的输入</strong>——它先拿到<strong>当前分支的全部 entries</strong>，再转换成发往 LLM 的消息。</div>
+    <div class="annotation"><b>读懂这段：</b> 可停在指定 <code class="inline">stopAtId</code> 或 <code class="inline">stopAtType</code>（inclusive：命中节点本身也返回，例如「停在最近的 compaction」），再按 type/customType/cursor/limit 过滤。这个「分支行走」正是 <strong>第 5 章上下文构建的输入</strong>——它先拿到<strong>当前分支的全部 entries</strong>，再转换成发往 LLM 的消息。</div>
 
     <style>
       .wr-demo{margin-top:18px}
@@ -325,15 +372,15 @@
 
     <div class="wr-demo">
       <div class="wr-controls">
-        <button class="wr-btn go" id="wr-play">▶ 播放 walkToRoot</button>
+        <button class="wr-btn go" id="wr-play">▶ 播放 scanBranch</button>
         <button class="wr-btn" id="wr-step">单步 →</button>
         <button class="wr-btn" id="wr-rst">重置</button>
-        <span style="font-size:13px;color:var(--fg-muted);margin-left:6px">起点=叶子 e07，沿 <code class="inline">parentId</code> 上溯到根；遇到 compaction 即 <code class="inline">stopAtType</code> 停下</span>
+        <span style="font-size:13px;color:var(--fg-muted);margin-left:6px">起点=叶子 e07，沿 <code class="inline">parentId</code> 上溯到根；遇到 compaction 即 <code class="inline">stopAtType</code> 停下（inclusive）</span>
       </div>
       <div class="wr-stage">
         <div class="wr-tree">
           <svg id="wr-svg" viewBox="0 0 560 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="wrt wrd">
-            <title id="wrt">walkToRoot 分支行走动画</title>
+            <title id="wrt">scanBranch 分支行走动画</title>
             <desc id="wrd">从叶子沿 parentId 走到根或 stopAtType</desc>
             <g id="wr-canvas"></g>
           </svg>
@@ -348,8 +395,34 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">4.8</span>为耐久而设的深度 JSON 校验</h2>
-    <p>4.4 讲了「追加式会话」保证数据一致，但没讲<strong>「写入前它凭什么敢保证你写的东西将来一定读得回来」</strong>。答案是 <code class="inline">session.ts</code> 里的 <code class="inline">assertJsonSerializable</code>——每次 commit 一个 entry/record 前，一个显式栈式遍历器会<strong>逐节点严查 JSON 可持久性</strong>：</p>
+    <h2><span class="num">4.8</span>为耐久而设的事务串行化与原子落盘</h2>
+    <p>4.4 讲了「追加式会话」保证数据一致，但没讲<strong>「并发写入谁来排队、进程死在半路怎么办」</strong>。两道防线都在 session 层：先是一个<strong>排他互斥线</strong>保证同一时刻只有一个读改写作业在飞：</p>
+    <div class="code-title">packages/agent/src/harness/session/mutation-line.ts — 完整源码</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Serializes complete read-modify-write jobs for one Session. */</span>
+<span class="kw">export class</span> <span class="cl">MutationLine</span> {
+  <span class="kw">private</span> tail: Promise&lt;<span class="kw">void</span>&gt; = Promise.resolve();
+  <span class="kw">private</span> sealedError: <span class="cl">Error</span> | <span class="kw">undefined</span>;
+
+  run&lt;T&gt;(operation: () =&gt; T | Promise&lt;T&gt;): Promise&lt;T&gt; {
+    <span class="kw">if</span> (<span class="kw">this</span>.sealedError !== <span class="kw">undefined</span>) <span class="kw">return</span> Promise.reject(<span class="kw">this</span>.sealedError);
+    <span class="kw">const</span> result = <span class="kw">this</span>.tail.then(() =&gt; operation());
+    <span class="kw">this</span>.tail = result.then(() =&gt; <span class="kw">undefined</span>, () =&gt; <span class="kw">undefined</span>);
+    <span class="kw">return</span> result;
+  }
+
+  seal(error: <span class="cl">Error</span>): Promise&lt;<span class="kw">void</span>&gt; {   <span class="cmt">// 关闭后拒绝一切新作业</span>
+    <span class="kw">this</span>.sealedError ??= error;
+    <span class="kw">return this</span>.tail;
+  }
+}</pre>
+    <p><code class="inline">SessionMutation</code> 的语义由此而来：<code class="inline">beginMutation()</code> 在 MutationLine 上排队拿到一个<strong>独占能力</strong>，它<strong>只允许一次 commit</strong>（第二次直接拒绝），<code class="inline">end()</code> 等待提交落地并释放互斥线。JSONL 后端再加最后一道防线——每个事务<strong>原子发布</strong>：先写 <code class="inline">{path}.tmp</code>，再 <code class="inline">rename</code> 覆盖正式文件；启动时逐行重放，<strong>不完整的最后一行（撕裂写）直接截断丢弃</strong>——半条事务永远不会被算数：</p>
+    <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — open() 里的撕裂处理（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> { lines, torn } = splitCompleteLines(content);
+<span class="cmt">// ……校验 header（format 4：v/kind/id/storageVersion/createdAt/cwd）、逐行重放事务</span>
+<span class="kw">if</span> (torn) <span class="kw">await</span> publishFileAtomically(options.fileSystem, options.path, `${lines.join(<span class="st">"\n"</span>)}\n`, context);</pre>
+    <div class="callout">
+      <strong>为什么这值得抄？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
+    </div>
     <div class="code-title">harness/session/session.ts · assertJsonSerializable（节选）</div>
     <pre class="code"><code><span class="kw">export function</span> <span class="fn">assertJsonSerializable</span>(value: unknown): <span class="kw">void</span> {
   <span class="kw">const</span> active = <span class="kw">new</span> WeakSet&lt;object&gt;();          <span class="cmt">// 记已访问，用于环检测</span>
@@ -380,7 +453,7 @@
     <h2><span class="num">4.9</span>对自研与使用的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      <strong>① 别把历史当数组，把它当一棵可分叉树</strong>——代价是多一点抽象，收益是「回溯」「分支」「恢复」全部免费。<strong>② 内容（Entry）与簿记（Record）分离</strong>，让你的「模型记录」不被运行噪音污染。<strong>③ 存储分配 seq/parentId/timestamp</strong>，保证单一事实来源。<strong>④ 后端走统一接口</strong>，内存/SQLite 随便换。
+      <strong>① 别把历史当数组，把它当一棵可分叉树</strong>——代价是多一点抽象，收益是「回溯」「分支」「恢复」全部免费。<strong>② 内容（Entry 树）与簿记（类型地址值）分离</strong>，让你的「模型记录」不被运行噪音污染。<strong>③ 所有写入走同一套事务</strong>（entry/usage/value/list），存储分配 seq，保证单一事实来源。<strong>④ 后端走统一 Storage 接口</strong>，内存/JSONL/SQLite 随便换。<strong>⑤ 操作现场（op.meta/op.state/pending）与数据分开存</strong>——fork 时直接丢弃，崩溃时用它精确恢复。
     </div>
   </section>
 
@@ -391,20 +464,24 @@
 </div>
 
 <footer>
-  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.84.3-4-gdcd461925 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>
 /* ============================================================
  * 会话树生长沙盘 — 最小 Session 状态机
- * 忠实复刻 packages/agent/src/harness/session/state.ts 的语义：
- *   - 单一共享 seq（1 起，严格 +1），entry/record/lane/fact 共用
- *   - lane = Map<name, leafId|null>，默认 "main" 起始 null
- *   - entry 经 lane 追加时 parentId 必须 === 该 lane 当前叶子；追加后推进叶子
- *   - record 只有 lane/seq/timestamp，无 parentId，不进树
- *   - log = LogItem[]，四种 kind 混排，append-only
- *   - moveLane: 把 lane 叶子指针拨回历史 entry（不删数据）→ 实现回溯/分叉
- *   - fork(branch): 沿 parentId 走到根复制路径，seq 从 1 重排，不复制 record
+ * 忠实复刻 packages/agent/src/harness/session/ 的语义：
+ *   - 单一共享 seq（1 起，严格 +1），entry/usage/value/lane 写入共用
+ *     （commit.ts: validateCommittedWrites 单调 seq / 唯一 id / 父必须存在）
+ *   - branch tip = Map<name, leafId|null>，默认 "main" 起始 null
+ *     （values.ts: pi.branch.tip/{branch}）
+ *   - entry 追加时 parentId 必须 === 该分支当前 tip；追加后推进 tip
+ *     （session.ts: appendToBranch，entry + tip 推进同事务）
+ *   - usage 行只有 seq/timestamp，无 parentId，不进树
+ *   - log = 事务写入流，多种 kind 混排，append-only
+ *   - 回溯 = 把 branch tip 拨回历史 entry（不删数据）→ 实现回溯/分叉
+ *   - fork(branch)（fork.ts: createForkSnapshot）: 沿 parentId 走到根
+ *     复制路径，继承源 seq，不带操作现场值（pi.op. 前缀与 pi.pending. 前缀）
  * ============================================================ */
 (function () {
   "use strict";
@@ -416,19 +493,20 @@
   const statusEl = $("sd-status");
   const targetSel = $("sd-target");
 
-  // —— 状态机（镜像 state.ts）——
+  // —— 状态机（镜像 commit.ts + in-memory-storage-state.ts）——
   const state = {
-    sequence: 0,                 // nextSequence = sequence + 1
+    sequence: 0,                 // nextSeq 高水位（首写 seq = 1）
     entriesById: new Map(),      // id -> entry
     entryOrder: [],              // id[]，插入序（用于布局）
-    lanes: new Map([["main", null]]),
-    log: [],                     // LogItem[]
+    lanes: new Map([["main", null]]),   // pi.branch.tip/{lane}
+    usageIds: new Set(),                // 已提交的 usage 行 id（查重）
+    log: [],                     // CommittedWrite 流（append-only）
     forkRoots: [],               // [{rootId, entries:Set}] 分叉出的独立子树
     // 布局：每个节点记录 {id, x, y, lane, kind, isNew, isLeaf}
     layout: new Map(),
   };
 
-  const KIND = { MESSAGE: "message", MODEL_CHANGE: "model_change", RECORD: "record" };
+  const KIND = { MESSAGE: "message" };
   let nodeCounter = 0;
   const newId = (p) => `${p}${String(++nodeCounter).padStart(2, "0")}`;
   const nextSeq = () => state.sequence + 1;
@@ -440,51 +518,52 @@
   const NODE_W = 78, NODE_H = 40, GX = 104, GY = 66;
   const TREE_X0 = 30, TREE_Y0 = 30;
 
-  // ============ mutation 核心 ============
+  // ============ 写入核心（镜像 validateCommittedWrites + applyValidated）============
   function applyEntry(entry, lane) {
-    // seq 严格 +1（storage 分配）
+    // seq 严格 +1（存储在事务里分配）
     if (entry.seq !== state.sequence + 1)
-      throw `non-consecutive seq ${entry.seq}`;
+      throw `non-monotonic seq ${entry.seq}`;
     // id 唯一
     if (state.entriesById.has(entry.id))
-      throw `duplicate id ${entry.id}`;
-    // 经 lane 追加：parentId 必须 === lane 叶子
+      throw `duplicate entry id ${entry.id}`;
+    // 经 lane 追加：parentId 必须 === lane 当前 tip
     if (lane !== undefined) {
       const leaf = state.lanes.get(lane);
-      if (leaf === undefined) throw `missing lane ${lane}`;
-      if (entry.parentId !== leaf) throw "does not chain to the lane leaf";
+      if (leaf === undefined) throw `unknown branch ${lane}`;
+      if (entry.parentId !== leaf) throw `missing parent entry: ${entry.parentId}`;
     }
     // parent 必须存在
     if (entry.parentId !== null && !state.entriesById.has(entry.parentId))
-      throw `missing parent ${entry.parentId}`;
+      throw `missing parent entry: ${entry.parentId}`;
     // —— commit ——
     state.entriesById.set(entry.id, entry);
     state.entryOrder.push(entry.id);
     state.sequence = entry.seq;
-    if (lane !== undefined) state.lanes.set(lane, entry.id); // 推进叶子
+    if (lane !== undefined) state.lanes.set(lane, entry.id); // 推进 branch tip
     state.log.push({ kind: "entry", seq: entry.seq, entry });
   }
 
-  function applyRecord(record) {
-    if (record.seq !== state.sequence + 1)
-      throw `non-consecutive seq ${record.seq}`;
-    if (!state.lanes.has(record.lane)) throw `missing lane ${record.lane}`;
-    state.sequence = record.seq;
-    state.log.push({ kind: "record", seq: record.seq, record });
-    // record 不进 entriesById，不进树，只挂 lane 记账
+  function applyUsage(row) {
+    if (row.seq !== state.sequence + 1)
+      throw `non-monotonic seq ${row.seq}`;
+    if (state.usageIds.has(row.id)) throw `duplicate usage id ${row.id}`;
+    state.usageIds.add(row.id);
+    state.sequence = row.seq;
+    state.log.push({ kind: "usage", seq: row.seq, record: row });
+    // usage 不进 entriesById，不进树，只进统计
   }
 
-  function moveLane(lane, to) {
-    if (!state.lanes.has(lane)) throw `missing lane ${lane}`;
+  function setValueWrite(lane, to) {
+    if (!state.lanes.has(lane)) throw `unknown branch ${lane}`;
     if (to !== null && !state.entriesById.has(to)) throw `missing target ${to}`;
     const seq = nextSeq();
     state.sequence = seq;
     state.lanes.set(lane, to);
-    state.log.push({ kind: "lane", seq, lane, leafId: to });
+    state.log.push({ kind: "value", seq, lane, leafId: to });
   }
 
   function createForkBranch(targetId) {
-    // 沿 parentId 走到根（镜像 walkToRoot / createForkMutations.branch）
+    // 沿 parentId 走到根（镜像 selectForkContents 的 branch 路径回溯）
     const target = state.entriesById.get(targetId);
     if (!target || target.type !== KIND.MESSAGE)
       throw "fork target is not a message entry";
@@ -497,34 +576,28 @@
       path.push(cur);
       if (cur.parentId === null) break;
       cur = state.entriesById.get(cur.parentId);
-      if (!cur) throw `missing parent`;
+      if (!cur) throw `corrupt branch: missing parent`;
     }
     path.reverse(); // oldest first
-    // 在新 lane 上重放：seq 从 1 重排、不复制 record。
-    // 真实代码里副本落进「新 session」，id 不冲突；本沙盘是单 session，
-    // 故给副本分配新 id，并用 idMap 把原 parentId 翻译到副本 id，保持树形。
+    // 副本继承源树 seq（createForkSnapshot 不重排）。真实代码里副本
+    // 落进「新 session」，id 不冲突；本沙盘是单 session，故给副本
+    // 分配新 id，并用 idMap 把原 parentId 翻译到副本 id，保持树形。
     const forkLane = "fork" + (state.forkRoots.length + 1);
-    const oldSeq = state.sequence;
-    state.lanes.set(forkLane, null);
-    state.sequence = 0; // 临时切到 fork 的序号空间
     const copiedIds = new Set();
     const idMap = new Map(); // 原id -> 副本id
     let forkLeaf = null; // 路径末尾（=fork 目标）的副本 id
     for (const src of path) {
       const newEid = newId("f");
       idMap.set(src.id, newEid);
-      const clone = { ...src, id: newEid, seq: nextSeq(), parentId: src.parentId ? idMap.get(src.parentId) : null };
-      applyEntry(clone, undefined); // 不带 lane → 跳过 parentId 校验，重放
+      const clone = { ...src, id: newEid, parentId: src.parentId ? idMap.get(src.parentId) : null };
+      applyEntry(clone, undefined); // 不带 lane → 跳过 tip 校验，重放（继承 seq）
       copiedIds.add(newEid);
       forkLeaf = newEid; // 不断覆盖，最后留下的就是路径末尾
     }
-    // 设置 fork lane 叶子 = 路径末尾（fork 目标）的副本
-    const leafSeq = nextSeq();
-    state.sequence = leafSeq;
+    // 复制分支 tip + lane 配置，lane 状态重置为空闲（fork.ts 的 destinationTips 逻辑）
     state.lanes.set(forkLane, forkLeaf);
-    state.log.push({ kind: "lane", seq: leafSeq, lane: forkLane, leafId: forkLeaf });
-    // 恢复主树序号空间（fork 的 log 项已记录，序号自洽于其子树）
-    state.sequence = oldSeq;
+    state.log.push({ kind: "value", seq: nextSeq(), lane: forkLane, leafId: forkLeaf, config: true, idle: true });
+    state.sequence = state.log[state.log.length - 1].seq;
     state.forkRoots.push({ lane: forkLane, rootId: idMap.get(targetId), ids: copiedIds });
     activeFork = state.forkRoots.length - 1;
     return forkLane;
@@ -546,41 +619,34 @@
     flash(`追加 <b>message</b> #${entry.seq}（parentId = ${leaf ?? "null"}）→ main 叶子推进到 <b>${entry.id}</b>`);
   }
 
-  function actRecord() {
-    const record = {
-      type: "tool_started",
-      id: newId("r"),
+  function actUsage() {
+    const row = {
+      id: newId("u"),
       seq: nextSeq(),
-      lane: "main",
       timestamp: Date.now(),
       toolName: pick(["read", "edit", "bash", "grep"]),
+      tokens: 100 + Math.floor(Math.random() * 900),
     };
-    applyRecord(record);
-    flash(`追加 <b>record</b> #${record.seq}（tool_started）→ 只进簿记轨道，<b>无 parentId、不进树</b>`);
+    applyUsage(row);
+    flash(`写入 <b>usage</b> #${row.seq}（${row.toolName} +${row.tokens} tok）→ 只进统计轨道，<b>无 parentId、不进树</b>`);
   }
 
   function actModel() {
-    const lane = "main";
-    const leaf = state.lanes.get(lane);
-    const entry = {
-      type: KIND.MODEL_CHANGE,
-      id: newId("m"),
-      seq: nextSeq(),
-      parentId: leaf,
-      timestamp: Date.now(),
-      modelId: pick(["opus-5", "sonnet-5", "haiku-4"]),
-    };
-    applyEntry(entry, lane);
-    flash(`追加 <b>model_change</b> #${entry.seq}（→ ${entry.modelId}）→ 仍是 Entry、进树`);
+    const modelId = pick(["opus-5", "sonnet-5", "haiku-4"]);
+    const seq = nextSeq();
+    state.sequence = seq;
+    state.laneConfig = modelId;
+    state.log.push({ kind: "value", seq, lane: "main", config: modelId });
+    flash(`setValue(<b>pi.lane.config/main</b>, model: ${modelId}) → 簿记值更新，<b>不进树</b>（旧版这里是一个 model_change entry）`);
   }
 
   function actMove() {
     const t = targetSel.value;
     if (!t) { flash(`<span class="sd-err">先在左侧选一个回溯目标节点</span>`); return; }
     const leaf = state.lanes.get("main");
-    if (t === leaf) { flash(`main 叶子已在 <b>${t}</b>，无需回溯`); return; }
-    moveLane("main", t);
-    flash(`moveLane(main, <b>${t}</b>) → 叶子指针拨回历史节点。<b>数据未删</b>，再追加 message 即长出新分支`);
+    if (t === leaf) { flash(`main tip 已在 <b>${t}</b>，无需回溯`); return; }
+    setValueWrite("main", t);
+    flash(`setValue(pi.branch.tip/main, <b>${t}</b>) → tip 指针拨回历史节点。<b>数据未删</b>，再追加 message 即长出新分支`);
   }
 
   function actFork() {
@@ -589,7 +655,7 @@
     if (!target) { flash(`<span class="sd-err">main 为空，无可 fork 的分支</span>`); return; }
     try {
       const lane = createForkBranch(target);
-      flash(`fork(branch) → 从 <b>${target}</b> 沿 parentId 复制路径到新车道 <b>${lane}</b>，seq 从 1 重排、<b>不带 record</b>`);
+      flash(`fork(branch) → 从 <b>${target}</b> 沿 parentId 复制路径到新分支 <b>${lane}</b>，<b>继承源 seq</b>、lane 状态重置为空闲`);
     } catch (e) { flash(`<span class="sd-err">${e}</span>`); }
   }
 
@@ -598,6 +664,8 @@
     state.entriesById.clear();
     state.entryOrder.length = 0;
     state.lanes = new Map([["main", null]]);
+    state.usageIds = new Set();
+    state.laneConfig = undefined;
     state.log.length = 0;
     state.forkRoots.length = 0;
     state.layout.clear();
@@ -646,25 +714,23 @@
         });
       });
     }
-    // record：挂在同 lane 的最近 entry 下方（簿记轨道）
+    // usage：挂在 main 最近 entry 下方（统计轨道）
     let recIdx = 0;
     for (const item of state.log) {
-      if (item.kind !== "record") continue;
-      const lane = item.record.lane;
-      const leaf = state.lanes.get(lane);
-      // 找该 record 时刻的 lane 叶子（近似：当前叶子）
+      if (item.kind !== "usage") continue;
+      const leaf = state.lanes.get("main");
+      // 找该 usage 时刻的 lane tip（近似：当前 tip）
       const anchor = leaf && state.layout.has(leaf) ? state.layout.get(leaf) : null;
       const y = anchor ? anchor.y + NODE_H + 8 : 240 + recIdx * 16;
       const x = anchor ? anchor.x + 6 : 30;
-      state.layout.set(item.record.id, { x, y: y + recIdx * 0, kind: "record", rail: true });
+      state.layout.set(item.record.id, { x, y: y + recIdx * 0, kind: "usage", rail: true });
       recIdx++;
     }
   }
 
   function kindOf(id) {
     const e = state.entriesById.get(id);
-    if (!e) return "record";
-    if (e.type === KIND.MODEL_CHANGE) return "mdl";
+    if (!e) return "usage";
     return "msg";
   }
 
@@ -674,8 +740,8 @@
     canvas.innerHTML = "";
     const mainLeaf = state.lanes.get("main");
 
-    // 簿记轨道虚线（如果存在 record）
-    const hasRecord = state.log.some((i) => i.kind === "record");
+    // 统计轨道虚线（如果存在 usage）
+    const hasRecord = state.log.some((i) => i.kind === "usage");
     if (hasRecord) {
       const rail = document.createElementNS(svgNs, "path");
       rail.setAttribute("class", "sd-rail");
@@ -685,7 +751,7 @@
       const cap = document.createElementNS(svgNs, "text");
       cap.setAttribute("class", "sd-cap");
       cap.setAttribute("x", 18); cap.setAttribute("y", 244);
-      cap.textContent = "簿记轨道（Records · 无 parentId · 不进树）";
+      cap.textContent = "usage 轨道（无 parentId · 不进树 · 只进统计）";
       canvas.appendChild(cap);
     }
 
@@ -709,7 +775,7 @@
       if (!lay) continue;
       const g = document.createElementNS(svgNs, "g");
       const r = document.createElementNS(svgNs, "rect");
-      let cls = "sd-rect " + (e.type === KIND.MODEL_CHANGE ? "mdl" : "msg");
+      let cls = "sd-rect msg";
       if (id === mainLeaf) cls += " leaf";
       if (newIds.has(id)) cls += " new";
       r.setAttribute("class", cls);
@@ -718,7 +784,7 @@
       g.appendChild(r);
       const t1 = document.createElementNS(svgNs, "text");
       t1.setAttribute("class", "sd-tx"); t1.setAttribute("x", lay.x + 6); t1.setAttribute("y", lay.y + 16);
-      t1.textContent = e.type === KIND.MODEL_CHANGE ? `mdl→${e.modelId}` : (e.label || "msg");
+      t1.textContent = e.label || "msg";
       g.appendChild(t1);
       const t2 = document.createElementNS(svgNs, "text");
       t2.setAttribute("class", "sd-tx id"); t2.setAttribute("x", lay.x + 6); t2.setAttribute("y", lay.y + 31);
@@ -730,9 +796,9 @@
       canvas.appendChild(g);
     }
 
-    // record 节点
+    // usage 节点
     for (const item of state.log) {
-      if (item.kind !== "record") continue;
+      if (item.kind !== "usage") continue;
       const lay = state.layout.get(item.record.id);
       if (!lay) continue;
       const g = document.createElementNS(svgNs, "g");
@@ -749,14 +815,14 @@
       canvas.appendChild(g);
     }
 
-    // main 叶子指针标签
+    // main tip 指针标签
     if (mainLeaf) {
       const lay = state.layout.get(mainLeaf);
       if (lay) {
         const t = document.createElementNS(svgNs, "text");
         t.setAttribute("class", "sd-cap"); t.setAttribute("x", lay.x); t.setAttribute("y", lay.y - 6);
         t.setAttribute("fill", "var(--brand)"); t.setAttribute("font-weight", "700");
-        t.textContent = "▼ main 叶子";
+        t.textContent = "▼ main tip";
         canvas.appendChild(t);
       }
     }
@@ -788,13 +854,15 @@
       const d = document.createElement("span"); d.className = "sd-ld";
       if (item.kind === "entry") {
         const e = item.entry;
-        d.textContent = `${e.id} · ${e.type}` + (e.type === KIND.MODEL_CHANGE ? `→${e.modelId}` : "") + ` · parent=${e.parentId ?? "null"}`;
-      } else if (item.kind === "record") {
-        d.textContent = `${item.record.id} · ${item.record.type}(${item.record.toolName}) · lane=${item.record.lane}`;
-      } else if (item.kind === "lane") {
-        d.textContent = `${item.lane} → leaf=${item.leafId ?? "null"}`;
-      } else if (item.kind === "fact") {
-        d.textContent = `${item.fact}`;
+        d.textContent = `${e.id} · ${e.type} · parent=${e.parentId ?? "null"}`;
+      } else if (item.kind === "usage") {
+        d.textContent = `${item.record.id} · usage(${item.record.toolName}) +${item.record.tokens}t`;
+      } else if (item.kind === "value") {
+        d.textContent = item.config === true
+          ? `pi.lane.config/${item.lane} + pi.lane.state/${item.lane}（空闲初值）`
+          : item.config
+            ? `pi.lane.config/main → model: ${item.config}`
+            : `pi.branch.tip/${item.lane} → ${item.leafId ?? "null"}`;
       }
       li.append(seq, k, d);
       logEl.appendChild(li);
@@ -829,7 +897,7 @@
 
   // —— 绑定 ——
   $("sd-msg").addEventListener("click", safe(actMessage));
-  $("sd-rec").addEventListener("click", safe(actRecord));
+  $("sd-rec").addEventListener("click", safe(actUsage));
   $("sd-mdl").addEventListener("click", safe(actModel));
   $("sd-move").addEventListener("click", safe(actMove));
   $("sd-fork").addEventListener("click", safe(actFork));
@@ -839,9 +907,8 @@
   function seed() {
     applyEntry({ type: KIND.MESSAGE, id: "e01", seq: nextSeq(), parentId: null, timestamp: 0, label: "你好" }, "main");
     applyEntry({ type: KIND.MESSAGE, id: "e02", seq: nextSeq(), parentId: "e01", timestamp: 0, label: "修个 bug" }, "main");
-    applyRecord({ type: "tool_started", id: "r03", seq: nextSeq(), lane: "main", timestamp: 0, toolName: "read" });
-    applyEntry({ type: KIND.MODEL_CHANGE, id: "m04", seq: nextSeq(), parentId: "e02", timestamp: 0, modelId: "sonnet-5" }, "main");
-    applyEntry({ type: KIND.MESSAGE, id: "e05", seq: nextSeq(), parentId: "m04", timestamp: 0, label: "跑测试" }, "main");
+    applyUsage({ id: "u03", seq: nextSeq(), timestamp: 0, toolName: "read", tokens: 421 });
+    applyEntry({ type: KIND.MESSAGE, id: "e05", seq: nextSeq(), parentId: "e02", timestamp: 0, label: "跑测试" }, "main");
     flash("已预置一段会话。试试：选 e02 回溯 → 追加 message 看新分支；或 fork(branch)。");
   }
   seed();
@@ -851,9 +918,9 @@
 
 <script>
 /* ============================================================
- * walkToRoot 动画 — §4.7
- * 复刻 state.ts 的 walkToRoot 生成器：从 start 沿 parentId 上溯，
- * 有环检测、inclusive 的 stopAtId / stopAtType 边界。
+ * scanBranch 动画 — §4.7
+ * 复刻 in-memory-storage-state.ts 的 scanBranch：从 start 沿 parentId
+ * 上溯到根，inclusive 的 stopAtId / stopAtType 边界。
  * ============================================================ */
 (function () {
   "use strict";
@@ -875,7 +942,7 @@
   const START = "e07";
   const STOP_TYPE = "compaction"; // 模拟 stopAtType
 
-  // walkToRoot 生成器（语义同 state.ts）
+  // 分支行走生成器（语义同 in-memory-storage-state.ts 的 scanBranch）
   function* walkToRoot(start, stopAtType) {
     const visited = new Set();
     let current = byId.get(start);
@@ -989,7 +1056,7 @@
     tick();
   }
   function pause() { playing = false; $("wr-play").textContent = "▶ 继续"; }
-  function reset() { playing = false; stepIdx = 0; $("wr-play").textContent = "▶ 播放 walkToRoot"; render(); }
+  function reset() { playing = false; stepIdx = 0; $("wr-play").textContent = "▶ 播放 scanBranch"; render(); }
 
   $("wr-play").addEventListener("click", () => { if (playing) pause(); else play(); });
   $("wr-step").addEventListener("click", step);

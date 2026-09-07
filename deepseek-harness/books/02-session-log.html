@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 会话日志 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 会话日志</div>
+    <h1>会话日志：一条 append-only 事件流是唯一事实</h1>
+    <div class="subtitle">dsh 的会话不是「消息数组」，而是一条只增不改的 SessionEvent 日志。模型历史、UI 转录、崩溃恢复、fork——全都是对这条日志的投影。这一章讲清事件词汇表、表面（surface）投影机制，以及「Model-visible means logged」这条铁律。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>一分钟版本</h2>
+    <ul>
+      <li>会话 = <strong>append-only 的 <code class="inline">SessionEvent</code> 日志</strong>（<code class="inline">packages/core/session</code>，ctx 键 <code class="inline">ctx.sessions</code>）。每条事件带单调递增 <code class="inline">seq</code>、时间戳、类型化 data。</li>
+      <li>只有三类事件能出现在「有序表面」上：<code class="inline">user/message</code>、<code class="inline">assistant/message</code>、<code class="inline">tool/result</code>（<code class="inline">SurfaceEventType</code>）。</li>
+      <li><code class="inline">deriveMessages()</code> 把表面节点折叠成 LLM 消息历史，带 O(新节点) 的增量缓存。</li>
+      <li>压缩不是删除：一个 <code class="inline">replace</code> 的 <code class="inline">user/message</code> 遮蔽（shadow）旧区间，原事件仍在日志里。</li>
+      <li>不认识的事件类型：带 <code class="inline">ignorable: true</code> 的可跳过；不带的<strong>必须拒绝重建</strong>，宁可拒绝也不静默丢内容。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>核心事件词汇表</h2>
+    <p>核心 <code class="inline">SessionEventMap</code> 定义在 <code class="inline">packages/core/session/src/types.ts</code>（SESSION_FORMAT_VERSION = 2）。每个事件都带精确的契约注释，摘录关键部分：</p>
+    <div class="code-title">packages/core/session/src/types.ts — SessionEventMap（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">SessionEventMap</span> {
+  <span class="cmt">/** Opens turn `turn` before the loop claims queued input or runs pre-step. */</span>
+  <span class="st">'turn/start'</span>: { turn: <span class="kw">number</span> }
+
+  <span class="cmt">/**
+   * Closes turn `turn` with the TurnEndReason that ended it. A turn
+   * with no entered step has no `step/start` or `step/end`. The loop does not
+   * await a flush at turn boundaries: `dsh-session-checkpoint-policy` owns the
+   * per-request durability checkpoint, and consumers that read storage after
+   * `whenIdle()` flush themselves.
+   */</span>
+  <span class="st">'turn/end'</span>: { turn: <span class="kw">number</span>; reason: <span class="cl">TurnEndReason</span> }
+
+  <span class="cmt">/** Opens step `step` of turn `turn` — one model call plus the tool executions it requested. */</span>
+  <span class="st">'step/start'</span>: { turn: <span class="kw">number</span>; step: <span class="kw">number</span> }
+  <span class="st">'step/end'</span>: { turn: <span class="kw">number</span>; step: <span class="kw">number</span> }
+
+  <span class="cmt">/**
+   * A user-role message on the model-visible surface: a direct human prompt,
+   * a synthetic `agent.inject()` context (file-change notices, subdir
+   * AGENTS.md, skill content, cron notifications, …), or an entered goal
+   * continuation round. All three project their `content` verbatim;
+   * `source` tells them apart.
+   */</span>
+  <span class="st">'user/message'</span>: <span class="cl">UserMessage</span>
+
+  <span class="cmt">/**
+   * Assembled assistant message for one step. Carries the step's `usage`
+   * when the adapter reported token accounting. A turn cancelled mid-stream
+   * finalizes its delivered text/reasoning prefix as this event with
+   * `interrupted: true`; undispatched tool calls are absent.
+   */</span>
+  <span class="st">'assistant/message'</span>: {
+    turn: <span class="kw">number</span>
+    step: <span class="kw">number</span>
+    message: <span class="cl">AssistantMessage</span>
+    <span class="cmt">/** Exact timed model stream, compacted without joining delta boundaries. */</span>
+    stream: <span class="cl">AssistantStreamRecord</span>[]
+    usage?: <span class="cl">TokenUsage</span>
+    interrupted?: <span class="kw">true</span>
+  }
+
+  <span class="cmt">/**
+   * One model attempt that committed no surface message: a failed, retried,
+   * cancelled, or stream-error attempt that reached settlement — without
+   * fabricating model-visible history.
+   */</span>
+  <span class="st">'assistant/attempt'</span>: { turn: <span class="kw">number</span>; step: <span class="kw">number</span>; stream: <span class="cl">AssistantStreamRecord</span>[] }
+
+  <span class="cmt">/**
+   * The model requested one tool invocation: `name` with the raw `arguments`
+   * JSON string exactly as the model produced it (unparsed).
+   */</span>
+  <span class="st">'tool/call'</span>: { turn: <span class="kw">number</span>; step: <span class="kw">number</span>; callId: <span class="cl">ToolCallId</span>; name: <span class="kw">string</span>; arguments: <span class="kw">string</span> }
+
+  <span class="cmt">/**
+   * A completed tool call's model-facing result, optional internal failure
+   * identity, and optional tool-private `meta` presentation payload. `meta`
+   * is opaque to the core (the producing tool owns its shape and reads it
+   * back in `presentResult`) but MUST be JSON-serializable: `Session.append`
+   * runtime-validates all event data with `isJsonValue`.
+   */</span>
+  <span class="st">'tool/result'</span>: {
+    turn: <span class="kw">number</span>
+    step: <span class="kw">number</span>
+    message: <span class="cl">ToolResultMessage</span>
+    error?: { name: <span class="kw">string</span>; code: <span class="kw">string</span> }
+    meta?: <span class="cl">JsonValue</span>
+  }
+
+  <span class="cmt">/**
+   * Full header for the next request, appended inside its step before
+   * dispatch. Log-only; the latest snapshot reconstructs the request header.
+   */</span>
+  <span class="st">'request/header'</span>: {
+    header: <span class="cl">EpochHeader</span>
+    reason: <span class="cl">RequestHeaderReason</span>  <span class="cmt">// 'initial' | 'resume' | 'change' | 'series'</span>
+    startsSeries?: <span class="kw">true</span>
+  }
+
+  <span class="cmt">/**
+   * Route metadata for the next request, logged only when the route or
+   * capacity changes. Not part of request reconstruction or header equality.
+   */</span>
+  <span class="st">'request/context'</span>: <span class="cl">RequestContext</span>
+
+  <span class="cmt">/**
+   * Marks the end of a constructor seed (resume, fork, or replay). Events
+   * before it have smaller seq values and came from the seed; this lifecycle
+   * produced none of them. The Session constructor is the only legitimate
+   * writer.
+   */</span>
+  <span class="st">'session/end-seed'</span>: { inherited?: <span class="kw">true</span> }
+}</pre>
+    <div class="annotation"><b>设计要点</b>：① <code class="inline">assistant/message</code> 把产生它的<strong>完整计时流</strong>内嵌进来（v2 决策）——输出与 token 记账同进同出，没有独立的 usage 记录；② <code class="inline">tool/call</code> 保存模型产出的<strong>原始未解析 JSON 字符串</strong>；③ <code class="inline">request/header</code> / <code class="inline">request/context</code> / <code class="inline">session/end-seed</code> 是 log-only 事件，只服务审计与重建，不上表面。</div>
+
+    <h3>插件合并进来的事件</h3>
+    <p><code class="inline">SessionEventMap</code> 是一个 TS declaration- merging 接口——各子系统往里添加自己的持久事件。这也是「新增模型可见输入 = 新增会话事件」的落地方式：</p>
+    <table class="tbl">
+      <tr><th>事件</th><th>声明处</th><th>载荷（要点）</th></tr>
+      <tr><td><code class="inline">agent/inbox/spliced</code></td><td><code class="inline">core/agent/src/types.ts</code></td><td>{target, start, removedCount?, inserted: UserMessage[], outcome?: 'canceled'} — inbox 变更的持久记录</td></tr>
+      <tr><td><code class="inline">approval/asked</code></td><td><code class="inline">interaction/user-approval/src/types.ts</code></td><td>{id, toolName, callId?, reason?}</td></tr>
+      <tr><td><code class="inline">approval/decided</code></td><td>同上</td><td>{id, outcome: ApprovalOutcome} — 与 asked 成对，仅审计</td></tr>
+      <tr><td><code class="inline">compaction/start</code></td><td><code class="inline">compaction/compaction/src/types.ts</code></td><td>{compactionId, sourceCommandId?, turn | null} — log-only，持有锁直到 end</td></tr>
+      <tr><td><code class="inline">todo/write</code></td><td><code class="inline">todo/tool-todo/src/types.ts</code></td><td>{todos: TodoItem[]} — 整表快照</td></tr>
+      <tr><td><code class="inline">goal/change</code></td><td><code class="inline">goal/goal/src/domain.ts</code></td><td>{kind:'goal/change', version:1, operation, goal: GoalSnapshot, roundsStarted, …}</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>表面（Surface）：三类事件 + 两种入场方式</h2>
+    <p>不是所有事件都进入「模型可见历史」。表面资格由两个类型精确刻画（<code class="inline">packages/core/session/src/types.ts</code>）：</p>
+    <div class="code-title">packages/core/session/src/types.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 只有这三类事件产生 LLM 消息、可以出现在有序表面上。 */</span>
+<span class="kw">export type</span> <span class="cl">SurfaceEventType</span> =
+  | <span class="st">'user/message'</span>
+  | <span class="st">'assistant/message'</span>
+  | <span class="st">'tool/result'</span>
+
+<span class="cmt">/**
+ * 一个表面事件如何进入有序表面。只在 SurfaceEventType 上有效。
+ * - 'append'：追加到尾部 —— 用户/助手/工具消息的常规路径。
+ * - { op: 'replace', start, end }：替换表面节点 [start, end]（闭区间）为当前
+ *   节点。节点的 sourceEventSeqs 必须包含所有被遮蔽的表面节点。
+ *   由 compaction 使用；任何做表面替换的生产者都可用。
+ */</span>
+<span class="kw">export type</span> <span class="cl">SurfaceOp</span> =
+  | <span class="st">'append'</span>
+  | { op: <span class="st">'replace'</span>; start: <span class="cl">SessionSeq</span>; end: <span class="cl">SessionSeq</span> }</pre>
+    <div class="annotation"><b>为什么这么严</b>：注释明确说 <code class="inline">surfaceOp</code> 在消息类事件上<strong>强制存在</strong>、在 log-only 事件上<strong>禁止存在</strong>，编译器在 <code class="inline">Session.append()</code> 调用点强制执行。v2 还规定 <code class="inline">assistant/message</code> 内嵌流、<strong>不能</strong>携带 <code class="inline">sourceEventSeqs</code>。</div>
+
+    <p>事件信封上有两个关键字段（同文件）：</p>
+    <div class="code-title">packages/core/session/src/types.ts — SessionEvent 信封（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">SessionEvent</span>&lt;<span class="cl">T</span> <span class="kw">extends</span> <span class="cl">SessionEventType</span> = <span class="cl">SessionEventType</span>&gt; = {
+  [<span class="cl">K</span> <span class="kw">in</span> <span class="cl">SessionEventType</span>]: {
+    type: <span class="cl">K</span>
+    <span class="cmt">/** Monotonic sequence number within the session. */</span>
+    seq: <span class="cl">SessionSeq</span>
+    <span class="cmt">/** Unix epoch milliseconds. */</span>
+    time: <span class="kw">number</span>
+    data: <span class="cl">SessionEventMap</span>[<span class="cl">K</span>]
+    <span class="cmt">/**
+     * Marks an event a reader may safely skip when it does not recognize
+     * `type`. Absent means required: a reader meeting an unrecognized type
+     * without this marker MUST refuse to reconstruct the session instead of
+     * silently dropping the event, because an unrecognized required event may
+     * change how the rest of the log is interpreted.
+     */</span>
+    ignorable?: <span class="kw">true</span>
+  } & <span class="cmt">/* surfaceOp + sourceEventSeqs 仅存在于 SurfaceEventType 变体上 */</span>
+}</pre>
+    <div class="callout info">
+      <b class="tag">设计哲学</b>
+      <code class="inline">ignorable</code> 的默认值是「必需」：忘写标记的代价是<strong>过度拒绝</strong>（不方便），而默认可跳过的代价是<strong>静默续读一个被掏空的会话</strong>（正确性事故）。宁可不方便，不可不正确。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>投影：deriveMessages() 如何从日志得到模型历史</h2>
+    <p>模型历史从不单独存储，它是对表面节点的<strong>折叠</strong>。核心实现带一个精细的增量缓存（<code class="inline">packages/core/session/src/index.ts</code>）：</p>
+    <div class="code-title">packages/core/session/src/index.ts — deriveMessages()</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/** The derived-message cache: frozen projections, extended per unseen node. */</span>
+  <span class="kw">private</span> derived: <span class="cl">Message</span>[] = []
+  <span class="cmt">/** Surface position (nodes projected) the cache has reached. */</span>
+  <span class="kw">private</span> derivedNodes = <span class="nu">0</span>
+  <span class="cmt">/** SurfaceManager.replaceGeneration the cache was built under. */</span>
+  <span class="kw">private</span> derivedGeneration = <span class="nu">0</span>
+
+  <span class="cmt">/**
+   * Derive the LLM message history by walking the ordered sequences of
+   * message-producing events maintained by `surfaceOp` markers.
+   *
+   * CACHED: each surface node is projected exactly once, when first seen —
+   * a call costs O(new nodes), and a surface rewrite (a `replace`)
+   * rebuilds. The returned array is a fresh snapshot per call; the `Message`
+   * objects in it are SHARED and **deep-frozen**. Their content reuses the
+   * already frozen durable event data, so the cache needs no second deep
+   * clone and consumers still cannot mutate the log.
+   */</span>
+  <span class="fn">deriveMessages</span>(): <span class="cl">Message</span>[] {
+    <span class="kw">const</span> surface = <span class="kw">this</span>.surface
+    <span class="kw">const</span> nodes = surface.nodes
+    <span class="kw">const</span> generation = surface.replaceGeneration
+    <span class="kw">if</span> (generation !== <span class="kw">this</span>.derivedGeneration) {
+      <span class="kw">this</span>.derived = []
+      <span class="kw">this</span>.derivedNodes = <span class="nu">0</span>
+      <span class="kw">this</span>.derivedGeneration = generation
+    }
+    <span class="kw">for</span> (<span class="kw">const</span> seq <span class="kw">of</span> nodes.<span class="fn">slice</span>(<span class="kw">this</span>.derivedNodes)) {
+      <span class="kw">const</span> msg = <span class="kw">this</span>.<span class="fn">deriveEventMessage</span>(<span class="kw">this</span>.log[seq]!)
+      <span class="cmt">// 空内容的 assistant/message（只承载 usage 的 max-tokens step）</span>
+      <span class="cmt">// 派生为 null，不进入转录。</span>
+      <span class="kw">if</span> (msg) <span class="kw">this</span>.derived.<span class="fn">push</span>(msg)
+    }
+    <span class="kw">this</span>.derivedNodes = nodes.length
+    <span class="kw">return</span> [...<span class="kw">this</span>.derived]
+  }</pre>
+    <div class="annotation"><b>三个不变量</b>：① 没带 <code class="inline">surfaceOp</code> 的裸事件（chunk、回合边界）天然缺席历史；② compaction 的 <code class="inline">replace</code> 会把被遮蔽节点从派生中删除（通过 replaceGeneration 使缓存失效重建）；③ 返回数组每次是<strong>新快照</strong>，里面的 Message 对象是<strong>共享且深冻结</strong>的——消费者拿到的历史不可变，日志也不可能被改。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>Model-visible means logged</h2>
+    <p>这是整个会话子系统的第一不变量（<code class="inline">docs/architecture.md</code>）：</p>
+    <div class="callout warn">
+      <b class="tag">铁律</b>
+      <strong>任何到达模型请求的内容，都必须能从日志重建</strong>——运行时有不变量断言强制这一点。所以「新增一种模型可见输入」的第一步永远是：扩展 <code class="inline">SessionEventMap</code>，然后从日志渲染。反过来，文件变更通知、子目录 AGENTS.md、skill 内容、cron 通知这些 <code class="inline">agent.inject()</code> 注入物，最终都以 <code class="inline">user/message</code>（带区分用的 <code class="inline">source</code>）落日志。
+    </div>
+    <p>这条铁律带来的直接收益：fork、resume、转录、遥测、持久化<strong>全部</strong>从同一份持久结算（assistant/message 与 assistant/attempt）派生，彼此不可能不一致。唯一的例外是 UI 的增量渲染——它消费进程内的 <code class="inline">agent/assistant-stream</code> live 事件，而进程崩溃时未结算的流不会留下任何持久痕迹（这是有意为之：宁缺勿假）。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node core" x="30" y="40" width="180" height="150" rx="9"/>
+        <text class="lbl" x="120" y="68" text-anchor="middle">SessionEvent 日志</text>
+        <text class="lbl code" x="120" y="90" text-anchor="middle">seq 0..N append-only</text>
+        <text class="lbl sm" x="120" y="112" text-anchor="middle">turn/*  step/*</text>
+        <text class="lbl sm" x="120" y="130" text-anchor="middle">user/assistant/tool</text>
+        <text class="lbl sm" x="120" y="148" text-anchor="middle">request/header|context</text>
+        <text class="lbl sm" x="120" y="166" text-anchor="middle">插件合并事件…</text>
+
+        <rect class="node" x="330" y="30" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="440" y="52" text-anchor="middle">deriveMessages() 投影</text>
+        <text class="lbl sm" x="440" y="70" text-anchor="middle">O(新节点) 增量缓存</text>
+
+        <rect class="node" x="330" y="100" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="440" y="122" text-anchor="middle">session-projection 单元</text>
+        <text class="lbl sm" x="440" y="140" text-anchor="middle">stateOf() / snapshot()</text>
+
+        <rect class="node" x="330" y="170" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="440" y="192" text-anchor="middle">persistence / 迁移链</text>
+        <text class="lbl sm" x="440" y="210" text-anchor="middle">JSONL vN（第 5 章）</text>
+
+        <rect class="node acc" x="660" y="30" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="770" y="52" text-anchor="middle">模型请求历史</text>
+        <text class="lbl sm" x="770" y="70" text-anchor="middle">发给 LLM 的 messages</text>
+        <rect class="node acc" x="660" y="100" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="770" y="122" text-anchor="middle">UI 转录 / Web 投影</text>
+        <text class="lbl sm" x="770" y="140" text-anchor="middle">fork / resume / 遥测</text>
+        <rect class="node acc" x="660" y="170" width="220" height="52" rx="9"/>
+        <text class="lbl sm" x="770" y="192" text-anchor="middle">崩溃恢复缝合</text>
+        <text class="lbl sm" x="770" y="210" text-anchor="middle">interruptedTurnClosers()</text>
+
+        <line class="edge" x1="210" y1="90" x2="328" y2="56"/>
+        <line class="edge" x1="210" y1="115" x2="328" y2="126"/>
+        <line class="edge" x1="210" y1="150" x2="328" y2="196"/>
+        <line class="edge" x1="550" y1="56" x2="658" y2="56"/>
+        <line class="edge" x1="550" y1="126" x2="658" y2="126"/>
+        <line class="edge" x1="550" y1="196" x2="658" y2="196"/>
+        <text class="lbl sm" x="120" y="240" text-anchor="middle">唯一写入方向：append。没有任何消费路径会回写日志。</text>
+      </svg>
+      <div class="fig-cap">图 2-1 — 一个事实源，多个投影。所有下游（模型历史、UI、fork、恢复）共享同一份不可变事件数据。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>格式版本与演进规则</h2>
+    <p><code class="inline">SESSION_FORMAT_VERSION = 2</code>（<code class="inline">packages/core/session/src/types.ts:86</code>）。它上方注释给出了版本号何时递增的完整决策规则，值得全文细读：</p>
+    <div class="code-title">packages/core/session/src/types.ts — 版本号递增规则（注释节选）</div>
+    <pre class="code"><span class="lang-tag">text</span><span class="cmt">/**
+ * Current logical Session format version, stamped into every newly written
+ * SessionHeader. The version is a single monotonic integer with no
+ * major/minor split. Whether a bump is needed is decided by what the WRITER
+ * emits, never by what a newer reader can accept: bump exactly when an older
+ * runtime could no longer handle a new log with full semantic correctness
+ * ("parses without error" is not correctness — silently skipping content
+ * that shapes reconstruction is a wrong read). Only structural changes reach
+ * that bar: the header shape, the SessionEvent envelope, core event
+ * semantics, or the surface mechanism (the SurfaceEventType set and
+ * SurfaceOp variants). Adding an ordinary event type does not bump — the
+ * per-event ignorable guard covers vocabulary growth instead. When in
+ * doubt, bump: a near-identity upgrade step is almost free, a missed bump
+ * makes older runtimes read new logs wrong silently.
+ */</span></pre>
+    <div class="annotation"><b>三个要点</b>：① 由<strong>写入方</strong>决定是否 bump，而不是读取方的宽容度；② 「能解析」不等于「读对了」——跳过影响重建语义的内容就是错误读取；③ 普通加事件类型<strong>不</strong>触发 bump，靠 <code class="inline">ignorable</code> 兜底；拿不准就 bump，因为近似恒等的迁移步骤几乎免费。v2 的 JSONL 命名规则与迁移链在<a href="05-persistence.html">第 5 章</a>展开。</div>
+
+    <h3>…Map → 派生联合：类型家族的模式</h3>
+    <p>dsh 大量使用同一种类型构造：<strong>一个以字符串字面量为键的 Map 接口 + 从它派生的联合类型 + branded ID</strong>。会话层有五个规范成员（<code class="inline">docs/subsystems/core.md</code>）：</p>
+    <table class="tbl">
+      <tr><th>Map</th><th>键（联合成员）</th><th>派生类型</th></tr>
+      <tr><td><code class="inline">ContentBlockMap</code></td><td>text / reasoning / image / file / tool-call / tool-result</td><td><code class="inline">ContentBlock</code></td></tr>
+      <tr><td><code class="inline">FinishReasonMap</code></td><td>stop / tool-calls / max-tokens / aborted / error</td><td><code class="inline">FinishReason</code></td></tr>
+      <tr><td><code class="inline">TurnEndReasonMap</code></td><td>completed / aborted{user,parent,hook,disposed,legacy} / blocked / error{LlmFailure} / max-tokens（粘滞）/ interrupted（仅崩溃恢复）</td><td><code class="inline">TurnEndReason</code></td></tr>
+      <tr><td><code class="inline">SessionEventMap</code></td><td>本章词汇表 + 插件合并事件</td><td><code class="inline">SessionEvent</code></td></tr>
+      <tr><td><code class="inline">SessionEventType</code></td><td>—（上者键的联合）</td><td>switch(event.type) 窄化 event.data 无需断言</td></tr>
+    </table>
+    <p>配套的是一组 branded ID（<code class="inline">SessionId</code>、<code class="inline">SessionSeq</code>、<code class="inline">SessionLogOffset</code>、<code class="inline">ToolCallId</code>…）——不同 ID 类型互相不可赋值，把「拿错 ID」从运行时 bug 变成编译错误。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.7</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 会话是日志不是数组——一切状态从事件流投影而来；② 只有 user/assistant/tool 三类事件上表面，入场方式要么 append 要么 replace（遮蔽）；③ <code class="inline">ignorable</code> 默认必需，让「新读者读旧日志」永远安全、「旧读者读新日志」永远失败得响亮；④ 想给模型看新东西 = 扩展 <code class="inline">SessionEventMap</code>。下一步进入 <a href="03-agent-lifecycle.html">第 3 章：一次对话的完整生命周期</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="01-architecture.html">← 上一章：整体架构</a>
+    <a href="03-agent-lifecycle.html">下一步：生命周期 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 02 会话日志 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>12 · 实战：模型权重加载 — vLLM 引擎学习站</title>
+<title>12 · 实战：模型权重加载 — 深入浅出vLLM</title>
 <link rel="stylesheet" href="assets/vllm-learn.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -26,6 +26,7 @@
       <a href="10-distributed.html">分布式</a>
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
+      <a href="13-agentic-gateway.html">实战·网关</a>
     </nav>
   </div>
 </header>
@@ -117,7 +118,7 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
   <section class="block">
     <h2><span class="num">12.3</span>选加载器：load_format 决定走哪条管线</h2>
     <p>模型类确定后，还要决定<strong>权重从哪来、怎么流进显存</strong>。一个 <code class="inline">--load-format</code> / <code class="inline">--load-format=…</code> 参数决定了 loader 的选择。全在 <code class="inline">get_model_loader</code> 这张表里：</p>
-    <div class="code-title">vllm/model_executor/model_loader/__init__.py:48 — load_format → 加载器映射（摘录）</div>
+    <div class="code-title">vllm/model_executor/model_loader/__init__.py:50 — load_format → 加载器映射（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>_LOAD_FORMAT_TO_MODEL_LOADER = {
     <span class="st">"auto"</span>: DefaultModelLoader,          <span class="cmt"># 默认：按文件类型自动判断</span>
     <span class="st">"hf"</span>: DefaultModelLoader,
@@ -230,19 +231,18 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
         <rect class="node" x="40" y="166" width="150" height="34" rx="5"></rect>
         <text class="lbl sm" x="115" y="187" text-anchor="middle">...weights_proj</text>
 
-        <line class="edge" x1="190" y1="57" x2="300" y2="110"></line>
-        <line class="edge" x1="190" y1="99" x2="300" y2="134"></line>
-        <line class="edge" x1="190" y1="141" x2="300" y2="110"></line>
-        <line class="edge" x1="190" y1="183" x2="300" y2="134"></line>
-
-        <rect class="node core" x="480" y="60" width="200" height="60" rx="6"></rect>
-        <text class="lbl sm" x="580" y="86" text-anchor="middle">fused_qkv_a_proj</text>
-        <text class="lbl sm" x="580" y="104" text-anchor="middle">（一个融合矩阵，一次 GEMM）</text>
-        <rect class="node core" x="480" y="130" width="200" height="60" rx="6"></rect>
-        <text class="lbl sm" x="580" y="156" text-anchor="middle">wk_weights_proj</text>
-        <text class="lbl sm" x="580" y="174" text-anchor="middle">（indexer 融合）</text>
-        <line class="edge" x1="420" y1="90" x2="478" y2="90"></line>
-        <line class="edge" x1="420" y1="160" x2="478" y2="160"></line>
+        <rect class="node core" x="270" y="60" width="180" height="60" rx="6"></rect>
+        <text class="lbl sm" x="360" y="86" text-anchor="middle">拼进同一个权重</text>
+        <text class="lbl sm" x="360" y="104" text-anchor="middle">stacked_params_mapping</text>
+        <rect class="node core" x="270" y="130" width="180" height="60" rx="6"></rect>
+        <text class="lbl sm" x="360" y="156" text-anchor="middle">拼进同一个权重</text>
+        <text class="lbl sm" x="360" y="174" text-anchor="middle">stacked_params_mapping</text>
+        <line class="edge" x1="190" y1="57" x2="268" y2="80"></line>
+        <line class="edge" x1="190" y1="99" x2="268" y2="94"></line>
+        <line class="edge" x1="190" y1="141" x2="268" y2="150"></line>
+        <line class="edge" x1="190" y1="183" x2="268" y2="164"></line>
+        <line class="edge" x1="450" y1="90" x2="478" y2="90"></line>
+        <line class="edge" x1="450" y1="160" x2="478" y2="160"></line>
 
         <text class="lbl" x="740" y="80" text-anchor="middle" fill="#5c6b7a" font-size="13">×融合后</text>
         <text class="lbl" x="740" y="150" text-anchor="middle" fill="#5c6b7a" font-size="13">×融合后</text>
@@ -257,10 +257,10 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
     <p>权重加载进来了。但「跑得好」还差最后一层：<strong>用什么 dtype 存权重、用什么格式存 KV、用哪个注意力后端</strong>。三者必须配合，DeepSeek-V4 / GLM 这类 DSA 稀疏模型尤其如此。</p>
     <ul>
       <li><strong>权重量化</strong>：FP8 / MXFP4 等。<code class="inline">vllm/models/deepseek_v4/quant_config.py</code> 是 DeepSeek-V4 的量化配置；GLM-5.2 也常见 <code class="inline">amd/GLM-5.2-MXFP4</code> 这类已量化 checkpoint（见 <code class="inline">quark/utils.py</code> 注释）。权重越小，I/O 越省、显存越够。</li>
-      <li><strong>KV cache dtype</strong>：稀疏 MLA 用的是 <code class="inline">--kv-cache-dtype fp8_ds_mla</code> 的专用分页布局（FlashMLA 稀疏）。见 <code class="inline">vllm/v1/attention/backends/mla/sparse_swa.py:97-110</code>——<code class="inline">fp8_ds_mla</code> 还需要 576B 对齐。</li>
+      <li><strong>KV cache dtype</strong>：稀疏 MLA 用的是 <code class="inline">--kv-cache-dtype fp8_ds_mla</code> 的专用分页布局（FlashMLA 稀疏）。见 <code class="inline">vllm/v1/attention/backends/mla/sparse_swa.py:101-118</code>——<code class="inline">fp8_ds_mla</code> 还需要 576B 对齐。</li>
       <li><strong>注意力后端</strong>：<code class="inline">DeepseekV4FlashMLABackend</code>（FlashMLA 稀疏）等通过 <code class="inline">vllm/v1/attention/backends/registry.py</code> 注册，按平台选 NVIDIA/AMD/XPU 的实现。</li>
     </ul>
-    <div class="code-title">vllm/v1/attention/backends/registry.py:85 — DSA 稀疏后端登记在枚举里（摘录）</div>
+    <div class="code-title">vllm/v1/attention/backends/registry.py:90 — DSA 稀疏后端登记在枚举里（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">AttentionBackendEnum</span>(Enum):  <span class="cmt"># 后端路径是枚举成员的值，运行时可被覆盖</span>
     FLASHMLA = <span class="st">"vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"</span>
     ...
@@ -425,12 +425,12 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
 
   <div class="arrow-nav">
     <a href="11-build-own-engine.html">← 上一步：自制引擎</a>
-    <a href="index.html">回到首页 →</a>
+    <a href="13-agentic-gateway.html">下一步：实战·Agentic 网关 →</a>
   </div>
 </div>
 
 <footer>
-  vLLM 引擎学习站 · 12 实战·权重加载 · 版本 v0.28.1rc0-141-g2a61f060d3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 12 实战·权重加载 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

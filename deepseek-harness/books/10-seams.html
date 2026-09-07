@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 能力缝实战 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 能力缝</div>
+    <h1>能力缝实战：shell / fs / web / skill / jobs</h1>
+    <div class="subtitle">第 1 章定义了「能力缝 = Service Definition + Provider + Consumer」。这一章巡检五个真实家族，看同一个模式如何在不同领域里落地——以及每家各自长出来的独特约束。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>一分钟版本</h2>
+    <ul>
+      <li><strong>shell</strong>：执行器契约 <code class="inline">ctx.shell</code>，每组合恰好挂一个实现（bash-local / bash-sandbox / pwsh-local / pwsh-sandbox）；挂两个 fail loud。</li>
+      <li><strong>fs</strong>：契约 <code class="inline">ctx.fs</code>，三个后端（fs-local / fs-sandbox / fs-e2b 远程执行世界）；突变带版本守卫，错误码稳定（FS_STALE_VERSION…）。</li>
+      <li><strong>web</strong>：<code class="inline">ctx.web</code> 单服务管 search+fetch，每操作选一个可用 provider；零或多个可用都是错误，语义各不同。</li>
+      <li><strong>skill</strong>：<code class="inline">ctx.skills</code> 注册表合并任意 provider 的目录；provider 类型不影响模型所见——渲染全在一个 consumer 包。</li>
+      <li><strong>jobs</strong>：契约 <code class="inline">ctx.jobs</code>（后台作业注册表），作业归属启动它的 agent session，完成以<strong>会话内通知</strong>送达而非轮询。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>shell 家族：契约 + 4 执行器 + 2 工具</h2>
+    <p><code class="inline">packages/shell</code> 的组 README 给出完整角色表：</p>
+    <table class="tbl">
+      <tr><th>包</th><th>角色</th><th>ctx key</th></tr>
+      <tr><td>shell</td><td>执行器契约：前台运行、后台句柄、请求解析</td><td><code class="inline">ctx.shell</code></td></tr>
+      <tr><td>bash-local</td><td>POSIX 上以全新 <code class="inline">bash -c</code> 进程运行</td><td>注册 ctx.shell</td></tr>
+      <tr><td>bash-sandbox</td><td>经沙箱能力限制每条命令，拒绝作为事实上报</td><td>注册 ctx.shell</td></tr>
+      <tr><td>pwsh-local / pwsh-sandbox</td><td>Windows 上的 PowerShell 对应物</td><td>注册 ctx.shell</td></tr>
+      <tr><td>shell-env</td><td>提供每条命令收到的托管 <code class="inline">DSH_*</code> 环境</td><td><code class="inline">ctx.shellEnv</code></td></tr>
+      <tr><td>tool-bash / tool-pwsh</td><td>把执行暴露为 <code class="inline">bash</code>/<code class="inline">pwsh</code> 工具（含后台任务）</td><td>注册 ctx.tools</td></tr>
+      <tr><td>tool-bash-persistent / tool-pwsh-persistent</td><td>在单一 owner 隔离的持久 shell 会话里跑模型调用</td><td>注册 ctx.tools</td></tr>
+    </table>
+    <div class="annotation"><b>win32 层换行不换契约</b>：README 说明 profile 层「the win32 layer swaps the POSIX rows for the pwsh ones; mounting two fails loud on the duplicate service registration」——同一条缝上两个 provider 直接冲突报错，而不是静默覆盖。工具层 sits on top of whichever executor is mounted，所以换执行器，工具 schema 与模型体验零变化。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>fs 家族：一个契约，三个世界</h2>
+    <div class="code-title">packages/fs/fs/src/index.ts:49 — fs/* 事件词汇表</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">interface</span> <span class="cl">Events</span> {
+  <span class="cmt">/**
+   * Single-slot decision for the next FileSystem.writeText. Calling next()
+   * yields the bare provider's unconditional write; the first listener that
+   * returns an intent owns the decision rather than composing with peers.
+   */</span>
+  'fs/write-intent'(target: <span class="cl">FsTarget</span>, actor, next): <span class="cl">Promise</span>&lt;<span class="cl">FsWriteIntent</span> | <span class="kw">undefined</span>&gt;
+  <span class="cmt">/** editText 的单槽决策，同样 first-intent-wins */</span>
+  'fs/edit-intent'(target: <span class="cl">FsTarget</span>, actor, next): <span class="cl">Promise</span>&lt;{ version: <span class="cl">FsVersion</span> } | <span class="kw">undefined</span>&gt;
+  <span class="cmt">/**
+   * Record an authoritative positive or negative observation. Listeners must
+   * be synchronous recorders: throws fail the tool call and returned promises
+   * are not awaited.
+   */</span>
+  'fs/observed'(target: <span class="cl">FsTarget</span>, observation: <span class="cl">FsObservation</span>, actor): <span class="kw">void</span>
+}</pre>
+    <div class="annotation"><b>两种派发模式的分工</b>：意图事件是 waterfall，但语义是「单槽决策」——第一个返回 intent 的监听器<strong>独占</strong>决定权，不与同伴组合（区别于第 1 章的环绕语义：这里 next() 只是「放弃决策权」）；观察事件是 emit，监听器必须同步（抛错直接打炸工具调用）。fs-sandbox 后端正是靠 fs/write-intent 上的 fence 实现按模式拒绝，错误码 <code class="inline">FS_SANDBOX_DENIED</code> 由工具渲染成第 9 章那个 <code class="inline">[sandbox: file access denied under &lt;mode&gt; mode]</code> 标记。</div>
+    <div class="code-title">packages/fs/fs/README.md — 契约承诺（摘要）</div>
+    <pre class="code"><span class="lang-tag">text</span>把任意路径解析为稳定目标身份（跨别名保持 identity）；
+在边界内读整份文本或分块流式读、读原始字节；
+列目录（稳定、不含内容）；
+原子地 create-or-replace 写、原子地字面编辑。
+两种突变都接受可选版本守卫：省略=无条件写；
+提供=自上次观察后文件已变则报 FS_STALE_VERSION。
+所有错误是带稳定码的 FsError（FS_NOT_FOUND / FS_STALE_VERSION /
+FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本。</pre>
+    <div class="callout info">
+      <b class="tag">看懂这个设计</b>
+      fs 的关键取舍是「 Loads it instead of fs-local … is the whole swap」：挂 fs-sandbox 而非 fs-local，就是启用限制的全部改动——模型工具、政策插件、schema 一概不动。README 还特意指出 fs-sandbox 「extends fs-local with every text-storage behavior intact and adds only a per-call mode fence on writes and edits, while reads always pass through」——读永远不设防，突变才 fenced，且 fence 与 bash 收到的是同一个 resolve() 政策（第 9 章），两个家族永不框到不同的根。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>web 家族：选择器与两个「没配好」错误</h2>
+    <div class="code-title">packages/web/web/src/index.ts:172 — resolveProvider()</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">resolveProvider</span>&lt;<span class="cl">P</span> <span class="kw">extends</span> <span class="cl">ResolvableProvider</span>&gt;(selection: <span class="cl">Selection</span>&lt;P&gt;): P {
+  <span class="kw">const</span> { configuredId, providers } = selection
+  <span class="kw">if</span> (configuredId !== <span class="kw">undefined</span>) {
+    <span class="kw">const</span> provider = providers.<span class="fn">get</span>(configuredId)
+    <span class="kw">if</span> (!provider) <span class="kw">throw new</span> <span class="cl">WebError</span>(…, <span class="st">'WEB_PROVIDER_CONFIGURED_MISSING'</span>)
+    <span class="kw">if</span> (!provider.<span class="fn">available</span>()) <span class="kw">throw new</span> <span class="cl">WebError</span>(…, <span class="st">'WEB_PROVIDER_CONFIGURED_UNAVAILABLE'</span>)
+    <span class="kw">return</span> provider
+  }
+  <span class="kw">const</span> usable = [...providers.<span class="fn">values</span>()].<span class="fn">filter</span>(provider =&gt; provider.<span class="fn">available</span>())
+  <span class="kw">if</span> (usable.length === <span class="nu">0</span>) <span class="kw">throw new</span> <span class="cl">WebError</span>(<span class="st">'no usable web provider is registered'</span>, <span class="st">'WEB_PROVIDER_UNAVAILABLE'</span>)
+  <span class="kw">if</span> (usable.length &gt; <span class="nu">1</span>) <span class="kw">throw new</span> <span class="cl">WebError</span>(`multiple usable web providers are registered (${ids}); configure one explicitly`, <span class="st">'WEB_PROVIDER_AMBIGUOUS')</span>
+  <span class="kw">return</span> usable[<span class="nu">0</span>]
+}</pre>
+    <div class="annotation"><b>配置即承诺</b>：配了名就得能用（MISSING 与 UNAVAILABLE 分开报）；没配名时「一个可用」才自动选择，「多个可用」是错误不是随机挑一个——WebError 词汇表把「怎么连上网」收进单一 owner。另一个细节：<code class="inline">fetch</code> 的注释「A non-2xx response is a result, not a throw」——HTTP 404 是正常结果，只有能力本身跑不起来才抛错。这与第 7 章 LlmFailure 的分类学同源：错误码表达「哪类事实」，不混入业务结果。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>skill 家族：注册表合并，渲染归一</h2>
+    <p><code class="inline">packages/skill</code>：providers（skill-filesystem、内嵌插件数据、远程服务）贡献技能，registry 合并目录、按名字解析胜者；consumer（tool-skill）发布 durable 会话目录 + 模型加载工具，用户也能 <code class="inline">/name</code> 直接调用。模块注释里最有分量的一句：</p>
+    <div class="callout info">
+      <b class="tag">看懂这个设计</b>
+      「Provider type does not change what the model sees, because all model-facing rendering lives in one consumer package.」——本地目录技能与远程服务技能在模型眼里<strong>长得一模一样</strong>（排序后的名字+描述列表，按需加载全文）。如果每个 provider 自己渲染目录，加一个来源就多一种模型体验；把渲染收拢到一个 consumer，provider 生态才能自由生长。这是「能力缝」里对 Consumer 角色最纯粹的示范。
+    </div>
+    <p>tool-skill 的插件声明一目了然：</p>
+    <div class="code-title">packages/skill/tool-skill/src/index.ts:24</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> name = <span class="st">'tool-skill'</span>
+<span class="kw">export const</span> inject = [<span class="st">'agents'</span>, <span class="st">'tools'</span>, <span class="st">'skills'</span>]</pre>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.6</span>jobs 家族：所有权围栏与会话内通知</h2>
+    <div class="code-title">packages/jobs/jobs/src/types.ts:17 — JobStatus / JobOutcome / JobStart（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * Task lifecycle: running, optionally stopping, then exactly one terminal
+ * status. Producer-specific facts belong in JobSnapshot.detail.
+ */</span>
+<span class="kw">export type</span> <span class="cl">JobStatus</span> = <span class="st">'running'</span> | <span class="st">'stopping'</span> | <span class="st">'completed'</span> | <span class="st">'killed'</span> | <span class="st">'failed'</span>
+
+<span class="kw">export interface</span> <span class="cl">JobOutcome</span> {
+  <span class="cmt">/** finished (completed) / cancelled (killed) / broke (failed) */</span>
+  status: <span class="st">'completed'</span> | <span class="st">'killed'</span> | <span class="st">'failed'</span>
+  <span class="cmt">/** 渲染进状态行的 kind 专属细节（'exit code: 3'、'max-tokens'） */</span>
+  detail?: <span class="kw">string</span>
+  output?: <span class="kw">string</span>
+}
+
+<span class="kw">export interface</span> <span class="cl">JobStart</span> {
+  kind: <span class="cl">JobKind</span>              <span class="cmt">// 也是 id 前缀：bash-N、subagent-N…</span>
+  label: <span class="kw">string</span>              <span class="cmt">// 模型可读的一行标签</span>
+  outputLimitBytes?: <span class="kw">number</span>
+  <span class="cmt">/**
+   * Owning live agent. Access is fenced by its session id, and agent disposal
+   * cancels and awaits the job.
+   */</span>
+  owner?: <span class="cl">Agent</span>
+  run(): <span class="cl">JobHooks</span>
+}
+
+<span class="kw">export interface</span> <span class="cl">JobHooks</span> {
+  <span class="cmt">/** 同步、幂等；reason 原样转发 */</span>
+  cancel(reason?: <span class="kw">string</span>): <span class="kw">void</span>
+  <span class="cmt">/** 在 producer 释放资源之后才 resolve；不得 reject（rejection 会被转为 failed） */</span>
+  done: <span class="cl">Promise</span>&lt;<span class="cl">JobOutcome</span>&gt;
+  <span class="cmt">/** 消费自上次调用以来产出的输出；每个作业一个消费游标 */</span>
+  readOutput?(): <span class="kw">string</span>
+}</pre>
+    <div class="annotation"><b>三个契约决定三个行为</b>：① <code class="inline">owner</code> 按启动会话围栏访问（「one agent never sees another's work」），agent 销毁时取消并等待作业——不留孤儿；② <code class="inline">done</code> resolve 于「producer 释放资源之后」而非工作完成时——运行时把 rejection 转为 failed 但「without claiming that the work stopped」，诚实报告；③ 完成通知作为<strong>会话内 notice</strong> 送达 owner agent（tool-jobs 派发），模型下一轮自然看到，不用主动轮询。id 是 <code class="inline">&lt;kind&gt;-N</code> 递增——可读、可排序、可引用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.7</span>图 10-1：五条缝一张图</h2>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="五条能力缝">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L9,3 L0,6 Z" fill="#4156c8"/>
+            </marker>
+          </defs>
+          <rect x="20" y="20" width="920" height="40" rx="8" fill="#12142b"/>
+          <text x="480" y="46" text-anchor="middle" font-size="12" fill="#8ea2ff">模型侧（Consumer）：tool-bash · tool-fs/read-write-edit · web_search/web_fetch · skill · job_* —— schema 稳定，后端可换</text>
+
+          <rect x="20" y="90" width="170" height="230" rx="10" fill="#eceffe" stroke="#4156c8"/>
+          <text x="105" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">ctx.shell</text>
+          <text x="105" y="140" text-anchor="middle" font-size="10" fill="#444">执行器契约</text>
+          <rect x="35" y="155" width="140" height="30" rx="5" fill="#fff" stroke="#6a7fe8"/>
+          <text x="105" y="174" text-anchor="middle" font-size="10" fill="#333">bash-local</text>
+          <rect x="35" y="192" width="140" height="30" rx="5" fill="#fff" stroke="#6a7fe8"/>
+          <text x="105" y="211" text-anchor="middle" font-size="10" fill="#333">bash-sandbox</text>
+          <rect x="35" y="229" width="140" height="30" rx="5" fill="#fff" stroke="#6a7fe8"/>
+          <text x="105" y="248" text-anchor="middle" font-size="10" fill="#333">pwsh-local</text>
+          <rect x="35" y="266" width="140" height="30" rx="5" fill="#fff" stroke="#6a7fe8"/>
+          <text x="105" y="285" text-anchor="middle" font-size="10" fill="#333">pwsh-sandbox</text>
+          <text x="105" y="312" text-anchor="middle" font-size="9" fill="#888">每组合恰好一个</text>
+
+          <rect x="210" y="90" width="170" height="230" rx="10" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="295" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">ctx.fs</text>
+          <text x="295" y="140" text-anchor="middle" font-size="10" fill="#444">文件系统契约</text>
+          <rect x="225" y="155" width="140" height="30" rx="5" fill="#fff" stroke="#57b97e"/>
+          <text x="295" y="174" text-anchor="middle" font-size="10" fill="#333">fs-local</text>
+          <rect x="225" y="192" width="140" height="30" rx="5" fill="#fff" stroke="#57b97e"/>
+          <text x="295" y="211" text-anchor="middle" font-size="10" fill="#333">fs-sandbox (fence)</text>
+          <rect x="225" y="229" width="140" height="30" rx="5" fill="#fff" stroke="#57b97e"/>
+          <text x="295" y="248" text-anchor="middle" font-size="10" fill="#333">fs-e2b (远程世界)</text>
+          <text x="295" y="290" text-anchor="middle" font-size="9" fill="#888">fs/write-intent 单槽决策</text>
+          <text x="295" y="304" text-anchor="middle" font-size="9" fill="#888">fs/observed 记录观察</text>
+          <text x="295" y="312" text-anchor="middle" font-size="9" fill="#888"></text>
+
+          <rect x="400" y="90" width="170" height="230" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="485" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">ctx.web</text>
+          <text x="485" y="140" text-anchor="middle" font-size="10" fill="#444">search + fetch 一体</text>
+          <rect x="415" y="155" width="140" height="30" rx="5" fill="#fff" stroke="#f0a83c"/>
+          <text x="485" y="174" text-anchor="middle" font-size="10" fill="#333">web-search-exa</text>
+          <rect x="415" y="192" width="140" height="30" rx="5" fill="#fff" stroke="#f0a83c"/>
+          <text x="485" y="211" text-anchor="middle" font-size="10" fill="#333">web-search-perplexity</text>
+          <rect x="415" y="229" width="140" height="30" rx="5" fill="#fff" stroke="#f0a83c"/>
+          <text x="485" y="248" text-anchor="middle" font-size="10" fill="#333">web-search-deepseek</text>
+          <rect x="415" y="266" width="140" height="30" rx="5" fill="#fff" stroke="#f0a83c"/>
+          <text x="485" y="285" text-anchor="middle" font-size="10" fill="#333">web-fetch-http</text>
+          <text x="485" y="312" text-anchor="middle" font-size="9" fill="#888">0 可用=错误 · ≥2 需显式配置</text>
+
+          <rect x="590" y="90" width="170" height="230" rx="10" fill="#f3e8fd" stroke="#8a4fd0"/>
+          <text x="675" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#5a2d8a">ctx.skills</text>
+          <text x="675" y="140" text-anchor="middle" font-size="10" fill="#444">注册表合并目录</text>
+          <rect x="605" y="155" width="140" height="30" rx="5" fill="#fff" stroke="#a874e0"/>
+          <text x="675" y="174" text-anchor="middle" font-size="10" fill="#333">skill-filesystem</text>
+          <rect x="605" y="192" width="140" height="30" rx="5" fill="#fff" stroke="#a874e0"/>
+          <text x="675" y="211" text-anchor="middle" font-size="10" fill="#333">内嵌插件数据</text>
+          <rect x="605" y="229" width="140" height="30" rx="5" fill="#fff" stroke="#a874e0"/>
+          <text x="675" y="248" text-anchor="middle" font-size="10" fill="#333">远程服务</text>
+          <text x="675" y="290" text-anchor="middle" font-size="9" fill="#888">渲染收拢在一个 consumer</text>
+          <text x="675" y="304" text-anchor="middle" font-size="9" fill="#888">provider 类型对模型透明</text>
+          <text x="675" y="312" text-anchor="middle" font-size="9" fill="#888"></text>
+
+          <rect x="780" y="90" width="160" height="230" rx="10" fill="#eceffe" stroke="#2d6cdf"/>
+          <text x="860" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e4a9e">ctx.jobs</text>
+          <text x="860" y="140" text-anchor="middle" font-size="10" fill="#444">后台作业注册表</text>
+          <text x="860" y="180" text-anchor="middle" font-size="10" fill="#444">id: &lt;kind&gt;-N</text>
+          <text x="860" y="204" text-anchor="middle" font-size="10" fill="#444">owner = 启动会话</text>
+          <text x="860" y="228" text-anchor="middle" font-size="10" fill="#444">完成 = 会话内通知</text>
+          <text x="860" y="252" text-anchor="middle" font-size="10" fill="#444">agent 销毁 → cancel+await</text>
+          <text x="860" y="290" text-anchor="middle" font-size="9" fill="#888">实现：jobs-local</text>
+          <text x="860" y="312" text-anchor="middle" font-size="9" fill="#888"></text>
+
+          <line x1="105" y1="65" x2="105" y2="85" stroke="#4156c8" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="295" y1="65" x2="295" y2="85" stroke="#2d8a56" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="485" y1="65" x2="485" y2="85" stroke="#e8850a" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="675" y1="65" x2="675" y2="85" stroke="#8a4fd0" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="860" y1="65" x2="860" y2="85" stroke="#2d6cdf" stroke-width="2" marker-end="url(#arrow)"/>
+        </svg>
+      </div>
+      <div class="svg-legend">图 10-1 · 同一模式五种实例：契约(ctx key) → 多个可换后端 → 稳定的模型侧工具</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.8</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 缝的宽度即复杂度：shell 一个执行器（单选）、fs 三个后端（单选+远程）、web 多 provider（单操作选一）、skills 任意多 provider（合并）、jobs 单实现——契约都远小于实现面；② 事件也是缝的一部分：fs/write-intent 是单槽决策不是环绕中间件；③ 错误码即契约：FS_*、WEB_PROVIDER_* 让调用者按码分支；④ 渲染权收拢在 consumer，provider 才能自由生长。下一步看 compaction——最依赖会话日志不变量的子系统：<a href="11-compaction.html">第 11 章：Compaction</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="09-security.html">← 上一章：安全</a>
+    <a href="11-compaction.html">下一步：Compaction →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 10 能力缝 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

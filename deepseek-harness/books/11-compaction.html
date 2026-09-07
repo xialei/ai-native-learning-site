@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Compaction — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 Compaction</div>
+    <h1>Compaction：在 append-only 日志上「改历史」</h1>
+    <div class="subtitle">日志不可变，但上下文必须能缩。dsh 的答案不是删除，而是<strong>遮蔽</strong>：选一段表面范围，用一条摘要节点替换它的表面位置，原始事件原封不动地留在日志里。这一章看缝（CompactionEngine）、触发（pressure / context-overflow）、影子定价协议，以及缓存友好的摘要调用。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>一分钟版本</h2>
+    <ul>
+      <li><code class="inline">ctx.compaction</code> 是抽象缝（<code class="inline">CompactionEngine</code>），三个方法对应三种入口：<code class="inline">compactIfNeeded</code>（自动）、<code class="inline">compactNow</code>（手动、idle）、<code class="inline">compactRegion</code>（强制区域）。</li>
+      <li>内置后端 compaction-basic：<code class="inline">thresholdRatio 0.8</code>（请求压力阈值）、<code class="inline">retainRatio 0.16</code>（逐字尾部保留）、<code class="inline">maxTokens 8192</code>（摘要生成上限）。</li>
+      <li>两个自动触发点：<code class="inline">agent/pre-step</code> 上按 pressure 检查；<code class="inline">agent/request-error</code> 上按 CONTEXT_WINDOW_EXCEEDED 做 overflow 恢复。</li>
+      <li>事务由持久事件串成：compaction/start（锁）→ compaction/summary（定价）→ <strong>紧跟的</strong> user/message（真正做表面替换）→ compaction/end（放锁）。</li>
+      <li>摘要调用是「重放对话 + 最后一条指令」——system/tools/消息前缀逐字复用，让辅助调用命中供应商的 warm prefix 缓存；标记 <code class="inline">purpose: 'compaction'</code>。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>缝：三个方法三种入口</h2>
+    <div class="code-title">packages/compaction/compaction/src/index.ts:96 — CompactionEngine</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export abstract class</span> <span class="cl">CompactionEngine</span> <span class="kw">extends</span> <span class="cl">Service</span> {
+  <span class="cmt">/** 自动：pressure 用最近路由请求计量；context-overflow 可在阈值下强制有效缩减 */</span>
+  <span class="kw">abstract</span> <span class="fn">compactIfNeeded</span>(
+    agent: <span class="cl">CompactionAgentContext</span>, trigger: <span class="cl">CompactionTrigger</span>, signal: <span class="cl">AbortSignal</span>,
+  ): <span class="cl">Promise</span>&lt;<span class="cl">CompactionResult</span> | <span class="kw">null</span>&gt;
+
+  <span class="cmt">/**
+   * 手动：仅 idle 时经 runMaintenance 执行；先同步启动 idle 任务，
+   * 选好范围后先落一条独立 compaction/start——该持久标记就是锁。
+   */</span>
+  <span class="kw">abstract</span> <span class="fn">compactNow</span>(
+    agent: <span class="cl">ManualCompactAgentContext</span>, signal: <span class="cl">AbortSignal</span>, sourceCommandId?: <span class="cl">CommandId</span>,
+  ): <span class="cl">Promise</span>&lt;<span class="cl">CompactionResult</span> | <span class="kw">null</span>&gt;
+
+  <span class="cmt">/**
+   * 强制：把 [start, end] 的表面节点换成一个摘要节点。start/end 是
+   * 表面位置（surface position）不是数值区间——之前的替换可能让
+   * visible seq 非单调，start 可以大于 end。两边必须 tool-pairing
+   * balanced：assistant 工具调用必须与其结果保持配对。
+   */</span>
+  <span class="kw">abstract</span> <span class="fn">compactRegion</span>(
+    start: <span class="cl">SessionSeq</span>, end: <span class="cl">SessionSeq</span>, agent: <span class="cl">CompactionAgentContext</span>, signal?: <span class="cl">AbortSignal</span>,
+  ): <span class="cl">Promise</span>&lt;<span class="cl">CompactionResult</span>&gt;
+}</pre>
+    <div class="annotation"><b>两个类型纪律</b>：① trigger 是封闭联合 <code class="inline">'pressure' | 'context-overflow'</code>——失败类也有封闭分类（ManualCompactionError code：busy/cancelled/changed/summary/commit/persistence）；② 「tool-pairing balanced」边界由共享谓词 <code class="inline">toolPairingBalancedBefore/After</code> 检查——为什么？deriveMessages（第 2 章）重建的消息序列里，一个 assistant 的 tool_calls 若失去对应 tool result，下一次请求就是 invalid。压缩永远不许打断调用/结果配对。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>事件编舞：锁、定价、替换、放锁</h2>
+    <div class="code-title">packages/compaction/compaction/src/types.ts — SessionEventMap 合并（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * Marks the start of a compaction — log-only, holds the lock until
+ * compaction/end. A numbered owner is strictly enclosed by that open turn;
+ * null identifies a standalone manual transaction between turns.
+ */</span>
+'compaction/start': { compactionId: <span class="cl">CompactionId</span>; sourceCommandId?: <span class="cl">CommandId</span>; turn: <span class="kw">number</span> | <span class="kw">null</span> }
+
+<span class="cmt">/**
+ * Completed summary, its inputs, and its model call facts — log-only, no
+ * surfaceOp. The actual surface replacement is performed by the immediately
+ * following user/message event that shadows the compacted range. That
+ * adjacency is contractual — the shadowed pricing fields are the
+ * replacement's shadow price, so a consumer may pair a replacement with the
+ * metering event directly before it.
+ */</span>
+'compaction/summary': {
+  compactionId: <span class="cl">CompactionId</span>
+  summary: <span class="cl">ContentBlock</span>[]
+  shadowedRange: { start: <span class="cl">SessionSeq</span>; end: <span class="cl">SessionSeq</span> }
+  shadowedSeqs: <span class="cl">SessionSeq</span>[]
+  shadowedTokenCount: <span class="kw">number</span>
+  provider: <span class="kw">string</span>
+  <span class="cmt">/** 写摘要的模型——"which model wrote this summary" 有持久答案 */</span>
+  model: <span class="kw">string</span>
+  maxTokens?: <span class="kw">number</span>
+  usage?: <span class="cl">TokenUsage</span>
+  ...
+}
+
+<span class="cmt">/** log-only, releases the lock; error 记录一次未成功的尝试 */</span>
+'compaction/end': { compactionId: <span class="cl">CompactionId</span>; turn: <span class="kw">number</span> | <span class="kw">null</span>; error?: <span class="kw">string</span> }</pre>
+    <div class="figure">
+      <div class="svg-box">
+        <svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="compaction 事务编舞">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+              <path d="M0,0 L9,3 L0,6 Z" fill="#4156c8"/>
+            </marker>
+          </defs>
+          <text x="30" y="30" font-size="13" font-weight="bold" fill="#1e2a6e">日志（append-only，时间自上而下）</text>
+
+          <rect x="30" y="50" width="430" height="36" rx="6" fill="#eceffe" stroke="#4156c8"/>
+          <text x="45" y="73" font-size="11" fill="#1e2a6e">compaction/start {compactionId, turn}</text>
+          <text x="480" y="73" font-size="10" fill="#888">← 落锁：其他 compaction 事务被排除</text>
+
+          <rect x="30" y="96" width="430" height="36" rx="6" fill="#fdf1e2" stroke="#e8850a"/>
+          <text x="45" y="119" font-size="11" fill="#9a5a06">compaction/summary {summary, shadowedRange, shadowedTokenCount, model}</text>
+          <text x="480" y="119" font-size="10" fill="#888">← 影子定价（metering）</text>
+
+          <rect x="30" y="142" width="430" height="36" rx="6" fill="#e8f6ee" stroke="#2d8a56"/>
+          <text x="45" y="165" font-size="11" fill="#1c5c38">user/message（checkpoint，source=compact+compactionId）</text>
+          <text x="480" y="165" font-size="10" fill="#888">← surfaceOp.replace：真正遮蔽范围</text>
+
+          <rect x="30" y="188" width="430" height="36" rx="6" fill="#eceffe" stroke="#4156c8"/>
+          <text x="45" y="211" font-size="11" fill="#1e2a6e">compaction/end {compactionId, error?}</text>
+          <text x="480" y="211" font-size="10" fill="#888">← 放锁（error 表示未成功也可见）</text>
+
+          <rect x="560" y="50" width="380" height="174" rx="10" fill="#12142b"/>
+          <text x="750" y="78" text-anchor="middle" font-size="12" font-weight="bold" fill="#8ea2ff">不变量</text>
+          <text x="580" y="104" font-size="10.5" fill="#c8cfef">· start→end 之间被压缩的事实不丢：原事件都在</text>
+          <text x="580" y="126" font-size="10.5" fill="#c8cfef">· 表面只「多」一个节点：replace 不重写历史</text>
+          <text x="580" y="148" font-size="10.5" fill="#c8cfef">· summary 与替换消息相邻是契约（影子价配对）</text>
+          <text x="580" y="170" font-size="10.5" fill="#c8cfef">· 摘要运行中注入的上下文可落在标记对之间——</text>
+          <text x="580" y="190" font-size="10.5" fill="#c8cfef">  只要被选 span 保持稳定</text>
+          <text x="580" y="212" font-size="10.5" fill="#c8cfef">· checkpoint source 与后端无关，消费者按标记识别</text>
+
+          <line x1="460" y1="120" x2="555" y2="120" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+        </svg>
+      </div>
+      <div class="svg-legend">图 11-1 · 一次 compaction 的四个持久事件；相邻的 summary 与替换消息构成影子定价协议</div>
+    </div>
+    <div class="annotation"><b>影子定价协议</b>：compaction/prune 事件的注释把协议说透了——「a surface <code class="inline">replace</code> event is priced by the metering event immediately before it … which states the heuristic token price of the exact replaced range so a pure consumer can subtract it without retaining per-node prices. The replacement MUST be appended synchronously right after this event.」token 计量服务用路由定价（真实 tokenizer），而替换节点的投影折叠用固定启发式定价（shadowedTokenCount）——region.ts 注释解释：「prices replacements with the fixed heuristic so the O(1) projection fold stays in agreement with its own appends; retention, range selection, and the shrink comparison read the route-priced tokens instead」。两种定价各司其职：折叠一致性要确定性，选择决策要精确性。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>触发：pressure 与 overflow 恢复</h2>
+    <p>compaction-basic 的 <code class="inline">_registerAutomaticCompaction()</code>（<code class="inline">packages/compaction/compaction-basic/src/index.ts</code>）挂两个监听器：</p>
+    <div class="code-title">packages/compaction/compaction-basic/src/index.ts — 两个触发点（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// ① 步间压力检查：在 agent/pre-step 上，失败只告警不阻断回合</span>
+ctx.<span class="fn">on</span>(<span class="st">'agent/pre-step'</span>, <span class="kw">async</span> ({ agent, signal }, next) =&gt; {
+  <span class="kw">if</span> (!signal.aborted) {
+    <span class="kw">try</span> {
+      <span class="kw">const</span> result = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">compactIfNeeded</span>(agent, <span class="st">'pressure'</span>, signal)
+      <span class="kw">if</span> (result !== <span class="kw">null</span>) <span class="fn">logResult</span>(result, <span class="st">'step pressure'</span>)
+    } <span class="kw">catch</span> (error) {
+      ctx.logger.<span class="fn">warn</span>(`step compaction failed: ${message}; continuing the turn`)
+    }
+  }
+  <span class="kw">return</span> <span class="fn">next</span>()
+})
+
+<span class="cmt">// ② overflow 恢复：在 agent/request-error 上，只认 CONTEXT_WINDOW_EXCEEDED</span>
+ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <span class="kw">async</span> ({ agent, failure, signal }, next) =&gt; {
+  <span class="kw">if</span> (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) <span class="kw">return</span> <span class="fn">next</span>()
+  <span class="cmt">// 超过 maxOverflowRetries 就放弃；成功的 assistant/message 重置计数</span>
+  <span class="kw">const</span> generation = agent.session.surface.replaceGeneration
+  <span class="kw">const</span> result = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">compactIfNeeded</span>(agent, <span class="st">'context-overflow'</span>, signal)
+  <span class="cmt">// 表面 generation 没变 = 什么都没替换 → 保留原始错误；</span>
+  <span class="cmt">// 变了 → { kind: 'retry' } 用新表面重发原请求</span>
+  <span class="kw">if</span> (agent.session.surface.replaceGeneration &lt;= generation) <span class="kw">return</span> <span class="fn">next</span>()
+  <span class="kw">return</span> { kind: <span class="st">'retry'</span> }
+})</pre>
+    <div class="annotation"><b>与第 3/4 章接上了</b>：第 7 章讲过 DeepSeek 适配器把「400 + 上下文超限特征」归一化为 CONTEXT_WINDOW_EXCEEDED 码（不可重试）——正是这个码让 overflow 恢复与普通重试分流。replaceGeneration（第 2 章）在这里当「表面是否真的变了」的守卫：压缩失败但 prune 已经落地时，注释说「That durable reduction is sufficient retry proof; do not discard it just because the optional second phase threw」——部分成果也算进展，重试从替换后的表面继续。</div>
+    <div class="code-title">packages/compaction/compaction-basic/src/config.ts:20 — 默认值</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Default request-pressure fraction for every routed model. */</span>
+<span class="kw">const</span> <span class="cl">DEFAULT_THRESHOLD_RATIO</span> = <span class="nu">0.8</span>
+<span class="cmt">/** Default verbatim-tail fraction for every routed model. */</span>
+<span class="kw">const</span> <span class="cl">DEFAULT_RETAIN_RATIO</span> = <span class="nu">0.16</span>
+<span class="cmt">// maxTokens 默认 8192 —— 摘要生成的输出上限</span>
+<span class="cmt">// modelPolicies 允许按 provider/model 精确覆盖每个参数</span>
+<span class="cmt">// auto: false 可整体关闭自动 compaction（保留手动 /compact）</span></pre>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>摘要调用：重放对话，命中 warm prefix</h2>
+    <div class="code-title">packages/compaction/compaction-basic/src/summarizer.ts — 设计注释与指令（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
+ * The summarization directive, delivered as the FINAL user message after the
+ * replayed conversation rather than as a distinct summarizer system prompt.
+ * Keeping the conversation's own system prompt, tools, and message prefix in
+ * front of it makes the auxiliary call a genuine prefix of the last routed
+ * request, so the provider's KV cache is reused instead of invalidated.
+ */</span>
+<span class="kw">const</span> COMPACTION_INSTRUCTION = [
+  <span class="st">'You are now acting as a compaction engine for this AI coding assistant. '</span>
+  + <span class="st">'Condense the conversation ABOVE into a structured checkpoint…'</span>,
+  <span class="st">''</span>,
+  <span class="st">'## Primary Request and Intent'</span>,
+  <span class="st">"- [the user's original and evolving goals; quote verbatim where the exact wording matters]"</span>,
+  <span class="st">'## Key Technical Concepts'</span>, <span class="st">'## Files and Code'</span>, <span class="st">'## Errors and Fixes'</span>,
+  <span class="st">'## Pending Jobs'</span>, <span class="st">'## Current Work'</span>, <span class="st">'## Next Step'</span>, <span class="st">'## Critical Context'</span>,
+  <span class="st">''</span>,
+  <span class="st">'Rules:'</span>,
+  <span class="st">'- Preserve exact file paths, commands, error strings, identifiers, numeric values…'</span>,
+  <span class="st">'- Capture user feedback and explicit instructions faithfully, especially corrections.'</span>,
+  <span class="st">'- Do NOT mention this summarization request or that the context was compacted.'</span>,
+  <span class="st">'- Output only the checkpoint text: do not call any tool…'</span>,
+  <span class="st">`- If the conversation already contains a &lt;compacted-summary&gt; block, it is a PRIOR checkpoint. </span>
+<span class="st">    Do not copy it forward verbatim: preserve still-true facts, drop stale ones, merge…`</span>,
+]
+
+<span class="cmt">/** Framing that makes the replacement user message established context. */</span>
+<span class="kw">const</span> CHECKPOINT_PREAMBLE =
+  <span class="st">'This is an automatically generated checkpoint condensing an earlier span of the '</span>
+  + <span class="st">'conversation to free up context. Treat the captured context as established background…'</span>
+
+<span class="kw">export interface</span> <span class="cl">SummarizationInput</span> {
+  <span class="cmt">/** 会话自己的 system prompt——为前缀缓存对齐而复用 */</span>
+  <span class="kw">readonly</span> system?: <span class="kw">string</span>
+  <span class="cmt">/** 会话的工具 schema——同上 */</span>
+  <span class="kw">readonly</span> tools?: <span class="kw">readonly</span> <span class="cl">ToolSchema</span>[]
+  <span class="cmt">/** 被遮蔽区域的消息，表面顺序 */</span>
+  <span class="kw">readonly</span> messages: <span class="kw">readonly</span> <span class="cl">Message</span>[]
+}</pre>
+    <div class="annotation"><b>三处缓存敏感设计</b>：① 指令是<strong>最后一条 user 消息</strong>而不是独立 system prompt——前缀 = 会话自己的 system + tools + 消息开头，与最近一次路由请求逐字相同，KV 缓存直接复用，唯一的新 token 是尾部指令；② 摘要调用带 <code class="inline">purpose: 'compaction'</code>（第 7 章 GenerateOptions 的辅助调用分类，重放游标据此与对话分离）；③ 落地的 checkpoint 消息由 CHECKPOINT_PREAMBLE 框定 + <code class="inline">&lt;compacted-summary&gt;</code> 标签包裹结构化内容，且指令里教模型「遇到旧 checkpoint 就合并而非照抄」——连续多轮压缩不会堆叠陈旧摘要。第 8 章的 runtime-context 快照协议正是这一切的先决条件：动态上下文不进 system prompt，所以重放前缀才可能与路由请求对齐。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.6</span>检查点来源：后端无关的识别标记</h2>
+    <div class="code-title">packages/compaction/compaction/src/checkpoint.ts:16 — COMPACT_CHECKPOINT_MARKER</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> COMPACT_CHECKPOINT_MARKER = <span class="cl">Object</span>.<span class="fn">freeze</span>({ kind: <span class="st">'plugin'</span>, plugin: <span class="st">'compact'</span> } <span class="kw">as const</span>)
+
+<span class="cmt">/** Message provenance carried by a concrete compaction checkpoint. */</span>
+<span class="kw">export type</span> <span class="cl">CompactionCheckpointSource</span> = <span class="kw">typeof</span> COMPACT_CHECKPOINT_MARKER &amp; {
+  <span class="kw">readonly</span> compactionId: <span class="cl">CompactionId</span>
+  <span class="kw">readonly</span> sourceCommandId?: <span class="cl">CommandId</span>
+}
+
+<span class="kw">export function</span> <span class="fn">isCompactCheckpointSource</span>(source: <span class="cl">MessageSource</span>): <span class="kw">boolean</span> {
+  <span class="kw">return</span> source.kind === <span class="st">'plugin'</span> &amp;&amp; source.plugin === COMPACT_CHECKPOINT_MARKER.plugin
+}</pre>
+    <div class="annotation"><b>为什么单拎一个文件</b>：注释说这个模块是「a pure type/value/predicate outlet (no cordis imports, no module augmentation) so client and wire programs can name the checkpoint source without loading the host plugin's Context merges」。识别一个消息是不是 compaction 检查点，不该强迫消费者加载整个宿主插件——第 8 章 RuntimeContextProjection 用 <code class="inline">source.plugin</code> 恢复快照归属是同一招：消息来源是持久、可折叠、后端无关的事实通道。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.7</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① 压缩 = 遮蔽不是删除：日志只增，表面用 replace 换成摘要节点；② 事务即事件编舞：start 持锁 → summary 定价 → 相邻 user/message 替换 → end 放锁，失败尝试也留在日志；③ 影子定价协议让纯消费者 O(1) 对账，启发式与路由定价各管折叠与决策；④ 摘要调用重放会话前缀命中 KV 缓存，purpose 隔离游标；⑤ 边界必须 tool-pairing balanced，永远不打断调用/结果配对。下一步看多 agent 编排：<a href="12-orchestration.html">第 12 章：编排与多 Agent</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="10-seams.html">← 上一章：能力缝</a>
+    <a href="12-orchestration.html">下一步：编排 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 11 Compaction · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -41,32 +41,32 @@
 
   <section class="block">
     <h2><span class="num">9.1</span>一个工具长什么样：AgentTool 契约</h2>
-    <p>顶层工具接口在 <code class="inline">packages/agent/src/types.ts</code>。核心只要求两样东西——<strong>schema（给模型看的说明书）</strong>和 <strong>execute（真正动手）</strong>：</p>
+    <p>顶层工具接口在 <code class="inline">packages/agent/src/types.ts</code>。它继承 pi-ai 的 <code class="inline">Tool</code>（name/description/parameters），核心要求三样东西——<strong>label（给 UI 看的名字）</strong>、<strong>parameters schema（给模型看的说明书）</strong>和 <strong>execute（真正动手）</strong>：</p>
     <div class="code-title">packages/agent/src/types.ts · AgentTool 接口（要点）</div>
-    <pre class="code"><code><span class="kw">export interface</span> AgentTool&lt;TArgs = <span class="kw">any</span>, TResult = <span class="kw">any</span>&gt; {
-  <span class="cmt">// 1. 元数据：名字 + 给模型的 JSON-schema 参数说明</span>
-  name: <span class="kw">string</span>;
-  description: <span class="kw">string</span>;
-  schema: TSchema;              <span class="cmt">// typebox schema，决定模型该传什么参数</span>
+    <pre class="code"><code><span class="kw">export interface</span> AgentTool&lt;TParameters <span class="kw">extends</span> TSchema = TSchema, TDetails = <span class="kw">any</span>&gt;
+  <span class="kw">extends</span> Tool&lt;TParameters&gt; {              <span class="cmt">// 基座：name + description + parameters(TSchema)</span>
+  <span class="cmt">// 1. 元数据：给 UI 显示的人类可读标签</span>
+  label: <span class="kw">string</span>;
 
-  <span class="cmt">// 2. 执行入口：id + 参数 + 中止信号 + 流式更新回调</span>
-  <span class="fn">execute</span>(toolCallId: <span class="kw">string</span>, args: TArgs, signal?: AbortSignal,
-          update?: AgentToolUpdateCallback): <span class="fn">Promise</span>&lt;AgentToolResult&lt;TResult&gt;&gt;;
+  <span class="cmt">// 2. 执行入口：id + 参数 + 中止信号 + 流式更新回调（抛错=失败，不往 content 里塞错误）</span>
+  <span class="fn">execute</span>(toolCallId: <span class="kw">string</span>, params: Static&lt;TParameters&gt;, signal?: AbortSignal,
+          onUpdate?: AgentToolUpdateCallback&lt;TDetails&gt;): <span class="fn">Promise</span>&lt;AgentToolResult&lt;TDetails&gt;&gt;;
 
   <span class="cmt">// 3. 可选增强</span>
+  prepareArguments?: (args: unknown) =&gt; Static&lt;TParameters&gt;; <span class="cmt">// schema 校验前改写原始参数</span>
+  replay?: <span class="st">"never"</span> | <span class="st">"safe"</span>;                     <span class="cmt">// 崩溃恢复时该副作用能否安全重放</span>
   executionMode?: <span class="st">"sequential"</span> | <span class="st">"parallel"</span>;  <span class="cmt">// 本工具是否强制串行</span>
-  prepareArguments?: (args) =&gt; args;             <span class="cmt">// 执行前改写参数（如补全路径）</span>
-  beforeToolCall?: ...;                           <span class="cmt">// 也可自带闸门（更常用的是全局 config 钩子）</span>
 }</code></pre>
     <p>这里有几个被低估的设计点，值得逐句拆：</p>
     <ul>
       <li><strong><code class="inline">signal</code>（AbortSignal）</strong>：每个工具 execute 都收到中止信号。这打破了「工具一旦跑起来就不能停」的僵局——用户可以 <code class="inline">steer</code> 打断一个正在执行的 Bash。<strong>这是让中断语义（第 8 章）能落到工具层的关键。</strong></li>
-      <li><strong><code class="inline">update</code> 流式回调</strong>：长任务（如 Bash 持续输出）可以边跑边吐 <code class="inline">partialResult</code>，对应 Agent 事件 <code class="inline">tool_execution_update</code>。这样 TUI 能实时渲染进度。</li>
+      <li><strong><code class="inline">onUpdate</code> 流式回调</strong>：长任务（如 Bash 持续输出）可以边跑边吐 <code class="inline">partialResult</code>，对应 Agent 事件 <code class="inline">tool_execution_update</code>。回调只在 execute 存续期内有效，工具落定后的调用会被忽略。</li>
       <li><strong><code class="inline">executionMode</code> 混搭</strong>：全局可设 <code class="inline">toolExecution</code>，但<strong>单个工具可以自我声明「我必须串行」</strong>——比如「编辑文件」在你预期上有依赖时。（见 9.3）</li>
-      <li><strong><code class="inline">prepareArguments</code></strong>：模型给的参数常是相对路径、带省略号；在真正执行前改写（补全 cwd、展开 ~），让模型侧更轻、执行侧更正确。</li>
+      <li><strong><code class="inline">prepareArguments</code></strong>：模型给的参数常是相对路径、带省略号；在 schema 校验前改写原始参数（补全 cwd、展开 ~），让模型侧更轻、执行侧更正确。</li>
+      <li><strong><code class="inline">replay</code> 恢复语义</strong>：durable 意图已落盘但结果未知时（崩溃恢复），该副作用能不能安全重放——<code class="inline">"never"</code> 不重放、<code class="inline">"safe"</code> 可重放。这是把「幂等性」提升为工具契约的一部分。</li>
     </ul>
     <div class="callout">
-      <strong>一句话记忆：</strong>工具的 execute 签名其实是一个「<strong>可中止、可流式、可枚举</strong>」的 IO。你在自制 Runtime 里定义工具时，这三样（signal / update / 参数校验）几乎是开箱就得有的最低配置。
+      <strong>一句话记忆：</strong>工具的 execute 签名其实是一个「<strong>可中止、可流式、可枚举</strong>」的 IO。你在自制 Runtime 里定义工具时，这几样（signal / onUpdate / 参数校验 / 放行闸门）几乎是开箱就得有的最低配置。注意放行闸门不在工具身上——<code class="inline">beforeToolCall</code> 是 AgentLoopConfig 上的全局钩子（第 3 章），工具自身只声明 <code class="inline">label</code>、<code class="inline">replay</code>、<code class="inline">executionMode</code> 这些「自我描述」。
     </div>
   </section>
 
@@ -105,7 +105,7 @@
         <text class="lbl" x="740" y="116" font-size="11" fill="#556674" text-anchor="middle">result/terminate 收尾</text>
         <text class="lbl" x="740" y="132" font-size="11" fill="#b45309" text-anchor="middle">→ 包装成 toolResult 消息</text>
 
-        <line x1="170" y1="185" x2="228" y2="140" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
+        <line x1="170" y1="185" x2="208" y2="128" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
         <line x1="390" y1="108" x2="428" y2="108" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
         <line x1="610" y1="108" x2="648" y2="108" stroke="#556674" stroke-width="2" marker-end="url(#arrow9)"/>
 
@@ -333,8 +333,8 @@ fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
         </defs>
         <rect class="node" x="30" y="70" width="250" height="90" rx="10" fill="#eef4fb" stroke="#2563eb"/>
         <text class="lbl" x="155" y="95" font-size="14" fill="#2563eb" text-anchor="middle">契约（AgentTool）</text>
-        <text class="lbl" x="155" y="115" font-size="12" fill="#1f2937" text-anchor="middle">schema + execute(signal, update)</text>
-        <text class="lbl" x="155" y="132" font-size="12" fill="#1f2937" text-anchor="middle">executionMode · prepareArguments</text>
+        <text class="lbl" x="155" y="115" font-size="12" fill="#1f2937" text-anchor="middle">label + parameters + execute(signal, onUpdate)</text>
+        <text class="lbl" x="155" y="132" font-size="12" fill="#1f2937" text-anchor="middle">executionMode · prepareArguments · replay</text>
 
         <rect class="node" x="340" y="70" width="250" height="90" rx="10" fill="#ecfdf5" stroke="#0f7d7a"/>
         <text class="lbl" x="465" y="95" font-size="14" fill="#0f7d7a" text-anchor="middle">管线（agent-loop）</text>
@@ -358,7 +358,7 @@ fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 基于 <code>github.com/earendil-works/pi</code> 源码整理</p>
+  <p>Pi Agent Harness · 09 工具层 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

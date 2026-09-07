@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>04 调度器 — vLLM 引擎学习站</title>
+<title>04 调度器 — 深入浅出vLLM</title>
 <link rel="stylesheet" href="assets/vllm-learn.css">
 </head>
 <body>
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM 引擎学习站</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -26,6 +26,7 @@
       <a href="10-distributed.html">分布式</a>
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
+      <a href="13-agentic-gateway.html">实战·网关</a>
     </nav>
   </div>
 </header>
@@ -51,7 +52,7 @@
   <section class="block">
     <h2><span class="num">4.2</span>核心思想：没有“阶段”，只有两个计数器（重点）</h2>
     <p>vLLM v1 的调度器最反直觉的一点，是它<strong>没有显式的 prefill 阶段 / decode 阶段</strong>。作者在 <code class="inline">schedule()</code> 里用一大段注释说明了设计意图。这段注释是整个 v1 调度器的灵魂，值得逐句读懂：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:503 — 调度算法设计注释</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:537 — 调度算法设计注释</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># NOTE(woosuk) on the scheduling algorithm:</span>
 <span class="cmt"># There's no "decoding phase" nor "prefill phase" in the scheduler.</span>
 <span class="cmt"># Each request just has the num_computed_tokens and</span>
@@ -80,7 +81,7 @@
   <section class="block">
     <h2><span class="num">4.3</span>用代码看 schedule()：每一步怎么填满 GPU</h2>
     <p><code class="inline">schedule()</code> 每次被调用，都对应模型的一次 forward。它维护一个 <code class="inline">token_budget</code>——这步总共最多能算多少个 token（来自 <code class="inline">max_num_scheduled_tokens</code>），然后逐请求“分”这个预算。开头是这样的：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:501 — schedule() 开头</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:535 — schedule() 开头</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">schedule</span>(self, throttle_prefills: <span class="cl">bool</span> = <span class="kw">False</span>) <span class="kw">-&gt;</span> <span class="cl">SchedulerOutput</span>:
     self.current_step += <span class="nu">1</span>
     ...
@@ -111,7 +112,7 @@
       </ul>
     </div>
     <p>拿到 <code class="inline">num_new_tokens</code> 后，下一步是找 KV cache 要块。如果 KV 不够（比如被别的请求占满），<code class="inline">allocate_slots</code> 会返回 <code class="inline">None</code>，此时调度器要么抢占一个低优先级请求腾地方，要么放弃调度当前请求：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:655 — allocate_slots 失败则跳过</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:689 — allocate_slots 失败则跳过</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Schedule newly needed KV blocks for the request.</span>
 <span class="kw">with</span> record_function_or_nullcontext(<span class="st">"schedule: allocate_slots"</span>):
     <span class="kw">while</span> <span class="kw">True</span>:
@@ -198,7 +199,7 @@
   <section class="block">
     <h2><span class="num">4.5</span>优先级与抢占：稀缺资源怎么分</h2>
     <p>调度策略由 <code class="inline">SchedulingPolicy</code> 决定（FCFS 或 PRIORITY）。在 PRIORITY 策略下，抢占发生时，调度器会挑 <strong>最低优先级</strong>的请求下手。代码里用 <code class="inline">key=(r.priority, r.arrival_time)</code> 作为排序依据：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:669 — 抢占最低优先级请求</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:703 — 抢占最低优先级请求</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># The request cannot be scheduled.</span>
 <span class="cmt"># Preempt the lowest-priority request.</span>
 <span class="kw">if</span> self.policy == SchedulingPolicy.PRIORITY:
@@ -218,7 +219,7 @@ preempted_reqs.<span class="fn">append</span>(preempted_req)</pre>
     <div class="annotation"><b>读懂这段：</b><code class="inline">max(..., key=(r.priority, r.arrival_time))</code>——取 <code class="inline">priority</code> 最大者，同优先级再取 <code class="inline">arrival_time</code> 最大（即来得最晚）者：也就是“最不重要、最新到”的那个先被牺牲。选完调用 <code class="inline">_preempt_request</code>，把它的 KV 块释放、<code class="inline">num_computed_tokens = 0</code>、投回 waiting 队列（见 4.4 的回退边）。<code class="inline">num_preemptions</code> 计数会 +1，用于观测与评估。</div>
     <div class="callout info">
       <b class="tag">延伸</b>
-      “低优先级先让路”这个思想，正是<strong>投机解码（speculative decoding）</strong>能跑起来的调度的另一半。投机解码用一个小而快的 <strong>draft model</strong> 先猜接下来的几个 token，再用大模型一次性验证，接受就赚、拒绝就只损失一点点（<code class="inline">num_rejected</code> 会回滚 <code class="inline">num_computed_tokens</code>，见 scheduler.py:1908）。但要让投机有效，调度器必须给 draft 的 lookahead 预留 KV 空间（<code class="inline">num_lookahead_tokens</code>、<code class="inline">spec_token_ids</code> 一并算进 <code class="inline">num_tokens_with_spec</code>）。调度器越会“夹缝里塞请求”，投机 batch 越满，draft 越可能一次命中多个 token——吞吐增益和调度质量强相关。这也是理解第 4.7 里“先不碰投机”结论的原因。
+      “低优先级先让路”这个思想，正是<strong>投机解码（speculative decoding）</strong>能跑起来的调度的另一半。投机解码用一个小而快的 <strong>draft model</strong> 先猜接下来的几个 token，再用大模型一次性验证，接受就赚、拒绝就只损失一点点（<code class="inline">num_rejected</code> 会回滚 <code class="inline">num_computed_tokens</code>，见 scheduler.py:1943）。但要让投机有效，调度器必须给 draft 的 lookahead 预留 KV 空间（<code class="inline">num_lookahead_tokens</code>、<code class="inline">spec_token_ids</code> 一并算进 <code class="inline">num_tokens_with_spec</code>）。调度器越会“夹缝里塞请求”，投机 batch 越满，draft 越可能一次命中多个 token——吞吐增益和调度质量强相关。这也是理解第 4.7 里“先不碰投机”结论的原因。
     </div>
   </section>
 
@@ -303,7 +304,7 @@ preempted_reqs.<span class="fn">append</span>(preempted_req)</pre>
 </div>
 
 <footer>
-  vLLM 引擎学习站 · 04 调度器 · 版本 v0.28.1rc0-141-g2a61f060d3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 04 调度器 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

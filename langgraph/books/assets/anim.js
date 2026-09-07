@@ -1,11 +1,11 @@
 /* ============================================================
-   anim.js — LangGraph 学习站 动态演示步进器
-   仅用于"第一档"过程性概念:并行扇出 / interrupt暂停恢复 /
+   anim.js — 深入浅出LangGraph 动态演示步进器
+   仅用于"第一档"过程性概念：并行 fan-out / interrupt暂停恢复 /
    ReAct循环 / Reducer对比 / 时间旅行。
-   纯 vanilla JS,无依赖。每个演示由一个 SCENE 对象定义:
+   纯 vanilla JS，无依赖。每个演示由一个 SCENE 对象定义：
      svg    : SVG 模板字符串(画布)
      states : [ [ {sel, cls, txt?, note?}, ... ], ... ]  每步的状态补丁列表
-   引擎按 step 索引应用补丁,渲染 state 文本框与说明栏。
+   引擎按 step 索引应用补丁，渲染 state 文本框与说明栏。
    ============================================================ */
 
 (function () {
@@ -14,14 +14,14 @@
   const SCENES = {};
 
   // 注册一个演示场景
-  // name: 场景标识; scene: { svg, states, init? }
+  // name： 场景标识； scene: { svg, states, init? }
   function register(name, scene) { SCENES[name] = scene; }
 
   // ---- 渲染单个演示容器 ----
   function mount(container) {
     const name = container.dataset.anim;
     const scene = SCENES[name];
-    if (!scene) { container.textContent = "[未知演示: " + name + "]"; return; }
+    if (!scene) { container.textContent = "[未知演示： " + name + "]"; return; }
 
     let step = 0;
     const total = scene.states.length;
@@ -50,7 +50,7 @@
       // 应用初始(清除所有动态 class)
       if (scene.init) scene.init(canvas);
 
-      // 应用第 0..s 步的所有补丁(累积,而非只当前步)
+      // 应用第 0..s 步的所有补丁(累积，而非只当前步)
       for (let i = 0; i <= s; i++) {
         const patches = scene.states[i] || [];
         patches.forEach(function (p) {
@@ -105,11 +105,11 @@
     go(0);
   }
 
-  // 应用一条补丁:给匹配元素设置 class / 文本
+  // 应用一条补丁：给匹配元素设置 class / 文本
   function applyPatch(canvas, p) {
     // p.sel 是 SVG 内的 CSS 选择器(相对 canvas)
-    // p.cls: 设为该 class 字符串(替换); p.add/p.rm: 增删 class
-    // p.txt: 设置文本内容; p.attr: {name:val} 设置属性
+    // p.cls： 设为该 class 字符串(替换); p.add/p.rm： 增删 class
+    // p.txt： 设置文本内容； p.attr: {name:val} 设置属性
     let els;
     try { els = canvas.querySelectorAll(p.sel); } catch (err) { return; }
     els.forEach(function (el) {
@@ -130,8 +130,8 @@
   };
 
   // 自动挂载
-  // 注意:defer 脚本执行时 readyState 为 "interactive"(非 "loading"),
-  // 此时若立即挂载,排在后面的 scenes.js 还没执行、场景未注册 → 显示"未知演示"。
+  // 注意：defer 脚本执行时 readyState 为 "interactive"(非 "loading"),
+  // 此时若立即挂载，排在后面的 scenes.js 还没执行、场景未注册 → 显示"未知演示"。
   // 因此只要还没到 "complete" 就等 DOMContentLoaded(此时所有 defer 脚本均已跑完)。
   if (document.readyState === "complete") {
     window.LGAnim.mountAll();

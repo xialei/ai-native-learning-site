@@ -1,4 +1,4 @@
-# Claude Code 深入浅出
+# Claude Code
 
 基于 [`anthropics/claude-code`](https://github.com/anthropics/claude-code) 仓库与官方文档整理的一套**静态 Web 站点**，用于系统学习 Claude Code 这个 agentic 编码工具的设计与工程实践。
 

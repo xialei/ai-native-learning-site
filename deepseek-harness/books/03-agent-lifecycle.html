@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 一次对话的完整生命周期 — 深入浅出 DeepSeek Harness</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 生命周期</div>
+    <h1>一次对话的完整生命周期：从 inbox 到 turn/end</h1>
+    <div class="subtitle">第 2 章看了「日志里有什么」，这一章看「日志是怎么被写出来的」：一条消息如何被认领、被 pre-step 决策、被派发给模型、触发工具、又如何收尾。掌握这条时序，你就掌握了 dsh 的主干道。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>一分钟版本</h2>
+    <ul>
+      <li><strong>step</strong> = 一次模型请求 + 它触发的全部工具调用；<strong>turn</strong> = 零或多步（第一个输入被认领前打开，无事可欠时关闭）；<strong>round</strong> = 外层策略迭代（goal round、Ralph round）。</li>
+      <li>输入经唯一的 <strong>inbox</strong> 进入驱动器。消息可立即唤醒；注入型上下文在 inbox 里等下一班车。</li>
+      <li><code class="inline">agent/pre-step</code> waterfall 决定模型看见什么：改写消息、追加上下文、或直接 <code class="inline">reject</code>。</li>
+      <li>每个 step 把「Prompt 段 + 工具 schema + 从日志派生的历史」组装成请求，流式接收，结算为 <code class="inline">assistant/message</code> 或 <code class="inline">assistant/attempt</code>。</li>
+      <li>有工具调用 → 执行 → 结果回填 → 可能再来一步；没有 → <code class="inline">agent/turn-stopping</code>（serial）→ <code class="inline">turn/end</code>。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>全景图：一步的完整时序</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="20" y="20" width="130" height="46" rx="9"/>
+        <text class="lbl sm" x="85" y="48" text-anchor="middle">用户消息</text>
+
+        <rect class="node" x="190" y="20" width="150" height="46" rx="9"/>
+        <text class="lbl sm" x="265" y="48" text-anchor="middle">Inbox（持久）</text>
+
+        <rect class="node core" x="380" y="20" width="170" height="46" rx="9"/>
+        <text class="lbl sm" x="465" y="48" text-anchor="middle">ReactLoopAgent</text>
+
+        <rect class="node" x="600" y="20" width="140" height="46" rx="9"/>
+        <text class="lbl sm" x="670" y="48" text-anchor="middle">LLM 适配器</text>
+
+        <rect class="node" x="780" y="20" width="130" height="46" rx="9"/>
+        <text class="lbl sm" x="845" y="48" text-anchor="middle">工具管线</text>
+
+        <line class="edge" x1="150" y1="43" x2="188" y2="43"/>
+        <line class="edge" x1="340" y1="43" x2="378" y2="43"/>
+        <line class="edge" x1="550" y1="43" x2="598" y2="43"/>
+        <line class="edge" x1="770" y1="43" x2="778" y2="43"/>
+
+        <text class="lbl sm" x="470" y="100" text-anchor="middle">┌─ turn/start {turn} ────────────────────────────────┐</text>
+        <text class="lbl sm" x="470" y="120" text-anchor="middle">│ claim(target, turn)：取走全部 next-step + 1 个 next-turn │</text>
+        <text class="lbl sm" x="470" y="140" text-anchor="middle">│ assemble：prompt sections + tool schemas               │</text>
+        <text class="lbl sm" x="470" y="160" text-anchor="middle">│ → agent/pre-step waterfall → reject | enter(messages)  │</text>
+        <text class="lbl sm" x="470" y="180" text-anchor="middle">│ step/start → 逐条 append user/message (append)         │</text>
+        <text class="lbl sm" x="470" y="200" text-anchor="middle">│ deriveMessages() → buildRequest → agent/request        │</text>
+        <text class="lbl sm" x="470" y="220" text-anchor="middle">│ llm/stream → agent/assistant-stream 帧流               │</text>
+        <text class="lbl sm" x="470" y="240" text-anchor="middle">│ settle → assistant/message | assistant/attempt          │</text>
+        <text class="lbl sm" x="470" y="260" text-anchor="middle">│ tool/call* → tools/pre|execute|post → tool/result*     │</text>
+        <text class="lbl sm" x="470" y="280" text-anchor="middle">│ step/end → (无下一步时) agent/turn-stopping            │</text>
+        <text class="lbl sm" x="470" y="300" text-anchor="middle">└─ turn/end {turn, reason} ───────────────────────────┘</text>
+
+        <line class="edge back" x1="340" y1="150" x2="265" y2="68"/>
+        <text class="lbl sm" x="255" y="95" text-anchor="middle">claim</text>
+        <line class="edge" x1="550" y1="200" x2="598" y2="120"/>
+        <line class="edge" x1="700" y1="120" x2="780" y2="180"/>
+        <line class="edge back" x1="780" y1="200" x2="700" y2="220"/>
+        <text class="lbl sm" x="835" y="215" text-anchor="middle">结果回填</text>
+        <line class="edge back" x1="550" y1="260" x2="470" y2="320"/>
+        <text class="lbl sm" x="470" y="340" text-anchor="middle">工具要求再请求或 next-step 到达 → 继续循环</text>
+      </svg>
+      <div class="fig-cap">图 3-1 — 一次 turn 的时序骨架（对应 docs/architecture.md 的 Turn flow 文字图与 docs/agent-lifecycle.md 的序列图）。</div>
+    </div>
+    <div class="annotation"><b>对照源</b>：这段流程在 <code class="inline">docs/architecture.md</code> 里有逐字的文字版；本页 3.4 节给出实现它的 <code class="inline">turn()</code> 源码。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>用代码看：preStep() —— 决策点</h2>
+    <p>step 的第一步永远是「认领 + 决策」。注意默认决策如何把运行时投影出的上下文（<code class="inline">renderContextSections</code>）追加到认领的消息后面（<code class="inline">packages/core/agent-loop/src/agent.ts:237</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">preStep</span>(target: <span class="cl">InboxTarget</span>, position: { turn: <span class="kw">number</span>; step: <span class="kw">number</span> }): <span class="cl">Promise</span>&lt;<span class="cl">PreparedStep</span>&gt; {
+    <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'running'</span>) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`agent "${this.id}": pre-step outside running phase`</span>)
+    <span class="kw">const</span> signal = <span class="kw">this</span>.phase.abort.signal
+    <span class="kw">const</span> claimed = <span class="kw">this</span>.inbox.<span class="fn">claim</span>(target, position.turn)
+    <span class="kw">const</span> assembly = <span class="kw">await</span> <span class="kw">this</span>.loopCtx.systemPrompt.<span class="fn">assemble</span>(<span class="fn">assembleContextFor</span>(<span class="kw">this</span>, signal))
+    signal.<span class="fn">throwIfAborted</span>()
+    <span class="kw">const</span> sections = <span class="fn">renderContextSections</span>(assembly)
+    <span class="kw">const</span> context = <span class="kw">this</span>.runtimeContext.<span class="fn">project</span>(<span class="fn">joinContextSections</span>(sections), sections)
+    <span class="kw">const</span> decision = <span class="kw">await</span> <span class="kw">this</span>.dispatch.<span class="fn">waterfall</span>(
+      <span class="st">'agent/pre-step'</span>, { messages: claimed, ...position, signal },
+      (): <span class="cl">Promise</span>&lt;<span class="cl">PreStepDecision</span>&gt; =&gt; <span class="cl">Promise</span>.<span class="fn">resolve</span>&lt;<span class="cl">PreStepDecision</span>&gt;({
+        kind: <span class="st">'enter'</span>,
+        messages: context === <span class="kw">undefined</span> ? claimed : [...claimed, context],
+      }),
+    )
+    signal.<span class="fn">throwIfAborted</span>()
+    <span class="kw">return</span> decision.kind === <span class="st">'reject'</span> ? decision : { ...decision, assembly }
+  }</pre>
+    <div class="annotation"><b>决策类型</b>（<code class="inline">packages/core/agent/src/runtime-types.ts:58</code>）：
+      <pre class="code" style="margin-top:8px"><span class="kw">export type</span> <span class="cl">PreStepDecision</span> =
+  | { kind: <span class="st">'reject'</span> }
+  | {
+    kind: <span class="st">'enter'</span>
+    messages: <span class="cl">UserMessage</span>[]
+    <span class="cmt">/** 在本 step 被接纳的消息之前，开启一个独立的模型消息系列。 */</span>
+    startsRequestSeries?: <span class="kw">true</span>
+  }</pre>
+      要点：被拒绝或被改写为空的<strong>首个</strong>认领，仍会关闭一个「零 step」的持久 turn——日志记录这次尝试，但不花模型调用。enter 还可以用 <code class="inline">startsRequestSeries</code> 开启新的请求序列（循环随之记录新的 <code class="inline">request/header</code>，reason 为 <code class="inline">series</code>）。改写下游 enter 决策的监听器必须展开它：<code class="inline">{ ...decision, messages }</code>，保住决策的其他字段。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>用代码看：turn() —— 骨架循环</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:258 — turn()</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">turn</span>(): <span class="cl">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
+    <span class="cmt">// ... phase 校验省略</span>
+    <span class="kw">const</span> phase = <span class="kw">this</span>.phase
+    <span class="kw">const</span> { signal } = phase.abort
+    signal.<span class="fn">throwIfAborted</span>()
+    <span class="kw">const</span> turn = phase.turn + <span class="nu">1</span>
+    <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'turn/start'</span>, { turn })
+    phase.turn = turn
+    <span class="kw">let</span> turnEnds: <span class="cl">TurnEndReason</span> | <span class="kw">null</span> = <span class="kw">null</span>
+    <span class="kw">let</span> target: <span class="cl">InboxTarget</span> = <span class="st">'next-turn'</span>
+    <span class="kw">try</span> {
+      <span class="kw">while</span> (<span class="kw">true</span>) {
+        signal.<span class="fn">throwIfAborted</span>()
+        <span class="kw">const</span> step = phase.step + <span class="nu">1</span>
+        <span class="kw">const</span> decision = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">preStep</span>(target, { turn, step })
+        <span class="kw">if</span> (decision.kind === <span class="st">'reject'</span>) {
+          turnEnds = { kind: <span class="st">'blocked'</span> }
+          <span class="kw">return</span> <span class="kw">false</span>
+        }
+        <span class="kw">if</span> (turnEnds && decision.messages.length === <span class="nu">0</span>) <span class="kw">break</span>
+        <span class="cmt">// 被移除的唤醒消息或改写为空的 enter 仍拥有回合边界，但不花模型调用。</span>
+        <span class="kw">if</span> (phase.step === <span class="nu">0</span> && decision.messages.length === <span class="nu">0</span>) {
+          turnEnds = { kind: <span class="st">'completed'</span> }
+          <span class="kw">return</span> <span class="kw">false</span>
+        }
+        signal.<span class="fn">throwIfAborted</span>()
+        <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'step/start'</span>, { turn, step })
+        phase.step = step
+        <span class="kw">try</span> {
+          <span class="kw">for</span> (<span class="kw">const</span> message <span class="kw">of</span> decision.messages) {
+            <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'user/message'</span>, message, { surfaceOp: <span class="st">'append'</span> })
+          }
+          <span class="cmt">// max-tokens 是粘滞的：任何一步触顶后，后续正常完成的</span>
+          <span class="cmt">// 步骤不得把回合结局降级。</span>
+          <span class="kw">const</span> stepEnd = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">step</span>(decision.assembly, decision.startsRequestSeries === <span class="kw">true</span>)
+          <span class="kw">if</span> (turnEnds === <span class="kw">null</span> || turnEnds.kind !== <span class="st">'max-tokens'</span>) turnEnds = stepEnd
+        } <span class="kw">finally</span> {
+          <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'step/end'</span>, { turn, step })
+        }
+        signal.<span class="fn">throwIfAborted</span>()
+        <span class="kw">if</span> (turnEnds && <span class="kw">this</span>.inbox.nextStep.length === <span class="nu">0</span>) {
+          <span class="kw">await</span> <span class="kw">this</span>.dispatch.<span class="fn">serial</span>(<span class="st">'agent/turn-stopping'</span>, { turn, signal })
+          signal.<span class="fn">throwIfAborted</span>()
+        }
+        <span class="kw">if</span> (turnEnds && <span class="kw">this</span>.inbox.nextStep.length === <span class="nu">0</span>) <span class="kw">break</span>
+        target = <span class="st">'next-step'</span>
+      }
+    } <span class="kw">catch</span> (error: <span class="kw">unknown</span>) {
+      <span class="kw">if</span> (signal.aborted) {
+        turnEnds = { kind: <span class="st">'aborted'</span>, reason: signal.reason <span class="kw">as</span> <span class="cl">AgentCancelCause</span> }
+        <span class="kw">throw</span> error
+      }
+      <span class="cmt">// 所有失败都是结构化的：LlmError 保留事实，其余扁平化为</span>
+      <span class="cmt">// errorChain 文本 + UNKNOWN 码。</span>
+      turnEnds = {
+        kind: <span class="st">'error'</span>,
+        error: error <span class="kw">instanceof</span> <span class="cl">LlmError</span>
+          ? error.failure
+          : { message: <span class="fn">errorChain</span>(error), code: <span class="st">'UNKNOWN'</span> },
+      }
+      <span class="kw">this</span>.<span class="fn">throwError</span>(error)
+    } <span class="kw">finally</span> {
+      <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'turn/end'</span>, { turn, reason: turnEnds! })
+    }
+    <span class="kw">return</span> <span class="kw">this</span>.inbox.<span class="fn">hasPending</span>()   <span class="cmt">// 还有排队输入 → 换新 AbortController 再来一回合</span>
+  }</pre>
+    <div class="annotation"><b>细节</b>：① <code class="inline">turnEnds</code> 的 max-tokens <strong>粘滞</strong>语义在两处体现：step 返回后不覆盖已有的 max-tokens 结果；② <code class="inline">agent/turn-stopping</code> 只在「回合要结束且无 next-step」时以 <strong>serial</strong> 模式派发——它是没有 <code class="inline">next()</code> 的收口点（例如 plan-mode 在这里拦截提交）；③ 出错时 <code class="inline">LlmError</code> 保留其 failure，其他错误扁平化为 errorChain 文本、code 为 <code class="inline">UNKNOWN</code>；④ <code class="inline">finally</code> 里无条件写 <code class="inline">turn/end</code>，所以崩溃前的最后一次尝试也会留下回合结束记录（如果进程没死）。</div>
+    <div class="callout warn"><b class="tag">勘误</b>本页源码摘录为讲解做了等价简化（例如 while 循环尾部的 break 条件），以仓库原文为准。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>用代码看：step() —— 一次模型请求的一生</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:344 — step()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">step</span>(assembly: <span class="cl">PromptAssembly</span>, startsRequestSeries: <span class="kw">boolean</span>): <span class="cl">Promise</span>&lt;<span class="cl">StepEndReason</span> | <span class="kw">null</span>&gt; {
+    <span class="kw">const</span> { turn, step, abort: { signal } } = <span class="kw">this</span>.phase
+    <span class="kw">const</span> system = <span class="fn">renderPrompt</span>(assembly)
+
+    <span class="kw">while</span> (<span class="kw">true</span>) {                       <span class="cmt">// ← 每次重试/继续都重新 buildRequest</span>
+      <span class="kw">const</span> surfaceGeneration = <span class="kw">this</span>.session.surface.replaceGeneration
+      <span class="kw">const</span> { request, preparedCall } = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">buildRequest</span>(
+        turn, step, assembly.tools, system,
+        <span class="kw">this</span>.session.<span class="fn">deriveMessages</span>(),     <span class="cmt">// ← 历史永远从日志现算（缓存后 O(新节点)）</span>
+        startsRequestSeries, surfaceGeneration, signal,
+      )
+      startsRequestSeries = <span class="kw">false</span>
+      <span class="kw">const</span> live = <span class="kw">new</span> <span class="cl">AssistantStreamAttempt</span>(...)
+      <span class="kw">let</span> started = <span class="kw">false</span>
+      <span class="kw">try</span> {
+        <span class="kw">const</span> stream = preparedCall?.<span class="fn">stream</span>(request) ?? <span class="kw">this</span>.loopCtx.llm.<span class="fn">stream</span>(request)
+        live.<span class="fn">start</span>()
+        started = <span class="kw">true</span>
+        <span class="kw">for await</span> (<span class="kw">const</span> chunk <span class="kw">of</span> stream) {
+          signal.<span class="fn">throwIfAborted</span>()
+          live.<span class="fn">push</span>(chunk)
+        }
+      } <span class="kw">catch</span> (error) {
+        <span class="kw">if</span> (!started) <span class="kw">throw</span> error
+        <span class="kw">if</span> (signal.aborted) {
+          <span class="kw">const</span> content = live.<span class="fn">interruptedBlocks</span>()
+          <span class="kw">if</span> (content.length &gt; <span class="nu">0</span>) {
+            <span class="cmt">// 中断流：已送达的 text/reasoning 前缀结算为 interrupted 消息</span>
+            live.<span class="fn">settle</span>(<span class="st">'assistant/message'</span>, () =&gt; <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'assistant/message'</span>, {
+              turn, step,
+              message: <span class="fn">createAssistantMessage</span>({ content, source: {...} }),
+              interrupted: <span class="kw">true</span>,
+              stream: live.stream,
+            }, { surfaceOp: <span class="st">'append'</span> }).seq)
+          } <span class="kw">else</span> {
+            live.<span class="fn">settle</span>(<span class="st">'assistant/attempt'</span>, () =&gt; <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'assistant/attempt'</span>, { turn, step, stream: live.stream }).seq)
+          }
+        } <span class="kw">else</span> {
+          live.<span class="fn">settle</span>(<span class="st">'assistant/attempt'</span>, ...)
+        }
+        <span class="kw">throw</span> error
+      }
+      <span class="kw">try</span> {
+        <span class="kw">const</span> finish = live.finish
+        <span class="kw">if</span> (finish.kind === <span class="st">'error'</span> || finish.kind === <span class="st">'aborted'</span>) {
+          <span class="cmt">// 失败的尝试 → assistant/attempt（不伪造模型历史）</span>
+          live.<span class="fn">settle</span>(<span class="st">'assistant/attempt'</span>, ...)
+          <span class="kw">const</span> action = <span class="kw">await</span> <span class="kw">this</span>.dispatch.<span class="fn">waterfall</span>(
+            <span class="st">'agent/request-error'</span>, { turn, step, provider: request.provider, failure: finish.failure, retryPolicy: preparedCall?.retryPolicy, signal },
+            () =&gt; <span class="cl">Promise</span>.<span class="fn">resolve</span>&lt;<span class="cl">RequestErrorAction</span>&gt;(<span class="kw">undefined</span>),
+          )
+          <span class="kw">if</span> (action?.kind !== <span class="st">'retry'</span>) {
+            <span class="kw">throw new</span> <span class="cl">LlmError</span>(finish.failure.message, finish.failure.code, finish.failure)
+          }
+          <span class="kw">continue</span>                          <span class="cmt">// ← 重试由监听器决定，循环只认 {kind:'retry'}</span>
+        }
+        <span class="cmt">// 成功：结算为 assistant/message 并上表面</span>
+        live.<span class="fn">settle</span>(<span class="st">'assistant/message'</span>, () =&gt; <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'assistant/message'</span>, {
+          turn, step, message,
+          ...live.usage === <span class="kw">undefined</span> ? {} : { usage: live.usage },
+          stream: live.stream,
+        }, { surfaceOp: <span class="st">'append'</span> }).seq)
+        <span class="kw">if</span> (finish.kind === <span class="st">'max-tokens'</span>) <span class="kw">return</span> { kind: <span class="st">'max-tokens'</span> }
+        <span class="kw">const</span> toolCalls = message.content.<span class="fn">filter</span>(b =&gt; b.type === <span class="st">'tool-call'</span>)
+        <span class="kw">if</span> (toolCalls.length === <span class="nu">0</span>) <span class="kw">return</span> { kind: <span class="st">'completed'</span> }
+        <span class="kw">const</span> { concluded } = <span class="kw">await</span> <span class="fn">executeToolCalls</span>(<span class="kw">this</span>.loopCtx, turn, step, toolCalls, signal,
+          context =&gt; <span class="kw">this</span>.inbox.<span class="fn">splice</span>(<span class="st">'next-step'</span>, <span class="kw">this</span>.inbox.nextStep.length, <span class="nu">0</span>, [context]),
+        )
+        <span class="kw">return</span> concluded ? { kind: <span class="st">'completed'</span> } : <span class="kw">null</span>
+      } <span class="kw">catch</span> (error) {
+        <span class="kw">if</span> (!live.ended) live.<span class="fn">abandon</span>()
+        <span class="kw">throw</span> error
+      }
+    }
+  }</pre>
+    <div class="annotation"><b>结算规则</b>：① 流成功 → 完整压缩流作为一条 <code class="inline">assistant/message</code> 落日志（含 usage 与完整 stream 记录）；② 错误/重试/取消且无可见内容 → <code class="inline">assistant/attempt</code>（只留流记录，不产生模型历史）；③ 中断但已输出前缀 → 前缀结算为 <code class="inline">interrupted: true</code> 的消息。第 7 章会看到与 retry 策略插件的配合。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>请求头折叠：request/header 的四种 reason</h2>
+    <p>每次派发前，循环用 <code class="inline">buildRequest</code> 组装冻结请求，并决定是否追加一条 <code class="inline">request/header</code>（<code class="inline">packages/core/agent-loop/src/agent.ts:488</code>）：</p>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts — buildRequest()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>    <span class="kw">const</span> header = <span class="fn">canonicalHeader</span>({
+      config,
+      ...preparedCall === <span class="kw">undefined</span> ? {} : { adapterDefaults: preparedCall.adapterDefaults },
+      ...system ? { system } : {},
+      ...tools.length &gt; <span class="nu">0</span> ? { tools } : {},
+    })
+    <span class="kw">const</span> baseline = <span class="kw">this</span>.session.<span class="fn">requestHeader</span>()
+    <span class="kw">const</span> startsSeries = startsRequestSeries
+      || <span class="kw">this</span>.requestSurfaceGeneration !== surfaceGeneration
+    <span class="kw">if</span> (!<span class="kw">this</span>.requestHeaderLogged) {
+      <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'request/header'</span>, { header, reason: baseline === <span class="kw">undefined</span> ? <span class="st">'initial'</span> : <span class="st">'resume'</span> })
+      <span class="kw">this</span>.requestHeaderLogged = <span class="kw">true</span>
+    } <span class="kw">else if</span> (baseline === <span class="kw">undefined</span> || !<span class="fn">headerEquals</span>(baseline, header)) {
+      <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'request/header'</span>, {
+        header, reason: <span class="st">'change'</span>,
+        ...startsSeries ? { startsSeries: <span class="kw">true</span> } : {},
+      })
+    } <span class="kw">else if</span> (startsSeries) {
+      <span class="cmt">// 头未变但系列重启 → reason 'series'</span>
+      <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'request/header'</span>, { header, reason: <span class="st">'series'</span> })
+    }</pre>
+    <table class="tbl">
+      <tr><th>reason</th><th>何时写入</th></tr>
+      <tr><td><code class="inline">initial</code></td><td>会话首次派发（此前没有持久 header）</td></tr>
+      <tr><td><code class="inline">resume</code></td><td>进程重启后首次派发（有持久 header，本实例未记录过）</td></tr>
+      <tr><td><code class="inline">change</code></td><td>canonical header 与基线不相等（模型、系统提示词或工具集变了）</td></tr>
+      <tr><td><code class="inline">series</code></td><td>header 未变，但 pre-step 以 <code class="inline">startsRequestSeries</code> 或表面重写开启了新系列</td></tr>
+    </table>
+    <div class="annotation"><b>用途</b>：请求头 + request/context 是 KV-cache 命中分析与「为什么这个 step 换了模型」审计的数据来源。注意 canonical header 包含 system 与 tools——所以任何 prompt 段变化都会形成一次 <code class="inline">change</code>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.7</span>Inbox：认领与拼接</h2>
+    <p>inbox 是持久的：它的每次拼接都写成 <code class="inline">agent/inbox/spliced</code> 会话事件，重启后重放即可恢复排队消息（<code class="inline">packages/core/agent/src/types.ts:58</code>）：</p>
+    <div class="code-title">packages/core/agent/src/types.ts — inbox 拼接事件</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="st">'agent/inbox/spliced'</span>: {
+    target: <span class="cl">InboxTarget</span>          <span class="cmt">// 'next-turn' | 'next-step'</span>
+    start: <span class="kw">number</span>
+    removedCount?: <span class="kw">number</span>
+    inserted: <span class="cl">UserMessage</span>[]
+    outcome?: <span class="st">'canceled'</span>
+  }</pre>
+    <ul>
+      <li><strong>claim(target, turn)</strong>：取走全部 next-step 消息；target 为 <code class="inline">next-turn</code> 时额外取走一个 next-turn 消息，随后发布被认领通知。</li>
+      <li><strong>steer</strong>（next-step + 立即唤醒）vs <strong>inject</strong>（next-step、不唤醒）：注入物安静排队，等下一个 step 的 claim。</li>
+      <li><strong>followup</strong>（next-turn + 唤醒）：在回合边界之后开启新回合。</li>
+      <li>每个回合续期用<strong>全新的 AbortController</strong>，取消不会跨回合泄漏。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.8</span>要点</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      ① turn/step 两层结构，step 才花钱（模型调用），turn 可以零 step 关闭；② pre-step 是「模型看见什么」的守门人；③ 流式尝试只有两种持久结局——committed 的 assistant/message 或 settled 的 assistant/attempt，不存在第三种；④ request/header 四种 reason 记录了请求配置的完整演化史。下一步进入 <a href="04-agent-loop.html">第 4 章：Agent 循环的并发模型</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="02-session-log.html">← 上一章：会话日志</a>
+    <a href="04-agent-loop.html">下一步：Agent 循环 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 03 生命周期 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

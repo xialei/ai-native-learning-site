@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>深入浅出 DeepSeek Harness (dsh) — 一本讲透 AI Coding Agent 运行时的书</title>
+<link rel="stylesheet" href="assets/dsh-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-session-log.html">会话日志</a>
+      <a href="03-agent-lifecycle.html">生命周期</a>
+      <a href="04-agent-loop.html">Agent 循环</a>
+      <a href="05-persistence.html">持久化</a>
+      <a href="06-tools.html">工具系统</a>
+      <a href="07-llm.html">LLM 层</a>
+      <a href="08-scope-prompt.html">Prompt/Scope</a>
+      <a href="09-security.html">安全</a>
+      <a href="10-seams.html">能力缝</a>
+      <a href="11-compaction.html">Compaction</a>
+      <a href="12-orchestration.html">编排</a>
+      <a href="13-roadmap.html">自制 Harness</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <div class="hero">
+    <h1>深入浅出 DeepSeek Harness</h1>
+    <div class="tagline">从源码读懂一个生产级 AI Coding Agent 运行时：插件容器、事件溯源会话、Agent 循环、工具管线与多代理编排</div>
+    <div class="version-badge">
+      <span class="vb-key">源码版本</span>
+      <span class="vb-val">dsh-v0.1.3-alpha.1</span>
+      <span class="vb-key">HEAD</span>
+      <span class="vb-val">d347e70390</span>
+      <span class="vb-meta">所有代码引用来自 /Users/lei.xia/workspace/github/deepseek-harness，行号随版本演进可能偏移，仅供参考</span>
+    </div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">0</span>这本书讲什么</h2>
+    <p><strong>DeepSeek Harness（命令 <code class="inline">dsh</code>）</strong>是 DeepSeek 开源的 AI Coding Agent 运行时：一个终端里跑的编码代理，有会话持久化、工具系统、权限沙箱、子代理编排，也能以 SDK / Web UI / ACP 三种形态被集成。它和「提示词 + 循环」的玩具 demo 之间隔着一整层工程——而这层工程正是这本书的主题。</p>
+    <p>三个贯穿全书的设计决定：</p>
+    <ul>
+      <li><strong>一切皆插件。</strong>内核只有一个插件框架 <code class="inline">Cordis</code>：LLM 适配器、会话存储、工具、Agent 循环、权限、压缩——全都是挂在同一个容器上的插件，没有特权核心。</li>
+      <li><strong>会话日志是唯一事实。</strong>模型看见什么，日志里就有什么（"Model-visible means logged"）。消息历史、工具结果、压缩摘要，全部是对同一条 append-only 事件流的投影。</li>
+      <li><strong>能力缝（capability seam）是扩展点。</strong>每个可替换的能力都由「服务定义 + 服务提供者 + 消费者」三方构成，换掉中间那方就能换实现——沙箱、Web 搜索、子代理后端皆如此。</li>
+    </ul>
+    <p>读完这本书，你应该能：读懂 dsh 的任意一条执行路径（从一次 <code class="inline">turn/start</code> 到一个工具结果落盘）；解释每个设计取舍背后的原因；以及按第 13 章的路线图，动手搭一个自己的 Harness。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.1</span>一分钟总览：dsh 的组成与数据流</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 960 470" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+          <marker id="arrow-acc" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#e8850a"/>
+          </marker>
+        </defs>
+
+        <!-- 入口 -->
+        <rect class="node acc" x="20" y="30" width="150" height="64" rx="9"/>
+        <text class="lbl" x="95" y="56" text-anchor="middle">CLI / SDK / Web / ACP</text>
+        <text class="lbl sm" x="95" y="76" text-anchor="middle">入口形态（--profile）</text>
+
+        <!-- Boot -->
+        <rect class="node" x="220" y="30" width="170" height="64" rx="9"/>
+        <text class="lbl" x="305" y="56" text-anchor="middle">Boot + profiles</text>
+        <text class="lbl sm" x="305" y="76" text-anchor="middle">bundles → patch 叠层</text>
+
+        <!-- Cordis 容器 -->
+        <rect class="node core" x="440" y="20" width="220" height="84" rx="9"/>
+        <text class="lbl" x="550" y="48" text-anchor="middle">Cordis 容器</text>
+        <text class="lbl sm" x="550" y="68" text-anchor="middle">服务 + 事件 + 可逆副作用</text>
+        <text class="lbl sm" x="550" y="86" text-anchor="middle">5 种事件派发模式</text>
+
+        <!-- 服务行 -->
+        <rect class="node" x="20" y="160" width="128" height="52" rx="9"/>
+        <text class="lbl sm" x="84" y="182" text-anchor="middle">ctx.llm</text>
+        <text class="lbl sm" x="84" y="200" text-anchor="middle">LLM 适配层</text>
+
+        <rect class="node" x="163" y="160" width="128" height="52" rx="9"/>
+        <text class="lbl sm" x="227" y="182" text-anchor="middle">ctx.sessions</text>
+        <text class="lbl sm" x="227" y="200" text-anchor="middle">事件溯源会话</text>
+
+        <rect class="node" x="306" y="160" width="128" height="52" rx="9"/>
+        <text class="lbl sm" x="370" y="182" text-anchor="middle">ctx.agentLoop</text>
+        <text class="lbl sm" x="370" y="200" text-anchor="middle">turn/step 循环</text>
+
+        <rect class="node" x="449" y="160" width="128" height="52" rx="9"/>
+        <text class="lbl sm" x="513" y="182" text-anchor="middle">ctx.tools</text>
+        <text class="lbl sm" x="513" y="200" text-anchor="middle">工具管线</text>
+
+        <rect class="node" x="592" y="160" width="128" height="52" rx="9"/>
+        <text class="lbl sm" x="656" y="182" text-anchor="middle">sandbox/approval</text>
+        <text class="lbl sm" x="656" y="200" text-anchor="middle">权限与沙箱</text>
+
+        <rect class="node" x="735" y="160" width="200" height="52" rx="9"/>
+        <text class="lbl sm" x="835" y="182" text-anchor="middle">subagents / workflow / jobs</text>
+        <text class="lbl sm" x="835" y="200" text-anchor="middle">编排原语</text>
+
+        <!-- Agent 循环放大 -->
+        <rect class="node core" x="120" y="270" width="330" height="120" rx="9"/>
+        <text class="lbl" x="285" y="296" text-anchor="middle">Agent 循环（ReactLoopAgent）</text>
+        <text class="lbl sm" x="285" y="318" text-anchor="middle">turn/start → claim inbox → agent/pre-step</text>
+        <text class="lbl sm" x="285" y="336" text-anchor="middle">step/start → LLM 流式 → assistant/message</text>
+        <text class="lbl sm" x="285" y="354" text-anchor="middle">tool/call → 工具管线 → tool/result</text>
+        <text class="lbl sm" x="285" y="374" text-anchor="middle">step/end → turn/end</text>
+
+        <!-- 持久化 -->
+        <rect class="node acc" x="560" y="286" width="200" height="88" rx="9"/>
+        <text class="lbl" x="660" y="314" text-anchor="middle">会话日志（JSONL）</text>
+        <text class="lbl sm" x="660" y="334" text-anchor="middle">append-only SessionEvent</text>
+        <text class="lbl sm" x="660" y="352" text-anchor="middle">崩溃恢复 / 压缩 / 投影</text>
+
+        <!-- LLM 云 -->
+        <rect class="node" x="820" y="300" width="120" height="60" rx="9"/>
+        <text class="lbl sm" x="880" y="326" text-anchor="middle">DeepSeek API</text>
+        <text class="lbl sm" x="880" y="344" text-anchor="middle">SSE 流式</text>
+
+        <!-- edges -->
+        <line class="edge" x1="170" y1="62" x2="218" y2="62"/>
+        <line class="edge" x1="390" y1="62" x2="438" y2="62"/>
+        <line class="edge" x1="550" y1="104" x2="550" y2="130"/>
+        <line class="edge" x1="550" y1="130" x2="84" y2="130"/>
+        <line class="edge" x1="550" y1="130" x2="835" y2="130"/>
+        <line class="edge" x1="84" y1="130" x2="84" y2="158"/>
+        <line class="edge" x1="227" y1="130" x2="227" y2="158"/>
+        <line class="edge" x1="370" y1="130" x2="370" y2="158"/>
+        <line class="edge" x1="513" y1="130" x2="513" y2="158"/>
+        <line class="edge" x1="656" y1="130" x2="656" y2="158"/>
+        <line class="edge" x1="835" y1="130" x2="835" y2="158"/>
+        <line class="edge core" x1="285" y1="212" x2="285" y2="268"/>
+        <line class="edge acc" x1="330" y1="390" x2="560" y2="350"/>
+        <line class="edge acc" x1="450" y1="300" x2="558" y2="318"/>
+        <line class="edge" x1="760" y1="330" x2="818" y2="330"/>
+        <text class="lbl sm" x="490" y="376">追加事件</text>
+        <text class="lbl sm" x="470" y="290">派生请求</text>
+      </svg>
+      <div class="fig-cap">图 0 — dsh 总览：入口（profile）决定装配哪组 bundle，Cordis 容器承载所有插件服务；Agent 循环消费会话日志派生请求、调用工具、并把每一步写回日志。</div>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>核心机制</span>
+        <span class="lg-item"><span class="sw node"></span>插件服务</span>
+        <span class="lg-item"><span class="sw acc"></span>持久化 / 入口</span>
+      </div>
+    </div>
+    <div class="annotation"><b>读图</b>：从上到下是「装配 → 服务 → 运行」。装配期（Boot + profiles/bundles）决定有哪些插件；运行期所有交互都经过 Cordis 事件总线；唯一落地状态是会话日志，它同时服务于崩溃恢复、上下文压缩和 UI 投影。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.2</span>学习路径</h2>
+    <p>13 章按依赖关系排列：1–3 章建立世界观（插件容器、事件日志、生命周期），4–8 章深入单会话执行（循环、持久化、工具、LLM、Prompt/Scope），9–12 章覆盖安全与多代理，13 章动手造一个。</p>
+    <div class="pathgrid">
+      <a class="pathcard" href="01-architecture.html">
+        <div class="pc-num">STEP 1 · 01</div>
+        <h3>整体架构：一切皆插件</h3>
+        <p>Cordis 插件框架、profiles/bundles 装配、packages/ 目录地图，以及「没有内核」的系统如何启动。</p>
+      </a>
+      <a class="pathcard" href="02-session-log.html">
+        <div class="pc-num">STEP 2 · 02</div>
+        <h3>会话日志：事件溯源</h3>
+        <p>SessionEvent 全集、Model-visible means logged、deriveMessages 投影、branded ID 与 …Map 联合类型家族。</p>
+      </a>
+      <a class="pathcard" href="03-agent-lifecycle.html">
+        <div class="pc-num">STEP 3 · 03</div>
+        <h3>一次对话的完整生命周期</h3>
+        <p>turn/step 模型、inbox 认领、agent/pre-step 决策点、请求头折叠，到 turn/end 的全部事件时序。</p>
+      </a>
+      <a class="pathcard" href="04-agent-loop.html">
+        <div class="pc-num">STEP 4 · 04</div>
+        <h3>Agent 循环实现</h3>
+        <p>ReactLoopAgent 源码走读：Phase 状态机、followup/steer/inject 三种注入、流式尝试的结算与重试。</p>
+      </a>
+      <a class="pathcard" href="05-persistence.html">
+        <div class="pc-num">STEP 5 · 05</div>
+        <h3>持久化与崩溃恢复</h3>
+        <p>SessionHandle 契约、JSONL 后端、检查点策略、generation 迁移链，以及进程被 kill 后的自动缝合。</p>
+      </a>
+      <a class="pathcard" href="06-tools.html">
+        <div class="pc-num">STEP 6 · 06</div>
+        <h3>工具系统与并行调度</h3>
+        <p>defineTool DSL、五段工具管线、并行安全分类与滚动窗口调度、PTC（程序化工具调用）模式。</p>
+      </a>
+      <a class="pathcard" href="07-llm.html">
+        <div class="pc-num">STEP 7 · 07</div>
+        <h3>LLM 适配层与流式</h3>
+        <p>StreamChunk 协议、LlmFailure 稳定错误码、重试插件、DeepSeek 适配器与推理深度映射。</p>
+      </a>
+      <a class="pathcard" href="08-scope-prompt.html">
+        <div class="pc-num">STEP 8 · 08</div>
+        <h3>System Prompt 组装与 Scope</h3>
+        <p>PromptSection 有序装配、persona 覆盖、Scope 遮蔽与 tools.restrict，子代理如何「继承又收敛」。</p>
+      </a>
+      <a class="pathcard" href="09-security.html">
+        <div class="pc-num">STEP 9 · 09</div>
+        <h3>安全：沙箱 / 审批 / 权限预设</h3>
+        <p>SandboxMode 与四平台沙箱后端、审批事件审计对、fail-closed 语义、permission presets。</p>
+      </a>
+      <a class="pathcard" href="10-seams.html">
+        <div class="pc-num">STEP 10 · 10</div>
+        <h3>能力缝实战</h3>
+        <p>以 shell / fs / web / skills / jobs 五条缝为例，看「定义—提供者—消费者」如何在真实代码里协作。</p>
+      </a>
+      <a class="pathcard" href="11-compaction.html">
+        <div class="pc-num">STEP 11 · 11</div>
+        <h3>Compaction：上下文管理</h3>
+        <p>压力触发与溢出触发、shadow-price 协议、结构化摘要检查点、以及 warm-prefix 复放。</p>
+      </a>
+      <a class="pathcard" href="12-orchestration.html">
+        <div class="pc-num">STEP 12 · 12</div>
+        <h3>编排：子代理 / Workflow / Ralph</h3>
+        <p>continuable 子代理、Workflow 脚本引擎、jobs 抽象，以及用这些原语拼出 Ralph 循环。</p>
+      </a>
+      <a class="pathcard" href="13-roadmap.html">
+        <div class="pc-num">ROADMAP · 13</div>
+        <h3>自制 Harness 路线图</h3>
+        <p>SDK JSON-RPC 协议、Web 服务端、扩展 cookbook——从零搭一个自己的 Agent 运行时要走哪几步。</p>
+      </a>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.3</span>怎么读这本书</h2>
+    <div class="callout info">
+      <b class="tag">约定</b>
+      每章都遵循同一结构：<strong>一分钟版本 → 图解 → 用代码看（摘自真实源码，标注文件路径）→ 机制表格 → 要点</strong>。代码块均来自 deepseek-harness 仓库在 <code class="inline">dsh-v0.1.3-alpha.1</code> 的真实内容，文件路径写在代码块标题里；行号会随版本演进偏移，定位时以符号名搜索为准。
+    </div>
+    <div class="callout warn">
+      <b class="tag">前置</b>
+      熟悉 TypeScript（读懂接口与联合类型即可）、事件驱动编程。不需要用过 dsh —— 第 1 章会从安装跑通讲起。若你已读过《深入浅出vLLM》，可以按相同的方式阅读：先图后码，逐章推进。
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  深入浅出 DeepSeek Harness · 源码基准 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

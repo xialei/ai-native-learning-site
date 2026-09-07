@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 策略动物园 — 深入浅出具身智能</title>
+<link rel="stylesheet" href="assets/robotics-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出具身智能</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-overview.html">全景</a>
+      <a href="02-hardware.html">硬件抽象</a>
+      <a href="03-teleop.html">遥操作</a>
+      <a href="04-dataset.html">数据集</a>
+      <a href="05-policy.html">策略</a>
+      <a href="06-smolvla.html">SmolVLA</a>
+      <a href="07-vla-frontier.html">VLA 前沿</a>
+      <a href="08-sim-isaaclab.html">仿真</a>
+      <a href="09-manager-based-env.html">环境</a>
+      <a href="10-rl-training.html">RL 训练</a>
+      <a href="11-sim2real.html">Sim2Real</a>
+      <a href="12-build-own.html">实战路线</a>
+      <a href="13-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 策略动物园</div>
+    <h1>策略动物园：从 ACT 到 Diffusion</h1>
+    <div class="subtitle">数据就位，现在轮到「学习」本身。lerobot 的 policies/ 目录下有二十余种策略，但它们都遵守同一个契约：输入观测 dict，输出动作。本章先读这个契约（PreTrainedPolicy），再深读两个经典——ACT（transformer 序列翻译）与 Diffusion Policy（迭代去噪），把「action chunk 从哪来、训练 loss 怎么算、推理时怎么消费」三件事彻底看清。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>PreTrainedPolicy：所有策略的统一契约</h2>
+    <p>不管网络结构多花哨，每个策略都要回答同样三个问题：<strong>看到观测选什么动作</strong>（select_action）、<strong>预测一段动作</strong>（predict_action_chunk）、<strong>给一批数据算多大 loss</strong>（forward）。基类（src/lerobot/policies/pretrained.py:61）把它们钉死为抽象方法：</p>
+    <div class="code-title">src/lerobot/policies/pretrained.py:215 — 基类抽象接口（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PreTrainedPolicy</span>(nn.Module, HubMixin, abc.ABC):
+    <span class="cmt">"""Base class for policy models."""</span>
+
+    <span class="kw">def</span> <span class="fn">reset</span>(self):
+        <span class="cmt">"""To be called whenever the environment is reset. Does things like clearing caches."""</span>
+        ...  <span class="cmt"># 清空 action queue / 观测历史队列</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, batch: <span class="cl">dict</span>[<span class="cl">str</span>, Tensor]) -&gt; <span class="cl">tuple</span>[Tensor, <span class="cl">dict</span> | <span class="kw">None</span>]:
+        ...  <span class="cmt"># 训练：返回 (loss, 日志字典)</span>
+
+    <span class="kw">def</span> <span class="fn">predict_action_chunk</span>(self, batch: <span class="cl">dict</span>[<span class="cl">str</span>, Tensor]) -&gt; Tensor:
+        ...  <span class="cmt"># 一次性预测 (B, chunk_size, action_dim)</span>
+
+    <span class="kw">def</span> <span class="fn">select_action</span>(self, batch: <span class="cl">dict</span>[<span class="cl">str</span>, Tensor]) -&gt; Tensor:
+        ...  <span class="cmt"># 部署：返回环境要执行的「单步」动作</span></pre>
+    <div class="annotation"><b>读法：</b><code class="inline">forward</code> 服务训练循环，<code class="inline">select_action</code> 服务 30 Hz 的执行循环（第 3 章 record_loop 与第 11 章机器人跑 policy 都调它）。两者之间的桥就是 <strong>action chunk</strong>：predict_action_chunk 一次算出未来几十步动作，select_action 负责把这段动作「一点点放出去」——用队列缓存，或者做时序集成（5.3）。基类还提供 <code class="inline">from_pretrained</code>（safetensors 加载 + 强制 eval 模式，pretrained.py:147）与 <code class="inline">drop_queued_actions</code>（pretrained.py:230，中途换指令时强制丢弃缓存队列），这些细节在部署章（11）会再次出现。</div>
+    <p>二十多个策略全部通过同一个工厂按名字实例化，且<strong>惰性导入</strong>——选哪个策略才 import 哪个重型依赖：</p>
+    <div class="code-title">src/lerobot/policies/factory.py:80 — 按名取类（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_policy_class</span>(name: <span class="cl">str</span>) -&gt; type[PreTrainedPolicy]:
+    <span class="cmt">"""Resolution is convention-based: the draccus-registered config class of `name`
+    is looked up, its `configuration_*` module path is rewritten to `modeling_*`,
+    and the `&lt;X&gt;Policy` class is imported from there. The modeling module is only
+    imported at call time, keeping heavy optional dependencies lazy."""</span>
+    <span class="kw">return</span> _get_policy_cls_from_policy_name(name=name)</pre>
+    <p>当前动物园的概貌（policies/__init__.py 导出 + 各配置类论文出处）：</p>
+    <table class="tbl">
+      <tr><th>家族</th><th>策略</th><th>动作怎么生成</th><th>一句话定位</th></tr>
+      <tr><td rowspan="4">经典模仿学习<br>（本章）</td><td><code class="inline">act</code></td><td>transformer 一次回归整段 chunk + 可选 CVAE（条件变分自编码器，5.3）</td><td>低成本双臂操作的事实标准（2023）</td></tr>
+      <tr><td><code class="inline">diffusion</code></td><td>1D 卷积 U-Net 迭代去噪</td><td>多模态动作分布的经典方案（2023）</td></tr>
+      <tr><td><code class="inline">vqbet</code></td><td>VQ-BeT：离散 token + BET</td><td>把动作离散化后当序列预测</td></tr>
+      <tr><td><code class="inline">tdmpc</code></td><td>基于模型的 RL</td><td>lerobot 里少数的 RL 系策略</td></tr>
+      <tr><td rowspan="3">VLA（第 6-7 章）</td><td><code class="inline">smolvla</code></td><td>VLM + 流匹配动作专家</td><td>小而全的 VLA 基线</td></tr>
+      <tr><td><code class="inline">pi0 / pi05 / pi0_fast</code></td><td>PaliGemma 双塔 + 流匹配 / 自回归</td><td>Physical Intelligence 系旗舰</td></tr>
+      <tr><td><code class="inline">groot / wall_x / xvla / eo1 / evo1…</code></td><td>各实验室 VLA 变体</td><td>同一接口接入的社区模型</td></tr>
+    </table>
+    <div class="annotation"><b>关键洞察：</b>不管哪个家族，<strong>训练数据都是第 4 章的 LeRobotDataset，输入键都是 <code class="inline">observation.state / observation.images.*</code>，输出都是 <code class="inline">action</code></strong>。换策略 = 换一种「从观测到动作」的映射假设，数据管线一行不改。这就是 4.2 节说的「命名约定即接口约定」的回报。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>ACT：把模仿学习变成序列翻译</h2>
+    <p>ACT（Action Chunking Transformer，modeling_act.py:42）的直觉：与其每帧猜一个动作，不如把「一段演示」当成一次序列到序列的翻译——观测是原文，未来 100 步动作是译文。网络由三块组成（modeling_act.py:260）：</p>
+    <div class="code-title">src/lerobot/policies/act/modeling_act.py:260 — ACT 网络结构（结构注释 + 关键组件，节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ACT</span>(nn.Module):
+    <span class="cmt">"""Action Chunking Transformer: The underlying neural network for ACTPolicy.
+
+    - The `vae_encoder` encodes the target data (a sequence of actions) and the
+      condition (the robot joint-space) into a latent distribution [training only].
+    - A transformer with an `encoder` and `decoder` with cross-attention is used
+      as the VAE decoder (and used alone for inference)."""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config: ACTConfig):
+        <span class="kw">if</span> self.config.use_vae:
+            self.vae_encoder = ACTEncoder(config, is_vae_encoder=<span class="kw">True</span>)   <span class="cmt"># 只在训练用</span>
+            self.vae_encoder_cls_embed = nn.Embedding(<span class="nu">1</span>, config.dim_model)
+            ...
+        <span class="kw">if</span> self.config.image_features:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(...)
+            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={<span class="st">"layer4"</span>: <span class="st">"feature_map"</span>})
+
+        self.encoder = ACTEncoder(config)            <span class="cmt"># 消费 [latent, state, 图像特征 token]</span>
+        self.decoder = ACTDecoder(config)            <span class="cmt"># DETR 风格 object queries</span>
+        self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[<span class="nu">0</span>])</pre>
+    <div class="code-title">src/lerobot/policies/act/modeling_act.py:462 — forward：token 组装与动作头（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Prepare transformer encoder inputs: [latent, robot_state, env_state, *image_tokens]</span>
+encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+<span class="kw">if</span> self.config.robot_state_feature:
+    encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+<span class="kw">if</span> self.config.image_features:
+    <span class="kw">for</span> img <span class="kw">in</span> batch[OBS_IMAGES]:
+        cam_features = self.backbone(img)[<span class="st">"feature_map"</span>]          <span class="cmt"># ResNet 特征图</span>
+        cam_features = self.encoder_img_feat_input_proj(cam_features)
+        cam_features = einops.rearrange(cam_features, <span class="st">"b c h w -&gt; (h w) b c"</span>)  <span class="cmt"># 拉平成 token 序列</span>
+        encoder_in_tokens.extend(list(cam_features))
+
+encoder_out = self.encoder(torch.stack(encoder_in_tokens, axis=<span class="nu">0</span>), ...)
+decoder_out = self.decoder(torch.zeros((chunk_size, B, D)), encoder_out, ...)  <span class="cmt"># 可学习查询</span>
+actions = self.action_head(decoder_out.transpose(<span class="nu">0</span>, <span class="nu">1</span>))     <span class="cmt"># → (B, 100, action_dim)</span></pre>
+    <div class="annotation"><b>读法：</b>推理时（不复用 VAE 编码器）latent 取零向量，整个网络就是「一个普通 transformer 把多相机图像 token + 关节状态 token 翻译成 100 步动作」。训练时才启用 VAE 支路：把<strong>真实动作序列</strong>也编码进 latent（modeling_act.py:409-453，重参数化采样），迫使模型从「当前观测」就能猜出一个合理的 latent——这正是 CVAE 的标准玩法，用来表达「同一观测可以有几种合理做法」的多模态性。loss 由两部分组成（modeling_act.py:145-164）：<strong>L1 重建损失 + KL 散度</strong>（<code class="inline">kl_weight=10</code>，configuration_act.py:123）。</div>
+    <div class="callout warn">
+      <b class="tag">源码注</b>
+      configuration_act.py:108-111：默认 <code class="inline">n_decoder_layers=1</code>——注释明说原论文实现是 7 层，但因一个 bug 只有第一层生效，lerobot 为复现原效果保持 1 层。读论文数值（参数量、层数）时务必核对源码，这类「论文与代码不一致」在机器人学习领域并不罕见。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>两种消费模式：action queue 与时序集成</h2>
+    <p>ACT 一次吐 100 步动作，但环境每步只接受一个。怎么放？lerobot 给了两种答案。默认是<strong>队列模式</strong>——预测一次，排队慢慢执行：</p>
+    <div class="code-title">src/lerobot/policies/act/modeling_act.py:102 — select_action 的队列逻辑（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="attr">@torch.no_grad()</span>
+<span class="kw">def</span> <span class="fn">select_action</span>(self, batch):
+    self.eval()
+    <span class="cmt"># Action queue logic for n_action_steps &gt; 1. When the action_queue is depleted,
+    # populate it by querying the policy.</span>
+    <span class="kw">if</span> len(self._action_queue) == <span class="nu">0</span>:
+        actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+        <span class="cmt"># (batch, steps, dim) → (steps, batch, dim)，逐步出队</span>
+        self._action_queue.extend(actions.transpose(<span class="nu">0</span>, <span class="nu">1</span>))
+    <span class="kw">return</span> self._action_queue.popleft()</pre>
+    <p>另一种是<strong>时序集成</strong>——每步都重新推理，把「历史所有 chunk 在当前时刻的预测」做指数加权平均。权重公式（modeling_act.py:170-179）：<code class="inline">wᵢ = exp(-m·i)</code>，i 是「这条预测距它被做出的时刻过了多久」：</p>
+    <div class="code-title">src/lerobot/policies/act/modeling_act.py:169 — ACTTemporalEnsembler（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ACTTemporalEnsembler</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, temporal_ensemble_coeff: <span class="cl">float</span>, chunk_size: <span class="cl">int</span>) -&gt; <span class="kw">None</span>:
+        <span class="cmt">"""Weights: wᵢ = exp(-temporal_ensemble_coeff * i) where w₀ is the oldest action.
+        - Setting it to 0 uniformly weighs all actions.
+        - Setting it positive gives more weight to older actions.
+        - Setting it negative gives more weight to newer actions."""</span>
+        self.ensemble_weights = torch.exp(-temporal_ensemble_coeff * torch.arange(chunk_size))
+
+    <span class="kw">def</span> <span class="fn">update</span>(self, actions: Tensor) -&gt; Tensor:
+        <span class="cmt">"""在线更新：新 chunk 进来，对重叠时刻做加权平均，弹出第一个动作执行。"""</span>
+        ...</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t6 d6">
+        <title id="t6">action chunk 的三种消费模式</title>
+        <desc id="d6">队列模式、时序集成、diffusion horizon 截取，三个泳道沿同一时间轴对比</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">同一个 select_action 接口，三种「整段预测 → 单步执行」的放行方式（时间 →）</text>
+
+        <g>
+          <text class="lbl" x="40" y="60">① 队列模式（ACT / Diffusion 默认）</text>
+          <rect class="node" x="60" y="72" width="220" height="34" rx="6"></rect>
+          <text class="lbl sm" x="170" y="93" text-anchor="middle">推理一次 → chunk 100 步</text>
+          <rect class="node dim" x="60" y="112" width="44" height="26" rx="4"></rect>
+          <rect class="node acc" x="108" y="112" width="44" height="26" rx="4"></rect>
+          <rect class="node acc" x="156" y="112" width="44" height="26" rx="4"></rect>
+          <rect class="node acc" x="204" y="112" width="44" height="26" rx="4"></rect>
+          <text class="lbl sm" x="130" y="129" text-anchor="middle">step t</text>
+          <text class="lbl sm" x="178" y="129" text-anchor="middle">t+1</text>
+          <text class="lbl sm" x="226" y="129" text-anchor="middle">t+2</text>
+          <text class="lbl sm" x="284" y="129" text-anchor="middle">…执行期间模型「失明」，直到队列耗尽才再推理</text>
+          <line class="edge" x1="82" y1="106" x2="82" y2="114"></line>
+        </g>
+
+        <g>
+          <text class="lbl" x="40" y="172">② 时序集成（temporal_ensemble_coeff 开启）</text>
+          <rect class="node" x="60" y="182" width="130" height="30" rx="6"></rect>
+          <text class="lbl sm" x="125" y="201" text-anchor="middle">chunk @ t-2</text>
+          <rect class="node" x="100" y="216" width="130" height="30" rx="6"></rect>
+          <text class="lbl sm" x="165" y="235" text-anchor="middle">chunk @ t-1</text>
+          <rect class="node acc" x="140" y="250" width="130" height="30" rx="6"></rect>
+          <text class="lbl sm" x="205" y="269" text-anchor="middle">chunk @ t（新推理）</text>
+          <text class="lbl sm" x="310" y="235" text-anchor="middle">同一时刻的多个预测 → wᵢ=exp(-m·i) 加权平均 → 执行 1 步</text>
+          <text class="lbl sm" x="310" y="255" text-anchor="middle">每步都要推理（30 Hz 打满 GPU），但动作平滑、抗漂移</text>
+        </g>
+
+        <g>
+          <text class="lbl" x="40" y="302">③ horizon 截取（Diffusion，configuration_diffusion.py:104）</text>
+          <text class="lbl sm" x="60" y="322">预测 horizon=64 步，只取 [n_obs_steps-1 : n_obs_steps-1+n_action_steps] = 32 步入队；训练数据同样按 horizon 取窗，最后 7 帧丢弃（drop_n_last_frames）</text>
+        </g>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw"></span>已执行的步</span>
+        <span class="lg-item"><span class="sw acc"></span>当前正在执行的步</span>
+        <span class="lg-item"><span class="sw dim"></span>队列中已过期 / 被覆盖的步</span>
+      </div>
+      <div class="fig-cap">图 5.1：三种 chunk 放行方式。① 省算力但执行期间开环；② 每步闭环推理、平滑但贵；③ diffusion 的折中——预测长窗、执行半窗。第 11 章的 RTC 会在此基础上再做「重规划对齐」。</div>
+    </div>
+    <div class="annotation"><b>两种模式的选择：</b>队列模式（①）下 <code class="inline">n_action_steps=100</code>，意味着连续 100 步没有任何新观测参与决策——对结构化场景够用、算力友好。时序集成（②）强制 <code class="inline">n_action_steps=1</code>（configuration_act.py:138 有断言），等于每步都看世界再决策，代价是 GPU 一直在线。原论文默认 <code class="inline">temporal_ensemble_coeff=0.01</code>：偏信<strong>旧</strong>预测，实验表明过度偏信新预测会抵消 action chunking 本身的平滑收益（modeling_act.py:179 注释引 PR #319）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>Diffusion Policy：把动作生成变成迭代去噪</h2>
+    <p>ACT 对「同一观测多种做法」的处理靠 CVAE latent，Diffusion Policy 则干脆把「生成动作序列」建模成<strong>从纯噪声逐步去噪出一段轨迹</strong>。先用一句话建立直觉：训练时，拿一条真实轨迹，随机加一点噪声，让网络看着「加噪后的轨迹 + 噪声等级」预测<strong>当初加进去的那份噪声</strong>——练一万次后网络就学会了「怎样把噪声变成动作」；推理时反着来，从纯噪声出发，反复问网络「这里的噪声长什么样」并减掉，几十步后就「洗」出一段干净轨迹（这正是本节标题的「迭代去噪」）。模型本体是条件 1D U-Net（时间维做卷积，动作维度当通道），条件（状态 + 图像特征）拼成 <code class="inline">global_cond</code> 用 FiLM（特征级线性调制：用条件向量对网络每层的输出做逐通道的缩放与平移，是最常用的条件注入手法）注入。推理循环（modeling_diffusion.py:234）：</p>
+    <div class="code-title">src/lerobot/policies/diffusion/modeling_diffusion.py:234 — conditional_sample（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">conditional_sample</span>(self, batch_size, global_cond=<span class="kw">None</span>, noise=<span class="kw">None</span>) -&gt; Tensor:
+    <span class="cmt"># Sample prior: 从纯噪声出发，形状 (B, horizon, action_dim)</span>
+    sample = noise <span class="kw">if</span> noise <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">else</span> torch.randn(
+        size=(batch_size, self.config.horizon, self.config.action_feature.shape[<span class="nu">0</span>]), ...)
+
+    self.noise_scheduler.set_timesteps(self.num_inference_steps)
+    <span class="kw">for</span> t <span class="kw">in</span> self.noise_scheduler.timesteps:
+        model_output = self.unet(sample, t, global_cond=global_cond)
+        <span class="cmt"># Compute previous sample: x_t -&gt; x_{t-1}</span>
+        sample = self.noise_scheduler.step(model_output, t, sample).prev_sample
+    <span class="kw">return</span> sample</pre>
+    <div class="code-title">src/lerobot/policies/diffusion/modeling_diffusion.py:360 — compute_loss：训练时的前向加噪（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span>trajectory = batch[ACTION]                     <span class="cmt"># 干净的真值轨迹 (B, horizon, dim)</span>
+eps = torch.randn(trajectory.shape, ...)         <span class="cmt"># 采噪声</span>
+timesteps = torch.randint(<span class="nu">0</span>, num_train_timesteps, ...)  <span class="cmt"># 每条轨迹随机采一个噪声等级</span>
+noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
+
+pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+<span class="kw">if</span> self.config.prediction_type == <span class="st">"epsilon"</span>:
+    target = eps                                 <span class="cmt"># 默认：预测「加了什么噪声」</span>
+<span class="kw">elif</span> self.config.prediction_type == <span class="st">"sample"</span>:
+    target = batch[ACTION]                       <span class="cmt"># 或直接预测干净轨迹</span>
+loss = F.mse_loss(pred, target, reduction=<span class="st">"none"</span>)</pre>
+    <div class="annotation"><b>读法：</b>训练是「加噪 → 预测噪声 → MSE」（一步前向，很快）；推理是「从噪声迭代去噪 num_inference_steps 次」（默认等于训练步数 100，configuration_diffusion.py:149）。两头的<strong>不对称</strong>是所有 diffusion 系模型的共性，也是它部署比 ACT 慢的根源——ACT 推理是单次前向，diffusion 推理是 100 次。scheduler 支持 DDPM/DDIM 两种（modeling_diffusion.py:176），DDIM 步数可调小提速。默认超参（configuration_diffusion.py:104-118）：<code class="inline">n_obs_steps=2</code>（观测历史两帧）、<code class="inline">horizon=64</code>、<code class="inline">n_action_steps=32</code>——注意它和 ACT 的 <code class="inline">chunk_size=100</code> 完全不同量级，第 4 章 delta_timestamps 的取窗参数必须与之匹配。</div>
+    <p>ACT 与 Diffusion 的取舍对比：</p>
+    <table class="tbl">
+      <tr><th></th><th>ACT</th><th>Diffusion Policy</th></tr>
+      <tr><td>动作头</td><td>transformer decoder + 线性回归</td><td>条件 1D U-Net（时间维卷积）</td></tr>
+      <tr><td>多模态机制</td><td>CVAE latent（训练）</td><td>天然支持（去噪起点随机）</td></tr>
+      <tr><td>训练目标</td><td>L1 + KL（kl_weight=10）</td><td>MSE（epsilon / sample）</td></tr>
+      <tr><td>推理成本</td><td>单次前向</td><td>num_inference_steps 次前向（默认 100）</td></tr>
+      <tr><td>默认 chunk</td><td>chunk=100，执行 100</td><td>horizon=64，执行 32</td></tr>
+      <tr><td>适合场景</td><td>算力紧张、任务短平快</td><td>动作分布复杂、需要精细轨迹</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>训练入口：策略、数据、处理器的组装点</h2>
+    <p>三条线在第 3 章见过的 <code class="inline">lerobot-train</code>（scripts/lerobot_train.py:385 的 <code class="inline">train(TrainPipelineConfig)</code>）汇合。组装逻辑藏在 factory 里：<code class="inline">make_policy</code> 按名字实例化策略 → 从数据集 metadata 拿 features 与 stats → 生成配套的 pre/post processor（归一化用 4.5 的 stats.json）：</p>
+    <div class="code-title">组装顺序（factory.py + train.py 逻辑示意）</div>
+    <pre class="code"><span class="lang-tag">python</span>policy = make_policy(
+    policy_cfg,                                    <span class="cmt"># draccus 解析的 --policy.type=act 等</span>
+    ds_meta=dataset_metadata,                      <span class="cmt"># 第 4 章：features 定义 + stats</span>
+)
+preprocessor, postprocessor = make_pre_post_processors(
+    policy_cfg,
+    dataset_stats=dataset_metadata.stats,          <span class="cmt"># 4.5：与权重配套的坐标系</span>
+)</pre>
+    <div class="annotation"><b>读法：</b>这正是 3.5 节 Processor 流水线的另一端——训练侧 preprocessor 把数据集样本归一化后喂给 <code class="inline">policy.forward</code>；部署侧 preprocessor 处理实时观测、postprocessor 把网络输出反归一化回关节目标。第 2 章 <code class="inline">send_action</code> 收到的最终值，就来自 postprocessor 之后、再经 <code class="inline">ensure_safe_goal_position</code> 限幅的动作。四层链路（数据 schema → 归一化 → 策略 → 限幅）每一环都换过「单位」，出错时要用这条链逐段排查。</div>
+    <div class="callout info">
+      <b class="tag">延伸</b>
+      每个 checkpoint 目录里除了 <code class="inline">model.safetensors</code> 和 <code class="inline">config.json</code>，还存着 pre/post processor 的配置（pretrained.py 的 HubMixin 序列化）。这意味着「策略 + 归一化」必须整体搬运——只拷权重不拷 processor 配置，是新手部署失败的第一大原因。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>本章小结</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>要点</th><th>源码锚点</th></tr>
+      <tr><td>策略契约</td><td>reset / forward / predict_action_chunk / select_action 四抽象方法；from_pretrained 强制 eval</td><td>policies/pretrained.py:61,215,269,282,291</td></tr>
+      <tr><td>工厂</td><td>draccus 注册名 → config → modeling 模块惰性导入，第三方插件同机制</td><td>policies/factory.py:80</td></tr>
+      <tr><td>ACT</td><td>CVAE（训练）+ transformer 序列翻译；L1+KL；n_decoder_layers=1 为复现原作 bug</td><td>act/modeling_act.py:42,260,462; configuration_act.py:111</td></tr>
+      <tr><td>队列模式</td><td>chunk 入队逐步出队，执行期开环；reset/drop_queued_actions 清队列</td><td>act/modeling_act.py:102</td></tr>
+      <tr><td>时序集成</td><td>每步推理，重叠预测按 wᵢ=exp(-m·i) 加权平均；n_action_steps 必须=1</td><td>act/modeling_act.py:169</td></tr>
+      <tr><td>Diffusion</td><td>训练加噪预测噪声（MSE），推理 100 步迭代去噪；horizon=64 执行 32</td><td>diffusion/modeling_diffusion.py:234,360</td></tr>
+      <tr><td>组装点</td><td>策略 + 数据集 features/stats + pre/post processor 在 train 入口汇合</td><td>scripts/lerobot_train.py:385; policies/factory.py</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      ACT/Diffusion 是「小模型学单一任务」的经典范式。当任务需要理解语言指令、泛化到没见过的物体时，就该请出视觉-语言-动作（VLA）模型了。先读 lerobot 里最小而全的 SmolVLA：VLM 主干如何看世界，流匹配动作专家如何出手。这是<a href="06-smolvla.html">第 6 章：SmolVLA</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="04-dataset.html">← 上一步：LeRobotDataset</a>
+    <a href="06-smolvla.html">下一步：SmolVLA →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出具身智能 · 05 策略动物园 · 基于 huggingface/lerobot（3f2c29ef7e）· 行号随版本演进可能偏移，以仓库最新代码为准
+</footer>
+
+</body>
+</html>

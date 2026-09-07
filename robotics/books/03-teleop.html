@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 遥操作与数据采集 — 深入浅出具身智能</title>
+<link rel="stylesheet" href="assets/robotics-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出具身智能</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-overview.html">全景</a>
+      <a href="02-hardware.html">硬件抽象</a>
+      <a href="03-teleop.html">遥操作</a>
+      <a href="04-dataset.html">数据集</a>
+      <a href="05-policy.html">策略</a>
+      <a href="06-smolvla.html">SmolVLA</a>
+      <a href="07-vla-frontier.html">VLA 前沿</a>
+      <a href="08-sim-isaaclab.html">仿真</a>
+      <a href="09-manager-based-env.html">环境</a>
+      <a href="10-rl-training.html">RL 训练</a>
+      <a href="11-sim2real.html">Sim2Real</a>
+      <a href="12-build-own.html">实战路线</a>
+      <a href="13-glossary.html">术语表</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 遥操作与数据采集</div>
+    <h1>遥操作与数据采集：让人类示范，让机器人记录</h1>
+    <div class="subtitle">模仿学习的数据从哪来？答案是「人类上手演一遍」。这一章拆解 LeRobot 的两条采集链路：<code class="inline">lerobot-teleoperate</code>（纯遥操作）与 <code class="inline">lerobot-record</code>（遥操作 + 数据落盘），重点是一条节拍严苛的循环和一套可插拔的 processor 流水线。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>Teleoperator 基类：动作的「输入源」</h2>
+    <p>第 2 章的 <code class="inline">Robot</code> 是动作的<strong>出口</strong>（<code class="inline">send_action</code>）；遥操作设备是动作的<strong>入口</strong>。两者接口刻意长得像：</p>
+    <div class="code-title">src/lerobot/teleoperators/teleoperator.py:29 — Teleoperator 抽象基类（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Teleoperator</span>(abc.ABC):
+    <span class="cmt"># 与 Robot 相同的结构描述约定</span>
+    config_class: builtins.<span class="cl">type</span>[TeleoperatorConfig]
+    name: <span class="cl">str</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">action_features</span>(self) -&gt; <span class="cl">dict</span>:
+        <span class="cmt">"""输出动作的结构：键与 get_action() 返回一致"""</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">feedback_features</span>(self) -&gt; <span class="cl">dict</span>:
+        <span class="cmt">"""力反馈的结构（可空）：键与 send_feedback() 入参一致"""</span>
+
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">connect</span>(self, calibrate: <span class="cl">bool</span> = <span class="kw">True</span>) -&gt; <span class="kw">None</span>: ...
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">get_action</span>(self) -&gt; RobotAction: ...
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">send_feedback</span>(self, feedback: RobotAction) -&gt; <span class="kw">None</span>: ...
+    <span class="kw">@abc.abstractmethod</span>
+    <span class="kw">def</span> <span class="fn">disconnect</span>(self) -&gt; <span class="kw">None</span>: ...</pre>
+    <div class="annotation"><b>关键不对称：</b>遥操作设备的 <code class="inline">get_action()</code> 返回的字典<strong>键名必须能对上机器人的 <code class="inline">action_features</code></strong>——leader 臂的 <code class="inline">"shoulder_pan.pos"</code> 直接就是 follower 臂的 <code class="inline">"shoulder_pan.pos"</code>。因为第 2 章说过：所有物理差异（方向反转、零位、量程）已在标定时折算成统一归一化坐标，所以 leader 的关节读数可以<strong>原样</strong>当作 follower 的目标。这个「归一化对齐」是主从臂遥操作成立的全部秘密。</div>
+    <p>设备家族一览：</p>
+    <table class="tbl">
+      <tr><th>类别</th><th>实现（teleoperators/ 下）</th><th>原理</th></tr>
+      <tr><td>主从臂（leader）</td><td>so_leader、koch_leader、omx_leader、bi_so_leader、rebot_102_leader</td><td>同构硬件，leader 臂卸掉扭矩只读位置，follower 臂复现</td></tr>
+      <tr><td>外骨骼</td><td>homunculus、openarm_leader</td><td>穿戴式，关节映射到机械臂</td></tr>
+      <tr><td>通用输入</td><td>keyboard、gamepad、phone</td><td>把按键/摇杆/手机姿态映射成关节增量</td></tr>
+      <tr><td>整机映射</td><td>unitree_g1、reachy2_teleoperator</td><td>人形/整机专用遥操协议</td></tr>
+    </table>
+    <div class="annotation"><b>为什么主从臂是主流：</b>键盘/手柄是「增量为动作」，操作者要在大脑里做关节坐标变换，效率低；主从臂是「位姿即动作」，人类肌肉记忆直接复用。代价是要多买一只臂。<code class="inline">so_leader</code> 与 <code class="inline">so_follower</code> 硬件同构（都是 sts3215 舵机），leader 臂的 <code class="inline">bus</code> 只调 <code class="inline">enable_torque(False)</code> 让关节自由活动，读数即示范动作。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>teleoperate：一条节拍严苛的闭环</h2>
+    <p><code class="inline">lerobot-teleoperate</code> 的主循环只有一个 while，但它揭示了所有实时机器人程序共同的骨架——<strong>固定节拍的三段式</strong>：</p>
+    <div class="code-title">src/lerobot/scripts/lerobot_teleoperate.py:193 — 主循环（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span>timer = CycleTimer(fps, records_data=<span class="kw">False</span>)
+<span class="kw">while</span> <span class="kw">True</span>:
+    timer.tick()
+    loop_start = time.perf_counter()
+
+    <span class="kw">with</span> timer.section(<span class="st">"observe"</span>):
+        obs = robot.<span class="fn">get_observation</span>()          <span class="cmt"># 读 follower 全部关节 + 相机</span>
+        <span class="kw">if</span> robot.name == <span class="st">"unitree_g1"</span>:
+            teleop.send_feedback(obs)           <span class="cmt"># 力反馈设备把状态回传给操作者</span>
+
+    <span class="kw">with</span> timer.section(<span class="st">"teleop"</span>):
+        raw_action = teleop.<span class="fn">get_action</span>()        <span class="cmt"># 读 leader 关节</span>
+        teleop_action = teleop_action_processor((raw_action, obs))
+        robot_action_to_send = robot_action_processor((teleop_action, obs))
+
+    <span class="kw">with</span> timer.section(<span class="st">"send"</span>):
+        _ = robot.<span class="fn">send_action</span>(robot_action_to_send)
+
+    timer.wait()                                 <span class="cmt"># 睡掉剩余时间，保证固定 fps</span>
+    <span class="kw">if</span> duration <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> time.perf_counter() - start &gt;= duration:
+        <span class="kw">return</span></pre>
+    <div class="annotation"><b>逐段读：</b>
+      <ul>
+        <li><strong>CycleTimer</strong> 是整个循环的节拍器：<code class="inline">tick()</code> 打点、<code class="inline">section()</code> 记录每段耗时、<code class="inline">wait()</code> 把「这一拍用剩的时间」睡掉。循环结束时打印 <code class="inline">Teleop loop time: 18.2ms (55 Hz)</code> 这样的自检——<strong>掉拍立刻可见</strong>。写实时控制程序的第一课：先修好节拍器，再谈功能。</li>
+        <li><strong>obs 在遥操作里其实没被用</strong>（注释原话：Not really needed for now other than for visualization）——leader 臂的读数本身就是动作，follower 观测只用于可视化和 processor 链。但在第 11 章的 policy 部署里，同一条循环中 obs 是策略的输入，这个骨架是通用的。</li>
+        <li><strong>两段 processor</strong>：<code class="inline">teleop_action_processor</code>（处理「人给的原始动作」）与 <code class="inline">robot_action_processor</code>（处理「发给机器人的动作」）——见 3.4。</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>lerobot-record：在循环里落盘</h2>
+    <p><code class="inline">record_loop</code>（scripts/lerobot_record.py:228）与 teleoperate 的循环同构，只多了三件事：<strong>帧构造、写盘、多遥操作设备</strong>。先看源码里自带的 ASCII 数据流图——它就是本章的地图：</p>
+    <div class="code-title">src/lerobot/scripts/lerobot_record.py:204 — 源码注释中的数据流</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt">""" --------------- record_loop() data flow --------------------------
+       [ Robot ]
+           V
+     [ robot.get_observation() ] ---&gt; raw_obs
+           V
+     [ robot_observation_processor ] ---&gt; processed_obs
+           V
+     [ Teleoperator ]
+     |
+     |  [teleop.get_action] -&gt; raw_action
+     |          |
+     |          V
+     | [teleop_action_processor]
+     |          |
+     '--&gt; processed_teleop_action
+                               V
+                  [ robot_action_processor ] --&gt; robot_action_to_send
+                               V
+                    [ robot.send_action() ] -- (Robot Executes)
+                               V
+                    ( Save to Dataset )
+                               V
+                  ( Rerun Log / Loop Wait )
+"""</span></pre>
+    <p>对应的数据帧构造与落盘代码：</p>
+    <div class="code-title">src/lerobot/scripts/lerobot_record.py:322 与 :350 — 帧构造与写盘（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">with</span> timer.section(<span class="st">"send"</span>):
+    <span class="cmt"># 动作可能被 max_relative_target 限幅——所以落盘的是「实际发送」的动作</span>
+    _sent_action = robot.<span class="fn">send_action</span>(robot_action_to_send)
+
+<span class="kw">if</span> dataset <span class="kw">is not</span> <span class="kw">None</span>:
+    <span class="kw">with</span> timer.section(<span class="st">"record"</span>):
+        action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+        frame = {**observation_frame, **action_frame, <span class="st">"task"</span>: single_task}
+        dataset.<span class="fn">add_frame</span>(frame)   <span class="cmt"># 写进 episode 缓冲区（第 4 章详读）</span></pre>
+    <div class="annotation"><b>注意落盘的动作用的是 <code class="inline">action_values</code>（processor 处理后的遥操作动作）而限幅结果只体现在 <code class="inline">_sent_action</code> 里</b>——源码在 TODO 里承认这点（we should use a pipeline step to clip the action）。它暴露了一个真实的数据质量问题：<strong>数据集里的动作与真实执行的动作可能差一个限幅钳位</strong>。训练时模型学的是操作者的意图（好），但如果限幅频繁触发，意图与执行有偏差（坏）。自己采集数据时值得把 <code class="inline">max_relative_target</code> 设宽松些，或按 TODO 的思路改进。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>episode 生命周期：录、停、重置、重录</h2>
+    <p><code class="inline">record()</code>（scripts/lerobot_record.py:381）在循环外面包了一层 episode 编排。一次录制会话由多个 episode 组成，每个 episode 之间穿插<strong>不录制的重置阶段</strong>：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t3 d3">
+        <title id="t3">录制会话的 episode 生命周期</title>
+        <desc id="d3">record 外层循环：录制阶段 → 重置阶段（不落盘）→ save_episode，键盘事件可提前终止或重录</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">一次 record() 会话（num_episodes 次）</text>
+
+        <rect class="node core" x="40" y="50" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="130" y="72" text-anchor="middle">record_loop</text>
+        <text class="lbl sm" x="130" y="90" text-anchor="middle">录制 · episode_time_s 秒</text>
+
+        <rect class="node" x="300" y="50" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="390" y="72" text-anchor="middle">record_loop（重置）</text>
+        <text class="lbl sm" x="390" y="90" text-anchor="middle">不落盘 · reset_time_s 秒</text>
+
+        <rect class="node acc" x="560" y="50" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="635" y="72" text-anchor="middle">dataset.save_episode</text>
+        <text class="lbl sm" x="635" y="90" text-anchor="middle">缓冲区 → parquet/mp4</text>
+
+        <rect class="node" x="740" y="50" width="120" height="56" rx="8"></rect>
+        <text class="lbl" x="800" y="72" text-anchor="middle">下一集 / 结束</text>
+        <text class="lbl sm" x="800" y="90" text-anchor="middle">finalize + push</text>
+
+        <line class="edge" x1="220" y1="78" x2="298" y2="78"></line>
+        <text class="lbl sm" x="259" y="70" text-anchor="middle">时间到 / 右方向键</text>
+        <line class="edge" x1="480" y1="78" x2="558" y2="78"></line>
+        <line class="edge" x1="710" y1="78" x2="738" y2="78"></line>
+
+        <text class="lbl" x="20" y="160" font-weight="bold" fill="#0f5c4c">键盘事件（init_keyboard_listener，utils/keyboard_input.py:396）</text>
+        <rect class="node" x="40" y="180" width="200" height="52" rx="8"></rect>
+        <text class="lbl" x="140" y="200" text-anchor="middle">← / n（exit_early）</text>
+        <text class="lbl sm" x="140" y="218" text-anchor="middle">提前结束当前阶段</text>
+        <rect class="node warn" x="280" y="180" width="220" height="52" rx="8"></rect>
+        <text class="lbl" x="390" y="200" text-anchor="middle">r / →（rerecord_episode）</text>
+        <text class="lbl sm" x="390" y="218" text-anchor="middle">clear_episode_buffer 重录本集</text>
+        <rect class="node acc" x="540" y="180" width="200" height="52" rx="8"></rect>
+        <text class="lbl" x="640" y="200" text-anchor="middle">esc / q（stop_recording）</text>
+        <text class="lbl sm" x="640" y="218" text-anchor="middle">结束整个会话</text>
+
+        <line class="edge back" x1="140" y1="180" x2="130" y2="108"></line>
+        <line class="edge back" x1="390" y1="180" x2="150" y2="112"></line>
+        <line class="edge back" x1="640" y1="180" x2="800" y2="112"></line>
+
+        <text class="lbl sm" x="20" y="278">重置阶段不写帧（不传 dataset 参数）：CycleTimer 分开统计，避免稀释「有没有按 fps 录满」的指标；</text>
+        <text class="lbl sm" x="20" y="296">episode 时间到后手动恢复场景（把物体放回去），所以 reset_time_s 默认给了 60 秒。</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>录制阶段（写帧）</span>
+        <span class="lg-item"><span class="sw node"></span>重置阶段（不写帧）</span>
+        <span class="lg-item"><span class="sw acc"></span>收尾动作</span>
+        <span class="lg-item"><span class="sw warn"></span>重录 / 退出分支</span>
+      </div>
+      <div class="fig-cap">图 3.4：episode 编排。实线是正常流程，虚线是键盘事件触发的提前退出/重录分支。三个事件标志（exit_early / rerecord_episode / stop_recording）由监听线程置位、控制循环轮询。</div>
+    </div>
+    <p>配置参数（<code class="inline">DatasetRecordConfig</code>，configs/dataset.py:25）决定了数据的形态：</p>
+    <div class="code-title">src/lerobot/configs/dataset.py:25 — DatasetRecordConfig（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">DatasetRecordConfig</span>:
+    repo_id: <span class="cl">str</span> = <span class="st">""</span>            <span class="cmt"># {hf用户名}/{数据集名}，如 "you/so101_pick"</span>
+    single_task: <span class="cl">str</span> = <span class="st">""</span>        <span class="cmt"># 任务描述，会写进每帧的 "task" 字段</span>
+    fps: <span class="cl">int</span> = <span class="nu">30</span>
+    episode_time_s: <span class="cl">int</span> | <span class="cl">float</span> = <span class="nu">60</span>   <span class="cmt"># 每集时长</span>
+    reset_time_s: <span class="cl">int</span> | <span class="cl">float</span> = <span class="nu">60</span>     <span class="cmt"># 每集间重置时长</span>
+    num_episodes: <span class="cl">int</span> = <span class="nu">50</span>
+    video: <span class="cl">bool</span> = <span class="kw">True</span>           <span class="cmt"># 相机帧编码成 mp4（否则存 png）</span>
+    push_to_hub: <span class="cl">bool</span> = <span class="kw">True</span>     <span class="cmt"># 结束后上传 HF Hub</span>
+    num_image_writer_threads_per_camera: <span class="cl">int</span> = <span class="nu">4</span>  <span class="cmt"># 写图线程数，掉 fps 先调这里</span></pre>
+    <div class="annotation"><b>两个容易踩的坑：</b>
+      <ul>
+        <li><strong>fps 不稳是写盘阻塞主循环</strong>：源码注释说得很直白——Too many threads might cause unstable teleoperation fps due to main thread being blocked / Not enough threads might cause low camera fps。图片写入被放进独立线程/进程池（<code class="inline">image_writer_processes/threads</code>），调参口诀：先加线程，仍不稳加进程。</li>
+        <li><strong>「重置」是模仿学习的隐形成本</strong>：每一集结束，场景要回到近似初始状态，否则数据集里「同一任务」的初始条件五花八门，策略学不到一致的映射。reset_time_s 60 秒 + 不落盘，就是在为下一集「对齐初始分布」。录制 50 集，实际有一半时间是重置。</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>Processor 流水线：动作/观测的「可插拔中间件」</h2>
+    <p>循环里反复出现的 <code class="inline">xxx_processor</code> 是 LeRobot 3.x 的关键扩展点。它是<strong>对 EnvTransition（观测+动作+奖励+done 的字典）做变换的步骤序列</strong>：</p>
+    <div class="code-title">src/lerobot/processor/pipeline.py:150 — ProcessorStep 抽象（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ProcessorStep</span>(ABC):
+    <span class="kw">def</span> <span class="fn">__call__</span>(self, transition: EnvTransition) -&gt; EnvTransition:
+        <span class="cmt">"""对一条 transition（obs/action/reward/done…字典）做原地变换"""</span></pre>
+    <p>预置步骤都在 processor/ 下，各自剪裁一件事：</p>
+    <table class="tbl">
+      <tr><th>Processor</th><th>职责</th><th>在哪一章还会见到</th></tr>
+      <tr><td>IdentityProcessor</td><td>默认空操作（遥操作/录制默认链就是它）</td><td>—</td></tr>
+      <tr><td>normalize_processor</td><td>按数据集 stats 归一化/反归一化动作与观测</td><td>第 5 章策略输入、第 11 章部署</td></tr>
+      <tr><td>delta_action_processor</td><td>绝对位置 ↔ 增量动作互转</td><td>第 11 章 rollout</td></tr>
+      <tr><td>device_processor</td><td>张量搬进/搬出 GPU</td><td>第 6 章 VLA 推理</td></tr>
+      <tr><td>tokenize_processor</td><td>语言指令 → tokenizer 输入</td><td>第 6-7 章 VLA</td></tr>
+      <tr><td>image_processor 类</td><td>resize / 归一化相机帧</td><td>第 6 章</td></tr>
+    </table>
+    <div class="annotation"><b>为什么这个设计重要：</b>录制时用一条 processor 链（决定数据格式），部署时用<strong>反向</strong>一条（决定策略输入输出格式）——两边的格式约定不再硬编码在脚本里，而是数据集和 checkpoint 一起保存、一起加载。策略从 A 机器人迁到 B 机器人时，换 processor 而不是改代码。这与第 4 章数据集 features 的设计一脉相承：<strong>格式即元数据，元数据随数据走</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>小结与自建采集系统的清单</h2>
+    <table class="tbl">
+      <tr><th>概念</th><th>lerobot 实现</th><th>你自己做时</th></tr>
+      <tr><td>输入源抽象</td><td>Teleoperator.get_action() → 与机器人 action_features 同键位</td><td>输入源与执行端用同一套归一化坐标，杜绝单位换算散落各处</td></tr>
+      <tr><td>节拍控制</td><td>CycleTimer.tick/section/wait + 掉拍自检打印</td><td>先建节拍器与耗时统计，实时性问题 90% 是节拍被 IO 阻塞</td></tr>
+      <tr><td>写盘解耦</td><td>图像线程池（4 线程/相机）+ 视频批量编码 VideoEncodingManager</td><td>落盘永远异步；编码放到 episode 结束或后台</td></tr>
+      <tr><td>episode 编排</td><td>录/重置交替 + 键盘事件（n/r/q）+ save_episode 落定</td><td>把「重置」当一等公民设计；数据质量取决于初始条件对齐</td></tr>
+      <tr><td>可插拔变换</td><td>RobotProcessorPipeline，录制链与部署链互逆</td><td>格式变换写成中间件，随数据集/checkpoint 持久化</td></tr>
+    </table>
+    <div class="annotation"><b>一句话记住：</b>数据采集不是「录视频」，是<strong>以固定节拍把「观测-动作」对齐成帧</strong>，并在人手松开的那一刻还知道哪一帧属于哪个任务。节拍（fps）、帧（frame）、任务标签（task）三样齐了，才是一份能训练的数据。</div>
+    <div class="callout warn">
+      <b class="tag">下一步</b>
+      <code class="inline">add_frame</code> 进了缓冲区，<code class="inline">save_episode</code> 把它落成 parquet 与 mp4——但「LeRobotDataset v3.0」的目录结构、分片规则、统计归一化到底长什么样？下一章逐文件拆解。这是<a href="04-dataset.html">第 4 章：LeRobotDataset</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="02-hardware.html">← 上一步：硬件抽象层</a>
+    <a href="04-dataset.html">下一步：LeRobotDataset →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出具身智能 · 03 遥操作与数据采集 · 基于 huggingface/lerobot（3f2c29ef7e）· 行号随版本演进可能偏移，以仓库最新代码为准
+</footer>
+
+</body>
+</html>
