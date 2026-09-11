@@ -49,7 +49,7 @@
   <section class="block">
     <h2><span class="num">8.1</span>一分钟版本</h2>
     <p>Hooks 让你在 agentic 循环的生命周期点上运行<strong>任意脚本</strong>。脚本的通信契约很简单：<strong>从 stdin 收一段 JSON，用 stdout / 退出码回话</strong>。最强大的是 PreToolUse——它能在工具执行前<strong>拦截</strong>，甚至阻止调用并把原因告诉模型，让模型换路。</p>
-    <p>本仓库里有大量真实用法：<code class="inline">plugins/security-guidance</code> 用 PostToolUse（编辑文件后）+ Stop（提交/推送时）监测约 25 类安全问题；<code class="inline">plugins/explanatory-output-style</code> 与 <code class="inline">learning-output-style</code> 用 SessionStart 注入教学上下文；<code class="inline">plugins/ralph-wiggum</code> 用 Stop 拦截退出、让循环继续。</p>
+    <p>本仓库里有大量真实用法：<code class="inline">plugins/security-guidance</code> 用 PostToolUse（编辑文件后审查；带 <code class="inline">if</code> 条件的 PostToolUse 在 <code class="inline">git commit</code>/<code class="inline">git push</code> 时触发深度复查）+ Stop（回合结束时把 diff 发给 LLM 复查）监测约 25 类安全问题；<code class="inline">plugins/explanatory-output-style</code> 与 <code class="inline">learning-output-style</code> 用 SessionStart 注入教学上下文；<code class="inline">plugins/ralph-wiggum</code> 用 Stop 拦截退出、让循环继续。</p>
   </section>
 
   <section class="block">
@@ -62,8 +62,10 @@
       <tr><td>SessionEnd</td><td>会话结束</td><td>清理/收尾</td><td>—</td></tr>
       <tr><td>UserPromptSubmit</td><td>用户提交提示时</td><td>预处理/拦截输入</td><td>hookify 的 userpromptsubmit.py、security-guidance</td></tr>
       <tr><td>PreCompact</td><td>上下文压缩前</td><td>注入压缩摘要</td><td>—</td></tr>
-      <tr><td>Stop</td><td>代理尝试结束</td><td>拦截退出、强制继续</td><td>ralph-wiggum 的 stop-hook.sh、security-guidance</td></tr>
+      <tr><td>Stop</td><td>代理尝试结束</td><td>拦截退出、强制继续</td><td>ralph-wiggum 的 stop-hook.sh、security-guidance（回合末 LLM 复查）</td></tr>
       <tr><td>SubagentStop</td><td>子代理结束</td><td>同上，针对子代理</td><td>—</td></tr>
+      <tr><td>PreModelSwitch / PostModelSwitch</td><td>模型切换前后</td><td>阻止、确认或注记一次模型切换</td><td>—</td></tr>
+      <tr><td>PermissionRequest</td><td>弹出权限确认时</td><td>程序化决定允许/拒绝</td><td>—</td></tr>
       <tr><td>Notification</td><td>需要通知用户时</td><td>自定义通知渠道</td><td>—</td></tr>
     </table>
     <div class="annotation"><b>覆盖面：</b> 从「会话级」（SessionStart/Stop）到「单次工具级」（Pre/PostToolUse）再到「输入级」（UserPromptSubmit），循环的每个关节都有挂载点。这意味着你能在<strong>不碰内核</strong>的前提下，重塑模型的行为——这正是扩展层（第 2 章 L2）的力量。</div>
@@ -198,7 +200,32 @@ _VALIDATION_RULES = [
   </section>
 
   <section class="block">
-    <h2><span class="num">8.9</span>对使用的启示</h2>
+    <h2><span class="num">8.9</span>hooks 模块：函数式的新写法（mods/）</h2>
+    <p>2026 年 9 月起，仓库新增了 <code class="inline">mods/</code> 目录——三个<strong>随 CLI 内置</strong>的插件源码（<code class="inline">sec-default</code>、<code class="inline">diff</code>、<code class="inline">telemetry</code>）。它们代表了 Hooks 的第二种形态：<strong>hooks 模块</strong>。不再是一个被拉起的子进程脚本，而是一个 TypeScript 函数 <code class="inline">register(on, options)</code>，直接把处理函数挂到引擎事件上：</p>
+    <div class="code-title">mods/sec-default/hooks/register.ts（真实仓库内容，节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">import</span> type { On } <span class="kw">from</span> <span class="st">'claude-code'</span>
+
+<span class="kw">export function</span> <span class="fn">register</span>(on: On) {
+  <span class="cmt">// 每个事件挂一个 ($, e, next) 函数，而不是 shell 命令</span>
+  on(<span class="st">'settings.read'</span>, ($, e, next) =&gt; next.to(e, <span class="st">'append'</span>))
+  on(<span class="st">'tool.register'</span>, <span class="kw">async</span> ($, e, next) =&gt; {
+    <span class="cmt">// 能直接读调用方所在的层级，按策略决定放行或拒绝</span>
+    <span class="kw">if</span> (next.origin.tier === <span class="st">'prepend'</span> || next.origin.tier === <span class="st">'append'</span>) {
+      <span class="kw">return</span> next.to(e, <span class="st">'append'</span>)
+    }
+    <span class="cmt">// …用户层注册则拒绝（fail closed）</span>
+    <span class="kw">return</span> isRefused ? { deny: REFUSAL } : next(e)
+  })
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 三点变化值得注意。<strong>① 通信契约变了</strong>——从「stdin JSON + 退出码」变成函数签名 <code class="inline">($, e, next)</code>：事件对象 <code class="inline">e</code> 直接携带类型化数据，<code class="inline">next</code> 控制链式放行（还能知道调用来源的层级 <code class="inline">origin.tier</code>）。<strong>② 事件粒度更细</strong>——出现了 <code class="inline">settings.read</code>、<code class="inline">tool.register</code>、<code class="inline">prompt.section</code> 这类引擎内部事件，不再是只有 Pre/PostToolUse 级别。<strong>③ 仍是插件</strong>——每个 mod 就是一个带 <code class="inline">hooks/hooks.json</code> 的标准插件目录，只是 <code class="inline">hooks.json</code> 指向一个模块而非 shell 命令。这套 API 标注为早期访问、可能随版本变动；三个 mod 里 <code class="inline">diff</code>（<code class="inline">/diff</code> 面板）与 <code class="inline">telemetry</code>（<code class="inline">$.telemetry</code> 分析事件）直接内置在 CLI 里，<code class="inline">sec-default</code> 则在企业托管环境下最外层落座，把企业的 hooks、设置与工具策略挡在用户插件够不到的地方。</div>
+    <div class="callout info">
+      <b class="tag">两种形态怎么选</b>
+      脚本 Hook（stdin/exit code）——语言无关、可维护边界清晰，适合绝大多数护栏与注入场景，仍是默认写法。hooks 模块——强类型、能拿到引擎内部事件与链式上下文，适合深度定制（如本仓库 mods 的面板与安全策略）。目前函数 hooks 需要显式启用，且 API 未承诺稳定——生产配置仍以脚本 Hook 为准。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.10</span>对使用的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
       <strong>① Hooks 是循环的焊点</strong>——不碰内核就能重塑行为。<strong>② 退出码 2 是可教学的护栏</strong>——拦下并告诉模型原因，它会换路，比硬拒绝聪明。<strong>③ PreToolUse 做护栏</strong>、PostToolUse 做校验、SessionStart 做注入——按事件性质选。<strong>④ 企业用 allowManagedHooksOnly 锁定</strong>——能力越大，越要受控。

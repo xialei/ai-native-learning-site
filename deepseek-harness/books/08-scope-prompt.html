@@ -43,7 +43,7 @@
     <ul>
       <li><code class="inline">ctx.systemPrompt</code>（<code class="inline">packages/core/system-prompt</code>）是注册表服务：插件往里塞<strong>四类输入</strong>——sections（系统提示词段落）、contexts（动态运行时上下文）、tool providers（工具 schema）、variables（<code class="inline">{{变量}}</code>）。</li>
       <li>每次 pre-step 调 <code class="inline">assemble()</code>：合并全局层与该 agent 的 scope 层 → 排序 → 跑 <code class="inline">system-prompt/assemble</code> waterfall → 得到 <code class="inline">PromptAssembly</code>。</li>
-      <li>段落顺序由中央常量表 SECTION_ORDERS 分配——所有插件共享一张「哪里放什么」的地图，避免两插件抢位置。</li>
+      <li>段落顺序由中央常量表 SECTION_ORDERS 分配——所有插件共用同一份「哪里放什么」的分配表，避免两处重复占用同一个顺序。</li>
       <li>动态上下文<strong>不进 system prompt</strong>，而是作为 plugin 来源的 user/message 快照追加进历史——所以 KV 缓存前缀保持稳定，只有变化时才追加新快照。</li>
       <li>Scope 是不透明对象 + 父链：注册视图沿链<strong>向下</strong>继承（子 scope 看得见祖先的层），事件准入门沿链<strong>向上</strong>（祖先的监听器收得到子孙的事件，反之不行）。</li>
     </ul>
@@ -64,10 +64,11 @@
 }
 
 <span class="kw">export interface</span> <span class="cl">PromptContext</span> {
-  name: <span class="kw">string</span>
+  <span class="cmt">/** 唯一名字——重复注册直接抛错 */</span>
+  <span class="kw">readonly</span> name: <span class="kw">string</span>
   <span class="cmt">/** 动态上下文也按 order 升序拼接 */</span>
-  order: <span class="kw">number</span>
-  text: <span class="kw">string</span> | ((context: <span class="cl">AssembleContext</span>) =&gt; <span class="kw">string</span>)
+  <span class="kw">readonly</span> order: <span class="kw">number</span>
+  <span class="kw">readonly</span> text: <span class="kw">string</span> | ((context: <span class="cl">AssembleContext</span>) =&gt; <span class="kw">string</span>)
 }
 
 <span class="kw">export interface</span> <span class="cl">PromptAssembly</span> {
@@ -84,9 +85,7 @@
     <div class="code-title">packages/core/system-prompt/src/index.ts:121 — SECTION_ORDERS（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">SECTION_ORDERS</span> = {
   HARNESS_IDENTITY: -<span class="nu">1000</span>,      <span class="cmt">// "You are an AI agent powered by DeepSeek Harness."</span>
-  HARNESS_SOURCE: -<span class="nu">900</span>,
-  WEB_SURFACE: -<span class="nu">800</span>,
-  DEPLOYMENT_PERSONA: <span class="nu">0</span>,        <span class="cmt">// 部署方人格——可被 preset 遮蔽</span>
+  DEPLOYMENT_PERSONA_PREFIX: <span class="nu">0</span>, <span class="cmt">// 部署方人格·前缀——可被 preset 遮蔽</span>
   PLAN_POLICY: <span class="nu">500</span>,
   TEAM_POLICY: <span class="nu">600</span>,
   PTC_ONLY: <span class="nu">800</span>,                <span class="cmt">// 第 6 章的 PTC 指令</span>
@@ -97,7 +96,12 @@
   TOOLS_SDK: <span class="nu">5000</span>,
   DELIVERABLE_FILE_REFERENCES: <span class="nu">9000</span>,
   STRUCTURED_OUTPUT: <span class="nu">9900</span>,
+  <span class="cmt">// Local paths and endpoints follow reusable instructions.</span>
+  HARNESS_SOURCE: <span class="nu">10000</span>,
+  WEB_SURFACE: <span class="nu">10100</span>,
+  DEPLOYMENT_PERSONA_SUFFIX: <span class="nu">10200</span>, <span class="cmt">// 部署方人格·后缀——垫在所有指导之后</span>
 } <span class="kw">as const</span></pre>
+    <p>版面的两个端点也值得注意：<code class="inline">HARNESS_IDENTITY</code>（-1000）永远第一句，而原本排在前面的 <code class="inline">HARNESS_SOURCE</code>/<code class="inline">WEB_SURFACE</code> 被挪到了<strong>最后</strong>（10000/10100）——本地路径与端点属于「具体细节」，注释明确说它们应跟在可复用的指导之后；人格也从单段拆成了<strong>前缀（0）+ 后缀（10200）</strong>两段，夹住中间所有一方指导。</p>
     <p>三个「政策快照」context 同样中央分配（<code class="inline">CONTEXT_ORDERS</code>），注册者各自归位：</p>
     <table class="tbl">
       <tr><th>context 名</th><th>order</th><th>注册者</th><th>内容</th></tr>
@@ -105,7 +109,7 @@
       <tr><td><code class="inline">approval:policy</code></td><td>115</td><td>dsh-user-approval</td><td>一句话：approval 是 ask 还是 never</td></tr>
       <tr><td><code class="inline">subagent:delegation</code></td><td>120</td><td>dsh-subagent</td><td>委派边界说明，挂在子 agent 的 scope 上</td></tr>
     </table>
-    <div class="code-title">packages/interaction/user-approval/src/index.ts:152 — 审批政策作为动态上下文</div>
+    <div class="code-title">packages/interaction/user-approval/src/index.ts:153 — 审批政策作为动态上下文</div>
     <pre class="code"><span class="lang-tag">typescript</span>ctx.<span class="fn">inject</span>([<span class="st">'systemPrompt'</span>], (scope: <span class="cl">Context</span>) =&gt; {
   scope.systemPrompt.<span class="fn">context</span>({
     name: <span class="st">'approval:policy'</span>,
@@ -120,22 +124,38 @@
 })</pre>
     <div class="callout info">
       <b class="tag">看懂这个设计</b>
-      审批政策的注释点破动机：「完整当前值跟随在保留历史之后，切换政策时不必重写稳定的 system-prompt 缓存前缀」。凡是会<strong>中途变化</strong>的事实（沙箱模式、审批开关、委派状态）都走 user 快照；只有部署期固定的事实（身份、人格、工具说明书）才进 system prompt。注册者用 <code class="inline">getContextOrder()</code> 而非裸数字，就是为了让中央表成为唯一的版面权威。
+      审批政策的注释写明动机：「完整当前值跟随在保留历史之后，切换政策时不必重写稳定的 system-prompt 缓存前缀」。凡是会<strong>中途变化</strong>的事实（沙箱模式、审批开关、委派状态）都走 user 快照；只有部署期固定的事实（身份、人格、工具说明书）才进 system prompt。注册者用 <code class="inline">getContextOrder()</code> 而非裸数字，就是为了让中央表成为唯一的版面权威。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>PERSONA_SECTION：用「同名遮蔽」实现身份替换</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:166 — PERSONA_SECTION</div>
+    <h2><span class="num">8.4</span>PERSONA_PREFIX/SUFFIX：用「同名遮蔽」实现身份替换</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:174 — 人格段名常量</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
- * The deployment persona's section name. Exported because a
+ * The deployment persona prefix's section name. Exported because a
  * composition can replace this slot — an agent preset shadows the
  * deployment's persona with its own — and both sides naming the same section
  * is what makes the replacement work rather than duplicate.
  */</span>
-<span class="kw">export const</span> <span class="cl">PERSONA_SECTION</span> = <span class="st">'deployment:persona'</span></pre>
+<span class="kw">export const</span> <span class="cl">PERSONA_PREFIX_SECTION</span> = <span class="st">'deployment:persona-prefix'</span>
+
+<span class="cmt">/** Deployment persona suffix section name shared by global and scoped contributions. */</span>
+<span class="kw">export const</span> <span class="cl">PERSONA_SUFFIX_SECTION</span> = <span class="st">'deployment:persona-suffix'</span></pre>
+    <p>注册表构造时无条件注册这两个段——前缀来自 <code class="inline">config.personaPrefix</code>，后缀来自 <code class="inline">config.personaSuffix</code>（缺省为空串，渲染时空段落直接被丢弃）：</p>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:428 — 注册表构造函数（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">this</span>.<span class="fn">section</span>({
+  name: <span class="cl">PERSONA_PREFIX_SECTION</span>,
+  order: <span class="kw">this</span>.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_PREFIX'</span>),
+  <span class="cmt">// The fallback narrows the optional input type; the schema already defaults it.</span>
+  text: config.personaPrefix ?? <span class="st">''</span>,
+})
+<span class="kw">this</span>.<span class="fn">section</span>({
+  name: <span class="cl">PERSONA_SUFFIX_SECTION</span>,
+  order: <span class="kw">this</span>.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_SUFFIX'</span>),
+  text: config.personaSuffix ?? <span class="st">''</span>,
+})</pre>
     <p>遮蔽机制在 <code class="inline">assemble()</code> 里：同层重复注册抛错，<strong>跨层同名则 scope 层遮蔽全局层</strong>：</p>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:552 — assemble() 的合并（节选）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:568 — assemble() 的合并（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// Scoped sections shadow globals before the deterministic order sort.</span>
 <span class="kw">const</span> sectionByName = <span class="kw">this</span>.layers.<span class="fn">merge</span>(scope, layer =&gt; layer.sections)
 <span class="cmt">// Scope-chain variables, farthest first, so the nearest scope wins a name.</span>
@@ -146,26 +166,43 @@
 }</pre>
     <p>消费方是 persona 行（<code class="inline">packages/preset/persona</code>）——它<strong>只允许挂 scope 层</strong>：</p>
     <div class="code-title">packages/preset/persona/src/index.ts — 模块注释与 apply()</div>
-    <pre class="code"><span class="lang-tag">text</span>dsh-system-prompt 拥有全局 persona（自己的 config），无条件注册那段——
+    <pre class="code"><span class="lang-tag">text</span>dsh-system-prompt 拥有全局人格（自己的 config），无条件注册那两段——
 所以本行是 scope-only：挂进 agent preset 时遮蔽该会话的部署人格；
 挂到全局则与注册表自己的注册同名冲突，fail loud。
 这个约束正是本行存在的理由：agent preset 无法挂载 prompt 注册表本身，
 没有这一行，preset 能改工具却永远改不了身份。
 
-<span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">apply</span>(ctx: <span class="cl">Context</span>, config: <span class="cl">Config</span>): <span class="kw">void</span> {
+<span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">Config</span> {
+  <span class="cmt">/** Persona prose rendered as the `deployment:persona-prefix` section. */</span>
+  prefix: <span class="kw">string</span>
+  <span class="cmt">/** Persona suffix template rendered after first-party guidance. */</span>
+  suffix?: <span class="kw">string</span>
+  <span class="cmt">/** Make the prefix the complete system prompt, suppressing the suffix and every other section. */</span>
+  complete?: <span class="kw">boolean</span>
+  <span class="cmt">/** Suppress dynamic runtime-context snapshots for this persona's agent scope. */</span>
+  includeRuntimeContext?: <span class="kw">boolean</span>
+}
+
+<span class="kw">export function</span> <span class="fn">apply</span>(ctx: <span class="cl">Context</span>, config: <span class="cl">Config</span>): <span class="kw">void</span> {
   ctx.<span class="fn">effect</span>(() =&gt; ctx.systemPrompt.<span class="fn">section</span>({
-    name: PERSONA_SECTION,
-    order: ctx.systemPrompt.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA'</span>),
-    text: config.text,
+    name: <span class="cl">PERSONA_PREFIX_SECTION</span>,
+    order: ctx.systemPrompt.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_PREFIX'</span>),
+    text: config.prefix,
     ...config.complete ? { complete: <span class="kw">true</span> } : {},
-  }))
+  }), <span class="st">'persona.section()'</span>)
+  ctx.<span class="fn">effect</span>(() =&gt; ctx.systemPrompt.<span class="fn">section</span>({
+    name: <span class="cl">PERSONA_SUFFIX_SECTION</span>,
+    order: ctx.systemPrompt.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_SUFFIX'</span>),
+    text: config.suffix ?? <span class="st">''</span>,
+  }), <span class="st">'persona.suffix()'</span>)
+  <span class="kw">if</span> (!(config.includeRuntimeContext ?? <span class="kw">true</span>)) ctx.systemPrompt.<span class="fn">suppressRuntimeContext</span>()
 }</pre>
-    <div class="annotation"><b>两种「换人格」</b>：<code class="inline">text</code> 替换 persona 段，其余段落照常；<code class="inline">complete: true</code> 把整条系统提示词换成这段话（组装仍跑 waterfall 以解析工具/变量，然后恢复该段为唯一段落；两个 complete 同时生效直接抛错）。子 agent 的 <code class="inline">applyChildComposition</code> 用同一招给每个孩子装 <code class="inline">deployment:persona</code>——同名字段是替换而非重复的全部机关。</div>
+    <div class="annotation"><b>两种「换人格」</b>：<code class="inline">prefix</code> 替换 persona 前缀段，其余段落照常；<code class="inline">complete: true</code> 把整条系统提示词换成这段话（组装仍跑 waterfall 以解析工具/变量，然后恢复该段为唯一段落，同时<strong>压制后缀段</strong>；两个 complete 同时生效直接抛错）。行包还可以用 <code class="inline">includeRuntimeContext: false</code> 关掉动态运行时上下文快照。子 agent 的 <code class="inline">applyChildComposition</code> 用同一招给每个孩子装 <code class="inline">deployment:persona-prefix</code>——替换而非重复，靠的就是同名字段。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.5</span>渲染与严格插值</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:263 — renderPrompt / renderContextSnapshot</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:273 / :297 — renderPrompt / joinContextSections</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">renderPrompt</span>(assembly: <span class="cl">PromptAssembly</span>): <span class="kw">string</span> {
   <span class="kw">return</span> assembly.sections
     .<span class="fn">map</span>(section =&gt; <span class="fn">interpolate</span>(section, assembly.variables, <span class="st">'section'</span>))
@@ -173,12 +210,13 @@
     .<span class="fn">join</span>(<span class="st">'\n\n'</span>)
 }
 
+<span class="cmt">// renderContextSnapshot(assembly) 就是 joinContextSections(renderContextSections(assembly))</span>
 <span class="kw">export function</span> <span class="fn">joinContextSections</span>(sections: <span class="kw">readonly</span> <span class="cl">ContextSnapshotSection</span>[]): <span class="kw">string</span> {
   <span class="kw">const</span> body = sections.<span class="fn">map</span>(section =&gt; section.text).<span class="fn">join</span>(<span class="st">'\n\n'</span>)
   <span class="kw">if</span> (body.length === <span class="nu">0</span>) <span class="kw">return</span> <span class="st">''</span>
   <span class="kw">return</span> `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${body}`
 }</pre>
-    <div class="annotation"><b>插值是严格的</b>：变量名必须匹配 <code class="inline">/^[a-z][a-z0-9_]*$/</code>；未注册的名字抛错（并打印全部已注册变量）；注册了但本次组装无值的也抛错——<code class="inline">{{name}}</code> 拼错不是静默留白，而是启动即炸。替换后的值不再二次扫描，孤立的 <code class="inline">{{</code> 若后文无 <code class="inline">}}</code> 视为字面散文。工具顺序同理严格：<code class="inline">toolOrder</code> 必须恰好含一个 <code class="inline">&lt;unlisted-tools&gt;</code> 哨兵（未列出的工具按字典序插在那儿），列出未注册的名字在组装时抛错。</div>
+    <div class="annotation"><b>插值是严格的</b>：变量名必须匹配 <code class="inline">/^[a-z][a-z0-9_]*$/</code>；未注册的名字抛错（并打印全部已注册变量）；注册了但本次组装无值的也抛错——<code class="inline">{{name}}</code> 拼错不会静默留白，组装时直接抛错。替换后的值不再二次扫描，孤立的 <code class="inline">{{</code> 若后文无 <code class="inline">}}</code> 视为字面散文。工具顺序同理严格：<code class="inline">toolOrder</code> 必须恰好含一个 <code class="inline">&lt;unlisted-tools&gt;</code> 哨兵（未列出的工具按字典序插在那儿），列出未注册的名字在组装时抛错。</div>
   </section>
 
   <section class="block">
@@ -209,7 +247,7 @@
     })
   }
 }</pre>
-    <div class="annotation"><b>三个细节</b>：① 归属权靠 <code class="inline">source.plugin</code> 标记——投影只认自己来源的消息，重启时倒序扫日志即可恢复 <code class="inline">retained</code>；② surface 替换事件（第 2 章 SurfaceOp.replace）引用了保留快照的 seq 时，<code class="inline">retained</code> 置 null，下轮会补一条新快照；③ 变空时不是静默消失，而是写一句 CLEARED——模型永远能「看见」上下文被撤销这件事。这与第 2 章「model-visible means logged」一脉相承。</div>
+    <div class="annotation"><b>三个细节</b>：① 归属权靠 <code class="inline">source.plugin</code> 标记——投影只认自己来源的消息，重启时倒序扫日志即可恢复 <code class="inline">retained</code>；② surface 替换事件（第 2 章 SurfaceOp.replace）引用了保留快照的 seq 时，<code class="inline">retained</code> 置 null，下轮会补一条新快照；③ 变空时不是静默消失，而是写一句 CLEARED——模型永远能「看见」上下文被撤销这件事——仍然满足第 2 章的「model-visible means logged」。</div>
   </section>
 
   <section class="block">
@@ -300,7 +338,7 @@
         <svg viewBox="0 0 960 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="scope 双向语义">
           <rect x="40" y="40" width="240" height="60" rx="8" fill="#eceffe" stroke="#4156c8"/>
           <text x="160" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">根 ctx（全局）</text>
-          <text x="160" y="86" text-anchor="middle" font-size="10" fill="#666">harness:identity · deployment:persona</text>
+          <text x="160" y="86" text-anchor="middle" font-size="10" fill="#666">harness:identity · persona-prefix/suffix</text>
           <rect x="360" y="40" width="240" height="60" rx="8" fill="#e8f6ee" stroke="#2d8a56"/>
           <text x="480" y="68" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">team scope（父）</text>
           <text x="480" y="86" text-anchor="middle" font-size="10" fill="#2d5a40">team persona · delegation context</text>
@@ -318,17 +356,17 @@
           <line x1="720" y1="105" x2="610" y2="200" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
           <line x1="540" y1="200" x2="430" y2="105" stroke="#e8850a" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
           <text x="120" y="235" font-size="11" fill="#666">bindScopeParent 一次性绑定父链，</text>
-          <text x="120" y="253" font-size="11" fill="#666">rebind 仅限原始 binder 持有的通行证</text>
+          <text x="120" y="253" font-size="11" fill="#666">rebind 只允许最初的 binder 执行</text>
         </svg>
       </div>
       <div class="svg-legend">图 8-2 · 一条 parent 链同时定义「看见什么注册」（向下）与「收到什么事件」（向上）</div>
     </div>
-    <div class="annotation"><b>父子如何接上</b>：第 4 章讲过 agent 构造时 <code class="inline">createScope(loopCtx, this)</code>；子 agent 由 <code class="inline">applyChildComposition</code> 先 <code class="inline">composeFrom(childCtx, parent.ctx)</code> 继承父 preset 的注册，再挂自己的 persona / delegation 上下文 / 工具限制。cycle 检查、一次性绑定、rebind 需要原始通行证——这三道闸保证 scope 祖先链不可能被运行期偷改。</div>
+    <div class="annotation"><b>父子如何接上</b>：第 4 章讲过 agent 构造时 <code class="inline">createScope(loopCtx, this)</code>；子 agent 由 <code class="inline">applyChildComposition</code> 先 <code class="inline">composeFrom(childCtx, parent.ctx)</code> 继承父 preset 的注册，再挂自己的 persona / delegation 上下文 / 工具限制。绑定是<strong>一次性</strong>的：已经有父链的 key 再 bind 直接抛错，代码注释写明「没有开放的改链路径」（scope/index.ts:58）。但并非完全不可改——<code class="inline">bindScopeParent()</code> 返回一个 <code class="inline">ScopeParentBinding</code> 句柄，只有拿到它的那个 binder 能调用 <code class="inline">rebind(parent)</code> 把 key 挂到新父下；rebind 走同一套 cycle 检查，且契约上只在「旧父下没有任何产物被保留」时合法——也就是 blank-session 重建注册世界的场景。所以准确的表述是：祖先链不能被<em>别人</em>改，唯一的改动入口握在最初的 binder 手里，且它要自己保证会话里没留下旧父的痕迹（这条关系看不到会话记录了什么，只能靠持有者守约）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.9</span>tools.restrict：按 scope 收工具</h2>
-    <div class="code-title">packages/core/tools/src/index.ts:1062 — restrict()（节选）</div>
+    <div class="code-title">packages/core/tools/src/index.ts:1061 — restrict()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="fn">restrict</span>(filter: <span class="cl">ToolRestriction</span>): () =&gt; <span class="kw">void</span> {
   <span class="kw">const</span> scope = <span class="fn">scopeOf</span>(<span class="kw">this</span>.ctx)
   <span class="kw">if</span> (scope === <span class="kw">undefined</span>) {
@@ -353,7 +391,7 @@
     <h2><span class="num">8.10</span>要点</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      ① 系统提示词是组装产物不是常量——四类输入（sections/contexts/tools/variables）各有管道；② 版面由中央 SECTION_ORDERS 表权威分配，插件只报名字不抢数字；③ 会变的政策走 user 快照，保住 KV 缓存前缀；④ persona 靠同名遮蔽替换，complete 靠恢复机制独占；⑤ Scope 用一条 parent 链同时定义注册继承（向下）与事件准入（向上）。下一步看这些机制最敏感的应用：<a href="09-security.html">第 9 章：沙箱与审批</a>。
+      ① 系统提示词是组装产物不是常量——四类输入（sections/contexts/tools/variables）各有管道；② 版面由中央 SECTION_ORDERS 表权威分配，插件只报名字不抢数字；③ 会变的政策走 user 快照，保住 KV 缓存前缀；④ persona 拆成 prefix/suffix 两段、靠同名遮蔽替换，complete 靠恢复机制独占；⑤ Scope 用一条 parent 链同时定义注册继承（向下）与事件准入（向上）。下一步看这些机制最敏感的应用：<a href="09-security.html">第 9 章：沙箱与审批</a>。
     </div>
   </section>
 
@@ -365,7 +403,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-1351-ga9519cbcdd</span>
+    <span class="version-badge">rusty-v8-v150.4.0-1950-gda20788df9</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 上下文压缩</div>
     <h1>上下文压缩 Compaction：历史太长怎么办</h1>
     <div class="subtitle">一个长会话很快就会超出模型的上下文窗口。Codex 的解法是 <strong>compaction（压缩）</strong>：在采样前检测 token 预算，超限时把旧历史摘要成一条 compaction summary，腾出空间继续。本章拆开触发条件、本地 vs 远程压缩、token 预算模式三条路径。</div>
@@ -42,7 +42,7 @@
   <section class="block">
     <h2><span class="num">6.1</span>何时触发：采样前检查</h2>
     <p>第 3 章的 <code class="inline">run_turn</code> 第一步就是 <code class="inline">run_pre_sampling_compact</code>——在构建 prompt 之前先检查是否该压缩：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1013 — 采样前压缩检查</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1231 — 采样前压缩检查</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">async fn</span> run_pre_sampling_compact(
     sess: &amp;Arc&lt;Session&gt;,
     turn_context: &amp;Arc&lt;TurnContext&gt;,
@@ -72,7 +72,7 @@
   <section class="block">
     <h2><span class="num">6.2</span>三条压缩路径</h2>
     <p>压缩不止一种实现。<code class="inline">run_auto_compact</code> 根据功能开关和 provider 能力，分派到三条路径：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1179 — run_auto_compact 分派</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1397 — run_auto_compact 分派</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">async fn</span> run_auto_compact(sess, step_context, fallback, client_session, injection, reason, phase) {
     <span class="kw">if</span> turn_context.config.features.enabled(Feature::TokenBudget) {
         <span class="cmt">// 路径 A：token 预算压缩</span>
@@ -82,14 +82,17 @@
     }
 
     <span class="kw">match</span> turn_context.provider.capabilities().remote_compaction {
-        RemoteCompactionSupport::V2 <span class="kw">if</span> features.enabled(Feature::RemoteCompactionV2) =&gt; {
-            <span class="cmt">// 路径 B：远程压缩 v2（服务端做摘要）</span>
+        RemoteCompactionSupport::V2 =&gt; {
+            <span class="cmt">// 路径 B：远程压缩（流式 /responses + compaction_trigger，服务端做摘要）</span>
             run_inline_remote_auto_compact_task_v2(...).await?;
         }
-        <span class="cmt">// 路径 C：本地压缩 / 旧远程压缩 ...</span>
+        RemoteCompactionSupport::Unsupported =&gt; {
+            <span class="cmt">// 路径 C：本地压缩（本地调模型生成摘要）</span>
+            run_inline_auto_compact_task(...).await?;
+        }
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 三条路径按优先级：<strong>① TokenBudget（本地，开新窗口）</strong>——不调用模型做摘要，直接重置 context window，最快最省；<strong>② 远程压缩 V2</strong>——provider 服务端帮你做摘要（OpenAI 后端能力）；<strong>③ 本地压缩</strong>——本地调模型生成摘要。选哪条取决于功能开关 + provider 能力。<code class="inline">RemoteCompactionSupport</code> 是 provider 能力枚举。</div>
+    <div class="annotation"><b>读懂这段：</b> 三条路径按优先级：<strong>① TokenBudget（本地，开新窗口）</strong>——不调用模型做摘要，直接重置 context window，最快最省；<strong>② 远程压缩</strong>——provider 支持 <code class="inline">compaction_trigger</code> 时走流式 <code class="inline">/responses</code>，服务端帮你做摘要（OpenAI 后端能力）；<strong>③ 本地压缩</strong>——本地调模型生成摘要。选哪条只取决于 provider 能力（<code class="inline">RemoteCompactionSupport</code> 是 provider 能力枚举）+ TokenBudget 开关；早期版本还有个 <code class="inline">RemoteCompactionV2</code> 功能开关和一条走 <code class="inline">/responses/compact</code> 的旧远程压缩路径，后来都被移除（旧实现废弃于 #44273，feature 开关退役于 #44255），现在远程压缩统一走流式 v2 实现。</div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t62 d62">
         <title id="t62">三条压缩路径</title>
@@ -106,14 +109,14 @@
         <text class="lbl sm" x="770" y="103" text-anchor="middle">→ 历史被</text>
         <text class="lbl sm" x="770" y="120" text-anchor="middle">summary 替代</text>
       </svg>
-      <div class="fig-cap">图 6.2：压缩按功能开关 + provider 能力分派到三条路径。</div>
+      <div class="fig-cap">图 6.2：压缩按 TokenBudget 开关 + provider 能力分派到三条路径。</div>
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.3</span>TokenBudget 压缩：开新窗口</h2>
-    <p>最优雅的路径是 TokenBudget 压缩——它<strong>不调用模型生成摘要</strong>，而是直接装一个全新的 context window：</p>
-    <div class="code-title">codex-rs/core/src/compact_token_budget.rs:18 — token 预算压缩</div>
+    <p>相比之下 TokenBudget 压缩最直接——它<strong>不调用模型生成摘要</strong>，而是直接装一个全新的 context window：</p>
+    <div class="code-title">codex-rs/core/src/compact_token_budget.rs:24 — token 预算压缩</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 运行 token 预算手动压缩，走正常压缩生命周期。
 /// ///
 /// token 预算压缩跳过模型/服务端摘要，改为安装一个全新的 context window。
@@ -121,7 +124,7 @@
 /// 能观察到与本地或远程压缩相同的生命周期。</span>
 <span class="kw">pub(crate) async fn</span> run_manual_compact_task(sess, turn_context) -&gt; CodexResult&lt;()&gt; {
     <span class="cmt">// 仍发 TurnStarted 事件，保持生命周期一致</span>
-    sess.send_event(&amp;turn_context, EventMsg::TurnStarted(...)).await;
+    sess.emit_turn_started(&amp;turn_context).await;
     <span class="kw">let</span> step_context = sess.capture_step_context(...).await?;
     <span class="kw">let</span> world_state = sess.build_world_state_for_step(&amp;step_context).await?;
     run_compact_task_inner(&amp;sess, &amp;step_context, world_state, CompactionTrigger::Manual).await
@@ -129,13 +132,13 @@
 
 <span class="cmt">// 自动触发版本（同样的内核，trigger = Auto）</span>
 <span class="kw">pub(crate) async fn</span> run_inline_auto_compact_task(sess, step_context, injection) -&gt; CodexResult&lt;()&gt;;</pre>
-    <div class="annotation"><b>读懂这段：</b> 精妙之处在于<strong>统一生命周期</strong>：即便 TokenBudget 压缩不做摘要，它仍发 <code class="inline">TurnStarted</code>、仍走 <code class="inline">run_compact_task_inner</code>、仍产生 <code class="inline">ContextCompaction</code> turn item、仍触发 compact hooks。<strong>这样无论走哪条路径，下游（遥测、hook、事件流）看到的压缩事件是一致的</strong>。<code class="inline">CompactionTrigger::Manual / Auto</code> 区分手动触发（用户调 <code class="inline">/compact</code>）和自动触发（预算耗尽）。</div>
+    <div class="annotation"><b>读懂这段：</b> 关键在<strong>统一生命周期</strong>：即便 TokenBudget 压缩不做摘要，它仍发 <code class="inline">TurnStarted</code>、仍走 <code class="inline">run_compact_task_inner</code>、仍产生 <code class="inline">ContextCompaction</code> turn item、仍触发 compact hooks。<strong>这样无论走哪条路径，下游（遥测、hook、事件流）看到的压缩事件是一致的</strong>。<code class="inline">CompactionTrigger::Manual / Auto</code> 区分手动触发（用户调 <code class="inline">/compact</code>）和自动触发（预算耗尽）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.4</span>压缩后的历史长什么样</h2>
     <p>压缩发生后，旧历史被一条 <strong>compaction summary</strong> 替代。它作为一个特殊的 <code class="inline">ResponseItem</code> 注入，类型是 <code class="inline">ResponseItem::Compaction</code>（serde 别名 <code class="inline">compaction_summary</code>，见第 4 章 rollout）。对应的 context fragment 是 <code class="inline">CompactionSummary</code>：</p>
-    <div class="code-title">codex-rs/core/src/context/mod.rs:57 — 压缩摘要 fragment 的 re-export</div>
+    <div class="code-title">codex-rs/core/src/context/mod.rs:65 — 压缩摘要 fragment 的 re-export</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// 压缩后，旧的历史被一条摘要替代，作为 context fragment 注入。</span>
 <span class="kw">pub(crate) use</span> compaction_summary::CompactionSummary;</pre>
     <div class="figure">
@@ -157,25 +160,25 @@
       </svg>
       <div class="fig-cap">图 6.4：压缩把旧历史折叠成一条摘要，尾部保留以维持近期上下文。</div>
     </div>
-    <p>压缩后 <code class="inline">ContextManager</code> 的 <code class="inline">history_version</code> 递增（见第 5 章），<code class="inline">reference_context_item</code> 重置——下一轮做全量上下文重注入。事件 <code class="inline">EventMsg::ContextCompacted</code> 通知前端。</p>
+    <p>压缩后 <code class="inline">ContextManager</code> 的 <code class="inline">history_version</code> 递增（见第 5 章），<code class="inline">reference_context_item</code> 重置——下一轮做全量上下文重注入。前端通过 <code class="inline">ContextCompaction</code> turn item 观察到压缩；<code class="inline">EventMsg::ContextCompacted</code> 已标记废弃，仅作为兼容事件继续发给 raw-event/rollout 消费者。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">6.5</span>采样中超窗：ContextWindowExceeded 恢复</h2>
     <p>采样前检查不能保证万无一失——模型可能在采样中途产出超长内容导致超窗。第 3 章看到 <code class="inline">run_sampling_request</code> 的 loop 里专门处理这个：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1406 — 采样中超窗的处理</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1613 — 采样中超窗的处理</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">match</span> try_run_sampling_request(...).await {
     Ok(output) =&gt; <span class="kw">return</span> Ok((output, ...)),
     Err(err) =&gt; <span class="kw">match</span> err.details() {
         CodexErrorDetails::ContextWindowExceeded =&gt; {
             sess.set_total_tokens_full(&amp;turn_context).await;  <span class="cmt">// 标记满</span>
-            <span class="kw">return</span> Err(err);   <span class="cmt">// 上抛，触发压缩后重试</span>
+            <span class="kw">return</span> Err(err);   <span class="cmt">// 上抛（不在此重试）</span>
         }
         CodexErrorDetails::UsageLimitReached(e) =&gt; { ... <span class="kw">return</span> Err(err); }
         _ =&gt; err,
     },
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">ContextWindowExceeded</code> 不在 loop 里重试，而是<strong>上抛给上层</strong>。但上抛后并非「压缩完重新进入采样」——它走通用错误分支，发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续）。压缩的真正防线在<strong>采样之前</strong>（<code class="inline">run_pre_sampling_compact</code>，见 6.1）与<strong>采样成功之后</strong>（若 token 触顶 <code class="inline">should_roll_over</code>，在 mid-turn 跑 <code class="inline">run_auto_compact</code>）。也就是说，压缩主要跑在成功路径上预防超窗，而非作为超窗错误的兜底重试。<code class="inline">set_total_tokens_full</code> 标记窗口已满，让下一轮 pre-sampling 检查能据此触发压缩。</div>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">ContextWindowExceeded</code> 不在 loop 里重试，而是<strong>上抛给上层</strong>。但上抛后并非「压缩完重新进入采样」——它走通用错误分支，发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续）。压缩的真正防线在<strong>采样之前</strong>（<code class="inline">run_pre_sampling_compact</code>，见 6.1）与<strong>采样成功之后</strong>（若 token 触顶 <code class="inline">should_roll_over</code>，在 mid-turn 跑 <code class="inline">run_auto_compact</code>）。也就是说，压缩主要跑在成功路径上预防超窗，而非作为超窗错误的兜底重试。<code class="inline">set_total_tokens_full</code> 标记窗口已满，让下一轮 pre-sampling 检查能据此触发压缩。（例外：Guardian 审查预算耗尽后触发的超窗，会在 <code class="inline">run_turn</code> 的 loop 里先 <code class="inline">run_auto_compact</code> 一次再 <code class="inline">continue</code>，见 turn.rs:706-739；这是唯一一处超窗后压缩重试的路径。）</div>
   </section>
 
   <section class="block">
@@ -189,9 +192,9 @@
       <tr><th>原因 (CompactionReason)</th><th>阶段 (CompactionPhase)</th><th>说明</th></tr>
       <tr><td>ContextLimit</td><td>PreTurn</td><td>采样前发现预算耗尽</td></tr>
       <tr><td>ContextLimit</td><td>MidTurn</td><td>采样成功后 token 触顶（should_roll_over），mid-turn 开新窗口</td></tr>
-      <tr><td>UserRequested</td><td>—</td><td>用户显式请求压缩（<code>/compact</code>）</td></tr>
-      <tr><td>ModelDownshift</td><td>—</td><td>模型切换为更小上下文窗的型号</td></tr>
-      <tr><td>CompHashChanged</td><td>—</td><td>上下文指纹变化触发重算</td></tr>
+      <tr><td>UserRequested</td><td>StandaloneTurn</td><td>用户显式请求压缩（<code>/compact</code>）——独立 turn，本地与远程实现各有一条</td></tr>
+      <tr><td>ModelDownshift</td><td>PreTurn</td><td>模型切换为更小上下文窗的型号</td></tr>
+      <tr><td>CompHashChanged</td><td>PreTurn</td><td>切换模型后 compaction 兼容性 hash 不一致（previous/current model 的 hash 不同）</td></tr>
     </table>
   </section>
 
@@ -199,7 +202,7 @@
     <h2><span class="num">6.7</span>小结与对自研的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      Codex 的压缩有三个值得抄的设计：<strong>① 采样前预检 + 采样中兜底</strong>，双保险防超窗；<strong>② 多路径统一生命周期</strong>——无论本地摘要、远程摘要还是直接开新窗口，下游看到的事件/hook 一致；<strong>③ 压缩即重置 reference</strong>——压缩后下一轮全量重注入上下文，保证一致性。
+      Codex 的压缩有三个关键设计：<strong>① 采样前预检 + 采样中兜底</strong>，双保险防超窗；<strong>② 多路径统一生命周期</strong>——无论本地摘要、远程摘要还是直接开新窗口，下游看到的事件/hook 一致；<strong>③ 压缩即重置 reference</strong>——压缩后下一轮全量重注入上下文，保证一致性。
     </div>
     <div class="callout tip">
       <b class="tag">自研 checklist</b>
@@ -214,7 +217,7 @@
 </div>
 
 <footer>
-  Codex CLI · 06 上下文压缩 · 版本 rusty-v8-v150.4.0-1351-ga9519cbcdd · 所有引用代码路径以仓库最新为准
+  Codex CLI · 06 上下文压缩 · 版本 rusty-v8-v150.4.0-1950-gda20788df9 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

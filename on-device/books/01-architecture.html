@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <h1>整体架构：on-device 推理到底难在哪</h1>
+    <div class="subtitle">云端引擎（vLLM 那一类）的约束是「吞吐」；on-device 引擎的约束是「这台机器只有这么多显存、这么多带宽」。先把两个约束讲清楚，再看两个引擎各自怎么拆系统。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>问题定义：两堵墙</h2>
+    <p>on-device 推理与数据中心推理面对的不是一个问题。数据中心里你可以堆 8 张 H100；而一台游戏本、一块 RTX 4070、甚至一部手机，资源上限是固定的。具体来说有两堵墙：</p>
+    <ul>
+      <li><strong>容量墙</strong>：70B 模型即使 4-bit 量化也要 ~40GB，超过多数消费级 GPU 的 8~24GB 显存。放不下，就要决定「放多少层进显存、剩下留给谁」。</li>
+      <li><strong>带宽墙</strong>：decode 阶段每生成一个 token 都要把全部权重读一遍（memory-bound）。显存带宽 250~1000 GB/s，比 HBM3e 的 3~8 TB/s 低一个数量级。CPU 内存带宽（~50-100 GB/s）更低一个台阶。</li>
+    </ul>
+    <p>两个引擎对这两堵墙的答案完全不同，这正是本书分两条线讲的原因：</p>
+    <ul>
+      <li><strong>llama.cpp</strong>：通用轻量级。核心思路是「压缩到放得下 + 按层切分到多设备 + CPU 兜底」。它不假设你有什么硬件——CUDA、Metal、Vulkan、SYCL、OpenCL、WebGPU，甚至纯 CPU 都能跑同一个 GGUF。</li>
+      <li><strong>FreeToken</strong>：消费级 GPU 的 MoE 专用。MoE 模型（DeepSeek-V4、Qwen3.6、GLM-5.2 这类）总参数巨大但每个 token 只激活少数专家——于是它把<strong>全部专家权重放内存（pinned）、GPU 显存只留一个 LRU 槽池</strong>，缺谁补谁，再用 CPU 和 PCIe 带宽把补不上的缺口填掉。前提是你有一块像样的 NVIDIA 卡。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">怎么读</b>
+      第 1~9 章走 llama.cpp 线：加载、decode 循环、KV、图、多设备、采样、投机、server。第 10~12 章走 FreeToken 线：引擎分层、专家缓存、CPU/GPU 协同。第 13 章把两边放回一张对照表，并给出自研路线。两线之间不要求先后——但第 2 章的量化概念在 FreeToken 章节里会反复出现。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>llama.cpp 分层</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
+        <title id="t12">llama.cpp 架构分层</title>
+        <desc id="d12">从 tools 到 ggml 的四层结构</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
+          </marker>
+        </defs>
+
+        <!-- L1 tools -->
+        <rect class="node" x="20" y="20" width="900" height="80" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#1d6b4f">L1 · tools / app — 面向人的可执行程序</text>
+        <text class="lbl sm" x="40" y="68">llama-server（tools/server）· llama-cli · llama-quantize · llama-perplexity · 统一入口 app/llama.cpp（serve/cli/download/… 子命令）</text>
+        <text class="lbl sm" x="40" y="86">职责：HTTP API、CLI 交互、评测。不含任何张量计算。</text>
+
+        <!-- L2 C API -->
+        <rect class="node" x="20" y="116" width="900" height="66" rx="10"></rect>
+        <text class="lbl" x="40" y="142" font-weight="bold" fill="#1d6b4f">L2 · C API（include/llama.h）— 唯一的对外契约</text>
+        <text class="lbl sm" x="40" y="164">llama_model_load_from_file · llama_init_from_model · llama_decode · llama_sampler_* · llama_state_* —— 约 240 个纯 C 函数</text>
+
+        <!-- L3 llama 层 -->
+        <rect class="node core" x="20" y="198" width="900" height="130" rx="10"></rect>
+        <text class="lbl" x="40" y="224" font-weight="bold" fill="#1d6b4f">L3 · llama 层（src/）— 模型与上下文状态机</text>
+        <rect class="node" x="45" y="238" width="180" height="44" rx="6"></rect>
+        <text class="lbl" x="135" y="260" text-anchor="middle">llama_model</text>
+        <text class="lbl sm" x="135" y="254" text-anchor="middle">GGUF 加载/切层/量化</text>
+        <rect class="node core" x="245" y="238" width="190" height="46" rx="6"></rect>
+        <text class="lbl" x="340" y="260" text-anchor="middle">llama_context</text>
+        <text class="lbl sm" x="340" y="276" text-anchor="middle">decode 状态机/输出</text>
+        <rect class="node" x="455" y="238" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="555" y="260" text-anchor="middle">llama_memory</text>
+        <text class="lbl sm" x="555" y="276" text-anchor="middle">KV cache 统一接口</text>
+        <rect class="node" x="675" y="238" width="230" height="46" rx="6"></rect>
+        <text class="lbl" x="770" y="256" text-anchor="middle">llm_build_*</text>
+        <text class="lbl sm" x="770" y="272" text-anchor="middle">每架构一个图构建器</text>
+        <text class="lbl sm" x="40" y="312" fill="#55685e">职责：管理「模型现在处于什么状态」——批进来、KV 分槽、图建好、结果按请求归位。不碰 kernel。</text>
+
+        <!-- L4 ggml -->
+        <rect class="node" x="20" y="344" width="900" height="100" rx="10"></rect>
+        <text class="lbl" x="40" y="370" font-weight="bold" fill="#1d6b4f">L4 · ggml 层（ggml/）— 张量库 + 后端体系</text>
+        <rect class="node acc" x="45" y="384" width="230" height="40" rx="6"></rect>
+        <text class="lbl" x="160" y="404" text-anchor="middle">ggml-backend-reg</text>
+        <text class="lbl sm" x="160" y="418" text-anchor="middle">注册表/动态加载</text>
+        <rect class="node acc" x="295" y="384" width="210" height="40" rx="6"></rect>
+        <text class="lbl" x="400" y="404" text-anchor="middle">ggml_backend_sched</text>
+        <text class="lbl sm" x="400" y="418" text-anchor="middle">图切分/多设备执行</text>
+        <rect class="node" x="465" y="384" width="180" height="40" rx="6"></rect>
+        <text class="lbl" x="550" y="404" text-anchor="middle">ggml-alloc</text>
+        <text class="lbl sm" x="550" y="418" text-anchor="middle">图内存规划/原地复用</text>
+        <rect class="node" x="665" y="384" width="230" height="40" rx="6"></rect>
+        <text class="lbl" x="780" y="404" text-anchor="middle">backend 实现</text>
+        <text class="lbl sm" x="780" y="418" text-anchor="middle">CUDA/Metal/SYCL/Vulkan/CPU…</text>
+        <line class="edge" x1="470" y1="330" x2="470" y2="342"></line>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>状态机核心</span>
+        <span class="lg-item"><span class="sw acc"></span>硬件相关</span>
+        <span class="lg-item"><span class="sw"></span>一般组件</span>
+      </div>
+      <div class="fig-cap">图 1.2：llama.cpp 四层。规律：越往下越「数学」，越往上越「产品」。C API（L2）把上下两层隔开——tools 基本只认 llama.h（多模态路径另走 mtmd.h），重新实现 L3/L4 不用动调用方。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">tools/server</code>、<code class="inline">app/llama.cpp</code> → L1；
+      <code class="inline">include/llama.h</code> → L2；
+      <code class="inline">src/llama-model.cpp</code>、<code class="inline">src/llama-context.cpp</code>、<code class="inline">src/llama-kv-cache*.cpp</code> → L3；
+      <code class="inline">ggml/src/</code> → L4。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>FreeToken 分层</h2>
+    <p>FreeToken 是一个 Python 包（<code class="inline">freetoken</code>），但热路径全部下沉到 CUDA/Triton kernel 和 C++ 扩展。它的分层依据是仓库自己的说明（<code class="inline">AGENTS.md</code>）：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t13 d13">
+        <title id="t13">FreeToken 架构分层</title>
+        <desc id="d13">从 HTTP API 到 kernel 的五层结构</desc>
+        <rect class="node" x="20" y="20" width="900" height="70" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#c97a10">L1 · server/ — HTTP 面板</text>
+        <text class="lbl sm" x="40" y="68">api_server.py（FastAPI）· openai_api · anthropic_api · responses_api · function_call/reasoning parser · supervisor.py 看护子进程</text>
+
+        <rect class="node" x="20" y="106" width="900" height="66" rx="10"></rect>
+        <text class="lbl" x="40" y="132" font-weight="bold" fill="#c97a10">L2 · scheduler/ — 批与状态</text>
+        <text class="lbl sm" x="40" y="128">chunked prefill（prefill.py）· DecodeManager · CacheManager（radix/hybrid）· overlap_loop 双流重叠 · /v1/cache/rebuild 运行时重分</text>
+
+        <rect class="node core" x="20" y="188" width="900" height="130" rx="10"></rect>
+        <text class="lbl" x="40" y="214" font-weight="bold" fill="#c97a10">L3 · engine/ — 配置与执行</text>
+        <rect class="node" x="45" y="228" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="145" y="250" text-anchor="middle">engine.py</text>
+        <text class="lbl sm" x="145" y="266" text-anchor="middle">装配/预算/重建</text>
+        <rect class="node core" x="265" y="228" width="170" height="46" rx="6"></rect>
+        <text class="lbl" x="350" y="250" text-anchor="middle">graph.py GraphRunner</text>
+        <text class="lbl sm" x="350" y="266" text-anchor="middle">CUDA graph 捕获/重放</text>
+        <rect class="node" x="455" y="228" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="555" y="250" text-anchor="middle">cache_budget.py</text>
+        <text class="lbl sm" x="555" y="266" text-anchor="middle">MoE-first 预算切分</text>
+        <rect class="node" x="675" y="228" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="775" y="250" text-anchor="middle">config.py</text>
+        <text class="lbl sm" x="775" y="266" text-anchor="middle">auto 策略解析</text>
+        <text class="lbl sm" x="40" y="300" fill="#55685e">职责：把「这台 GPU 有多少余量」变成「专家槽池多大、KV 多少页、graph 捕到多大 bs」。</text>
+
+        <rect class="node core" x="20" y="270" width="900" height="60" rx="10" opacity="0.0"></rect>
+
+        <!-- L4 moe -->
+        <rect class="node" x="20" y="316" width="900" height="70" rx="10"></rect>
+        <text class="lbl" x="40" y="342" font-weight="bold" fill="#c97a10">L4 · moe/ + kvcache/ — 数据平面</text>
+        <text class="lbl sm" x="40" y="364">OffloadMoeCache（offload_cache.py，1077 行）· expert_banks/host_banks（pinned 内存）· cpu_executor（C++ 执行器）· radix/hybrid/SWA 前缀缓存</text>
+
+        <rect class="node" x="20" y="402" width="900" height="50" rx="10"></rect>
+        <text class="lbl" x="40" y="424" font-weight="bold" fill="#c97a10">L5 · kernel/ — CUDA / Triton / C++（csrc/）</text>
+        <text class="lbl sm" x="40" y="443">fast_index_copy（0 拷贝 gather）· flashlib slot_cache LRU · _cpu_moe 扩展 · JIT cache wheel（与运行时版本硬校验）</text>
+        <line class="edge" x1="470" y1="270" x2="470" y2="314"></line>
+      </svg>
+      <div class="fig-cap">图 1.3：FreeToken 五层。注意与 llama.cpp 的一个根本区别：这里没有「通用后端」概念——它假定 NVIDIA CUDA（RTX 30/40/50 系），把全部精力花在 MoE 的数据搬运上。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>一次请求在两个引擎里的形状</h2>
+    <p>同样一句 prompt「写一个快排」，两台典型机器上的关键路径：</p>
+    <table class="tbl">
+      <tr><th>阶段</th><th>llama.cpp（单卡 24GB + 64GB 内存）</th><th>FreeToken（单卡 16GB + 64GB 内存）</th></tr>
+      <tr><td>加载</td><td>GGUF mmap 直读，按 free memory 切 n_gpu_layers；放不下的层留在 CPU</td><td>FTW 分片 O_DIRECT 读入 pinned host bank（专家）+ 显存（稠密权重）</td></tr>
+      <tr><td>prefill</td><td>整段 prompt 一个 ubatch（受 n_ubatch 限制），一次前向</td><td>chunked prefill，边算第 N 层边把第 N+1 层专家从内存流进显存（双缓冲）</td></tr>
+      <tr><td>decode</td><td>每 token 一次 llama_decode → 图复用（can_reuse）→ sched 分发到设备</td><td>每 token 一次 graph replay；路由命中的专家在槽池里，缺失的走 PCIe 或 CPU executor（q* 比例分流）</td></tr>
+      <tr><td>KV</td><td>llama_kv_cells 槽位制，unified 或分序列，iswa 双缓存</td><td>radix/SWA/GDN 混合前缀缓存，页大小 1~128 随后端</td></tr>
+      <tr><td>出口</td><td>llama-server（多 slot 并发）或统一 llama 二进制 serve</td><td>FastAPI :1919，OpenAI/Anthropic/Responses 三套路由 + ft shell</td></tr>
+    </table>
+    <p>注意第二列的「图复用」和第三列的「graph replay」不是同一个东西：前者是跳过<strong>重建 C 计算图</strong>（CPU 侧开销），后者是重放<strong>预录制的 CUDA graph</strong>（消除 launch 开销）。名字都叫图，解决的问题不同。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>对「自研引擎」的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      先回答「你的模型是什么形状」。稠密模型 + 想覆盖所有硬件 → 走 llama.cpp 路线（量化 + 分层 + 通用后端）；MoE + 只针对 NVIDIA 消费卡 → 走 FreeToken 路线（槽池 + 带宽协同）。两条路线没有优劣，只有目标硬件和模型形态的区别。
+      下一步进入 <a href="02-gguf-loading.html">第 2 章：GGUF 与模型加载</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-gguf-loading.html">下一步：GGUF 与模型加载 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 01 整体架构 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

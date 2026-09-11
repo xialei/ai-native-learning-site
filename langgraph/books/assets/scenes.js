@@ -371,4 +371,273 @@
     ]
   });
 
+  /* ----------------------------------------------------------
+     6) two-layer-graph — 12.2 两层图结构(实战案例)
+     核心：顶层 10 节点主脊 + 4 个阶段子图,下钻看子图内部,
+           子图出口信号字段供顶层条件边消费
+     ---------------------------------------------------------- */
+  R("two-layer-graph", {
+    svg:
+      '<svg class="svg-box" viewBox="0 0 880 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tf dg">' +
+      '<title id="tf">两层图结构：顶层主脊 + 阶段子图(动态)</title><desc id="dg">主脊从 A 子图推进到 D 子图，C 子图写出口信号，顶层条件边读信号决定下一跳，最后下钻展开 D 子图内部</desc>' +
+      '<defs><marker id="arf2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>' +
+      // 顶层主脊 5 个框
+      '<rect class="node core" id="g-a" x="20" y="40" width="130" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="g-at" x="85" y="62" text-anchor="middle">stage_a_subgraph</text>' +
+      '<text class="lbl sm" id="g-at2" x="85" y="80" text-anchor="middle">理解与发现</text>' +
+      '<rect class="node core" id="g-b" x="200" y="40" width="130" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="g-bt" x="265" y="62" text-anchor="middle">stage_b_subgraph</text>' +
+      '<text class="lbl sm" id="g-bt2" x="265" y="80" text-anchor="middle">数据与契约</text>' +
+      '<rect class="node core" id="g-c" x="380" y="40" width="130" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="g-ct" x="445" y="62" text-anchor="middle">stage_c_subgraph</text>' +
+      '<text class="lbl sm" id="g-ct2" x="445" y="80" text-anchor="middle">评估门禁</text>' +
+      '<rect class="node core" id="g-d" x="560" y="40" width="130" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="g-dt" x="625" y="62" text-anchor="middle">stage_d_subgraph</text>' +
+      '<text class="lbl sm" id="g-dt2" x="625" y="80" text-anchor="middle">调优迭代</text>' +
+      '<rect class="node" id="g-fin" x="750" y="40" width="110" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="g-fint" x="805" y="62" text-anchor="middle">finalize</text>' +
+      '<text class="lbl sm" id="g-fint2" x="805" y="80" text-anchor="middle">注册交付</text>' +
+      // 主脊连线
+      '<line class="edge" id="g-e1" x1="150" y1="68" x2="198" y2="68" marker-end="url(#arf2)"></line>' +
+      '<line class="edge" id="g-e2" x1="330" y1="68" x2="378" y2="68" marker-end="url(#arf2)"></line>' +
+      '<line class="edge acc" id="g-e3" x1="510" y1="60" x2="558" y2="60" marker-end="url(#arf2)"></line>' +
+      '<text class="lbl sm code" id="g-l3" x="534" y="46" text-anchor="middle">tune_required</text>' +
+      '<line class="edge" id="g-e4" x1="690" y1="68" x2="748" y2="68" marker-end="url(#arf2)"></line>' +
+      // C 出口信号标注
+      '<text class="lbl sm code" id="g-sig" x="445" y="126" text-anchor="middle" opacity="0">signals.eval_exit_route = "tune_required"</text>' +
+      // D 子图内部(初始隐藏)
+      '<rect class="node" id="g-x1" x="480" y="180" width="120" height="44" rx="8" opacity="0"></rect>' +
+      '<text class="lbl sm" id="g-x1t" x="540" y="206" text-anchor="middle" opacity="0">prepare_tuning</text>' +
+      '<rect class="node warn" id="g-x2" x="480" y="244" width="120" height="44" rx="8" opacity="0"></rect>' +
+      '<text class="lbl sm" id="g-x2t" x="540" y="270" text-anchor="middle" opacity="0">idea ⏸ interrupt</text>' +
+      '<rect class="node" id="g-x3" x="660" y="212" width="120" height="44" rx="8" opacity="0"></rect>' +
+      '<text class="lbl sm" id="g-x3t" x="720" y="238" text-anchor="middle" opacity="0">trial_loop 子图</text>' +
+      '<line class="edge" id="g-xx1" x1="600" y1="202" x2="608" y2="242" marker-end="url(#arf2)" opacity="0"></line>' +
+      '<line class="edge" id="g-xx2" x1="600" y1="266" x2="658" y2="240" marker-end="url(#arf2)" opacity="0"></line>' +
+      // 顶层尾
+      '<rect class="node" id="g-tail" x="20" y="212" width="200" height="44" rx="8" opacity="0"></rect>' +
+      '<text class="lbl sm" id="g-tailt" x="120" y="238" text-anchor="middle" opacity="0">顶层尾：cleanup → finalize</text>' +
+      '<text class="lbl sm code" id="g-tailnote" x="120" y="278" text-anchor="middle" opacity="0">失败短路汇合点必须留顶层(子图不可跳入中间)</text>' +
+      '</svg>',
+    states: [
+      [
+        { sel: "#g-a", add: "act" },
+        { state: '顶层 StateGraph ~10 节点\nnext = ("stage_a_subgraph",)',
+          note: "顶层只有 4 个阶段子图 + 顶层尾（cleanup/finalize）。38 个细粒度节点全部下沉进子图，顶层一屏读完。" }
+      ],
+      [
+        { sel: "#g-a", rm: "act", add: "done" },
+        { sel: "#g-e1", add: "act" },
+        { sel: "#g-b", add: "act" },
+        { state: 'stage_a done → stage_b(数据与契约)\n子图作为节点嵌入： add_node("stage_b", compiled_b)',
+          note: "A 子图内部 10 个节点跑完，顶层只看到「一个节点完成」。子图是黑盒，内部事件要靠 subgraphs=True 才能接出来。" }
+      ],
+      [
+        { sel: "#g-b", rm: "act", add: "done" },
+        { sel: "#g-e2", add: "act" },
+        { sel: "#g-c", add: "act" },
+        { state: 'stage_b done → stage_c(评估门禁)\n内部： eval → domain_eval → overfit → gate_router',
+          note: "C 子图末节点 gate_router 是关键——它不路由,只写一个出口信号字段。" }
+      ],
+      [
+        { sel: "#g-ct2", txt: "gate_router 写信号" },
+        { sel: "#g-sig", attr: { opacity: "1" } },
+        { state: 'return {"runtime": {"signals":\n    {"eval_exit_route": "tune_required"}}}',
+          note: "子图出口信号契约：内部四向分流收敛为「写一个字段」，子图内部条件边统一走到 END。" }
+      ],
+      [
+        { sel: "#g-c", rm: "act", add: "done" },
+        { sel: "#g-e3", add: "act-acc" },
+        { sel: "#g-l3", add: "act" },
+        { sel: "#g-d", add: "act" },
+        { state: '顶层条件边读信号决定下一跳\ndef route(s): return s["runtime"]["signals"]["eval_exit_route"]\n# "tune_required" → stage_d_subgraph',
+          note: "顶层不用知道 C 内部发生了什么,只读信号字段。路由从 26 个内联闭包收敛为「子图出口 + 顶层条件边」。" }
+      ],
+      [
+        { sel: "#g-x1", attr: { opacity: "1" } },
+        { sel: "#g-x1t", attr: { opacity: "1" } },
+        { sel: "#g-x2", attr: { opacity: "1" } },
+        { sel: "#g-x2t", attr: { opacity: "1" } },
+        { sel: "#g-x3", attr: { opacity: "1" } },
+        { sel: "#g-x3t", attr: { opacity: "1" } },
+        { sel: "#g-xx1", attr: { opacity: "1" } },
+        { sel: "#g-xx2", attr: { opacity: "1" } },
+        { sel: "#g-d", rm: "act", add: "act-acc" },
+        { state: '▼ 下钻 stage_d 内部(可观测层)\nprecheck → prepare_tuning → idea(⏸interrupt) → trial_loop(子图)',
+          note: "产品前端的「下钻」就是这层：顶层主脊给管理者看,子图内部节点给工程师看。细粒度事件经 custom + subgraphs 接出来。" }
+      ],
+      [
+        { sel: "#g-x1", add: "done" },
+        { sel: "#g-xx1", rm: "act", add: "dim" },
+        { sel: "#g-xx2", add: "act-acc" },
+        { sel: "#g-d", rm: "act-acc", add: "done" },
+        { sel: "#g-e4", add: "act" },
+        { sel: "#g-fin", add: "act" },
+        { sel: "#g-tail", attr: { opacity: "1" } },
+        { sel: "#g-tailt", attr: { opacity: "1" } },
+        { sel: "#g-tailnote", attr: { opacity: "1" } },
+        { state: 'stage_d done → finalize\n为什么 cleanup 留顶层？\n子图只能从入口进,失败短路无法靶向子图中间节点',
+          note: "两层图的边界划分判据：需要被全图任意位置跳转的节点(cleanup)留顶层;阶段内聚的流程做成子图。" }
+      ]
+    ]
+  });
+
+  /* ----------------------------------------------------------
+     7) interrupt-ux — 12.5 interrupt 如何变成产品 UX(实战案例)
+     核心：interrupt({type}) → 前端按 type 渲染卡片 → resume 闭环
+     ---------------------------------------------------------- */
+  R("interrupt-ux", {
+    svg:
+      '<svg class="svg-box" viewBox="0 0 880 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tu du">' +
+      '<title id="tu">interrupt 如何变成产品 UI(动态)</title><desc id="du">节点抛 interrupt 带 type,前端据 type 渲染审批卡,人审批后 Command(resume) 恢复,状态从 running 修正为 interrupted</desc>' +
+      '<defs><marker id="arf3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>' +
+      // 左：图侧
+      '<rect class="node core" id="u-node" x="20" y="30" width="200" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="u-nodet" x="120" y="52" text-anchor="middle">generate_idea_library</text>' +
+      '<text class="lbl sm" id="u-nodet2" x="120" y="70" text-anchor="middle">产出 3 个高风险 idea</text>' +
+      '<rect class="node warn" id="u-int" x="280" y="30" width="200" height="56" rx="10"></rect>' +
+      '<text class="lbl sm" id="u-intt" x="380" y="52" text-anchor="middle">interrupt({...})</text>' +
+      '<text class="lbl sm" id="u-intt2" x="380" y="70" text-anchor="middle">type: "idea_approval"</text>' +
+      '<line class="edge" id="u-e1" x1="220" y1="58" x2="278" y2="58" marker-end="url(#arf3)"></line>' +
+      // 中：前端
+      '<rect class="node acc" id="ui-card" x="540" y="20" width="180" height="76" rx="10"></rect>' +
+      '<text class="lbl sm" id="ui-cardt" x="630" y="44" text-anchor="middle">⏸ 待审批卡片</text>' +
+      '<text class="lbl sm" id="ui-cardt2" x="630" y="62" text-anchor="middle">按 type 选组件渲染</text>' +
+      '<text class="lbl sm code" id="ui-cardt3" x="630" y="82" text-anchor="middle">idea_approval → IdeaCard</text>' +
+      '<line class="edge acc" id="u-e2" x1="480" y1="58" x2="538" y2="58" marker-end="url(#arf3)"></line>' +
+      // 底部状态行
+      '<rect class="node" id="u-status" x="280" y="150" width="200" height="40" rx="8"></rect>' +
+      '<text class="lbl sm code" id="u-statust" x="380" y="175" text-anchor="middle">status: "running"  ← 错!</text>' +
+      '<rect class="node" id="u-status2" x="540" y="150" width="180" height="40" rx="8"></rect>' +
+      '<text class="lbl sm code" id="u-status2t" x="630" y="175" text-anchor="middle">徽标： 无</text>' +
+      // 回传
+      '<path class="edge acc" id="u-e3" d="M630 96 Q 630 210 480 210 Q 380 210 380 88" fill="none" marker-end="url(#arf3)"></path>' +
+      '<text class="lbl sm code" id="u-l3" x="380" y="228" text-anchor="middle" opacity="0">Command(resume=[批准的 idea id 列表])</text>' +
+      '</svg>',
+    states: [
+      [
+        { sel: "#u-node", add: "act" },
+        { state: 'ideas = build_idea_library(state)\nhigh_risk = [i for i in ideas if i.risk in ("MEDIUM","HIGH")]',
+          note: "调优节点产出一批调参 idea。其中高风险的不能自动执行——需要人审批。" }
+      ],
+      [
+        { sel: "#u-node", rm: "act", add: "done" },
+        { sel: "#u-e1", add: "act-acc" },
+        { sel: "#u-int", add: "act-acc" },
+        { state: 'approved = interrupt({\n  "type": "idea_approval",\n  "ideas": high_risk,   # 结构化载荷\n})',
+          note: "关键设计:interrupt 的 value 带 type 字段。前端拿到 __interrupt__ 事件后按 type 选渲染组件——这是「一种 interrupt 一种 UI」的锚点。" }
+      ],
+      [
+        { sel: "#u-e2", add: "act-acc" },
+        { sel: "#ui-card", add: "act-acc" },
+        { sel: "#u-status", add: "warn" },
+        { sel: "#u-status2", add: "warn" },
+        { state: '前端读 snapshot.interrupts[0].value\n{"type": "idea_approval", "ideas": [...]}',
+          note: "反面教材:旧实现暂停时 status 仍写 running,前端无法区分「在跑」和「在等人」——列表页一片绿,没人知道有审批积压。" }
+      ],
+      [
+        { sel: "#u-statust", txt: 'status: "interrupted" ✓' },
+        { sel: "#u-status2t", txt: "徽标： 🔴 1 项待审批" },
+        { state: '# 中间件统一改写 status\nif snapshot.interrupts:\n    status = "interrupted"   # 而非 running',
+          note: "status 语义修正:暂停态由 checkpointer 快照推导(interrupts 非空 → interrupted),全局徽标才有可信数据源。" }
+      ],
+      [
+        { sel: "#u-l3", attr: { opacity: "1" } },
+        { sel: "#u-e3", add: "act-acc" },
+        { state: 'graph.invoke(\n  Command(resume=[idea_2, idea_3]),\n  config)   # 同 thread_id',
+          note: "人勾选批准的 idea,前端把它包进 Command(resume=...) 回传。resume 值就是 interrupt() 第二次执行的返回值。" },
+      ],
+      [
+        { sel: "#u-int", rm: "act-acc", add: "done" },
+        { sel: "#u-intt2", txt: "返回批准列表" },
+        { sel: "#ui-card", rm: "act-acc", add: "done" },
+        { sel: "#ui-cardt", txt: "✓ 已审批" },
+        { sel: "#u-status", rm: "warn" },
+        { sel: "#u-status2", rm: "warn" },
+        { sel: "#u-status2t", txt: "徽标： 无" },
+        { state: 'ideas = apply_approvals(ideas, approved)\nreturn {"tune": {"idea_library": ideas}}',
+          note: "闭环完成:同一节点从头重跑,interrupt() 这次返回批准列表,审批结果直接写回业务状态。三种 HITL 点位(idea/领域指标/test 集)共用这套协议。" }
+      ]
+    ]
+  });
+
+  /* ----------------------------------------------------------
+     8) stream-observability — 12.7 stream 事件如何驱动进度 UI(实战案例)
+     核心：updates 管节点级、custom 管子图内细粒度,事件 → 前端着色
+     ---------------------------------------------------------- */
+  R("stream-observability", {
+    svg:
+      '<svg class="svg-box" viewBox="0 0 880 280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ts ds">' +
+      '<title id="ts">stream 事件驱动进度 UI(动态)</title><desc id="ds">图执行产生 updates 与 custom 两类事件,updates 更新主脊节点状态,custom 携带子图内部 trial 进度(subgraphs=True 时经 ns 标记出现),前端据事件着色</desc>' +
+      '<defs><marker id="arf4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>' +
+      // 左：执行中的图(纵向主脊)
+      '<rect class="node core" id="s-n1" x="30" y="30" width="150" height="40" rx="8"></rect>' +
+      '<text class="lbl sm" id="s-n1t" x="105" y="55" text-anchor="middle">stage_c ✓ 完成</text>' +
+      '<rect class="node core" id="s-n2" x="30" y="90" width="150" height="40" rx="8"></rect>' +
+      '<text class="lbl sm" id="s-n2t" x="105" y="115" text-anchor="middle">stage_d ● 运行中</text>' +
+      '<rect class="node" id="s-n3" x="30" y="150" width="150" height="40" rx="8" opacity="0.45"></rect>' +
+      '<text class="lbl sm" id="s-n3t" x="105" y="175" text-anchor="middle">finalize ○ 待执行</text>' +
+      '<text class="lbl sm code" x="105" y="226" text-anchor="middle">主脊状态 ← updates 事件</text>' +
+      // 右：子图内部 trial 进度
+      '<rect class="node" x="300" y="20" width="250" height="220" rx="10" fill="none"></rect>' +
+      '<text class="lbl sm" x="425" y="42" text-anchor="middle">stage_d 内部(下钻)</text>' +
+      '<rect class="node" id="s-t1" x="330" y="60" width="190" height="34" rx="6"></rect>' +
+      '<text class="lbl sm code" id="s-t1t" x="425" y="82" text-anchor="middle">trial#1 r2 → 0.81 ✓</text>' +
+      '<rect class="node" id="s-t2" x="330" y="106" width="190" height="34" rx="6"></rect>' +
+      '<text class="lbl sm code" id="s-t2t" x="425" y="128" text-anchor="middle">trial#2 r1 → …</text>' +
+      '<rect class="node" id="s-t3" x="330" y="152" width="190" height="34" rx="6"></rect>' +
+      '<text class="lbl sm code" id="s-t3t" x="425" y="174" text-anchor="middle">trial#3 排队</text>' +
+      '<text class="lbl sm code" x="425" y="226" text-anchor="middle">trial 级进度 ← custom 事件(subgraphs)</text>' +
+      // 右：事件流
+      '<rect class="node acc" id="s-ev" x="620" y="30" width="230" height="180" rx="10"></rect>' +
+      '<text class="lbl sm code" id="s-evt" x="735" y="56" text-anchor="middle">((), "updates", {stage_c: ✓})</text>' +
+      '<text class="lbl sm code" id="s-evt2" x="735" y="84" text-anchor="middle">((), "updates", {stage_d: ●})</text>' +
+      '<text class="lbl sm code" id="s-evt3" x="735" y="112" text-anchor="middle">((stage:id,), "custom", trial#1)</text>' +
+      '<text class="lbl sm code" id="s-evt4" x="735" y="140" text-anchor="middle">((stage:id,), "custom", trial#2)</text>' +
+      '<text class="lbl sm code" id="s-evt5" x="735" y="168" text-anchor="middle">((), "updates", {finalize: ●})</text>' +
+      '<line class="edge" id="s-e1" x1="180" y1="110" x2="618" y2="110" marker-end="url(#arf4)"></line>' +
+      '<line class="edge acc" id="s-e2" x1="520" y1="120" x2="618" y2="120" marker-end="url(#arf4)"></line>' +
+      '</svg>',
+    states: [
+      [
+        { sel: "#s-n1", add: "done" },
+        { sel: "#s-evt", add: "act" },
+        { state: 'stream_mode=["updates","custom"], subgraphs=True\n>>> ((), "updates", {"stage_c": {...}})   # ns=() 顶层',
+          note: "updates 是框架自动吐的节点级 patch:每完成一个节点一条。主脊的 ✓/●/○ 着色就靠它。subgraphs=True 是拿到子图事件的前提。" }
+      ],
+      [
+        { sel: "#s-evt", rm: "act" },
+        { sel: "#s-evt2", add: "act" },
+        { sel: "#s-n2", add: "act" },
+        { state: '>>> ((), "updates", {"stage_d": {...}})\n主脊: stage_d 点亮',
+          note: "顶层视角到此为止——子图是一个黑盒节点。不开 subgraphs 时 trial 级进度完全不可见(现状 trial 子图用 invoke,事件被吞——这是框架默认行为的另一面)。" }
+      ],
+      [
+        { sel: "#s-evt2", rm: "act" },
+        { sel: "#s-evt3", add: "act-acc" },
+        { sel: "#s-t1", add: "done" },
+        { sel: "#s-e2", add: "act-acc" },
+        { state: '>>> (("stage:abc",), "custom", {"trial":1,"round":2})\n# 子图节点内: writer = get_stream_writer()\n#             writer({...})  → 带 ns 出现在父图 stream',
+          note: "custom 是节点主动推的:trial 子图内部每轮训练结束推一条,开了 subgraphs=True 后带 ns 标记出现在父图 stream——ns 为空是顶层事件,非空是子图事件。" }
+      ],
+      [
+        { sel: "#s-evt3", rm: "act-acc" },
+        { sel: "#s-evt4", add: "act-acc" },
+        { sel: "#s-t2", add: "act" },
+        { state: '>>> (("stage:abc",), "custom", {"trial":2,"round":1,...})\n# if ns: 下钻面板  elif mode=="updates": 主脊着色',
+          note: "前端消费协议:ns 非空的 custom → 下钻面板的 trial 行实时刷新;ns 为空的 updates → 主脊节点着色。三元组 (ns, mode, payload) 按 ns 分发。" }
+      ],
+      [
+        { sel: "#s-evt4", rm: "act-acc" },
+        { sel: "#s-evt5", add: "act" },
+        { sel: "#s-t2", rm: "act", add: "done" },
+        { sel: "#s-n2", rm: "act", add: "done" },
+        { sel: "#s-n3", add: "act", attr: { opacity: "1" } },
+        { sel: "#s-e1", rm: "act" },
+        { state: '>>> ((), "updates", {"finalize": {...}})',
+          note: "一条 stream 双通道:updates 给「全景」(管理者看主脊),custom 给「下钻」(工程师看 trial)。这就是可观测中间件的全部——不需要额外轮询接口。" }
+      ]
+    ]
+  });
+
 })();

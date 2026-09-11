@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 内存池与显存预算 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a class="active" href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 内存池与显存预算</div>
+    <h1>内存池与显存预算：token 槽位怎么发、KV 池怎么定大小</h1>
+    <div class="subtitle">调度器每一步做的决定，最终都落在「这一批 token 占哪些 KV 槽位」。这一章拆开三个对象：请求目录（ReqToTokenPool）、KV 本体（TokenToKVPool）、发号器（分配器），以及启动时决定 KV 池大小的一次显存 profiling。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>一分钟版本</h2>
+    <p>一张推理卡的显存分成三块：<strong>模型权重</strong>（启动时加载）、<strong>KV cache 池</strong>（启动时按 profiling 结果一次性建好，运行期大小不变）、<strong>激活值余量</strong>（每步前向临时用）。SGLang 用 <code class="inline">mem_fraction_static</code> 控制前两块的总量，这一参数的语义在 5.6 节展开。</p>
+    <p>KV 池一侧有三个对象，各管一件事：</p>
+    <ul>
+      <li><strong>ReqToTokenPool</strong>：一张 <code class="inline">(size+1, max_context_len)</code> 的 int32 表。第 r 行第 j 列写的是「第 r 个请求的第 j 个 token 存在 KV 池的哪个槽位」。它是目录，不是数据。</li>
+      <li><strong>TokenToKVPool</strong>（MHA 版 / MLA 版）：真正的张量。每层一对 <code class="inline">k_buffer / v_buffer</code>，按下标即槽位号存取。</li>
+      <li><strong>分配器（TokenToKVPoolAllocator）</strong>：维护空闲槽位/空闲页，对外发号（<code class="inline">out_cache_loc</code>）。分页版以页为单位，token 版以单个 token 为单位。</li>
+    </ul>
+    <p>运行时的数据流：调度阶段算出 <code class="inline">out_cache_loc</code>（本批 token 的槽位号）→ 写进 <code class="inline">req_to_token</code> 对应行 → 前向时注意力后端按行取出 K/V 参与计算。第 3 章的 RadixCache 存的也是这套槽位号。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>显存划分图</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t5 d5">
+        <title id="t5">SGLang 显存划分与池结构</title>
+        <desc id="d5">显存三段划分，KV 池的分层 buffer，以及 ReqToTokenPool 到槽位的索引关系</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- Part A: GPU memory bar -->
+        <rect class="node" x="20" y="20" width="900" height="112" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#16648f">一张卡的总显存 · 启动时按 profiling 划分</text>
+        <rect class="node acc" x="40" y="58" width="280" height="44" rx="6"></rect>
+        <text class="lbl" x="180" y="76" text-anchor="middle">模型权重</text>
+        <text class="lbl sm" x="180" y="93" text-anchor="middle">target + draft</text>
+        <rect class="node core" x="332" y="58" width="400" height="44" rx="6"></rect>
+        <text class="lbl" x="532" y="76" text-anchor="middle">KV cache 池（静态，运行期不变）</text>
+        <text class="lbl sm" x="532" y="93" text-anchor="middle">profiling 算出 token 数上限</text>
+        <rect class="node" x="744" y="58" width="156" height="44" rx="6"></rect>
+        <text class="lbl" x="822" y="76" text-anchor="middle">运行时余量</text>
+        <text class="lbl sm" x="822" y="93" text-anchor="middle">1 - mem_fraction_static</text>
+        <line class="edge" x1="320" y1="80" x2="330" y2="80"></line>
+        <line class="edge" x1="732" y1="80" x2="742" y2="80"></line>
+        <text class="lbl sm" x="40" y="122">mem_fraction_static 控制「静态区」占比：权重 + KV 池装在里面；剩下的留给每步前向的激活、CUDA Graph 输入缓冲</text>
+
+        <!-- Part B: KV pool internals -->
+        <rect class="node core" x="20" y="152" width="900" height="164" rx="10"></rect>
+        <text class="lbl" x="40" y="178" font-weight="bold" fill="#b34a10">KV 池内部 · MHATokenToKVPool：每层一对 buffer，按下标（槽位号）存取</text>
+        <rect class="node" x="40" y="192" width="424" height="100" rx="6"></rect>
+        <text class="lbl sm" x="52" y="210">k_buffer · list[Tensor] × layer_num</text>
+        <rect class="node" x="54" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="98" y="244" text-anchor="middle">layer 0</text>
+        <text class="lbl sm code" x="98" y="262" text-anchor="middle">(S+P, H, D)</text>
+        <rect class="node" x="150" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="194" y="244" text-anchor="middle">layer 1</text>
+        <text class="lbl sm code" x="194" y="262" text-anchor="middle">(S+P, H, D)</text>
+        <text class="lbl sm" x="270" y="252" text-anchor="middle">…</text>
+        <rect class="node" x="310" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="354" y="244" text-anchor="middle">layer L-1</text>
+        <text class="lbl sm code" x="354" y="262" text-anchor="middle">(S+P, H, D)</text>
+        <rect class="node" x="484" y="192" width="424" height="100" rx="6"></rect>
+        <text class="lbl sm" x="496" y="210">v_buffer · list[Tensor] × layer_num</text>
+        <rect class="node" x="496" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="540" y="244" text-anchor="middle">layer 0</text>
+        <text class="lbl sm code" x="540" y="262" text-anchor="middle">(S+P, H, Dv)</text>
+        <rect class="node" x="592" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="636" y="244" text-anchor="middle">layer 1</text>
+        <text class="lbl sm code" x="636" y="262" text-anchor="middle">(S+P, H, Dv)</text>
+        <text class="lbl sm" x="712" y="252" text-anchor="middle">…</text>
+        <rect class="node" x="732" y="222" width="88" height="52" rx="5"></rect>
+        <text class="lbl" x="774" y="244" text-anchor="middle">layer L-1</text>
+        <text class="lbl sm code" x="774" y="262" text-anchor="middle">(S+P, H, Dv)</text>
+        <text class="lbl sm" x="40" y="308">S = 池容量（token 数），P = page_size，多出的一个填充页吸收 padding 写入。MLA 池换成一层 (S+P, 1, kv_lora_rank+rope)</text>
+
+        <!-- Part C: ReqToTokenPool -->
+        <rect class="node" x="20" y="336" width="900" height="168" rx="10"></rect>
+        <text class="lbl" x="40" y="360" font-weight="bold" fill="#b34a10">ReqToTokenPool · req_to_token (size+1, max_context_len) · int32</text>
+        <text class="lbl sm" x="40" y="384">请求 A（req_pool_idx=1）</text>
+        <rect class="node core" x="40" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="63" y="411" text-anchor="middle">7</text>
+        <rect class="node core" x="94" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="117" y="411" text-anchor="middle">8</text>
+        <rect class="node core" x="148" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="171" y="411" text-anchor="middle">9</text>
+        <rect class="node core" x="202" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="194" y="411" text-anchor="middle">10</text>
+        <rect class="node" x="202" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="248" y="411" text-anchor="middle">105</text>
+        <rect class="node" x="256" y="392" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="279" y="411" text-anchor="middle">106</text>
+        <text class="lbl sm" x="40" y="440">请求 B（req_pool_idx=2）</text>
+        <rect class="node" x="40" y="448" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="63" y="467" text-anchor="middle">61</text>
+        <rect class="node" x="148" y="448" width="46" height="28" rx="4"></rect>
+        <text class="lbl sm code" x="171" y="467" text-anchor="middle">62</text>
+        <rect class="node" x="256" y="448" width="46" height="28" rx="5"></rect>
+        <text class="lbl sm code" x="279" y="467" text-anchor="middle">63</text>
+        <text class="lbl sm" x="40" y="496">行按 free_slots 从尾部弹出分配；req_generation 记代数，拦下异步路径里的旧行号</text>
+
+        <!-- KV slot strip -->
+        <rect class="node" x="520" y="376" width="380" height="116" rx="8"></rect>
+        <text class="lbl sm" x="536" y="396">KV 槽位（每层同一下标；k 与 v 各存一份）</text>
+        <rect class="node" x="536" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm" x="552" y="432" text-anchor="middle">…</text>
+        <rect class="node core" x="588" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="563" y="431" text-anchor="middle">7</text>
+        <rect class="node core" x="596" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="613" y="431" text-anchor="middle">8</text>
+        <rect class="node core" x="656" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="686" y="431" text-anchor="middle">9</text>
+        <rect class="node core" x="710" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="731" y="431" text-anchor="middle">10</text>
+        <rect class="node" x="718" y="410" width="42" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="764" y="431" text-anchor="middle">…</text>
+        <rect class="node core" x="764" y="410" width="46" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="810" y="431" text-anchor="middle">105</text>
+        <rect class="node core" x="810" y="410" width="46" height="36" rx="5"></rect>
+        <text class="lbl sm code" x="833" y="431" text-anchor="middle">106</text>
+        <text class="lbl sm" x="536" y="472">前向时按行读出槽位号，拼成 K/V gather 的索引</text>
+
+        <!-- arrows -->
+        <line class="edge" x1="352" y1="406" x2="516" y2="416"></line>
+        <text class="lbl sm code" x="380" y="398">out_cache_loc / prefix_indices</text>
+        <line class="edge back" x1="700" y1="492" x2="352" y2="466"></line>
+        <text class="lbl sm" x="560" y="486">请求结束 / 被抢占 → 页归还</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>KV 池本体 / 已占用槽位</span>
+        <span class="lg-item"><span class="sw acc"></span>静态分配（启动定死）</span>
+        <span class="lg-item"><span class="sw"></span>一般区域</span>
+      </div>
+      <div class="fig-cap">图 5.2：显存划分。上：静态区（权重 + KV 池）与运行时余量的切分；中：每层一对 k/v buffer，槽位号就是第一维下标；下：req_to_token 把「第 r 个请求的第 j 个 token」翻译成槽位号。虚线是释放路径。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>ReqToTokenPool：请求到槽位的目录</h2>
+    <p>这张表是一个 <code class="inline">(size+1, max_context_len)</code> 的 int32 张量。行数是最大并发请求数（加一行填充），列数是最大上下文长度。注意 <code class="inline">int32</code>——槽位号不会超过池容量，用 32 位正好把每步 gather 索引的传输量减半：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — ReqToTokenPool.__init__（摘录，注释为原文）</div>
+    <pre class="code"><span class="lang-tag">python</span>self.size = size
+<span class="cmt"># +1 padding row at index 0: cuda-graph padded batches default</span>
+<span class="cmt"># req_pool_indices to 0, so dummy reads/writes land here harmlessly.</span>
+self._alloc_size = size + <span class="nu">1</span>
+self.max_context_len = max_context_len
+self.device = device
+<span class="kw">with</span> memory_saver_adapter.region(<span class="cl">GPU_MEMORY_TYPE_KV_CACHE</span>):
+    self.req_to_token = torch.<span class="fn">zeros</span>(
+        (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+    )
+self.free_slots = <span class="fn">list</span>(<span class="fn">range</span>(<span class="nu">1</span>, self._alloc_size))
+self.req_generation = torch.<span class="fn">zeros</span>(self._alloc_size, dtype=torch.int64)</pre>
+    <div class="annotation"><b>读懂这段：</b> 两个细节。<strong>第一行是填充行</strong>：CUDA Graph 回放时，padding 出来的假请求 <code class="inline">req_pool_indices</code> 全是 0，让它们的读写都落在第 0 行，避免越界或污染真请求。<strong>free_slots 从 1 开始</strong>也是同一个原因。</div>
+    <p>分配行本身是个简化的空闲链表，但有三处细节值得看：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — alloc_rows（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_rows</span>(self, need_size: <span class="cl">int</span>) -&gt; Optional[<span class="cl">List</span>[<span class="cl">int</span>]]:
+    <span class="kw">if</span> need_size &gt; <span class="fn">len</span>(self.free_slots):
+        <span class="kw">return</span> <span class="kw">None</span>
+    <span class="kw">if</span> need_size == <span class="nu">0</span>:
+        <span class="cmt"># 单独处理：free_slots[-0:] 是整个列表，不是空列表</span>
+        <span class="kw">return</span> []
+    <span class="cmt"># 从尾部弹出：O(need_size)；从头部 pop 是 O(len(free_slots))</span>
+    select_index = self.free_slots[-need_size:]
+    <span class="kw">del</span> self.free_slots[-need_size:]
+    self.req_generation[select_index] += <span class="nu">1</span>
+    <span class="kw">if</span> self._on_alloc_rows <span class="kw">is not</span> <span class="kw">None</span>:
+        self._on_alloc_rows(select_index)
+    <span class="kw">return</span> select_index</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">free_slots[-0:]</code> 这个特判值得停下来看一眼：Python 里 <code class="inline">lst[-0:]</code> 等价于 <code class="inline">lst[0:]</code>，即整个列表——「分配 0 行」若不走这个分支会把所有空闲行都发出去。另外每次分配都会把该行的 <code class="inline">req_generation</code> 加一：行会被反复复用，重叠调度等异步路径里拿旧行号来写的人，可以凭代数判断自己是不是拿着过期引用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>TokenToKVPool：每层一对 k/v 张量</h2>
+    <p>MHA 版池子按层各建一对 buffer。第一维是 <strong>槽位号</strong>，长度是 <code class="inline">size + page_size</code>——多出的一个填充页，接住 CUDA Graph padding token 的哑写入。三种物理布局由环境和后端决定：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — _kv_buffer_shapes 与 _create_buffers_normal（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_kv_buffer_shapes</span>(self):
+    <span class="kw">if</span> self.use_hnd:
+        <span class="kw">return</span> (
+            (self.num_pages, self.head_num, self.page_size, self.head_dim),
+            (self.num_pages, self.head_num, self.page_size, self.v_head_dim),
+        )
+    rows = self.size + self.page_size
+    <span class="kw">return</span> (
+        (rows, self.head_num, self.head_dim),
+        (rows, self.head_num, self.v_head_dim),
+    )
+
+<span class="kw">def</span> <span class="fn">_create_buffers_normal</span>(self):
+    ...
+        <span class="cmt"># 默认（NHD）：每层一个 (size+page_size, H, D) 张量</span>
+        k_shape, v_shape = self._kv_buffer_shapes()
+        self.k_buffer = [
+            torch.<span class="fn">zeros</span>(k_shape, dtype=self.store_dtype, device=self.device)
+            <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(self.layer_num)
+        ]
+        self.v_buffer = [
+            torch.<span class="fn">zeros</span>(v_shape, dtype=self.store_dtype, device=self.device)
+            <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(self.layer_num)
+        ]</pre>
+    <div class="annotation"><b>读懂这段：</b> NHD 是默认布局（行=槽位，方便 gather）；HND 把第一维换成页，服务按 kv-head 稀疏取页的后端（如 trtllm_mha）；<code class="inline">vectorized_5d</code> 是 ROCm AITER 专用的重排布局。文件头注释写明 HND 与 vectorized_5d 互斥、HND 优先——这是为不同 kernel 的访存模式留的口子，而不是统一的「更好布局」。</div>
+
+    <p>写入路径 <code class="inline">set_kv_buffer</code> 每个前向步、每层调一次，尾部按布局分派：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — set_kv_buffer 尾段（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> cache_k.dtype != self.dtype:
+    <span class="kw">if</span> k_scale <span class="kw">is not</span> <span class="kw">None</span>:
+        cache_k.<span class="fn">div_</span>(k_scale)
+    <span class="kw">if</span> v_scale <span class="kw">is not</span> <span class="kw">None</span>:
+        cache_v.<span class="fn">div_</span>(v_scale)
+    cache_k = cache_k.<span class="fn">to</span>(self.dtype)
+    cache_v = cache_v.<span class="fn">to</span>(self.dtype)
+
+<span class="kw">if</span> self.use_hnd:
+    <span class="cmt"># HND 里一个槽位是 [page, :, off, :]，不是连续行，按（页，页内偏移）散射</span>
+    pages = loc <span class="cmt">//</span> self.page_size
+    offs = loc <span class="cmt">%</span> self.page_size
+    k_buf[pages, :, offs, :] = cache_k
+    v_buf[pages, :, offs, :] = cache_v
+    <span class="kw">return</span>
+
+self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, cache_k, cache_v)</pre>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      MLA（DeepSeek 系列）的池子为什么只有一个 <code class="inline">kv_buffer</code>？因为 MLA 把 K/V 压进一个隐空间向量：每 token 每层只存 <code class="inline">kv_lora_rank + qk_rope_head_dim</code> 维（解耦 RoPE 部分单独保留），attention 内部再做吸收变换。所以 <code class="inline">MLATokenToKVPool</code> 的 buffer 形状是 <code class="inline">(size + page_size, 1, kv_lora_rank + qk_rope_head_dim)</code>，比 MHA 的两份 per-head 张量省一个数量级的显存。池子和注意力后端是配套设计的（见第 7 章）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>分页分配器：以页为单位发号</h2>
+    <p>调度器拿到的不是零散槽位，而是 <code class="inline">out_cache_loc</code> 槽位数组；分页版分配器内部只维护一个 <code class="inline">free_pages</code> 张量（空闲页号）。<code class="inline">alloc_for_extend</code>（<code class="inline">mem_cache/allocation.py:342</code>）把两件事接起来：先从 <code class="inline">req_to_token_pool</code> 发请求行，再按 <code class="inline">page_size</code> 决定走 token 版还是分页版分配。</p>
+    <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_extend / alloc_decode（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_extend</span>(
+    self,
+    prefix_lens: torch.Tensor, prefix_lens_cpu: torch.Tensor,
+    seq_lens: torch.Tensor, seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    extend_num_tokens: <span class="cl">int</span>,
+    num_new_pages: <span class="cl">int</span> = <span class="kw">None</span>,
+):
+    bs = <span class="fn">len</span>(prefix_lens)
+    <span class="kw">if</span> extend_num_tokens <span class="cmt">//</span> self.page_size + bs + <span class="nu">1</span> &gt; <span class="fn">len</span>(self.free_pages):
+        self.<span class="fn">merge_and_sort_free</span>()
+
+    out_indices = torch.<span class="fn">empty</span>((extend_num_tokens,), dtype=torch.int64, device=...)
+
+    <span class="cmt"># 一次 Triton 启动算出整批 token 的槽位号</span>
+    <span class="fn">alloc_extend_kernel</span>[(bs,)](
+        prefix_lens, seq_lens, last_loc, self.free_pages,
+        out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size,
+    )
+
+    <span class="cmt"># 本批实际消耗的新页数；不够就返回 None（触发上层淘汰或回退）</span>
+    <span class="kw">if</span> num_new_pages <span class="kw">is</span> <span class="kw">None</span>:
+        num_new_pages = <span class="fn">get_num_new_pages</span>(
+            seq_lens=seq_lens_cpu, page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+    <span class="kw">if</span> num_new_pages &gt; <span class="fn">len</span>(self.free_pages):
+        <span class="kw">return</span> <span class="kw">None</span>
+    self.free_pages = self.free_pages[num_new_pages:]
+    <span class="kw">return</span> out_indices</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang/kernels/ops/memory/allocator.py:16</code>）每个请求一个 program，把槽位计算拆成三段：<strong>① 填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>）；<strong>② 申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移）；<strong>③ 开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。文件里还留着一个纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现，两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
+
+    <p>decode 每步每请求至多消耗一页，kernel 更简单；释放则要把 token 槽位号折算回页号并去重：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_decode 与 free（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_decode</span>(self, seq_lens, seq_lens_cpu, last_loc):
+    bs = <span class="fn">len</span>(seq_lens)
+    ...
+    <span class="fn">alloc_decode_kernel</span>[(bs,)](seq_lens, last_loc, self.free_pages,
+                               out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size)
+    num_new_pages = <span class="fn">get_num_new_pages</span>(seq_lens=seq_lens_cpu,
+                                      page_size=self.page_size, decode=<span class="kw">True</span>)
+    <span class="kw">if</span> num_new_pages &gt; <span class="fn">len</span>(self.free_pages):
+        <span class="kw">return</span> <span class="kw">None</span>
+    self.free_pages = self.free_pages[num_new_pages:]
+    <span class="kw">return</span> out_indices
+
+<span class="kw">def</span> <span class="fn">free</span>(self, free_index: torch.Tensor):
+    <span class="kw">if</span> free_index.<span class="fn">numel</span>() == <span class="nu">0</span>:
+        <span class="kw">return</span>
+    <span class="kw">if</span> self.free_group <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="cmt"># token 槽位号 → 页号，去重后归还（尾页可能被多个请求写过）</span>
+        self.<span class="fn">_release_page_ids</span>(torch.<span class="fn">unique</span>(free_index <span class="cmt">//</span> self.page_size))
+    <span class="kw">else</span>:
+        self.free_group.append(self._copy_for_free_group(free_index))
+
+<span class="kw">def</span> <span class="fn">free_segment</span>(self, free_index: torch.Tensor, *, start_pos: <span class="cl">int</span>):
+    <span class="cmt">"""固定形状释放：页对齐的起点 + 连续页内 token，
+    使 free_index[::page_size] 恰好每页命中一次，免掉一次 torch.unique 同步。"""</span>
+    ...
+    reps = free_index[::ps]
+    self.<span class="fn">free_page_ids</span>(reps <span class="cmt">//</span> ps)</pre>
+    <div class="annotation"><b>读懂这段：</b> 释放路径有三条，形状各不相同。<code class="inline">free</code> 是通用路径：<code class="inline">free_group</code> 为 <code class="inline">None</code> 时直接按页号归还（<code class="inline">//</code> 折算 + <code class="inline">torch.unique</code> 去重，因为尾页可能被多个请求写过）；否则只是把待释放索引攒进 <code class="inline">free_group</code>，延后合并。<code class="inline">free_segment</code> 是给「起点页对齐、页内 token 连续」这种规整形状走的快路径——<code class="inline">free_index[::page_size]</code> 直接就是每页一次，省掉 <code class="inline">torch.unique</code> 这个会同步设备的算子（NPU 后端的注释里明说了这一点）。<code class="inline">free_page_ids</code> 则是最底层的一条：调用方保证页号已去重，它连 <code class="inline">unique</code> 都不做。三条路最终都汇到 <code class="inline">_release_page_ids</code>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>显存预算：mem_fraction_static 与启动 profiling</h2>
+    <p><code class="inline">mem_fraction_static</code> 的语义：占启动时总显存的比例，划给「静态区」——权重加 KV 池。剩下的 <code class="inline">1 - mem_fraction_static</code> 留给运行时的激活、CUDA Graph 缓冲等。KV 池到底能建多大，不是拿一个写死的 GB 数，而是权重加载完之后现场量出来的：</p>
+    <div class="code-title">python/sglang/srt/mem_cache/kv_cache_configurator.py — _profile_available_bytes（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_profile_available_bytes</span>(self, pre_model_load_memory: <span class="cl">int</span>) -&gt; <span class="cl">int</span>:
+    <span class="cmt"># 权重加载的临时对象此时可能仍被引用，empty_cache() 收不回来；</span>
+    <span class="cmt"># 不先 gc 的话空闲量被低估，KV 池会明显偏小</span>
+    gc.<span class="fn">collect</span>()
+    available_gpu_memory = <span class="fn">get_available_gpu_memory</span>(...)
+
+    <span class="cmt"># 运行时余量 = 启动总量 × (1 - mem_fraction_static)</span>
+    slack_gb = pre_model_load_memory * (<span class="nu">1</span> - <span class="fn">get_schedule</span>().mem_fraction_static)
+    ...
+    mm_reservation_gb = <span class="fn">mm_runtime_reservation_gb</span>(...)  <span class="cmt"># 多模态预留</span>
+    rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+
+    <span class="cmt"># 权重（含投机解码的 draft）可能已经超出静态预算</span>
+    <span class="kw">if</span> rest_memory &lt;= <span class="nu">0</span>:
+        minimum_mem_fraction_static = (
+            <span class="nu">1</span> - available_gpu_memory / pre_model_load_memory
+        )
+        suggested_mem_fraction_static = (
+            math.<span class="fn">ceil</span>(minimum_mem_fraction_static * <span class="nu">1000</span>) / <span class="nu">1000</span>
+        )
+        <span class="kw">raise</span> <span class="cl">ValueError</span>(
+            <span class="st">f"Loaded weights leave no GPU memory for the KV cache under "</span>
+            <span class="st">f"--mem-fraction-static={...}. Raise --mem-fraction-static above "</span>
+            <span class="st">f"{suggested_mem_fraction_static:.3f} ..."</span>
+        )
+
+    <span class="kw">return</span> <span class="fn">int</span>(rest_memory * (<span class="nu">1</span> &lt;&lt; <span class="nu">30</span>))  <span class="cmt"># 字节</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 三个要点。<strong>其一</strong>，权重先加载、再量显存，所以权重已经占掉的部分自动被计入——KV 池大小是「总量减去权重再减去余量」的残差。<strong>其二</strong>，<code class="inline">slack_gb</code> 按「启动时总量」的固定比例扣，而不是按当前空闲量扣，保证运行时余量不随权重变大而缩水。<strong>其三</strong>，配置得太小、权重就把预算吃光时，直接抛 ValueError 并给出可行的最小值，把「调 mem-fraction」这个用户动作变成一条可执行的错误信息。</div>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么先 <code class="inline">gc.collect()</code>？注释里写得很直白：weight loading 的中间张量此时可能还有引用，<code class="inline">empty_cache()</code> 对被引用的块无能为力；不先收集，测得的空闲显存偏小，KV 池可能被算小几个数量级，而显存其实闲着。这是启动路径上少见的「先 gc 再测量」写法，属于用 profiling 结果换稳定性的例子。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.7</span>对自研引擎的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      自研引擎分三步走：v1 用 token 粒度的空闲链表（一个 int64 张量切首尾就够）+ 每层 k/v 大张量，几十行代码能跑；要上连续批处理的生产负载，再升级成页粒度 + 向量化分配 kernel（避免每步几千次小分配）；KV 池大小任何时候都从启动 profiling 推导，别写死 GB 数——不同卡、不同模型、不同上下文长度下写死的数字都会错。下一步进入 <a href="06-model-runner.html">第 6 章：ModelRunner 与 CUDA Graph</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="04-scheduler.html">← 上一步：调度器</a>
+    <a href="06-model-runner.html">下一步：ModelRunner 与 CUDA Graph →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -27,6 +27,7 @@
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
       <a href="13-agentic-gateway.html">实战·网关</a>
+      <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
 </header>
@@ -133,13 +134,13 @@
       <li><strong>mp（MultiprocExecutor）</strong>：<span class="mono">多进程</span>。每个 worker 是 <code class="inline">context.Process(target=WorkerProc.worker_main, name=f"VllmWorker-{rank}")</code> 拉起的独立进程，进程间用<strong>共享内存消息队列 MessageQueue</strong> 通信。vLLM 默认的多卡后端，<strong>不依赖 Ray</strong>，只需标准库多进程，适合单机多卡。</li>
       <li><strong>ray（RayDistributedExecutor / RayExecutorV2）</strong>：<span class="mono">Ray 编排</span>。每个 worker 是一个 Ray actor（<code class="inline">ray.remote(RayWorkerProc)</code>，远端对象），能跨节点、跨机调度，支持 PP 的编译 DAG。适合大规模、多机集群。注意 <code class="inline">RayExecutorV2</code> 继承自 <code class="inline">MultiprocExecutor</code>，复用了后者的基于消息队列（MQ）的控制平面，但 worker 进程由 Ray 管理、是 Ray actor 而非裸多进程。</li>
     </ul>
-    <div class="annotation"><b>一句话：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把蓝图（并行配置）给它，它负责拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。</div>
+    <div class="annotation"><b>概括：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把蓝图（并行配置）给它，它负责拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.3</span>用代码看：三种 Executor 的差异 & 并行配置</h2>
     <p>先看后端是怎么被选出来的。下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
-    <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录）</div>
+    <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">elif</span> distributed_executor_backend == <span class="st">"ray"</span>:
     executor_class = RayDistributedExecutor
 <span class="kw">elif</span> distributed_executor_backend == <span class="st">"mp"</span>:
@@ -148,13 +149,13 @@
     executor_class = <span class="fn">UniProcExecutor</span></pre>
 
     <p>单进程的 <code class="inline">collective_rpc</code> 最朴素——根本没有网络，直接在同进程内调用 worker 方法：</p>
-    <div class="code-title">vllm/v1/executor/uniproc_executor.py — UniProcExecutor.collective_rpc（摘录）</div>
+    <div class="code-title">vllm/v1/executor/uniproc_executor.py — UniProcExecutor.collective_rpc（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># driver_worker 就在当前进程里，调用等同于直接执行</span>
 result = <span class="fn">run_method</span>(self.driver_worker, method, args, kwargs)
 <span class="kw">return</span> result <span class="kw">if</span> single_value <span class="kw">else</span> [result]</pre>
 
     <p>而 Ray 版每个 worker 是一个远端 actor，于是 <code class="inline">collective_rpc</code> 变成「把方法序列化后 <code class="inline">.remote()</code> 发出去，再 <code class="inline">ray.get()</code> 收结果」：</p>
-    <div class="code-title">vllm/v1/executor/ray_executor.py — RayDistributedExecutor.collective_rpc（摘录）</div>
+    <div class="code-title">vllm/v1/executor/ray_executor.py — RayDistributedExecutor.collective_rpc（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>ray_worker_outputs = [
     worker.<span class="fn">execute_method</span>.remote(sent_method, *args, **kwargs)
     <span class="kw">for</span> worker <span class="kw">in</span> self.workers
@@ -173,7 +174,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
     <div class="annotation"><b>逐行读：</b>vLLM 里 <code class="inline">world_size</code> 的本质是 <strong>TP × PP</strong>（决定 worker 数量）；<code class="inline">world_size_across_dp</code> 在它基础上再乘 <code class="inline">data_parallel_size</code>，把 DP 的复制份也算进来。注意官方 docstring 写的是“TPxPP”，但代码里实际计算是 <code class="inline">PP × TP × PCP</code>（<code class="inline">prefill_context_parallel_size</code>，默认 1，所以多数情况等价于 TP×PP）；DCP（decode context parallel）则复用 TP 的 rank 来切序列。另外 vLLM <strong>没有独立的 <code class="inline">expert_parallel_size</code> 字段</strong>——MoE 的 expert 切分直接复用 TP/DP 的世界大小（<code class="inline">enable_expert_parallel</code> 只是开关）。</div>
 
     <p>多卡之间的「对话」最终落到设备通信。TP 组里每层都要做一次 all-reduce，走在 <code class="inline">GroupCoordinator</code> 上：</p>
-    <div class="code-title">vllm/distributed/parallel_state.py — GroupCoordinator.all_reduce（摘录）</div>
+    <div class="code-title">vllm/distributed/parallel_state.py — GroupCoordinator.all_reduce（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">all_reduce</span>(self, input_: torch.Tensor) -&gt; torch.Tensor:
     <span class="kw">if</span> self.world_size == <span class="nu">1</span>:        <span class="cmt"># 单卡直接跳过</span>
         <span class="kw">return</span> input_
@@ -246,7 +247,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 </div>
 
 <footer>
-  深入浅出vLLM · 10 分布式 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 10 分布式 · 版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

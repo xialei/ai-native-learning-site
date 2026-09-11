@@ -27,6 +27,7 @@
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
       <a href="13-agentic-gateway.html">实战·网关</a>
+      <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
 </header>
@@ -60,7 +61,7 @@
   <section class="block">
     <h2><span class="num">9.2</span>OpenAI 兼容入口：路由怎么接进来</h2>
     <p>HTTP 层是用 FastAPI 搭的 <code class="inline">build_app()</code>（定义在 <code class="inline">vllm/entrypoints/launchers/app.py</code>；旧的 <code class="inline">openai/api_server.py</code> 已废弃，只是重新导出它）。注意：<strong>实际的 <code class="inline">/v1/...</code> 路由并不直接写在 <code class="inline">build_app</code> 里</strong>——<code class="inline">build_app</code> 调 <code class="inline">register_api_routers()</code>，后者再调各子模块的 <code class="inline">api_router.py</code>，通过 <code class="inline">app.include_router(...)</code> 注册。抓主干：</p>
-    <div class="code-title">vllm/entrypoints/launchers/app.py + api_server/routers.py — build_app 的路由装配（摘录）</div>
+    <div class="code-title">vllm/entrypoints/launchers/app.py + api_server/routers.py — build_app 的路由装配（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.entrypoints.serve <span class="kw">import</span> register_vllm_serve_api_routers
 register_vllm_serve_api_routers(app)
 
@@ -70,7 +71,7 @@ register_vllm_serve_api_routers(app)
 register_generate_api_routers(app)
 <span class="cmt"># 其中 register_generate_api_routers 依次挂入 chat / responses / completion 等路由</span></pre>
     <p><code class="inline">register_generate_api_routers</code>（<code class="inline">vllm/entrypoints/generate/api_router.py</code>）把 <code class="inline">/v1/completions</code> 和 <code class="inline">/v1/chat/completions</code> 挂到 FastAPI app 上。来看完整函数。</p>
-    <div class="code-title">vllm/entrypoints/generate/api_router.py — 注册 completion 与 chat 路由（摘录）</div>
+    <div class="code-title">vllm/entrypoints/generate/api_router.py — 注册 completion 与 chat 路由（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.entrypoints.openai.chat_completion.api_router <span class="kw">import</span> (
     attach_router <span class="kw">as</span> register_chat_api_router,
 )
@@ -81,7 +82,7 @@ register_chat_api_router(app)
 )
 register_completion_api_router(app)</pre>
     <p>这两个路由端点分别定义在 <code class="inline">chat_completion/api_router.py</code>（<code class="inline">/v1/chat/completions</code> → <code class="inline">create_chat_completion</code>）和 <code class="inline">completion/api_router.py</code>（<code class="inline">/v1/completions</code> → <code class="inline">create_completion</code>）。路由装上之后，FastAPI 收到 HTTP 请求就交给这些 handler，handler 再调用 <code class="inline">openai_serving_xxx</code>（如 <code class="inline">OpenAIServingCompletion</code> / <code class="inline">OpenAIServingChat</code>）把 HTTP 请求翻译成「引擎能力请求」。以 completion 为例：</p>
-    <div class="code-title">vllm/entrypoints/openai/completion/api_router.py — /v1/completions 端点（摘录）</div>
+    <div class="code-title">vllm/entrypoints/openai/completion/api_router.py — /v1/completions 端点（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>@router.post(<span class="st">"/v1/completions"</span>, ...)
 @with_cancellation
 @load_aware_call
@@ -107,7 +108,7 @@ register_completion_api_router(app)</pre>
       <li>调用方（这里是 serving handler）迭代 <code class="inline">AsyncLLM.generate()</code> 返回的生成器，边产边取边 yield 给客户端。</li>
     </ul>
     <p>看 <code class="inline">generate()</code> 里等待输出那一段——它从按请求的队列里拿 <code class="inline">RequestOutput</code>，<strong>不是攒到最后</strong>，而是拿到一个吐一个：</p>
-    <div class="code-title">vllm/v1/engine/async_llm.py — AsyncLLM.generate 的取流循环（摘录）</div>
+    <div class="code-title">vllm/v1/engine/async_llm.py — AsyncLLM.generate 的取流循环（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">generate</span>(self, prompt, sampling_params, request_id, ...)
         <span class="kw">-&gt;</span> <span class="cl">AsyncGenerator</span>[<span class="cl">RequestOutput</span>, <span class="kw">None</span>]:
     q = await self.add_request(...)   <span class="cmt"># 把 EngineCoreRequest 加进后台 EngineCore</span>
@@ -185,7 +186,7 @@ register_completion_api_router(app)</pre>
   <section class="block">
     <h2><span class="num">9.5</span>用代码看：输出的最后一公里</h2>
     <p>承接 9.3，我们把 <code class="inline">AsyncLLM</code> 里那个「后台输出循环」看完整。它在一个 <code class="inline">asyncio</code> 任务里无限循环，从引擎拉 <code class="inline">EngineCoreOutputs</code>，处理成各请求的 <code class="inline">RequestOutput</code> 塞进队列：</p>
-    <div class="code-title">vllm/v1/engine/async_llm.py — _run_output_handler 里的 output_handler 协程（摘录）</div>
+    <div class="code-title">vllm/v1/engine/async_llm.py — _run_output_handler 里的 output_handler 协程（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">output_handler</span>():
     <span class="kw">while True</span>:
         <span class="cmt"># 1) 从后台 EngineCore 拉一批输出</span>
@@ -204,7 +205,7 @@ register_completion_api_router(app)</pre>
 self.output_handler = asyncio.create_task(output_handler())</pre>
     <div class="annotation"><b>逐行拆解：</b>(1) <code class="inline">get_output_async()</code> 是跨进程（ZMQ）拉取，是真正「读引擎」的地方；(2) 切成小片处理是为了<strong>不长期占住事件循环</strong>，让其他请求（包括流式连接的 IO）也能跑；(3) 某些终止条件（stop string）由输出处理器判定后，反向通知引擎 abort——注意这是一个<strong>回环</strong>：请求的结局也可能是引擎外决定的。</div>
     <p>再回头把「流式字节流」那段看一遍，它是 9.2 那段路由里 <code class="inline">StreamingResponse</code> 实际消费的内容。在 <code class="inline">OpenAIServingCompletion.completion_stream_generator</code> 里，每个 <code class="inline">RequestOutput</code> 被序列化成 OpenAI 风格的事件片：</p>
-    <div class="code-title">vllm/entrypoints/openai/completion/serving.py — 流式生成器（摘录）</div>
+    <div class="code-title">vllm/entrypoints/openai/completion/serving.py — 流式生成器（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async for</span> i, res <span class="kw">in</span> result_generator:   <span class="cmt"># 迭代引擎输出流</span>
     <span class="cmt"># ... 包装成 deltas ...</span>
     <span class="kw">yield</span> f<span class="st">"data: {response_json}\n\n"</span>   <span class="cmt"># SSE 事件，一个 token 一片</span>
@@ -215,13 +216,99 @@ self.output_handler = asyncio.create_task(output_handler())</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.6</span>小结与自研启示</h2>
+    <h2><span class="num">9.6</span>可观测性：TTFT / ITL / 吞吐，vLLM 怎么量自己</h2>
+    <p>前面所有章节讲的优化——分页 KV、连续批处理、chunked prefill、CUDA Graph——最终都要落到<strong>数字</strong>上才算数：「这个优化把哪个指标改善了、代价是什么」。vLLM 在引擎内部就埋好了一整套统计：每个请求记录一组时间戳（<code class="inline">vllm/v1/metrics/stats.py</code> 的 <code class="inline">RequestStateStats</code>），汇总成 Prometheus 指标（<code class="inline">vllm/v1/metrics/loggers.py</code>），还能进一步算 MFU（<code class="inline">vllm/v1/metrics/perf.py</code>）。</p>
+    <div class="code-title">vllm/v1/metrics/stats.py — RequestStateStats：每个请求的时间戳（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">@dataclass</span>
+<span class="kw">class</span> <span class="cl">RequestStateStats</span>:
+    <span class="st">"""Stats that need to be tracked across delta updates."""</span>
+    num_generation_tokens: <span class="cl">int</span> = <span class="nu">0</span>
+    num_preemptions: <span class="cl">int</span> = <span class="nu">0</span>
+
+    <span class="cmt"># This is an engine frontend timestamp (wall-clock)</span>
+    arrival_time: <span class="cl">float</span> = <span class="nu">0.0</span>       <span class="cmt"># 请求到达 API server 的时刻</span>
+
+    <span class="cmt"># These are engine core timestamps (monotonic)</span>
+    queued_ts: <span class="cl">float</span> = <span class="nu">0.0</span>          <span class="cmt"># QUEUED 事件</span>
+    scheduled_ts: <span class="cl">float</span> = <span class="nu">0.0</span>      <span class="cmt"># 第一次被调度</span>
+    first_token_ts: <span class="cl">float</span> = <span class="nu">0.0</span>    <span class="cmt"># 第一个新 token 产出</span>
+    last_token_ts: <span class="cl">float</span> = <span class="nu">0.0</span>     <span class="cmt"># 最后一个新 token 产出</span></pre>
+    <p>请求结束时，这些时间戳两两相减，就得到完整的延迟分解——排队、prefill、decode 各占多少一目了然：</p>
+    <div class="code-title">vllm/v1/metrics/stats.py — update_from_finished_request：延迟分解（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>e2e_latency = self._time_since(req_stats.arrival_time)
+
+<span class="cmt"># Queued interval is from first QUEUED event to first SCHEDULED</span>
+queued_time = req_stats.scheduled_ts - req_stats.queued_ts
+
+<span class="cmt"># Prefill interval is from first SCHEDULED to first NEW_TOKEN</span>
+prefill_time = req_stats.first_token_ts - req_stats.scheduled_ts
+
+<span class="cmt"># Decode interval is from first NEW_TOKEN to last NEW_TOKEN</span>
+decode_time = req_stats.last_token_ts - req_stats.first_token_ts
+
+<span class="cmt"># Inference interval is from first SCHEDULED to last NEW_TOKEN</span>
+inference_time = req_stats.last_token_ts - req_stats.scheduled_ts</pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow96" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">一个请求的延迟时间线（对应 RequestStateStats 的时间戳）</text>
+
+        <line x1="60" y1="150" x2="860" y2="150" stroke="#5c6b7a" stroke-width="2" marker-end="url(#arrow96)"></line>
+        <text class="lbl sm" x="866" y="154">t</text>
+
+        <rect class="node warn" x="80" y="110" width="140" height="40" rx="6"></rect>
+        <text class="lbl sm" x="150" y="126" text-anchor="middle">排队</text>
+        <text class="lbl sm" x="150" y="142" text-anchor="middle">queued_ts</text>
+        <rect class="node core" x="220" y="110" width="180" height="40" rx="6"></rect>
+        <text class="lbl sm" x="310" y="126" text-anchor="middle">prefill（首 token 前）</text>
+        <text class="lbl sm" x="310" y="142" text-anchor="middle">scheduled_ts → first_token_ts</text>
+        <rect class="node acc" x="400" y="110" width="300" height="40" rx="6"></rect>
+        <text class="lbl sm" x="550" y="126" text-anchor="middle">decode（逐 token）</text>
+        <text class="lbl sm" x="550" y="142" text-anchor="middle">first_token_ts → last_token_ts</text>
+
+        <line class="edge" x1="80" y1="180" x2="400" y2="180"></line>
+        <text class="lbl sm" x="240" y="196" text-anchor="middle" fill="#165a7b">TTFT = 首 token 时刻 − arrival_time</text>
+        <line class="edge" x1="400" y1="204" x2="700" y2="204"></line>
+        <text class="lbl sm" x="550" y="220" text-anchor="middle" fill="#0f7d7a">ITL/TPOT = 相邻两个 token 的间隔（逐个记录）</text>
+        <text class="lbl sm" x="20" y="238">e2e_latency = 结束时刻 − arrival_time；queued/prefill/decode_time 由上面四个时间戳两两相减得到</text>
+      </svg>
+      <div class="fig-cap">图 9.6：TTFT 覆盖「排队 + prefill」，ITL 是 decode 段相邻 token 的间隔。前者由排队/prefill 决定，后者由每步 batch 大小与 kernel 速度决定——所以调参时两者往往此消彼长。</div>
+    </div>
+    <p>这些字段汇总成一组 Prometheus 指标名。挑最常用的记录在案（均出自 <code class="inline">vllm/v1/metrics/loggers.py</code>）：</p>
+    <div class="code-title">vllm/v1/metrics/loggers.py — 核心指标名（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Gauge：当前瞬时状态</span>
+name=<span class="st">"vllm:num_requests_running"</span>       <span class="cmt"># 正在跑的请求数</span>
+name=<span class="st">"vllm:num_requests_waiting"</span>       <span class="cmt"># 排队中的请求数</span>
+name=<span class="st">"vllm:kv_cache_usage_perc"</span>        <span class="cmt"># KV cache 占用率</span>
+
+<span class="cmt"># Counter：只增不减的累计量</span>
+name=<span class="st">"vllm:prefix_cache_queries"</span>       <span class="cmt"># 累计查询的块数（对应第 8 章）</span>
+name=<span class="st">"vllm:prefix_cache_hits"</span>          <span class="cmt"># 累计命中的块数（对应第 8 章）</span>
+
+<span class="cmt"># Histogram：延迟分布（看 P50/P99，别只看均值）</span>
+name=<span class="st">"vllm:time_to_first_token_seconds"</span>      <span class="cmt"># TTFT</span>
+name=<span class="st">"vllm:inter_token_latency_seconds"</span>      <span class="cmt"># ITL</span>
+name=<span class="st">"vllm:e2e_request_latency_seconds"</span>      <span class="cmt"># 端到端</span>
+name=<span class="st">"vllm:request_queue_time_seconds"</span>       <span class="cmt"># 排队时长</span>
+name=<span class="st">"vllm:request_num_preemptions"</span>          <span class="cmt"># 被抢占次数（对应第 4 章）</span></pre>
+    <div class="annotation"><b>把指标映射回机制：</b><code class="inline">kv_cache_usage_perc</code> 高位 + <code class="inline">num_requests_waiting</code> 高位 → 该扩 KV 预算（第 8 章）或上抢占/优先级（第 4 章）；<code class="inline">prefix_cache_hits</code> 低 → 前缀缓存没吃上（第 8.5 章，或多副本没做会话亲和）；<code class="inline">request_num_preemptions</code> 非零 → KV 频繁不够，系统在反复重算（第 4.5 章）。<strong>每个指标都能追溯到某一章的机制——这就是「可观测性」和「读懂引擎」的关系。</strong></div>
+    <div class="callout info">
+      <b class="tag">延伸：MFU</b>
+      vLLM 还内置了一个更底层的度量：用解析法估算每步的 FLOPs 与读写字节数（<code class="inline">vllm/v1/metrics/perf.py</code> 模块，"Analytic flops/memory estimation ... to help derive MFU (Model Flops Utilization) stats"），打开 <code class="inline">VLLM_DEBUG_MFU_METRICS=1</code> 后日志会输出「MFU: N TF/s/GPU M GB/s/GPU」。MFU 回答的问题是「这张卡的算力我用满了几成」——它是判断「瓶颈在算力还是在访存」的最终依据，也正是第 7.1 章 arithmetic intensity 概念的实测形态。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>小结与自研启示</h2>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
       <tr><td>离线</td><td>LLM.generate（阻塞、整批）</td><td>先做同步 CLI + 一个生成接口，最快跑通正确性</td></tr>
       <tr><td>在线/并发</td><td>AsyncLLM（asyncio 常驻循环）</td><td>自研第二步再加 asyncio + 请求队列</td></tr>
       <tr><td>流式</td><td>AsyncGenerator + StreamingResponse</td><td>引擎每步产出就 yield，绝不攒批</td></tr>
       <tr><td>分层</td><td>API server ↔ EngineCore（ZMQ）</td><td>把「HTTP 壳」与「引擎」解耦，才能水平扩</td></tr>
+      <tr><td>可观测</td><td>RequestStateStats 时间戳 + Prometheus 直方图（TTFT/ITL/e2e）</td><td>第一版只记 arrival/first_token/last_token 三个时间戳就够——没有度量的优化是盲目的</td></tr>
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>
@@ -240,7 +327,7 @@ self.output_handler = asyncio.create_task(output_handler())</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 09 服务入口 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 09 服务入口 · 版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

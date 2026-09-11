@@ -84,7 +84,7 @@
    */</span>
   'fs/observed'(target: <span class="cl">FsTarget</span>, observation: <span class="cl">FsObservation</span>, actor): <span class="kw">void</span>
 }</pre>
-    <div class="annotation"><b>两种派发模式的分工</b>：意图事件是 waterfall，但语义是「单槽决策」——第一个返回 intent 的监听器<strong>独占</strong>决定权，不与同伴组合（区别于第 1 章的环绕语义：这里 next() 只是「放弃决策权」）；观察事件是 emit，监听器必须同步（抛错直接打炸工具调用）。fs-sandbox 后端正是靠 fs/write-intent 上的 fence 实现按模式拒绝，错误码 <code class="inline">FS_SANDBOX_DENIED</code> 由工具渲染成第 9 章那个 <code class="inline">[sandbox: file access denied under &lt;mode&gt; mode]</code> 标记。</div>
+    <div class="annotation"><b>两种派发模式的分工</b>：意图事件是 waterfall，但语义是「单槽决策」——第一个返回 intent 的监听器<strong>独占</strong>决定权，不与同伴组合（区别于第 1 章的环绕语义：这里 next() 只是「放弃决策权」）；观察事件是 emit，监听器必须同步（抛错直接打炸工具调用）。fs-sandbox 后端的 fence <strong>不走事件</strong>——它挂在继承的方法上：覆写 <code class="inline">writeText()</code> / <code class="inline">editText()</code> 这两个突变入口，先跑私有的 <code class="inline">checkedTarget()</code>（fs-sandbox/src/index.ts:118），再把<strong>检查通过的那个新 target</strong> 交给父类实现，避免「这里查、那边写」的 TOCTOU。拒绝时抛 <code class="inline">FS_SANDBOX_DENIED</code>，由工具渲染成第 9 章那个 <code class="inline">[sandbox: file access denied under &lt;mode&gt; mode]</code> 标记。注释写得很克制：这是「受信代码对模型可控路径的策略检查，不是内核边界」，内核级隔离仍然是 <code class="inline">ctx.shell</code>（bash-sandbox）的职责。</div>
     <div class="code-title">packages/fs/fs/README.md — 契约承诺（摘要）</div>
     <pre class="code"><span class="lang-tag">text</span>把任意路径解析为稳定目标身份（跨别名保持 identity）；
 在边界内读整份文本或分块流式读、读原始字节；
@@ -96,7 +96,7 @@
 FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本。</pre>
     <div class="callout info">
       <b class="tag">看懂这个设计</b>
-      fs 的关键取舍是「 Loads it instead of fs-local … is the whole swap」：挂 fs-sandbox 而非 fs-local，就是启用限制的全部改动——模型工具、政策插件、schema 一概不动。README 还特意指出 fs-sandbox 「extends fs-local with every text-storage behavior intact and adds only a per-call mode fence on writes and edits, while reads always pass through」——读永远不设防，突变才 fenced，且 fence 与 bash 收到的是同一个 resolve() 政策（第 9 章），两个家族永不框到不同的根。
+      fs 的关键取舍：挂 fs-sandbox 而非 fs-local，就是启用限制的全部改动——模型工具、政策插件、schema 一概不动（fs/fs/README.md:32「swapping backends changes nothing for the policy plugin, the tools, or the tool schemas」）。实现上 fs-sandbox 直接继承 LocalFileSystem（fs-sandbox/src/index.ts 模块注释：「It extends <code class="inline">LocalFileSystem</code> so all text-storage mechanics … are the local implementation's, verbatim; this package adds only the per-call POLICY fence on the two mutations. Reads pass through untouched」）——读永远不设防，突变才 fenced，且 fence 与 bash 收到的是同一个 resolve() 政策（第 9 章），两个家族永不框到不同的根。
     </div>
   </section>
 
@@ -117,14 +117,15 @@ FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本�
   <span class="kw">return</span> usable[<span class="nu">0</span>]
 }</pre>
     <div class="annotation"><b>配置即承诺</b>：配了名就得能用（MISSING 与 UNAVAILABLE 分开报）；没配名时「一个可用」才自动选择，「多个可用」是错误不是随机挑一个——WebError 词汇表把「怎么连上网」收进单一 owner。另一个细节：<code class="inline">fetch</code> 的注释「A non-2xx response is a result, not a throw」——HTTP 404 是正常结果，只有能力本身跑不起来才抛错。这与第 7 章 LlmFailure 的分类学同源：错误码表达「哪类事实」，不混入业务结果。</div>
+    <div class="annotation"><b>一个还没补上的洞（作者自己标注的）</b>：web-search-deepseek 把 <code class="inline">apiKey: z.string().role('secret')</code> 注册进 settings 命名空间，网页端读取时靠 <code class="inline">redactSecrets</code> 把 secret 字段从返回值里剥掉（api/settings-controller 的每次 remote read 都强制 <code class="inline">redactSecrets: true</code>）。但剥除遍历器只走 object/dict/array 三种容器——<code class="inline">redact.ts:87</code> 的 TODO 写明：藏在 union、intersection 或 transform 里的 secret 会<strong>原样放行</strong>，而且没有任何记录说它被漏掉了。README 的 Known Limitations 同样承认这一点，deferred 的答案是 fail-closed 的 <code class="inline">describeForWire()</code>：无法证明安全的 schema 直接拒绝上 wire。初读 <code class="inline">walk()</code> 容易觉得「schema 都解析了还漏什么」——漏的恰恰是 schemastery 的类型组合子：walker 拿到的 <code class="inline">SchemaNode</code> 只命名了 dict/inner 两种关系，union 分支的 schema 根本不在遍历路径上。现在的防线是注册约定（「a schema whose secrets are not reachable through the walked containers must not be registered on a wire-exposed namespace」），不是机制。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.5</span>skill 家族：注册表合并，渲染归一</h2>
-    <p><code class="inline">packages/skill</code>：providers（skill-filesystem、内嵌插件数据、远程服务）贡献技能，registry 合并目录、按名字解析胜者；consumer（tool-skill）发布 durable 会话目录 + 模型加载工具，用户也能 <code class="inline">/name</code> 直接调用。模块注释里最有分量的一句：</p>
+    <p><code class="inline">packages/skill</code>：providers（skill-filesystem、内嵌插件数据、远程服务）贡献技能，registry 合并目录、按名字解析胜者；consumer（tool-skill）发布 durable 会话目录 + 模型加载工具，用户也能 <code class="inline">/name</code> 直接调用。这一组的 README（<code class="inline">packages/skill/README.md</code>）把分工写成一句不等式：</p>
     <div class="callout info">
       <b class="tag">看懂这个设计</b>
-      「Provider type does not change what the model sees, because all model-facing rendering lives in one consumer package.」——本地目录技能与远程服务技能在模型眼里<strong>长得一模一样</strong>（排序后的名字+描述列表，按需加载全文）。如果每个 provider 自己渲染目录，加一个来源就多一种模型体验；把渲染收拢到一个 consumer，provider 生态才能自由生长。这是「能力缝」里对 Consumer 角色最纯粹的示范。
+      「Different sources produce the same model-visible format.」——本地目录技能与远程服务技能在模型眼里<strong>长得一模一样</strong>（排序后的名字+描述列表，按需加载全文）。如果每个 provider 自己渲染目录，加一个来源就多一种模型体验；把渲染收拢到一个 consumer，provider 来源再多，模型看到的目录形式也只有一个。（这句话 2026-09-08 的文档收敛提交 f1c1ff5a08 换掉了原文「Provider type does not change what the model sees, because all model-facing rendering lives in one consumer package.」——意思没变，措辞从「为什么」改成了「结果是什么」。）
     </div>
     <p>tool-skill 的插件声明一目了然：</p>
     <div class="code-title">packages/skill/tool-skill/src/index.ts:24</div>
@@ -209,7 +210,6 @@ FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本�
           <text x="295" y="248" text-anchor="middle" font-size="10" fill="#333">fs-e2b (远程世界)</text>
           <text x="295" y="290" text-anchor="middle" font-size="9" fill="#888">fs/write-intent 单槽决策</text>
           <text x="295" y="304" text-anchor="middle" font-size="9" fill="#888">fs/observed 记录观察</text>
-          <text x="295" y="312" text-anchor="middle" font-size="9" fill="#888"></text>
 
           <rect x="400" y="90" width="170" height="230" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
           <text x="485" y="115" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">ctx.web</text>
@@ -262,7 +262,7 @@ FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本�
     <h2><span class="num">10.8</span>要点</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      ① 缝的宽度即复杂度：shell 一个执行器（单选）、fs 三个后端（单选+远程）、web 多 provider（单操作选一）、skills 任意多 provider（合并）、jobs 单实现——契约都远小于实现面；② 事件也是缝的一部分：fs/write-intent 是单槽决策不是环绕中间件；③ 错误码即契约：FS_*、WEB_PROVIDER_* 让调用者按码分支；④ 渲染权收拢在 consumer，provider 才能自由生长。下一步看 compaction——最依赖会话日志不变量的子系统：<a href="11-compaction.html">第 11 章：Compaction</a>。
+      ① 缝的宽度即复杂度：shell 一个执行器（单选）、fs 三个后端（单选+远程）、web 多 provider（单操作选一）、skills 任意多 provider（合并）、jobs 单实现——契约都远小于实现面；② 事件也是缝的一部分：fs/write-intent 是单槽决策不是环绕中间件；③ 错误码即契约：FS_*、WEB_PROVIDER_* 让调用者按码分支；④ 渲染权收拢在 consumer，新增 provider 不改变模型体验。下一步看 compaction——最依赖会话日志不变量的子系统：<a href="11-compaction.html">第 11 章：Compaction</a>。
     </div>
   </section>
 
@@ -274,7 +274,7 @@ FS_AMBIGUOUS_EDIT / FS_SANDBOX_DENIED…）——按码分支，永不按文本�
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 10 能力缝 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 10 能力缝 · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 采样与结构化输出 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a class="active" href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 采样与结构化输出</div>
+    <h1>采样与结构化输出：logits 之后发生了什么</h1>
+    <div class="subtitle">模型前向算出 logits 只是半成品。这一章讲剩下的三件事：把每个请求各自的采样参数合并成 batch 级张量、Sampler 按「贪心/概率」两条路径选出 token、以及两类输出约束——grammar 逐 token 屏蔽和 function call 文本解析。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一分钟版本</h2>
+    <p>前向结束后，<code class="inline">LogitsProcessorOutput.next_token_logits</code>（形状 <code class="inline">[batch, vocab_size]</code>）交到采样链路手里。剩下的事分三步：</p>
+    <ul>
+      <li><strong>参数合并</strong>：每个请求带着自己的 <code class="inline">SamplingParams</code>（temperature、top_k、top_p、min_p、logit_bias、penalties…）。GPU kernel 不喜欢逐请求分支，所以 <code class="inline">SamplingBatchInfo.from_schedule_batch</code> 把它们压成 batch 级张量，并顺手算出几个布尔标志（<code class="inline">is_all_greedy</code>、<code class="inline">need_top_k_sampling</code>…）供代码走快速路径。</li>
+      <li><strong>选 token</strong>：<code class="inline">Sampler.forward</code> 先看 <code class="inline">is_all_greedy</code>——整个 batch 都是贪心时直接 <code class="inline">argmax</code>，一个 kernel 完事；否则按需走 top-k/top-p/min-p 的采样内核。</li>
+      <li><strong>约束</strong>：两类约束作用在两个不同的位置。grammar（JSON schema、正则）在<strong>采样之前</strong>把非法 token 的 logit 压成 -inf，逐 token 生效；function call 解析在<strong>反分词之后</strong>对文本做解析，把模型输出的特定标记格式转成结构化的 <code class="inline">tool_calls</code>。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>采样链路总流程</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
+        <title id="t8">采样与结构化输出数据流</title>
+        <desc id="d8">logits 经 grammar 屏蔽后进入 Sampler，分贪心与概率两路；function call 在反分词之后解析</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- grammar 分支（顶部） -->
+        <rect class="node acc" x="250" y="8" width="250" height="42" rx="6"></rect>
+        <text class="lbl" x="375" y="26" text-anchor="middle">update_regex_vocab_mask</text>
+        <text class="lbl sm" x="375" y="42" text-anchor="middle">按 grammar 状态填 vocab_mask</text>
+        <rect class="node acc" x="540" y="8" width="250" height="42" rx="6"></rect>
+        <text class="lbl" x="665" y="26" text-anchor="middle">GrammarMask.apply(logits)</text>
+        <text class="lbl sm" x="665" y="42" text-anchor="middle">非法 token → -inf</text>
+        <line class="edge" x1="500" y1="29" x2="538" y2="29"></line>
+
+        <!-- 主链路 -->
+        <rect class="node" x="20" y="110" width="170" height="46" rx="6"></rect>
+        <text class="lbl" x="105" y="130" text-anchor="middle">next_token_logits</text>
+        <text class="lbl sm" x="105" y="146" text-anchor="middle">LogitsProcessorOutput</text>
+        <rect class="node core" x="250" y="110" width="260" height="46" rx="6"></rect>
+        <text class="lbl" x="380" y="130" text-anchor="middle">ModelRunner._preprocess_logits</text>
+        <text class="lbl sm" x="380" y="146" text-anchor="middle">apply_logits_bias（含 grammar 屏蔽）</text>
+        <rect class="node core" x="570" y="110" width="160" height="46" rx="6"></rect>
+        <text class="lbl" x="650" y="130" text-anchor="middle">Sampler.forward</text>
+        <text class="lbl sm" x="650" y="146" text-anchor="middle">_preprocess_logits 先行</text>
+        <rect class="node acc" x="780" y="110" width="140" height="46" rx="6"></rect>
+        <text class="lbl" x="850" y="130" text-anchor="middle">batch_next_</text>
+        <text class="lbl" x="850" y="146" text-anchor="middle">token_ids</text>
+        <line class="edge" x1="190" y1="133" x2="248" y2="133"></line>
+        <line class="edge" x1="510" y1="133" x2="568" y2="133"></line>
+        <line class="edge" x1="730" y1="133" x2="778" y2="133"></line>
+
+        <!-- grammar 分支连线（虚线：约束路径） -->
+        <line class="edge back" x1="380" y1="108" x2="375" y2="52"></line>
+        <line class="edge back" x1="665" y1="52" x2="500" y2="108"></line>
+        <text class="lbl sm" x="180" y="40">采样前逐 token 屏蔽</text>
+
+        <!-- Sampler 两路 -->
+        <rect class="node" x="470" y="210" width="170" height="42" rx="6"></rect>
+        <text class="lbl" x="555" y="228" text-anchor="middle">argmax</text>
+        <text class="lbl sm" x="555" y="244" text-anchor="middle">is_all_greedy 快路径</text>
+        <rect class="node" x="680" y="210" width="220" height="42" rx="6"></rect>
+        <text class="lbl" x="790" y="228" text-anchor="middle">softmax → top-k/p/min-p 内核</text>
+        <text class="lbl sm" x="790" y="244" text-anchor="middle">flashinfer 采样 kernel</text>
+        <line class="edge" x1="630" y1="158" x2="560" y2="208"></line>
+        <line class="edge" x1="670" y1="158" x2="790" y2="208"></line>
+
+        <!-- SamplingBatchInfo -->
+        <rect class="node warn" x="480" y="300" width="300" height="56" rx="6"></rect>
+        <text class="lbl" x="630" y="322" text-anchor="middle">SamplingBatchInfo</text>
+        <text class="lbl sm" x="630" y="340" text-anchor="middle">temperatures · top_ks · top_ps · min_ps · is_all_greedy</text>
+        <line class="edge" x1="630" y1="298" x2="630" y2="158"></line>
+        <text class="lbl sm" x="640" y="280">batch 级采样参数</text>
+
+        <rect class="node warn" x="480" y="386" width="300" height="46" rx="6"></rect>
+        <text class="lbl" x="630" y="404" text-anchor="middle">penalizer_orchestrator</text>
+        <text class="lbl sm" x="630" y="420" text-anchor="middle">frequency / presence / repetition（按需启用）</text>
+        <line class="edge back" x1="630" y1="356" x2="630" y2="384"></line>
+
+        <!-- function call 旁路 -->
+        <rect class="node acc" x="40" y="446" width="380" height="50" rx="6"></rect>
+        <text class="lbl" x="230" y="466" text-anchor="middle">FunctionCallParser（serving 层）</text>
+        <text class="lbl sm" x="230" y="484" text-anchor="middle">parse_stream_chunk · ~39 种模型检测器</text>
+        <polyline class="edge back" points="850,158 850,471 424,471" fill="none"></polyline>
+        <text class="lbl sm" x="640" y="463">token ids → 反分词 → 增量文本 → tool_calls / 普通文本</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>采样主链路</span>
+        <span class="lg-item"><span class="sw acc"></span>输出/结构化出口</span>
+        <span class="lg-item"><span class="sw warn"></span>batch 级参数与惩罚</span>
+        <span class="lg-item"><span class="sw"></span>一般组件</span>
+      </div>
+      <div class="fig-cap">图 8.2：采样链路。虚线是两类「旁路」：grammar 屏蔽发生在 Sampler 之前（ModelRunner 阶段），function call 解析发生在反分词之后（serving 层）。两处都不在 Sampler 内部——这是本章最常见的误读。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">python/sglang/srt/layers/sampler.py</code> → Sampler 本体；
+      <code class="inline">python/sglang/srt/sampling/sampling_batch_info.py</code> → batch 级参数；
+      <code class="inline">python/sglang/srt/sampling/penaltylib/</code> → 各类惩罚器；
+      <code class="inline">python/sglang/srt/constrained/</code> → grammar 后端；
+      <code class="inline">python/sglang/srt/function_call/</code> → function call 检测器。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>Sampler 源码：两条路径</h2>
+    <p><code class="inline">Sampler.forward</code> 的分叉逻辑非常直白：整个 batch 都是贪心就 <code class="inline">argmax</code>，否则进概率路径。注意贪心路径连 softmax 都不做：</p>
+    <div class="code-title">python/sglang/srt/layers/sampler.py — Sampler.forward（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, logits_output, sampling_info, return_logprob,
+            top_logprobs_nums, token_ids_logprobs, positions):
+    logits = logits_output.next_token_logits
+
+    <span class="cmt"># 预处理：自定义 logit processor + NaN 清洗</span>
+    logits = self._preprocess_logits(logits, sampling_info)
+
+    <span class="kw">if</span> sampling_info.is_all_greedy:
+        <span class="cmt"># 贪心快路径：不需要概率分布，argmax 一步到位</span>
+        <span class="kw">if</span> _use_aiter <span class="kw">and</span> <span class="kw">not</span> _disable_aiter_greedy_sample:
+            batch_next_token_ids = torch.<span class="fn">empty</span>(
+                logits.shape[<span class="nu">0</span>], device=logits.device, dtype=torch.int32
+            )
+            _aiter_greedy_sample(batch_next_token_ids, logits)
+        <span class="kw">else</span>:
+            batch_next_token_ids = torch.<span class="fn">argmax</span>(logits, -<span class="nu">1</span>)
+        <span class="kw">if</span> return_logprob:
+            original_logprobs = logprobs = torch.nn.functional.<span class="fn">log_softmax</span>(
+                logits, dim=-<span class="nu">1</span>
+            )
+    <span class="kw">else</span>:
+        simple_sampling_case = (
+            <span class="kw">not</span> sampling_info.need_top_p_sampling
+            <span class="kw">and</span> <span class="kw">not</span> sampling_info.need_top_k_sampling
+            <span class="kw">and</span> <span class="kw">not</span> sampling_info.need_min_p_sampling
+        )
+        ...  <span class="cmt"># 概率路径，见下</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 三个布尔标志（<code class="inline">is_all_greedy</code>、<code class="inline">need_top_*_sampling</code>）把 batch 里<strong>所有请求</strong>的参数归约成一个分支决策。只要有一个请求不是贪心，整个 batch 就走概率路径——贪心请求在概率路径里靠 <code class="inline">top_k=1</code> 的 renorm 得到等价结果。<br><br><b>两个同名函数要分清：</b><code class="inline">Sampler._preprocess_logits</code>（上面这个）只做「自定义 logit processor + NaN 清洗」两件事；真正施加 grammar 掩码的是 <code class="inline">ModelRunner._preprocess_logits</code>（<code class="inline">model_executor/model_runner.py</code>），它调用 <code class="inline">sampling_info.update_regex_vocab_mask()</code> + <code class="inline">apply_logits_bias()</code>。调用关系是 ModelRunner 先做、再进 <code class="inline">Sampler.forward</code>。两者同名但职责不重叠，读代码时按文件路径区分。<code class="inline">positions</code> 是后来加到签名里的：确定性采样要用它给每个位置算唯一 seed。</div>
+
+    <p>概率路径先做温度缩放和 softmax，再按需选择内核：<code class="inline">simple_sampling_case</code>（top_k/top_p/min_p 全默认）直接多项式采样；否则用 flashinfer 的融合内核：</p>
+    <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 的 flashinfer 分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">else</span>:
+    <span class="cmt"># 标准路径：除以温度，原地 softmax</span>
+    logits.<span class="fn">div_</span>(sampling_info.temperatures)
+    logits[:] = torch.<span class="fn">softmax</span>(logits, dim=-<span class="nu">1</span>)
+    probs = logits
+
+    batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
+        probs, sampling_info, positions, simple_sampling_case, ...
+    )
+
+<span class="cmt"># _sample_from_probs 内部（flashinfer 后端）：</span>
+<span class="kw">if</span> simple_sampling_case:
+    batch_next_token_ids = <span class="fn">sampling_from_probs_torch</span>(
+        probs, sampling_seed=sampling_info.sampling_seed, positions=positions
+    )
+<span class="kw">elif</span> sampling_info.need_min_p_sampling:
+    <span class="cmt"># min-p 需要先做 top-k / top-p renorm，再单独采 min-p</span>
+    probs = <span class="fn">top_k_renorm_prob</span>(probs, sampling_info.top_ks)
+    probs = <span class="fn">top_p_renorm_prob</span>(probs, sampling_info.top_ps)
+    batch_next_token_ids = <span class="fn">min_p_sampling_from_probs</span>(probs, sampling_info.min_ps)
+<span class="kw">else</span>:
+    batch_next_token_ids = <span class="fn">top_k_top_p_sampling_from_probs</span>(
+        probs.contiguous(), sampling_info.top_ks, sampling_info.top_ps,
+        filter_apply_order=<span class="st">"joint"</span>,
+    )</pre>
+    <div class="annotation"><b>读懂这段：</b> 采样后端是可配的（<code class="inline">get_exec().kernel.sampling_backend</code>，CUDA 上默认 flashinfer，另有 pytorch/ascend）。min-p 没有融合内核，所以走「两次 renorm + 一次采样」的三步组合；top-k/top-p 用 joint 顺序的融合内核一次完成。这段代码里还留着一条演进痕迹：确定性推理（<code class="inline">enable_deterministic</code>）要求 logprob 一律取自 <code class="inline">log_softmax</code> 内核而不是 <code class="inline">log(softmax(x))</code>——两者在数学上等价，数值上有 ~1e-6 差异，足以破坏 prefill/decode 的逐位对齐，源码注释专门记录了这个坑。</div>
+
+    <p>细看签名会发现 <code class="inline">_sample_from_probs</code> 还返回第二个值 <code class="inline">sampling_mask_capture</code>：</p>
+    <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 签名（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_sample_from_probs</span>(
+    self,
+    probs: torch.Tensor,
+    sampling_info: <span class="cl">SamplingBatchInfo</span>,
+    positions: torch.Tensor,
+    simple_sampling_case: <span class="cl">bool</span>,
+) -&gt; <span class="cl">Tuple</span>[torch.Tensor, Optional[_SamplingMaskCapture]]:
+    <span class="cmt"># 只有「本 batch 有请求要采集掩码」时才产生 capture 开销</span>
+    capture_rows = sampling_info.sampling_mask_batch_indices
+    return_sampling_mask = capture_rows <span class="kw">is not</span> <span class="kw">None</span>
+    ...</pre>
+    <p>这就是<strong>采样掩码</strong>（<code class="inline">return_sampling_mask</code>）——训练侧要拿到「这一步采样时哪些 token 的正支撑集、各自概率多少」，才能做 on-policy 蒸馏或重要性采样。注意 <code class="inline">capture_rows</code> 的语义：它不是「整个 batch 的行」，而是<strong>本批中开了掩码的那些请求的行号</strong>，采集开销因此只落在需要的行上。第一版实现是在 Python 侧把每个请求的支撑集做成 list 字段挂在输出上：</p>
+    <div class="code-title">python/sglang/srt/layers/sampler.py — 旧版掩码回填（已被替换，此处保留作对照）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 旧实现：逐请求 Python list，逐行 cpu().tolist() 回填</span>
+flat_ids_cpu = flat_ids.<span class="fn">cpu</span>().<span class="fn">tolist</span>()
+mask_lengths_cpu = mask_lengths.<span class="fn">cpu</span>().<span class="fn">tolist</span>()
+masks = [<span class="kw">None</span>] * <span class="fn">len</span>(return_sampling_masks)
+<span class="kw">for</span> capture_row, batch_row <span class="kw">in</span> <span class="fn">enumerate</span>(requested_rows_list):
+    masks[batch_row] = row_ids       <span class="cmt"># 支撑集 token id 列表</span>
+logits_output.next_token_sampling_mask_idx = masks
+logits_output.next_token_sampling_logprobs = logprobs</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个问题逼着这段代码重写。① 每个 token 都要 GPU→CPU 同步拷一批 list，decode 阶段这是致命的；② 支撑集长度不设上限，top_p-only 采样的长尾能把元数据撑爆；③ 与 overlap 调度不兼容——CPU 侧的 list 处理挤不进 GPU 计算的时间窗。新实现改成固定容量的<strong>设备张量</strong>：</div>
+    <div class="code-title">python/sglang/srt/layers/sampler.py — _build_sampling_mask_output（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 状态码：支撑集算不出来 = INVALID，超过容量上限 = OVERFLOW</span>
+overflow = realized_lengths &gt; self.sampling_mask_max_tokens
+statuses = torch.<span class="fn">where</span>(
+    invalid,
+    <span class="cl">SamplingMaskStatus</span>.INVALID,
+    torch.<span class="fn">where</span>(overflow, <span class="cl">SamplingMaskStatus</span>.OVERFLOW, <span class="cl">SamplingMaskStatus</span>.OK),
+).<span class="fn">to</span>(torch.int32)
+
+<span class="cmt"># 所有副本必须对「是否中断该请求」做出一致决定，否则 TP/CP rank 各走各的</span>
+<span class="kw">if</span> dist.<span class="fn">is_initialized</span>():
+    <span class="kw">if</span> dist.<span class="fn">get_world_size</span>(self.tp_sync_group) &gt; <span class="nu">1</span>:
+        dist.<span class="fn">all_reduce</span>(statuses, op=dist.<span class="cl">ReduceOp</span>.MAX, group=self.tp_sync_group)
+
+packed_size = <span class="fn">min</span>(self.sampling_mask_max_tokens, weights.shape[-<span class="nu">1</span>])
+<span class="kw">if</span> token_ids <span class="kw">is</span> <span class="kw">None</span>:
+    _, packed_positions = torch.<span class="fn">topk</span>(weights, k=packed_size, dim=-<span class="nu">1</span>, sorted=<span class="kw">True</span>)
+    packed_token_ids = packed_positions.<span class="fn">to</span>(torch.int32)
+
+<span class="kw">return</span> <span class="cl">SamplingMaskOutput</span>(
+    token_ids=packed_token_ids, lengths=realized_lengths.<span class="fn">clamp</span>(max=packed_size),
+    selected_logprobs=selected_logprobs, statuses=statuses,
+)</pre>
+    <div class="annotation"><b>读懂这段：</b> 新契约是一个定长 <code class="inline">SamplingMaskOutput</code>：<code class="inline">token_ids</code> 形状固定为 <code class="inline">[batch, sampling_mask_max_tokens]</code>，真实长度写在 <code class="inline">lengths</code> 里；超长就截断并标 <code class="inline">OVERFLOW</code>。请求准入也因此收紧——<code class="inline">Scheduler.handle_generate_request</code> 现在要求 <code class="inline">top_k=1</code>（贪心）或 <code class="inline">1 &lt; top_k &lt;= sampling_mask_max_tokens</code>，否则直接以 400 拒绝，不再等到采样时才发现要炸。组内的 <code class="inline">all_reduce(MAX)</code> 是让整个 TP/CP 组对状态码取最坏值——只要有 rank 溢出，全组一起 abort，避免各 rank 对请求生死判断不一致而挂死（第 12 章讲过 PD 分离下这个值还要经元数据缓冲传给 decode 侧，且 prefill / decode 两侧都要开 <code class="inline">SGLANG_ENABLE_DISAGG_SAMPLING_MASK</code>，默认关闭）。</div>
+    <div class="annotation"><b>拒绝路径也重构过：</b> 上面这段准入检查的形状变过一次。原来的写法是四处分散的「设错误 → <code class="inline">init_req_max_new_tokens</code> → 塞进队列」，让请求先走一遍正常流程再被 abort；现在统一收进 <code class="inline">Scheduler._reject_sampling_mask_request(req, error_msg)</code>，它只做三件事：记日志、<code class="inline">prepare_abort</code>（带 <code class="inline">HTTPStatus.BAD_REQUEST</code>）、<code class="inline">stream_output</code> 把错误送到客户端——<strong>模型一步都不跑</strong>。同时错误文案本身也细化了：原来只笼统说「需要有限 top_k」，现在明确告诉你期望是 <code class="inline">top_k=1</code>（贪心）或 <code class="inline">1 &lt; top_k &lt;= sampling_mask_max_tokens</code>，并把实际收到的 <code class="inline">top_k</code> 值打进消息，还提示可以调大 <code class="inline">--sampling-mask-max-tokens</code>。PD 分离那条也从「要求某个 max_tokens 环境变量大于 0」改成了直接点名要开的开关名。</div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      这段代码完整保留了一次「Python 对象 → 设备张量」的迁移。留意 <code class="inline">SamplingBatchInfo</code> 里新加的 <code class="inline">sampling_mask_batch_indices</code>：它把「哪些请求要掩码」这个判断也从逐轮扫描 <code class="inline">return_sampling_masks</code> 的布尔列表，变成了一个预先算好的设备索引张量。capture 工作只在 <code class="inline">index_select</code> 选出的那几行上做——不设掩码的请求（绝大多数）完全不进这条路径。这类「把控制流从 Python 挪进张量」的重构，在推理引擎里几乎总发生在同一个触发点：某个分支开始出现在 TPOT 的热路径上。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>SamplingBatchInfo：逐请求参数怎么变成 batch 张量</h2>
+    <p>采样参数的合并发生在 <code class="inline">SamplingBatchInfo.from_schedule_batch</code>。它把每个请求的标量参数收成 GPU 张量，并归约出分支标志：</p>
+    <div class="code-title">python/sglang/srt/sampling/sampling_batch_info.py — from_schedule_batch（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>temperatures = (
+    torch.<span class="fn">tensor</span>(
+        [r.sampling_params.temperature <span class="kw">for</span> r <span class="kw">in</span> reqs],
+        dtype=torch.float, pin_memory=_pin,
+    )
+    .<span class="fn">to</span>(device, non_blocking=<span class="kw">True</span>)
+    .<span class="fn">view</span>(-<span class="nu">1</span>, <span class="nu">1</span>)
+)
+top_ps = torch.<span class="fn">tensor</span>([r.sampling_params.top_p <span class="kw">for</span> r <span class="kw">in</span> reqs], ...)
+top_ks = torch.<span class="fn">tensor</span>([r.sampling_params.top_k <span class="kw">for</span> r <span class="kw">in</span> reqs], ...)
+min_ps = torch.<span class="fn">tensor</span>([r.sampling_params.min_p <span class="kw">for</span> r <span class="kw">in</span> reqs], ...)
+
+<span class="kw">return</span> <span class="cl">SamplingBatchInfo</span>(
+    temperatures=temperatures, top_ps=top_ps, top_ks=top_ks, min_ps=min_ps,
+    <span class="cmt"># 分支标志：任一 / 全体的归约</span>
+    is_all_greedy=<span class="fn">all</span>(r.sampling_params.top_k &lt;= <span class="nu">1</span> <span class="kw">for</span> r <span class="kw">in</span> reqs),
+    need_top_p_sampling=<span class="fn">any</span>(r.sampling_params.top_p != <span class="nu">1.0</span> <span class="kw">for</span> r <span class="kw">in</span> reqs),
+    need_top_k_sampling=<span class="fn">any</span>(r.sampling_params.top_k != <span class="cl">TOP_K_ALL</span> <span class="kw">for</span> r <span class="kw">in</span> reqs),
+    need_min_p_sampling=<span class="fn">any</span>(r.sampling_params.min_p &gt; <span class="nu">0</span> <span class="kw">for</span> r <span class="kw">in</span> reqs),
+    ...)</pre>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      <code class="inline">is_all_greedy</code> 的判定是 <code class="inline">top_k &lt;= 1</code>，不是 <code class="inline">temperature == 0</code>。为什么？因为贪心语义在参数归一化阶段就已经折算进去了：temperature=0 的请求会被改写成 top_k=1（见 <code class="inline">sampling_params.py</code> 的 normalize 逻辑）。所以 Sampler 只需要看一个条件。<code class="inline">logit_bias</code> 则不走这条路——它直接展开成 <code class="inline">[batch, vocab_size]</code> 的稠密张量，在前向 bias 阶段逐元素加上去。
+    </div>
+
+    <p>惩罚类参数（frequency/presence/repetition/min_new_tokens）由一个可选的编排器统一管理。源码注释解释了为什么做成「总是创建、按需生效」：</p>
+    <div class="code-title">python/sglang/srt/sampling/sampling_batch_info.py — penalizer_orchestrator 构造（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每个惩罚器先自查请求的 sampling_params 判断自己是否被需要（见各 _is_required()），</span>
+<span class="cmt"># 不需要就什么都不做。所以这里总是创建实例，开销只是几个简单判断。</span>
+<span class="cmt"># 如果改成「不需要就不创建」，就要在 ScheduleBatch 里维护这些分支——</span>
+<span class="cmt"># 尤其是 filter_batch() / merge_batch() 两个场合，复杂度反而更高。</span>
+penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrator</span>(
+    vocab_size=vocab_size,
+    batch=batch,
+    penalizers={
+        penaltylib.<span class="cl">BatchedFrequencyPenalizer</span>,
+        penaltylib.<span class="cl">BatchedMinNewTokensPenalizer</span>,
+        penaltylib.<span class="cl">BatchedPresencePenalizer</span>,
+        penaltylib.<span class="cl">BatchedRepetitionPenalizer</span>,
+    },
+)</pre>
+    <div class="annotation"><b>读懂这段：</b> 惩罚器要跟着 batch 的增删同步状态（请求结束后从 batch 里 filter 掉，两个 batch 合并时要 merge 惩罚累积量），所以它挂在 <code class="inline">SamplingBatchInfo</code> 的生命周期上，而不是散在请求对象里。这是「batch 级状态收口」的又一次体现。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>grammar 约束生成：FSM 位掩码</h2>
+    <p>当请求带 <code class="inline">json_schema</code> / <code class="inline">regex</code> 等 <code class="inline">custom_params</code> 时，TokenizerManager 会为它编译一个 grammar 对象。后端可插拔，注册表在 <code class="inline">constrained/base_grammar_backend.py</code>：</p>
+    <div class="code-title">python/sglang/srt/constrained/base_grammar_backend.py — create_grammar_backend（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">create_grammar_backend</span>(server_args, tokenizer, vocab_size, ...):
+    name = <span class="fn">get_exec</span>().kernel.grammar_backend
+
+    <span class="cmt"># 自定义 grammar 后端优先（插件注册）</span>
+    <span class="kw">if</span> name <span class="kw">in</span> <span class="cl">GRAMMAR_BACKEND_REGISTRY</span>:
+        <span class="kw">return</span> <span class="cl">GRAMMAR_BACKEND_REGISTRY</span>[name](server_args, tokenizer, vocab_size, ...)
+
+    <span class="cmt"># 内置三种：outlines / xgrammar / llguidance</span>
+    <span class="kw">if</span> name == <span class="st">"outlines"</span>:
+        grammar_backend = <span class="cl">OutlinesGrammarBackend</span>(tokenizer, ...)
+    <span class="kw">elif</span> name == <span class="st">"xgrammar"</span>:
+        <span class="kw">try</span>:
+            grammar_backend = <span class="cl">XGrammarGrammarBackend</span>(
+                tokenizer, vocab_size=vocab_size, ...,
+                any_whitespace=<span class="kw">not</span> <span class="fn">get_serving</span>().constrained_json_disable_any_whitespace,
+            )
+        <span class="kw">except</span> <span class="cl">TokenizerNotSupportedError</span> <span class="kw">as</span> e:
+            ...</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个内置后端对应三种 FSM 实现：xgrammar 是默认（编译快、内核级的 token mask），outlines 最老牌（保留了 jump-forward 优化——FSM 确定走的字符序列直接跳过采样，见 <code class="inline">outlines_jump_forward.py</code> 与 <code class="inline">BaseGrammarObject.jump_and_retokenize</code>，这是早期「跳过确定性前缀」路线留下的接口），llguidance 支持最复杂的语法。编译是异步的：请求先进 <code class="inline">GrammarManager.grammar_queue</code>，FSM 编好之前不进调度。</div>
+
+    <p>编译期间的请求卡在 grammar 队列里，<strong>调度器每轮先放行已就绪的</strong>——这是 grammar 对调度准入的直接干预点：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — _get_new_batch_prefill_raw 开头（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_get_new_batch_prefill_raw</span>(self, ...):
+    <span class="cmt"># grammar 就绪检查优先于一切调度决策</span>
+    <span class="kw">if</span> self.grammar_manager.<span class="fn">has_waiting_grammars</span>():
+        ready_grammar_requests = self.grammar_manager.<span class="fn">get_ready_grammar_requests</span>()
+        <span class="kw">for</span> req <span class="kw">in</span> ready_grammar_requests:
+            self._add_request_to_queue(req)
+    ...</pre>
+
+    <p>真正施加约束的位置不在 Sampler 里，而在 <code class="inline">ModelRunner._preprocess_logits</code>——每一步前向之后、采样之前。掩码由 <code class="inline">SamplingBatchInfo</code> 生成并就地应用到 logits：</p>
+    <div class="code-title">python/sglang/srt/sampling/sampling_batch_info.py — update_regex_vocab_mask / apply_logits_bias（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">update_regex_vocab_mask</span>(self):
+    <span class="kw">if</span> <span class="kw">not</span> self.grammars:
+        self.grammar_mask = <span class="kw">None</span>
+        <span class="kw">return</span>
+
+    <span class="cmt"># 同一 batch 共享一个掩码缓冲；未列出的行保持「不约束」</span>
+    first_grammar = <span class="fn">next</span>(grammar <span class="kw">for</span> grammar <span class="kw">in</span> self.grammars <span class="kw">if</span> grammar)
+    vocab_mask = first_grammar.<span class="fn">allocate_vocab_mask</span>(
+        vocab_size=self.vocab_size, batch_size=<span class="fn">len</span>(self.temperatures), device=self.device,
+    )
+    entries = [<span class="cl">GrammarRow</span>(row=row, grammar=grammar)
+               <span class="kw">for</span> row, grammar <span class="kw">in</span> <span class="fn">enumerate</span>(self.grammars)
+               <span class="kw">if</span> grammar <span class="kw">and</span> <span class="kw">not</span> grammar.finished <span class="kw">and</span> <span class="kw">not</span> grammar.is_terminated()]
+    first_grammar.<span class="fn">fill_vocab_mask_batched</span>(entries, vocab_mask)
+    vocab_mask = first_grammar.<span class="fn">move_vocab_mask</span>(vocab_mask, self.device)
+    self.grammar_mask = <span class="cl">GrammarMask</span>(first_grammar, vocab_mask)
+
+<span class="kw">def</span> <span class="fn">apply_logits_bias</span>(self, logits):
+    self._apply_pre_grammar_logits_transforms(logits)   <span class="cmt"># logit_bias、自定义 processor</span>
+    <span class="kw">if</span> self.grammar_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        self.grammar_mask.<span class="fn">apply</span>(logits)                <span class="cmt"># 非法 token → -inf</span>
+    self._apply_post_grammar_logits_transforms(logits)</pre>
+    <div class="annotation"><b>读懂这段：</b> 一个 batch 里可以混装「有 grammar」和「没 grammar」的请求：掩码按行填，没 grammar 的行保持初始的「全放行」。应用之后掩码立即释放——<code class="inline">ModelRunner._preprocess_logits</code> 末尾有一行 <code class="inline">sampling_info.grammar_mask = None</code>，源码注释写明：overlap 调度下 sampling_info 会被 delay_sample 闭包多持有一步，不释放就是稳定的显存泄漏。这是结构化输出 + 重叠调度交叉处的一个真实事故痕迹。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.6</span>function call 解析：为什么在 serving 层</h2>
+    <p>grammar 约束「让模型只能生成合法序列」，而 function call 解决另一个问题：各家模型把工具调用编码进普通文本（特殊标记 + JSON），需要把它解析回结构化的 <code class="inline">tool_calls</code>。这个解析器按模型分派：</p>
+    <div class="code-title">python/sglang/srt/function_call/function_call_parser.py — FunctionCallParser（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">FunctionCallParser</span>:
+    <span class="st">"""
+    Parser for function/tool calls in model outputs.
+
+    This class handles both streaming and non-streaming parsing of function
+    calls using a detector. In streaming scenarios, each time new_text is
+    received, it calls detector.parse_streaming_increment and returns the
+    resulting normal_text and calls to the upper layer (or SSE).
+    """</span>
+
+    ToolCallParserEnum: <span class="cl">Dict</span>[<span class="cl">str</span>, <span class="cl">Type</span>[<span class="cl">BaseFormatDetector</span>]] = {
+        <span class="st">"deepseekv3"</span>: <span class="cl">DeepSeekV3Detector</span>,
+        <span class="st">"glm45"</span>: <span class="cl">Glm4MoeDetector</span>,
+        <span class="st">"gpt-oss"</span>: <span class="cl">GptOssDetector</span>,
+        <span class="st">"kimi_k2"</span>: <span class="cl">KimiK2Detector</span>,
+        <span class="st">"llama3"</span>: <span class="cl">Llama32Detector</span>,
+        <span class="st">"mistral"</span>: <span class="cl">MistralDetector</span>,
+        <span class="st">"pythonic"</span>: <span class="cl">PythonicDetector</span>,
+        <span class="st">"qwen25"</span>: <span class="cl">Qwen25Detector</span>,
+        <span class="st">"qwen3_coder"</span>: <span class="cl">Qwen3CoderDetector</span>,
+        ...  <span class="cmt"># 共 39 个模型条目，多个模型共享同一 detector 类</span>
+    }</pre>
+    <div class="annotation"><b>读懂这段：</b> 39 个条目对应 35 个不同的 detector 类——同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
+    <div class="callout info">
+      <b class="tag">为什么不在 Sampler 里做</b>
+      采样器工作在 token id 空间，而工具调用的边界（比如 <code class="inline">&lt;tool_call&gt;</code> 标记、JSON 的完整闭合）是<strong>文本层</strong>的概念，和分词边界不对齐——一个标记可能被切成多个 token，半个 JSON 对象在 token 序列里无法判定合法性。所以解析只能等反分词之后按文本做，位置自然落在 <code class="inline">entrypoints/openai/serving_chat.py</code>（<code class="inline">FunctionCallParser</code> 在流式与非流式两个分支里分别构造）。代价是约束不「硬」：模型输出格式坏了，解析层只能尽力恢复或报错；要硬约束得靠 8.5 节的 grammar 路线。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.7</span>对「自研引擎」的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      三条可落地的结论。<strong>① 贪心 argmax 路径从第一天就要有</strong>：它是最常用的服务形态，且实现只是一个 kernel，跳过 softmax 和采样内核的开销在大 batch 下很可观。<strong>② 逐请求参数先归约再进 kernel</strong>：像 <code class="inline">is_all_greedy</code> / <code class="inline">need_top_k_sampling</code> 这样的 batch 级布尔标志，把「逐请求分支」变成「一次分支决策」，这是保持 GPU 利用率的基本功。<strong>③ 约束分两层想清楚</strong>：token 级硬约束（grammar 位掩码，逐 token 生效，注意与重叠调度的内存生命周期交互）和文本级软约束（工具调用解析，放在 serving 层）。做 OpenAI 兼容 API 时，前者可以后补，后者迟早要补。下一步进入 <a href="09-serving-entry.html">第 9 章：服务入口</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="09-serving-entry.html">下一步：服务入口 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

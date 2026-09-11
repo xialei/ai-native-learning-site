@@ -2,7 +2,7 @@
 
 一套**纯静态、自包含**的 HTML 学习站点，用于系统学习 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的 agent 运行时实现，并为**自制 Harness** 提供路线图。无需任何构建工具，双击 `index.html` 即可浏览。
 
-> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.3-alpha.1**（HEAD `d347e70390`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
+> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.5-rc.2-139**（HEAD `c291e7961a`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
 
 ## 如何浏览
 
@@ -32,10 +32,37 @@ open ai-native-learning-site/deepseek-harness/books/index.html
 
 共享样式：`assets/dsh-learn.css`。所有架构图/流程图均为**内联 SVG**。
 
+## 术语表（全书基准）
+
+新增章节先查此表；同一概念不得引入第二译名。
+
+| 基准写法 | 英文原名 | 备注 |
+|---|---|---|
+| 能力缝 | capability seam | Service Definition + Provider + Consumer 三方；不用「接口缝」 |
+| 会话日志 | session log | append-only 事件流；「日志」均指此物 |
+| 事件（信封） | SessionEvent | 保留英文类型名，不译 |
+| 序号 | seq | 事件在日志中的位置 |
+| turn / 回合 | turn | 代码与类型保留 `turn`；行文用「回合」，首次并注（turn） |
+| step / 步 | step | 同上 |
+| 冷恢复 | cold resume | 重启后从持久日志重建 agent |
+| 代际 | generation | `session.vN.jsonl`；不用「世代」 |
+| 压缩 | compaction | 章节标题用 Compaction；行文用「压缩」，不用「压实」 |
+| 检查点 | checkpoint | 压缩产生的合并摘要消息 |
+| 影子定价 | shadow price | 紧邻 replace 的 metering 事件 |
+| 沙箱 | sandbox | 不用「沙盒」 |
+| 审批 | approval | 审计对 = approval/asked + approval/decided |
+| 升级 | escalation | 严格加宽（strictly wider）才有资格 |
+| 子 agent | subagent | 行文用「子 agent」；代码/类型保留 `SubagentProvider` |
+| 委派缝 | delegation seam | `ctx.subagents` 注册表 |
+| 独占栅栏 | exclusive fence | 调度器并行组语义 |
+| 程序化工具调用 | PTC (programmatic tool calling) | 第 6 章 |
+| 注册表 | registry | 命名 provider 注册表语义 |
+| fail-closed / fail-loud | — | 保留英文，不翻译 |
+
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
-- **基于 dsh v0.1.3-alpha.1（插件架构，cordis 内核）** 编写。
+- **基于 dsh v0.1.5-rc.2（插件架构，cordis 内核）** 编写。
 - 站点内代码片段均摘自真实源码并标注文件路径与行号；仓库持续演进，若某处函数/路径对不上，以仓库最新代码为准。
 
 ## 维护指南

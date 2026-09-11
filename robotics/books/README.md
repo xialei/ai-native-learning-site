@@ -24,7 +24,7 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 | `06-smolvla.html` | SmolVLA | 双流架构（VLM+动作专家）、flow matching、prefix KV cache、微调实战 |
 | `07-vla-frontier.html` | VLA 前沿 | π0（PaliGemma+手工注意力）、UnifoLM-VLA（DiT 动作头）、Prismatic 三件套 |
 | `08-sim-isaaclab.html` | Isaac Lab 全景 | monorepo 分层、configclass 任务、SimulationContext、4096 环境并行、actuator 家族 |
-| `09-manager-based-env.html` | 环境内核 | step() 八步流程、六大 Manager、_reset_idx 顺序、LiftCube episode 走查 |
+| `09-manager-based-env.html` | 环境内核 | step() 八步流程、八大 Manager、_reset_idx 顺序、LiftCube episode 走查 |
 | `10-rl-training.html` | RL 训练 | 奖励接力棒设计、课程学习、域随机化四种 mode、rsl_rl PPO 回路 |
 | `11-sim2real.html` | Sim2Real | 差距清单、gRPC 异步推理、must-go 直通、队列聚合、师生蒸馏 |
 | `12-build-own.html` | 实战路线 | 六个里程碑 M1-M6：硬件点亮→数据→模仿→RL→VLA→部署 |
@@ -35,7 +35,7 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
-- **基于真实源码**：lerobot（真机栈与策略）、Isaac Lab v3.0.0（仿真与 RL）、prismatic-vlms（VLM 底座）、unifolm-vla（VLA 框架）。
+- **基于真实源码**：lerobot（真机栈与策略）、Isaac Lab v3.0.0（release/3.0.0 @ 4a961d71，仿真与 RL）、prismatic-vlms（VLM 底座）、unifolm-vla（VLA 框架）。
 - 站点内代码片段均摘自上述仓库真实代码并标注文件路径；仓库持续演进，若某处函数/路径对不上，以仓库最新代码为准。
 
 ## 维护指南

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · GGUF 与模型加载 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 GGUF 与模型加载</div>
+    <h1>GGUF 与模型加载：权重从磁盘到显存</h1>
+    <div class="subtitle">on-device 引擎的第一件事是「把模型装进这台机器」。GGUF 怎么编码元数据与张量、量化格式怎么选、mmap 为什么省内存、n_gpu_layers 怎么切——这一章把加载路径走完。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>GGUF 文件格式</h2>
+    <p>GGUF（GPT-Generated Unified Format）是 llama.cpp 的单文件模型容器。一个文件里装三样东西：<strong>魔数与版本</strong>、<strong>键值元数据</strong>（架构名、上下文长度、tokenizer）、<strong>张量表</strong>（名字 + 类型 + 维度 + 偏移）。解析入口在 <code class="inline">ggml/src/gguf.cpp</code>：</p>
+    <div class="code-title">ggml/src/gguf.cpp — gguf_init_from_reader 的头部校验（摘录，注释为译注；GGUF_MAGIC/VERSION 定义在 ggml/include/gguf.h:41-42）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 文件魔数与版本（gguf.h）</span>
+<span class="kw">#define</span> GGUF_MAGIC   <span class="st">"GGUF"</span>
+<span class="kw">#define</span> GGUF_VERSION <span class="nu">3</span>          <span class="cmt">// v1 已不支持，v3 为当前版本</span>
+
+<span class="cmt">// gguf.cpp:452 — 解析入口</span>
+<span class="kw">static struct</span> <span class="cl">gguf_context</span> * <span class="fn">gguf_init_from_reader</span>(...) {
+    <span class="cmt">// 1) 读 4 字节魔数，逐字符比对</span>
+    <span class="kw">for</span> (<span class="kw">uint32_t</span> i = <span class="nu">0</span>; i &lt; magic.size(); i++) {
+        <span class="kw">if</span> (magic[i] != GGUF_MAGIC[i]) {
+            GGML_LOG_ERROR(<span class="st">"%s: invalid magic characters..."</span>, __func__);
+            gguf_free(ctx);
+            <span class="kw">return</span> <span class="kw">nullptr</span>;
+        }
+    }
+    <span class="cmt">// 2) 读版本号；高 16 位为 0 说明字节序与主机不符</span>
+    <span class="cmt">// 3) 读 n_tensors、n_kv，再逐个读键值对与张量信息</span>
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 版本检查里有一个容易忽略的细节——<code class="inline">(ctx-&gt;version &amp; 0x0000FFFF) == 0</code> 用于探测大小端不匹配（大端机器读出的版本号会位移到高位）。GGUF 的设计目标是<strong>单文件、自描述、可 mmap</strong>：元数据都读进内存（很小），张量数据不拷贝，靠文件偏移直接映射。</div>
+    <p>关键元数据键（常量定义在 <code class="inline">ggml/include/gguf.h</code>）包括 <code class="inline">general.alignment</code> 等；模型架构名、quant version 等由 llama 层按字符串约定读取。张量信息表的每项记录了名字、维度、类型和对齐后的数据偏移——这就是 mmap 直读的索引。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>量化格式：从 Q4_0 到 NVFP4</h2>
+    <p><code class="inline">llama_ftype</code> 枚举（<code class="inline">include/llama.h:116</code> 起）给出了全部支持文件类型。挑几个里程碑（完整表见源码 :117-156）：</p>
+    <div class="code-title">include/llama.h:116-158 — llama_ftype 节选（摘录，Q4_0=2 在 :119，Q1_0/Q2_0 在 :157-158）</div>
+    <pre class="code"><span class="lang-tag">c</span><span class="cl">LLAMA_FTYPE_MOSTLY_Q4_0</span>      = <span class="nu">2</span>,   <span class="cmt">// 最基础的 4-bit 块量化</span>
+<span class="cl">LLAMA_FTYPE_MOSTLY_Q4_K_M</span>    = <span class="nu">15</span>,  <span class="cmt">// K-quants：按重要性分块的 4-bit</span>
+<span class="cl">LLAMA_FTYPE_MOSTLY_IQ2_XS</span>    = <span class="nu">20</span>,  <span class="cmt">// I-quants： importance 导向，2.x-bit</span>
+<span class="cl">LLAMA_FTYPE_MOSTLY_TQ1_0</span>     = <span class="nu">36</span>,  <span class="cmt">// TQ：ternary，1-bit 级别</span>
+<span class="cl">LLAMA_FTYPE_MOSTLY_MXFP4_MOE</span> = <span class="nu">38</span>,  <span class="cmt">// MoE 专家的 MXFP4（gpt-oss 系）</span>
+<span class="cl">LLAMA_FTYPE_MOSTLY_NVFP4</span>     = <span class="nu">39</span>,  <span class="cmt">// NVFP4：4-bit + fp8 块 scale</span></pre>
+    <div class="annotation"><b>怎么选：</b> 数值上大致是「位宽每降 1-bit，困惑度代价递增，但显存占用减半」。日常推理 Q4_K_M 是质量/体积折中点；极限压缩（1~2-bit）用 IQ/TQ 系列；MoE 专家权重现在流行 MXFP4/NVFP4（第 10~11 章的 FreeToken 会原生读这些格式）。</div>
+    <p>每组量化的反量化数学都在 <code class="inline">ggml/src/ggml-quants.c</code> 与 <code class="inline">ggml/src/ggml-cpu/quants.c</code> 实现，各架构另有 <code class="inline">ggml/src/ggml-cpu/arch/{x86,arm,powerpc,riscv,s390,wasm,loongarch}/quants.c</code> 放 SIMD 特化；GPU 端在 CUDA 后端有配套的 dequant kernel 与 MMQ（matrix-mul-quantized）路径。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>mmap：不加载的加载</h2>
+    <p>加载器 <code class="inline">src/llama-model-loader.h</code> 持有 <code class="inline">use_mmap</code> 标志。打开 mmap 后，权重数据不经历「读进 CPU 缓冲再拷进显存」两步，而是把文件页直接映射进进程地址空间：</p>
+    <ul>
+      <li><strong>CPU 层</strong>：张量指针就是映射地址本身（<code class="inline">buffer_from_host_ptr</code>），首次访问按页调入，物理内存里放不下的部分由 OS 回收（冷层自然被淘汰）。</li>
+      <li><strong>GPU 层</strong>：CUDA 后端从映射地址发起 H2D 拷贝，避免多一次主机内存驻留。</li>
+    </ul>
+    <p>load_mode 的选择逻辑在 <code class="inline">src/llama-model.cpp</code> 的 <code class="inline">load_tensors()</code>：</p>
+    <div class="code-title">src/llama-model.cpp:1405-1438 — load_tensors 开头（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cl">bool</span> llama_model_base::<span class="fn">load_tensors</span>(llama_model_loader &amp; ml) {
+    <span class="kw">const bool</span> use_mlock = params.load_mode == LLAMA_LOAD_MODE_MLOCK
+                        || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    ...
+    <span class="kw">if</span> (ml.use_mmap &amp;&amp; params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        <span class="kw">for</span> (<span class="kw">const auto</span> &amp; dev : devices) {
+            ggml_backend_dev_props props;
+            <span class="fn">ggml_backend_dev_get_props</span>(dev.dev, &amp;props);
+            <span class="kw">if</span> (!props.caps.mmap_support) {
+                ml.use_mmap = <span class="kw">false</span>;   <span class="cmt">// 某设备不支持 mmap → 全局退回</span>
+                <span class="kw">break</span>;
+            }
+        }
+    }
+    <span class="cmt">// resolve AUTO on systems without mmap support (e.g. iGPUs)</span>
+    <span class="kw">if</span> (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) { ... <span class="cmt">// 同样退回 OFF</span> }</pre>
+    <div class="annotation"><b>读懂这段：</b> 两个 AUTO 都会「按能力降级」：设备不支持 mmap 就关 mmap，iGPU 这类设备直接把 lazy 模式关掉。这是 on-device 引擎的典型写法——<strong>默认值必须是「探测后的最优」而不是「理论最优」</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>n_gpu_layers：按 free memory 切层</h2>
+    <p>「模型 40GB、显存 16GB」怎么办？llama.cpp 的答案是 <code class="inline">--n-gpu-layers</code>：把 transformer 的第 i_gpu_start 层之后搬进 GPU，其余留 CPU。而默认值会按<strong>每块设备的 free memory 比例</strong>自动分配多卡之间的层：</p>
+    <div class="code-title">src/llama-model.cpp:1461-1519 — split 点计算与层分配（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 默认 split：每块设备按 free memory 占比</span>
+<span class="kw">if</span> (all_zero) {
+    <span class="kw">for</span> (size_t i = <span class="nu">0</span>; i &lt; n_devices(); ++i) {
+        ggml_backend_dev_t dev = devices[i].dev;
+        size_t total; size_t free;
+        <span class="fn">ggml_backend_dev_memory</span>(dev, &amp;free, &amp;total);
+        <span class="cmt">// 设备报 0 字节时退回 host 内存（issue #18577）</span>
+        <span class="kw">if</span> (free == <span class="nu">0</span> &amp;&amp; total == <span class="nu">0</span>) {
+            <span class="fn">ggml_backend_dev_memory</span>(cpu_dev, &amp;free, &amp;total);
+        }
+        splits[i] = free;
+    }
+}
+<span class="cmt">// 归一化成累计比例</span>
+...
+<span class="kw">const int</span> i_gpu_start = std::max(n_layer_all + <span class="nu">1</span> - n_gpu_layers, <span class="nu">0</span>);
+<span class="kw">const int</span> act_gpu_layers = devices.empty() ? <span class="nu">0</span> : std::min(n_gpu_layers, n_layer_all + <span class="nu">1</span>);
+<span class="kw">auto</span> <span class="fn">get_layer_buft_list</span> = [&amp;](<span class="kw">int</span> il) -&gt; llama_model::impl::layer_dev {
+    <span class="kw">const bool</span> is_swa = il &lt; n_layer_all &amp;&amp; hparams.is_swa(il);
+    <span class="cmt">// 层号超出 GPU 覆盖范围 → CPU</span>
+    <span class="kw">if</span> (il &lt; i_gpu_start || (il - i_gpu_start) &gt;= act_gpu_layers) {
+        <span class="kw">return</span> {cpu_dev, &amp;pimpl-&gt;cpu_buft_list};
+    }
+    <span class="cmt">// 在 GPU 覆盖范围内 → 按 split 比例挑一块卡</span>
+    <span class="kw">const int</span> layer_gpu = std::upper_bound(
+        splits.begin(), splits.begin() + n_devices(),
+        <span class="kw">float</span>(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+    <span class="kw">return</span> {devices.at(layer_gpu).dev, ...};
+};
+<span class="cmt">// 输入层始终留 CPU：几乎没有收益</span>
+pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };
+<span class="cmt">// 逐层分配 + 输出层</span>
+<span class="kw">for</span> (<span class="kw">int</span> il = <span class="nu">0</span>; il &lt; n_layer_all; ++il) {
+    pimpl-&gt;dev_layer[il] = get_layer_buft_list(il);
+}
+pimpl-&gt;dev_output = get_layer_buft_list(n_layer_all);</pre>
+    <div class="annotation"><b>读懂这段：</b>
+      ① n_gpu_layers() 返回「要放 GPU 的层数」（用户指定则用之，否则全部）；② i_gpu_start 是 GPU 起始层号——层数从后往前数，因为推理时层是串行走的，把<strong>尾部层</strong>放 GPU 同样生效；③ 多卡时按 free memory 加权切，不是平均切——24GB+8GB 的组合，24GB 卡分到 3/4 的层；④ 输入层（embedding）永远留 CPU，注释写明「offload 收益极小」。</div>
+    <div class="callout warn">
+      <b class="tag">坑</b>
+      这套「按 free memory 比例切层」是<strong>静态</strong>的：加载时定死。推理过程中 KV cache 增长挤压显存时，它不会重新分配。这就是为什么后面章节（06）还要讲 fit-params——先在 CPU 上模拟整个内存规划，确认装得下再真的加载。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>FreeToken 侧：为什么它不用 GGUF（为主）</h2>
+    <p>FreeToken 也支持 GGUF（<code class="inline">python/freetoken/models/gguf/</code>），但它的主路径是 <strong>FTW（FreeToken Weight）</strong>——一种为「把专家权重读进 host bank」优化过的自有格式（<code class="inline">python/freetoken/checkpoint/ftw.py</code>）。它的模块 docstring 说明了动机：</p>
+    <div class="code-title">python/freetoken/checkpoint/ftw.py — FTW 格式 docstring（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="str">"""FreeToken Weight (FTW) checkpoint: one O_DIRECT-friendly on-disk format
+for a whole model.
+
+...safetensors 张量间无对齐，单个张量无法在任意偏移上 O_DIRECT 读；
+每个 expert bank 一个文件的旧方案覆盖不了稠密权重，也把 norm/bias/router
+这类小张量变成几百次小 IO。
+
+FTW 修复两点：
+* **Aligned** — 每个张量起始于 4096 对齐的区间偏移并 pad 到 4096；shard 在
+  4096 对齐的边界切分。任何张量（或其 shard 内切片）都可以用对齐的
+  offset/length/destination 一次读出——正是 O_DIRECT 要求的。
+* **Unified** — kind="weight"（稠密权重）与 kind="experts_bank"（offload
+  专家状态）放在同一个逻辑连续字节区里。
+
+Layout on disk:
+    &lt;dir&gt;/freetoken_weight.json        # 索引: tensors[] + shards[] + meta
+    &lt;dir&gt;/freetoken-00000.ftw          # 字节区，按 ≤ 8 GiB 切 shard
+"""</span></pre>
+    <div class="annotation"><b>读懂这段：</b> GGUF/safetensors 是「通用可交换」优先；FTW 是「磁盘→host bank 一次 DMA 到位」优先。所有张量 4096 对齐后，<code class="inline">O_DIRECT</code> 多线程 preadv 可以把 NVMe 顺序带宽打满，绕过 page cache。这条线在第 11 章展开（expert bank 装载流程）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>小结</h2>
+    <ul>
+      <li>GGUF = 魔数/版本 + KV 元数据 + 对齐张量表；单文件、可 mmap、自描述。</li>
+      <li>量化位宽谱系：Q4_0（2）→ Q4_K_M（15）→ IQ2_XS（20）→ TQ1_0（36）→ MXFP4_MOE（38）→ NVFP4（39）。</li>
+      <li>mmap 让「加载」变成「建立映射」；load_mode AUTO 按设备能力降级。</li>
+      <li>n_gpu_layers 按 free memory 比例静态切层，输入层恒留 CPU。</li>
+      <li>FreeToken 的 FTW 是同一个问题的另一种答案：放弃交换性，换取 O_DIRECT 直读。</li>
+    </ul>
+    <p>权重进内存/显存之后，下一个问题是：<strong>一次 decode 到底发生了什么</strong> → <a href="03-decode-loop.html">第 3 章：decode 循环</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="01-architecture.html">← 整体架构</a>
+    <a href="03-decode-loop.html">下一步：decode 循环 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 02 GGUF与模型加载 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

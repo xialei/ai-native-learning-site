@@ -5,7 +5,7 @@
 ## 如何浏览
 
 ```bash
-open /Users/lei.xia/workspace/github/vllm/learning-site/index.html
+open vllm-engine/books/index.html
 # 或：在浏览器中打开该文件
 ```
 
@@ -17,18 +17,19 @@ open /Users/lei.xia/workspace/github/vllm/learning-site/index.html
 |------|------|----------|
 | `index.html` | 首页 | 学习路径导航 + 总览图 |
 | `01-architecture.html` | 整体架构 | 四层架构、组件职责、EngineCore 进程模型 |
-| `02-request-lifecycle.html` | 请求生命周期 | generate() → token 输出的全链路、prefill/decode |
+| `02-request-lifecycle.html` | 请求生命周期 | generate() → token 输出的全链路、prefill/decode、重叠调度（async scheduling） |
 | `03-paged-attention.html` | PagedAttention & KV Cache | 分页思想、逻辑块/物理块、BlockPool、allocate_slots |
 | `04-scheduler.html` | 调度器 | 连续批处理、统一调度、优先级/抢占、PD 分离（prefill/decode 分离式部署） |
 | `05-model-runner.html` | Model Runner | batch→GPU 张量、KV 传递、CUDA Graph |
-| `06-sampling.html` | 采样 | SamplingParams、logits 后处理、Sampler、detokenize |
+| `06-sampling.html` | 采样 | SamplingParams、logits 后处理、Sampler、detokenize、束搜索、投机解码（n-gram/EAGLE 草稿 + rejection sampling） |
 | `07-kernels.html` | Kernel 层 | 注意力后端抽象、FlashAttention/FlashInfer、自定义算子 |
 | `08-memory.html` | 内存与 KV 预算 | 显存划分、memory profile、前缀缓存 |
-| `09-serving-entry.html` | 服务入口 | OpenAI API、AsyncLLMEngine、流式、引擎分离 |
+| `09-serving-entry.html` | 服务入口 | OpenAI API、AsyncLLMEngine、流式、引擎分离、性能指标（TTFT/ITL/Prometheus/MFU） |
 | `10-distributed.html` | 分布式 | TP/PP/DP/EP、Executor（uniproc/ray/multiproc） |
 | `11-build-own-engine.html` | 自研路线图 | 六个里程碑：从单请求到多卡 |
 | `12-model-weights.html` | 实战·模型权重加载 | 注册表→loader→load_weights 重映射→量化/稀疏调优；以 DeepSeek-V4 / GLM-5.2 / Kimi-K2 为例；附三个真实 checkpoint 仓库目录结构对照 |
-| `13-agentic-gateway.html` | 实战·Agentic 网关 | 拆解 vllm-project/agentic-api（Rust）：previous_response_id 注水、服务端工具循环、工具所有权路由、SSE 缝合、compaction；vLLM 前的有状态编排层 |
+| `13-agentic-gateway.html` | 实战·Agentic 网关 | 拆解 vllm-project/agentic-api（Rust）：previous_response_id 状态恢复、服务端工具循环、工具所有权路由、SSE 流重组、compaction；vLLM 前的有状态编排层 |
+| `14-model-evolution.html` | 实战·国产开源模型架构变迁 | 以引擎视角追踪 DeepSeek-V4/V4.1、GLM-5.2/5.3-Flash、Kimi-K2.6/K3、Qwen3.8/Flash-Next 的架构演进：稀疏索引省法、残差流变体、线性注意力混合，及引擎侧对应的新机制（KVCacheSpec、model_states、CacheDType） |
 
 共享样式：`assets/vllm-learn.css`。所有架构图/流程图均为**内联 SVG**。
 
@@ -40,7 +41,7 @@ open /Users/lei.xia/workspace/github/vllm/learning-site/index.html
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 14 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
 - 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
 - 代码片段：务必从真实源码摘录并标注路径，不要凭记忆杜撰函数签名。
 - 如需在 `index.html` 的 `pathgrid` 增删卡片，同步调整对应页面即可。

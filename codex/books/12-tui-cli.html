@@ -34,11 +34,11 @@
 <div class="page">
 
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-1351-ga9519cbcdd</span>
+    <span class="version-badge">rusty-v8-v150.4.0-1950-gda20788df9</span>
     <h1>12 · TUI 与 CLI：前端的多种姿态</h1>
     <p class="lead">
       第 2 章我们说 Codex 是「协议优先」——内核与前端解耦。这一章看前端如何消费那个协议。
-      Codex 不止是「终端里的聊天框」，它是一组前端：<b>交互式 TUI</b>、<b>非交互 exec</b>、<b>app-server 守护进程</b>、<b>MCP server 模式</b>。
+      Codex 不止是「终端里的聊天框」，它是一组前端：<b>交互式 TUI</b>、<b>非交互 exec</b>、<b>app-server 守护进程</b>。
       它们共享同一套 Op/Event 协议，却服务于截然不同的使用场景——从人机结对编程到 CI 无人值守。
     </p>
   </div>
@@ -47,10 +47,10 @@
     <h2><span class="num">12.1</span>前端的四种姿态</h2>
     <p>Codex 的二进制 <code class="inline">codex</code> 是一个多子命令的 CLI。不传子命令时进入交互式 TUI；传子命令则进入不同模式：</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/cli/src/main.rs:104</span>
+    <pre class="code"><span class="lang-tag">codex-rs/cli/src/main.rs:130</span>
 <span class="cmt">/// 不指定子命令时，转发给交互式 CLI。</span>
 #[clap(..)]
-<span class="kw">struct</span> <span class="cl">Cli</span> {
+<span class="kw">struct</span> <span class="cl">MultitoolCli</span> {
     <span class="cmt">// 直接运行 → 交互式 TUI</span>
     #[clap(flatten)]
     interactive: <span class="cl">TuiCli</span>,
@@ -59,14 +59,14 @@
     subcommand: <span class="kw">Option</span>&lt;<span class="cl">Subcommand</span>&gt;,
 }
 
-<span class="lang-tag">codex-rs/cli/src/main.rs:133</span>
+<span class="lang-tag">codex-rs/cli/src/main.rs:148</span>
 <span class="kw">enum</span> <span class="cl">Subcommand</span> {
+    <span class="cmt">/// 浏览共享 app-server 守护进程上的所有 Agent 会话</span>
+    Agents(<span class="cl">AgentsCommand</span>),
     <span class="cmt">/// 非交互执行（visible_alias = "e"）</span>
     Exec(<span class="cl">ExecCli</span>),
     <span class="cmt">/// 非交互代码评审</span>
     Review(<span class="cl">ReviewCommand</span>),
-    <span class="cmt">/// 作为 MCP server 运行 (stdio)</span>
-    McpServer(<span class="cl">McpServerCommand</span>),
     <span class="cmt">/// [experimental] 运行 app server</span>
     AppServer(<span class="cl">AppServerCommand</span>),
     <span class="cmt">/// [experimental] exec-server 服务</span>
@@ -77,7 +77,7 @@
     Fork(<span class="cl">ForkCommand</span>),
     <span class="cmt">/// 给已有会话排队消息</span>
     Queue(<span class="cl">QueueCommand</span>),
-    <span class="cmt">// + Login/Logout/Mcp/Plugin/Update/Doctor/Sandbox/Apply/Cloud ...</span>
+    <span class="cmt">// + Login/Logout/Mcp/Plugin/Update/Doctor/Sandbox/Apply/Cloud/Archive ...</span>
 }</pre>
 
     <table class="tbl">
@@ -86,7 +86,7 @@
         <tr><td>TUI</td><td><code>codex</code></td><td>全交互</td><td>结对编程</td></tr>
         <tr><td>exec</td><td><code>codex exec</code></td><td>非交互</td><td>脚本 / CI</td></tr>
         <tr><td>review</td><td><code>codex review</code></td><td>非交互</td><td>PR 评审</td></tr>
-        <tr><td>MCP server</td><td><code>codex mcp-server</code></td><td>stdio 协议</td><td>被其它 Agent 客户端调用</td></tr>
+        <tr><td>MCP server</td><td><code>codex mcp-server</code></td><td>stdio 协议</td><td>被其它 Agent 客户端调用（<b>已于 2026-09 移除</b>，见 12.6）</td></tr>
         <tr><td>app-server</td><td><code>codex app-server</code></td><td>守护进程</td><td>多会话 / 桌面 app / 远程</td></tr>
       </tbody>
     </table>
@@ -203,21 +203,26 @@ request_handle.request_typed::&lt;<span class="cl">ModelListResponse</span>&gt;(
 
     <p>exec 模式复用第 4 章的 rollout 能力——<code class="inline">Resume</code> 和 <code class="inline">Fork</code> 直接操作历史会话。它的输出是一组<b>结构化 item 事件</b>：</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/exec/src/exec_events.rs</span>
-<span class="cmt">// 生命周期事件：一个 item 的开始 / 更新 / 完成</span>
+    <pre class="code"><span class="lang-tag">codex-rs/exec/src/exec_events.rs:11</span>
+<span class="cmt">// 生命周期事件（完整枚举还有 thread/turn 级事件，这里只列 item 相关子集）</span>
 <span class="kw">pub enum</span> <span class="cl">ThreadEvent</span> {
+    ThreadStarted(..), TurnStarted(..), TurnCompleted(..), TurnFailed(..),
     ItemStarted(<span class="cl">ItemStartedEvent</span>),
     ItemUpdated(<span class="cl">ItemUpdatedEvent</span>),
     ItemCompleted(<span class="cl">ItemCompletedEvent</span>),
     Error(<span class="cl">ThreadErrorEvent</span>),
 }
 
-<span class="cmt">// 一个 item 的具体内容（嵌在上述事件里）</span>
+<span class="cmt">// 一个 item 的具体内容（嵌在上述事件里；节选）</span>
 <span class="kw">pub enum</span> <span class="cl">ThreadItemDetails</span> {
     AgentMessage(<span class="cl">AgentMessageItem</span>),        <span class="cmt">// Agent 的一条消息</span>
+    Reasoning(<span class="cl">ReasoningItem</span>),             <span class="cmt">// 推理摘要</span>
     CommandExecution(<span class="cl">CommandExecutionItem</span>), <span class="cmt">// 一次命令执行</span>
     FileChange(<span class="cl">FileChangeItem</span>),           <span class="cmt">// 文件变更</span>
     McpToolCall(<span class="cl">McpToolCallItem</span>),          <span class="cmt">// MCP 工具调用</span>
+    CollabToolCall(<span class="cl">CollabToolCallItem</span>),     <span class="cmt">// 协作工具调用</span>
+    WebSearch(<span class="cl">WebSearchItem</span>),             <span class="cmt">// 网页搜索</span>
+    TodoList(<span class="cl">TodoListItem</span>),               <span class="cmt">// 任务清单</span>
     Error(<span class="cl">ErrorItem</span>),                    <span class="cmt">// 错误</span>
 }
 
@@ -230,9 +235,10 @@ request_handle.request_typed::&lt;<span class="cl">ModelListResponse</span>&gt;(
     <h2><span class="num">12.5</span>app-server：守护进程与多会话</h2>
     <p><code class="inline">codex app-server</code> 把内核跑成一个长驻守护进程，支持多传输（stdio / WebSocket / Unix socket）、多会话、远程控制。这是 Codex 走向「桌面 app + 云端」的基石。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/app-server/src/lib.rs</span>
+    <pre class="code"><span class="lang-tag">codex-rs/app-server/src/lib.rs:36</span>
 <span class="kw">use</span> crate::transport::{
     <span class="cl">ConnectionOrigin</span>, <span class="cl">ConnectionState</span>,
+    <span class="cl">DaemonShutdownAccess</span>,
     <span class="cl">OutboundConnectionState</span>,
     <span class="cl">RemoteControlPolicy</span>, <span class="cl">RemoteControlStartConfig</span>,
     <span class="cl">TransportEvent</span>,
@@ -244,14 +250,17 @@ request_handle.request_typed::&lt;<span class="cl">ModelListResponse</span>&gt;(
     route_outgoing_envelope,              <span class="cmt">// 出站信封路由</span>
 };</pre>
 
-    <p>transport 层抽象了多种连接方式，让同一个 app-server 既能被本地 TUI 经 stdio 调用，也能被桌面 app 经 WebSocket 调用，还能接受远程控制（带 <code class="inline">RemoteControlPolicy</code> 鉴权）。<code class="inline">acquire_app_server_startup_lock</code> 保证一台机器上只有一个守护实例，多个前端连到同一个共享 app-server——这就是 <code class="inline">codex agents</code> 子命令能「浏览所有本地会话」的原理。</p>
+    <p>transport 层抽象了多种连接方式，让同一个 app-server 既能被本地 TUI 经 stdio 调用，也能被桌面 app 经 WebSocket 调用，还能接受远程控制（带 <code class="inline">RemoteControlPolicy</code> 鉴权）。<code class="inline">acquire_app_server_startup_lock</code> 保证一台机器上只有一个守护实例，多个前端连到同一个共享 app-server——这就是 <code class="inline">codex agents</code> 子命令能「浏览所有本地会话」的原理。stdio 传输在关停时有界等待（配合 <code class="inline">DaemonShutdownAccess</code> 区分托管/禁用关停），SIGTERM 也能优雅退出，避免守护进程退出时被阻塞的 rollout I/O 卡死。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">12.6</span>MCP server 模式：角色反转</h2>
-    <p><code class="inline">codex mcp-server</code> 让 Codex 自己<b>作为 MCP 服务器</b>暴露——第 10 章里 Codex 是 MCP 客户端，这里它反过来成为服务器，供其它 Agent 客户端调用。这构成一个有趣的对称：Codex 既能消费 MCP 工具，也能被消费为 MCP 工具。</p>
-
-    <p>这意味着你可以把 Codex 作为一个「编码能力」挂到任何支持 MCP 的客户端下——比如另一个 Agent 框架需要写代码时，不必自己实现工具，直接 spawn 一个 Codex MCP server。这是 Agent 生态互操作的关键。</p>
+    <h2><span class="num">12.6</span>MCP server 模式：角色反转（已被移除）</h2>
+    <p>早期版本曾提供 <code class="inline">codex mcp-server</code> 子命令，让 Codex 自己<b>作为 MCP 服务器</b>暴露——第 10 章里 Codex 是 MCP 客户端，这里它反过来成为服务器，供其它 Agent 客户端调用。</p>
+    <div class="callout warn">
+      <b class="tag">已移除</b>
+      该子命令（以及独立的 <code class="inline">codex-mcp-server</code> crate）在 2026-09 的 <code class="inline">531f3836a1</code> 中被移除（此前已长期标记 deprecated）。如今的等价做法是把 Codex 以 <code class="inline">codex exec</code> / app-server 协议的方式被外部客户端编排——「角色反转」的思想保留在 app-server 的多传输架构里，而不再是独立的 stdio MCP 服务器形态。
+    </div>
+    <p>这个反复本身值得一提：Codex 曾尝试「既能消费 MCP 也能被消费为 MCP」的对称设计，最终发现客户端角色才是高频路径，于是砍掉了服务器角色。自研时同理——<b>一个方向的集成做扎实，比两个方向都半成品更值钱</b>。</p>
   </section>
 
   <section class="block">
@@ -262,23 +271,23 @@ request_handle.request_typed::&lt;<span class="cl">ModelListResponse</span>&gt;(
       <tbody>
         <tr><td><code>codex resume</code></td><td>恢复会话继续</td><td>Resumed</td></tr>
         <tr><td><code>codex fork</code></td><td>从某点分叉新会话</td><td>Forked</td></tr>
-        <tr><td><code>codex queue</code></td><td>给已有会话排队消息</td><td>Resumed (+ steer)</td></tr>
+        <tr><td><code>codex queue</code></td><td>给已有会话排队消息</td><td>—（经 thread/queue/add 入队，空闲时以 turn_trigger="queue" 开新 turn）</td></tr>
         <tr><td><code>codex archive</code></td><td>归档会话</td><td>—</td></tr>
         <tr><td><code>codex delete</code></td><td>永久删除会话</td><td>—</td></tr>
       </tbody>
     </table>
-    <p>这些命令把 rollout 的「事件源」能力直接暴露给用户——会话不是一次性的，而是可恢复、可分叉、可归档的持久资产。这是 Codex 区别于「阅后即焚」式 Agent 的核心特征。</p>
+    <p>这些命令把 rollout 的「事件源」能力直接暴露给用户——会话不是一次性的，而是可恢复、可分叉、可归档的持久资产。这是 Codex 与「会话用完即弃」式 Agent 的核心区别。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">12.8</span>小结与对自研的启示</h2>
     <div class="callout tip">
       <b class="tag">自研 checklist</b>
-      前端多样性是 Agent 落地的关键——同一内核要服务不同场景。<strong>① 协议优先</strong>——内核与前端用协议隔开，别让 TUI 直接持有内核对象，否则加新前端要重写。<strong>② 一份内核多种前端</strong>——交互式 / 非交互 / 守护进程 / 作为工具被调用，覆盖人机与机机两类消费者。<strong>③ 非交互模式要有结构化输出</strong>——CI 需要可解析的事件流（JSON item），不是给人看的 ANSI 文本。<strong>④ 多传输守护进程</strong>——app-server 支持 stdio/WebSocket/socket，才能服务桌面和远程。<strong>⑤ 会话是一等公民</strong>——resume/fork/queue/archive 让会话可持久管理，而非阅后即焚。<strong>⑥ 角色可反转</strong>——既能消费 MCP 也能作为 MCP 被消费，融入更大生态。
+      前端多样性是 Agent 落地的关键——同一内核要服务不同场景。<strong>① 协议优先</strong>——内核与前端用协议隔开，别让 TUI 直接持有内核对象，否则加新前端要重写。<strong>② 一份内核多种前端</strong>——交互式 / 非交互 / 守护进程 / 作为工具被调用，覆盖人机与机机两类消费者。<strong>③ 非交互模式要有结构化输出</strong>——CI 需要可解析的事件流（JSON item），不是给人看的 ANSI 文本。<strong>④ 多传输守护进程</strong>——app-server 支持 stdio/WebSocket/socket，才能服务桌面和远程。<strong>⑤ 会话是一等公民</strong>——resume/fork/queue/archive 让会话可持久管理，而非用完即弃。<strong>⑥ 集成方向要敢砍</strong>——Codex 曾同时做 MCP 客户端和 MCP 服务器，最终砍掉服务器角色（见 12.6）：把高频方向的集成做扎实，比两个方向都半成品更值钱。
     </div>
     <div class="callout info">
-      <b class="tag">一句话</b>
-      Codex 的前端哲学：<b>「协议隔离内核，一份内核多种姿态」</b>。TUI/exec/app-server/mcp-server 四种前端共享同一套 Op/Event 协议，从结对编程到 CI 无人值守到生态互操作，全由同一个内核支撑。
+      <b class="tag">整体结构</b>
+      Codex 的前端设计：<b>「协议隔离内核，一份内核多种形态」</b>。TUI/exec/app-server 等前端共享同一套 Op/Event 协议，从结对编程到 CI 无人值守到生态互操作，全由同一个内核支撑。
     </div>
   </section>
 
@@ -289,7 +298,7 @@ request_handle.request_typed::&lt;<span class="cl">ModelListResponse</span>&gt;(
 </div>
 
 <footer>
-  Codex CLI · 12 TUI 与 CLI · 版本 rusty-v8-v150.4.0-1351-ga9519cbcdd · 所有引用代码路径以仓库最新为准
+  Codex CLI · 12 TUI 与 CLI · 版本 rusty-v8-v150.4.0-1950-gda20788df9 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

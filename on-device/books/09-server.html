@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 服务入口 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 服务入口</div>
+    <h1>服务入口：从 HTTP 请求到 KV 复用</h1>
+    <div class="subtitle">引擎本体是「一次 llama_decode」的世界；server 层是「并发请求、slot 调度、前缀复用」的世界。llama-server 把两者粘在一个进程里；FreeToken 把它们拆成三个进程用 ZMQ 连接。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>slot：并发的基本单位</h2>
+    <p>llama-server 的并发模型围绕 slot——「一个序列在一个 context 里的租约」。每个 slot 有自己的状态机：</p>
+    <div class="code-title">tools/server/server-context.cpp:99-111 — slot 状态机（摘录）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// state diagram: https://github.com/ggml-org/llama.cpp/pull/9283</span>
+<span class="kw">enum</span> slot_state {
+    SLOT_STATE_IDLE,
+    SLOT_STATE_WAIT_OTHER,  <span class="cmt">// 任务已派发，但父 slot 还在处理 prompt</span>
+    SLOT_STATE_STARTED,     <span class="cmt">// 任务已派发，即将处理 prompt</span>
+    SLOT_STATE_PROCESSING_PROMPT,
+    SLOT_STATE_DONE_PROMPT,
+    SLOT_STATE_GENERATING,
+};</pre>
+    <p>请求进来时先选 slot。选择逻辑有明确的优先级（server-context.cpp:1553-1636）：客户端显式指定 <code class="inline">id_slot</code> 时先按 id 直选，然后才是 LCP 相似度，最后 LRU 兜底——自动调度场景下起作用的是后两级：</p>
+    <div class="code-title">tools/server/server-context.cpp — slot 选择（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// ① 按最长公共前缀（LCP）相似度选 slot</span>
+<span class="kw">const</span> size_t lcp_len = tokens.<span class="fn">get_common_prefix</span>(task.tokens);
+<span class="kw">const</span> <span class="kw">float</span> f_sim_cur = <span class="kw">float</span>(lcp_len) / task.tokens.size();
+...
+<span class="kw">if</span> (f_sim_cur &gt; f_sim_best &amp;&amp; f_sim_cur &gt; slot_prompt_similarity) {
+    f_sim_best = f_sim_cur;
+    ret = &amp;slot;
+}
+...
+<span class="cmt">// 即将丢掉现有 context 的大半 → 先存进 prompt cache</span>
+<span class="kw">if</span> (f_keep &lt; <span class="nu">0.5f</span>) { update_cache = <span class="kw">true</span>; }
+
+<span class="cmt">// ② 没有相似 slot → LRU</span>
+<span class="kw">if</span> (ret == <span class="kw">nullptr</span>) {
+    <span class="cmt">// used to determine the slot that has been used the longest</span>
+    ...
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> LCP 选择是关键设计：多轮对话的每一轮都重复上一轮的 prompt（system + 历史 + 新消息），命中一个带前缀的 slot 意味着<strong>整段历史不用重算</strong>。f_keep &lt; 0.5 的判断（丢掉的旧 context 超过一半）触发 prompt cache 保存——先存档再释放，和 OS 页缓存「换出前写回」是同一个顺序约束。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>前缀复用与 cache_reuse</h2>
+    <p>选中 slot 后，新 prompt 与 slot 现有 tokens 求公共前缀，KV 从前缀末端开始算（server-context.cpp:3217-3231）：</p>
+    <div class="code-title">tools/server/server-context.cpp — 前缀复用（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// n_past = 公共前缀长度；之后的 token 才需要 prefill</span>
+n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_tokens);
+
+<span class="cmt">// alora 调用点之后不缓存</span>
+<span class="kw">if</span> (slot.alora_invocation_start &gt; <span class="nu">0</span>) {
+    n_past = std::min(n_past, slot.alora_invocation_start - <span class="nu">1</span>);
+}
+
+<span class="kw">const bool</span> can_cache_reuse =
+    <span class="fn">llama_memory_can_shift</span>(llama_get_memory(ctx_tgt)) &amp;&amp;
+    !slot.prompt.tokens.has_mtmd;</pre>
+    <p><code class="inline">n_cache_reuse</code> 参数更进一步：不求公共前缀，允许<strong>从旧 prompt 中段搬 KV 块</strong>——哪怕新 prompt 与旧 prompt 只在中段局部相似也能复用（server-context.cpp:3238-3282）：</p>
+    <div class="code-title">tools/server/server-context.cpp — 块级 KV 搬移（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 双指针扫旧 cache 与新 prompt</span>
+<span class="kw">size_t</span> head_c = n_past;  <span class="cmt">// cache 指针</span>
+<span class="kw">size_t</span> head_p = n_past;  <span class="cmt">// prompt 指针</span>
+<span class="kw">while</span> (head_c &lt; slot.prompt.tokens.size() &amp;&amp; head_p &lt; input_tokens.size()) {
+    size_t n_match = <span class="nu">0</span>;
+    <span class="cmt">// 找从当前位置开始的最长匹配段</span>
+    <span class="kw">while</span> (... slot.prompt.tokens[head_c + n_match] == input_tokens[head_p + n_match]) {
+        n_match++;
+    }
+    <span class="kw">if</span> (n_match &gt;= (size_t) n_cache_reuse) {
+        <span class="cmt">// 匹配段够长 → 把这段 KV 平移到新位置</span>
+        <span class="kw">const</span> int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
+        slot.mem.<span class="fn">seq_rm</span> (slot.id, head_p, head_c);
+        slot.mem.<span class="fn">seq_add</span>(slot.id, head_c, head_c + n_match, kv_shift);
+        ...
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> cache_reuse 本质上是把第 4 章的 context-shift 原语（seq_rm + seq_add）用到了极致：不再只复用前缀，任何「长度 ≥ n_cache_reuse 的重复片段」的 KV 都可以原地平移复用。限制条件已经写在 can_cache_reuse 里：memory 必须支持 shift，且多模态（mtmd）禁用。注意 shift 的拒绝条件不是「recurrent 不行」——恰恰相反，recurrent 内存的 <code class="inline">get_can_shift()</code> 直接返回 true（源码注释：shifting the pos is trivial for recurrent models）；真正被拒的是 M-RoPE 这类 <code class="inline">n_pos_per_embd() &gt; 1</code> 的架构，以及 Step35（它用逐层 RoPE 维度，而 K-shift 假设单一的全局 n_rot）。这是 KV 时代对「指令级缓存」的一种类比——搬的粒度从 token 变成 KV 块。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>server_tokens：多模态占位符</h2>
+    <p>server 层的 prompt 不是简单 token 数组，而是 <code class="inline">server_tokens</code>——支持图文交错的「占位符」结构（tools/server/server-common.h:136-157）：</p>
+    <div class="code-title">tools/server/server-common.h — server_tokens（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">struct</span> <span class="cl">server_tokens</span> {
+    <span class="kw">bool</span> has_mtmd = <span class="kw">false</span>;
+
+<span class="kw">private</span>:
+    <span class="cmt">// 起始索引 → 图像 chunk 的映射（顺序必须与 tokens 同步）</span>
+    std::map&lt;size_t, mtmd::input_chunk_ptr&gt; map_idx_to_media;
+
+    <span class="cmt">// LLAMA_TOKEN_NULL 表示该位置被 media chunk 占用</span>
+    llama_tokens tokens;
+
+    <span class="cmt">// 输入 5 个文本 token + 2 张图（每图占 3 token / 2 pos）：</span>
+    <span class="cmt">//      [0] [1] [2] [3] [4] [img0] [img0] [img0] [img1] [img1] [img1]</span>
+    <span class="cmt">// idx  0   1   2   3   4   5      6      7      8      9      10</span>
+    <span class="cmt">// pos  0   1   2   3   4   5      5      5      7      7      7</span>
+    <span class="cmt">// map_idx_to_media = {5, img0}, {8, img1}</span>
+    ...</pre>
+    <div class="annotation"><b>读懂这段：</b> 注释里的示例把语义讲全了：一张图占多个 token 槽位但可能共享同一个 pos（M-RoPE），token 数组里放 LLAMA_TOKEN_NULL 占位、图像数据存在旁边的 map 里。这个结构解释了前面反复出现的约束：context shift 不支持多模态（shift 会破坏图文 pos 对齐）、cache_reuse 不支持多模态——凡是「移动 KV 位置」的操作都假定 token↔pos 是一一映射，图文交错打破了这个假定。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>prompt cache：把整个 slot 存档</h2>
+    <p>前缀复用只在「slot 还留着那个 prompt」时有效。slot 被复用后旧 prompt 的 KV 就没了——prompt cache 把它留在内存里（tools/server/server-task.h:566-635）。注意是纯 RAM、没有磁盘持久化，容量由 <code class="inline">cache_ram_mib</code>（默认 8192，即 8 GiB）控制：</p>
+    <div class="code-title">tools/server/server-task.h — prompt cache（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">struct</span> <span class="cl">server_prompt</span> {
+    server_tokens tokens;
+    std::list&lt;common_prompt_checkpoint&gt; checkpoints;  <span class="cmt">// KV 状态快照</span>
+    ...
+};
+
+<span class="kw">struct</span> <span class="cl">server_prompt_cache</span> {
+    <span class="cl">server_prompt_cache</span>(int32_t limit_size_mib, size_t limit_tokens) {
+        <span class="cmt">// 0 = 无限制</span>
+        <span class="kw">this</span>-&gt;limit_size   = <span class="nu">1024ull*1024ull</span> * (limit_size_mib &lt; <span class="nu">0</span> ? <span class="nu">0</span> : limit_size_mib);
+        <span class="kw">this</span>-&gt;limit_tokens = limit_tokens;
+    }
+    std::list&lt;server_prompt_cache_state&gt; states;   <span class="cmt">// LRU 链</span>
+    ...
+    <span class="kw">bool</span> <span class="fn">load</span>(server_prompt &amp; prompt, <span class="kw">const</span> server_tokens &amp; tokens_new, ...);
+};</pre>
+    <div class="annotation"><b>读懂这段：</b> 缓存条目 = token 序列 + KV checkpoint（common_prompt_checkpoint，投机解码那章见过同一类型）。命中时 load() 把 KV 状态直接恢复进 slot——新请求的前缀部分零计算。容量按字节数和 token 数双限。这补上了 slot 调度的短板：LCP 选择只在「slot 内存里有」的范围内有效，prompt cache 把有效范围扩展到「曾经出现过」的 prompt。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>对照：FreeToken 的多进程 server</h2>
+    <p>llama-server 是单进程多线程；FreeToken 把 HTTP 层与引擎拆成多个进程。api_server.py 是 FastAPI 应用，注册五组路由：</p>
+    <div class="code-title">python/freetoken/server/api_server.py:417-422 — 路由注册（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>app = <span class="cl">FastAPI</span>(title=<span class="st">"FreeToken API Server"</span>, version=__version__, lifespan=lifespan)
+<span class="fn">register_openai_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
+<span class="fn">register_anthropic_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
+<span class="fn">register_responses_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
+<span class="fn">register_control_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
+<span class="fn">register_accounting_routes</span>(app, get_global_state)</pre>
+    <div class="annotation"><b>读懂这段：</b> 与 llama-server 不同，FreeToken 同时暴露 OpenAI、Anthropic、Responses 三套协议——端侧应用（桌面客户端等）可能来自任何一家生态。HTTP 进程不直接碰模型：请求经 ZMQ 队列传给 tokenizer/scheduler 进程（utils/mp.py 的 ZmqAsyncPushQueue/ZmqAsyncPullQueue），引擎进程独占 GPU。supervisor（server/supervisor.py）负责启动握手：drain_ready 等所有 worker ack ready、收集进度条、故障时抛 WorkerDied。这个进程拓扑的动机在第 10 章展开：GIL 之下 Python 引擎要把「HTTP 解析、token 流式处理、模型前向」分给不同进程才能吃满 CPU/GPU 流水线。并发上限默认 4：<code class="inline">engine/config.py:24 max_running_req: int = 4</code>（可被 <code class="inline">--max-running-requests</code> 覆盖，shell 模式强制为 1）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>小结</h2>
+    <ul>
+      <li>slot 状态机六态；调度按「id 直选（若指定）→ LCP 相似度 → LRU」选 slot。</li>
+      <li>前缀复用免算历史；n_cache_reuse 把「搬 KV 块」推广到中段重复片段。</li>
+      <li>server_tokens 用 NULL 占位符 + 旁挂 map 支持图文交错，也解释了 shift/reuse 的多模态禁区。</li>
+      <li>prompt cache 把 KV 状态整体存档，复用范围从「slot 内存里」扩展到「历史上出现过」。</li>
+      <li>FreeToken：FastAPI 三协议 + ZMQ 多进程 + supervisor 握手，max_running_req=4。</li>
+    </ul>
+    <p>llama.cpp 部分完结。下一章进入 FreeToken 的世界。<a href="10-freetoken.html">第 10 章：FreeToken 引擎总览</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="08-speculative.html">← 投机解码</a>
+    <a href="10-freetoken.html">下一步：FreeToken 引擎总览 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

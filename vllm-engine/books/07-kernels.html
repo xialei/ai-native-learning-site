@@ -27,6 +27,7 @@
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
       <a href="13-agentic-gateway.html">实战·网关</a>
+      <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
 </header>
@@ -51,14 +52,14 @@
       <li><strong>FlashAttention 的 IO 优化</strong>：Naive 注意力要把完整的 S×S 分数矩阵 + softmax 中间结果写回显存（HBM）再读回。FlashAttention 把<strong>整个 Q/K/V 分块（tiling）</strong>，把当前分块读进片上 SRAM，在 SRAM 里算分数、做在线 softmax、累加输出，<strong>绝不让整个 K/V 或中间分数矩阵落回 HBM</strong>。它把显存往返次数从 O(N) 降到 O(N²/M)，本质是「以多算一点为代价，少搬大量数据」。</li>
       <li><strong>GEMM 用 CUTLASS / cuBLAS</strong>：注意力里的矩阵乘（QK^T、PV）本质是 GEMM，直接调 NVIDIA 已有高度调优的库，而不是自己写一个平庸的矩阵乘核。</li>
     </ul>
-    <div class="annotation"><b>一句话：</b>prefill 拼算力、decode 拼带宽——kernel 层就是针对这两种瓶颈分别做极致优化的地方。</div>
+    <div class="annotation"><b>概括：</b>prefill 拼算力、decode 拼带宽——kernel 层就是针对这两种瓶颈分别做极致优化的地方。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.2</span>注意力后端抽象：接口与多实现</h2>
     <p>vLLM 并不自己闷头写死一套注意力 kernel，而是定义了一组<strong>架构无关的接口</strong>，然后让 FlashAttention、FlashInfer、TRT-LLM、Triton 等实现都去实现它。模型层代码只依赖接口，不需要知道底层是哪个 kernel。</p>
     <p>核心是两个抽象基类，都在 <code class="inline">vllm/v1/attention/backend.py</code>：</p>
-    <div class="code-title">vllm/v1/attention/backend.py — AttentionBackend（接口）与 AttentionImpl.forward（契约）</div>
+    <div class="code-title">vllm/v1/attention/backend.py — AttentionBackend（接口）与 AttentionImpl.forward（契约；注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">AttentionBackend</span>(ABC):
     <span class="cmt"># 声明这个后端支持哪些 dtype / kv_cache_dtype / block_size</span>
     <span class="cmt"># 前后端选择器（selector）靠这些 supports_* 判断是否可用</span>
@@ -83,7 +84,7 @@
     </ul>
     <p><code class="inline">forward</code> 的签名非常统一：输入 query/key/value、<code class="inline">kv_cache</code>、<code class="inline">attn_metadata</code>，输出 attention 结果。模型层每层注意力都按这个签名调用，到底执行哪个实现由上层选择器决定。这就是「<strong>架构无关接口 + 多后端实现</strong>」——同一份模型代码能同时跑在 FlashAttention、FlashInfer、TRTLLM 上，而 vLLM 几乎是全平台支持的。</p>
     <p>后端的「账单」在 <code class="inline">vllm/v1/attention/backends/registry.py</code> 里：一个 <code class="inline">AttentionBackendEnum</code> 枚举，每一项的值是类的完整限定名。例如：</p>
-    <div class="code-title">vllm/v1/attention/backends/registry.py — 后端枚举（摘录）</div>
+    <div class="code-title">vllm/v1/attention/backends/registry.py — 后端枚举（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">AttentionBackendEnum</span>(Enum, ...):
     FLASH_ATTN  = <span class="st">"vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"</span>
     FLASHINFER  = <span class="st">"vllm.v1.attention.backends.flashinfer.FlashInferBackend"</span>
@@ -141,7 +142,7 @@
   <section class="block">
     <h2><span class="num">7.3</span>后端选择：selector 怎么挑</h2>
     <p>模型初始化时调 <code class="inline">get_attn_backend</code>，它把「模型配置 + 设备信息」打包成一个 <code class="inline">AttentionSelectorConfig</code>，再层层下发给平台层去挑后端。关键逻辑在 <code class="inline">vllm/v1/attention/selector.py</code>：</p>
-    <div class="code-title">vllm/v1/attention/selector.py — 根据配置与平台选择后端类</div>
+    <div class="code-title">vllm/v1/attention/selector.py — 根据配置与平台选择后端类（注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_attn_backend</span>(...) <span class="kw">-&gt;</span> <span class="cl">type</span>[<span class="cl">AttentionBackend</span>]:
     config = <span class="cl">AttentionSelectorConfig</span>(head_size=..., dtype=...,
         kv_cache_dtype=..., block_size=..., use_mla=...,
@@ -166,7 +167,7 @@
   <section class="block">
     <h2><span class="num">7.4</span>自定义算子入口：ops 那层皮</h2>
     <p>模型里大量直接调用的是 <code class="inline">vllm/_custom_ops.py</code>。它是「Python 壳」：把 <code class="inline">torch.ops._C.*</code> / <code class="inline">_vllm</code> 这些 C++/CUDA 算子包成好读、带类型注解的 Python 函数，同时用 <code class="inline">@register_fake</code> 给自定义算子在 torch 里登记 shape 规则（供 torch.compile / fake tensor 用）。</p>
-    <div class="code-title">vllm/_custom_ops.py — 几个真实自定义算子入口</div>
+    <div class="code-title">vllm/_custom_ops.py — 几个真实自定义算子入口（注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">rms_norm</span>(out, input, weight, epsilon) <span class="kw">-&gt;</span> <span class="kw">None</span>:
     <span class="cl">torch</span>.ops._C.rms_norm(out, input, weight, epsilon)
 
@@ -241,7 +242,7 @@
 </div>
 
 <footer>
-  深入浅出vLLM · 07 Kernel · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 07 Kernel · 版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

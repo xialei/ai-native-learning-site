@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · decode 循环 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 decode 循环</div>
+    <h1>decode 循环：一次 llama_decode 里发生了什么</h1>
+    <div class="subtitle">批校验 → KV 分槽 → ubatch 拆分 → 建图执行 → logits 提取 → 输出重排。整条路径都在 <code class="inline">llama_context::decode</code> 这一个 C++ 函数里（约 400 行）。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>n_batch 与 n_ubatch：两个 batch 尺寸</h2>
+    <p><code class="inline">include/llama.h:361-362</code> 定义了两个容易混淆的参数：</p>
+    <div class="code-title">include/llama.h — 上下文参数（摘录）</div>
+    <pre class="code"><span class="lang-tag">c</span><span class="kw">uint32_t</span> n_batch;    <span class="cmt">// 逻辑最大批：一次 llama_decode 能提交的 token 数</span>
+<span class="kw">uint32_t</span> n_ubatch;   <span class="cmt">// 物理最大批：一次真正前向计算的 token 数</span></pre>
+    <p>两者的关系由 <code class="inline">memory-&gt;init_batch(*balloc, cparams.n_ubatch, output_all)</code> 驱动：llama_batch_allocr 把 n_tokens_all 的输入<strong>切成若干 ubatch</strong>，每个 ubatch 独立走一遍「KV 分槽 + 建图 + 前向」。为什么要切？KV cache 要为每个 ubatch 找槽位——一次找 2048 个连续位置比一次找 512 个难得多（第 4 章细讲）。decode 入口的断言点明了约束：</p>
+    <div class="code-title">src/llama-context.cpp — decode 入口断言（摘录）</div>
+    <pre class="code"><span class="lang-tag">c++</span>GGML_ASSERT(n_tokens_all &lt;= cparams.n_batch);
+GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
+    &amp;&amp; <span class="st">"non-causal attention requires n_ubatch &gt;= n_tokens"</span>);</pre>
+    <div class="annotation"><b>读懂这段：</b> 因果注意力下可以切 ubatch（每段独立算注意力）；非因果（fill-in-middle、某些编码器）必须一个 ubatch 装下全部——它要看到整段上下文。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>decode 主流程</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 600" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
+        <title id="t31">llama_context::decode 主流程</title>
+        <desc id="d31">从 batch 校验到 output_swaps 的完整路径</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="330" y="16" width="280" height="46" rx="8"></rect>
+        <text class="lbl" x="470" y="38" text-anchor="middle">llama_decode(batch_inp)</text>
+        <text class="lbl sm" x="470" y="54" text-anchor="middle">balloc-&gt;init：校验、计数、切 ubatch</text>
+
+        <rect class="node" x="330" y="86" width="280" height="40" rx="8"></rect>
+        <text class="lbl" x="470" y="112" text-anchor="middle">sched_reserve()　· memory_update(false)</text>
+        <line class="edge" x1="470" y1="62" x2="470" y2="84"></line>
+
+        <!-- memory loop -->
+        <rect class="node core" x="240" y="150" width="460" height="150" rx="10"></rect>
+        <text class="lbl" x="260" y="176" font-weight="bold" fill="#1d6b4f">while(true)：memory-&gt;init_batch（KV 找槽）</text>
+        <rect class="node" x="270" y="192" width="150" height="40" rx="6"></rect>
+        <text class="lbl" x="345" y="216" text-anchor="middle">SUCCESS → break</text>
+        <rect class="node warn" x="440" y="192" width="230" height="58" rx="6"></rect>
+        <text class="lbl" x="555" y="212" text-anchor="middle">FAILED_PREPARE</text>
+        <text class="lbl sm" x="555" y="228" text-anchor="middle">→ memory_update(true) 优化一次</text>
+        <text class="lbl sm" x="555" y="242" text-anchor="middle">→ continue 重试；再失败 return 1</text>
+        <line class="edge back" x1="440" y1="216" x2="422" y2="216"></line>
+        <text class="lbl sm" x="260" y="254" fill="#55685e">注意：内存不够 ≠ 直接报错，先做一次缓存整理（shift 等）再试</text>
+
+        <rect class="node" x="330" y="324" width="280" height="44" rx="8"></rect>
+        <text class="lbl" x="470" y="346" text-anchor="middle">output_reserve + 逐 ubatch 循环</text>
+        <text class="lbl sm" x="470" y="362" text-anchor="middle">process_ubatch → 建图/复用图 → graph_compute</text>
+        <line class="edge" x1="470" y1="300" x2="470" y2="322"></line>
+
+        <rect class="node" x="150" y="396" width="300" height="64" rx="8"></rect>
+        <text class="lbl" x="300" y="420" text-anchor="middle">提取 logits / embd（异步）</text>
+        <text class="lbl sm" x="300" y="438" text-anchor="middle">ggml_backend_tensor_get_async</text>
+        <line class="edge" x1="380" y1="368" x2="330" y2="394"></line>
+
+        <rect class="node" x="490" y="396" width="300" height="64" rx="8"></rect>
+        <text class="lbl" x="640" y="420" text-anchor="middle">输出重排</text>
+        <text class="lbl sm" x="640" y="438" text-anchor="middle">out_ids 非有序 → selection sort → output_swaps</text>
+        <line class="edge" x1="560" y1="368" x2="610" y2="394"></line>
+
+        <rect class="node acc" x="330" y="496" width="280" height="46" rx="8"></rect>
+        <text class="lbl" x="470" y="518" text-anchor="middle">return 0</text>
+        <text class="lbl sm" x="470" y="534" text-anchor="middle">调用方随后 llama_get_logits_ith 读取（惰性应用 swaps）</text>
+        <line class="edge" x1="300" y1="460" x2="380" y2="494"></line>
+        <line class="edge" x1="640" y1="460" x2="560" y2="494"></line>
+      </svg>
+      <div class="fig-cap">图 3.1：decode 主路径。FAILED_PREPARE 的「重试一次」是理解内存管理的关键：engine 把「腾地方」的职责交给 memory 模块，自己只负责再问一遍。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>源码：内存状态机</h2>
+    <p>decode 的中段是一个循环，处理 KV cache「装不下」的情形。这是整个 llama.cpp 内存管理的枢纽：</p>
+    <div class="code-title">src/llama-context.cpp:1749-1786 — init_batch 状态机（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span>llama_memory_context_ptr mctx;
+
+<span class="kw">while</span> (<span class="kw">true</span>) {
+    mctx = memory-&gt;<span class="fn">init_batch</span>(*balloc, cparams.n_ubatch, output_all);
+    <span class="kw">if</span> (!mctx) { <span class="kw">return</span> -<span class="nu">2</span>; }
+
+    <span class="kw">switch</span> (mctx-&gt;<span class="fn">get_status</span>()) {
+        <span class="kw">case</span> LLAMA_MEMORY_STATUS_SUCCESS:
+            <span class="kw">break</span>;                          <span class="cmt">// 槽位找到，继续</span>
+        <span class="kw">case</span> LLAMA_MEMORY_STATUS_FAILED_PREPARE:
+            {
+                <span class="kw">if</span> (!did_optimize) {
+                    did_optimize = <span class="kw">true</span>;
+                    <span class="cmt">// 只重试一次：先做 shift 等整理动作</span>
+                    <span class="kw">if</span> (memory_update(<span class="kw">true</span>)) {
+                        LLAMA_LOG_DEBUG(<span class="st">"%s: retrying batch size %d after cache optimization"</span>, ...);
+                        <span class="kw">continue</span>;
+                    }
+                }
+                LLAMA_LOG_WARN(<span class="st">"%s: failed to find a memory slot for batch of size %d"</span>, ...);
+                <span class="kw">return</span> <span class="nu">1</span>;                  <span class="cmt">// 正数返回值：不是错误，是「这次没跑成」</span>
+            }
+        <span class="kw">case</span> LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+            <span class="kw">return</span> -<span class="nu">2</span>;
+    }
+    <span class="kw">break</span>;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b>
+      ① <code class="inline">memory</code> 是 <code class="inline">llama_memory_i</code> 接口（<code class="inline">src/llama-memory.h</code>），统一三种实现：普通 KV、iswa 双缓存、循环状态（Mamba/GDN 类）。decode 只面对这个接口；
+      ② FAILED_PREPARE 的处理是「<strong>整理一次 + 重试一次</strong>」——did_optimize 标志保证不会无限循环。整理动作包括 context shift（把 KV 窗口平移）等，见第 4 章；
+      ③ 返回值约定容易记错：<strong>正数 = 业务性失败（没跑成但状态一致）</strong>，负数 = 系统性错误。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>源码：ubatch 执行与 logits 提取</h2>
+    <p>状态机退出后进入 do-while 循环，每个 ubatch 调用 <code class="inline">process_ubatch</code>（内部做建图 + 执行，第 5 章展开）。成功后把 logits/embd <strong>异步</strong>搬回 host：</p>
+    <div class="code-title">src/llama-context.cpp:1865-1885 — logits 提取（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * t_logits = res-&gt;<span class="fn">get_logits</span>();
+...
+<span class="cmt">// 从「logits 所在的设备」异步拷到 host 缓冲</span>
+<span class="kw">if</span> (logits.data &amp;&amp; t_logits &amp;&amp; n_outputs &gt; <span class="nu">0</span> &amp;&amp; needs_raw_logits(ubatch, sampling.samplers)) {
+    ggml_backend_t backend_res = <span class="fn">ggml_backend_sched_get_tensor_backend</span>(sched.get(), t_logits);
+    GGML_ASSERT(backend_res != <span class="kw">nullptr</span>);
+
+    <span class="kw">float</span> * logits_out = logits.data + n_outputs_prev*n_vocab;
+    <span class="kw">if</span> (n_outputs) {
+        <span class="fn">ggml_backend_tensor_get_async</span>(backend_res, t_logits, logits_out, <span class="nu">0</span>,
+            n_outputs*n_vocab*<span class="kw">sizeof</span>(<span class="kw">float</span>));
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 两个细节值得记住。① <code class="inline">sched_get_tensor_backend</code>：logits 可能落在任何一块设备上（sched 切图后输出张量挂在哪块卡就拷哪块）；② <code class="inline">n_outputs_prev</code>：多 ubatch 时输出按「先来先填」追加进 host 缓冲，顺序与用户提交顺序不一定一致——这正是下面 output_swaps 存在的原因。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>源码：output_swaps 与选择排序</h2>
+    <p>decode 的最后一段把输出顺序还原成「用户提交时的顺序」。llama.cpp 选择的算法值得一看：</p>
+    <div class="code-title">src/llama-context.cpp:1990-2023 — 输出重排（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> &amp; out_ids = balloc-&gt;<span class="fn">get_out_ids</span>();
+GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
+
+<span class="kw">for</span> (<span class="kw">int64_t</span> i = <span class="nu">0</span>; i &lt; n_outputs; ++i) {
+    <span class="kw">int64_t</span> out_id = out_ids[i];
+    output_ids[out_id] = i;
+    <span class="kw">if</span> (out_id != i) { sorted_output = <span class="kw">false</span>; }
+}
+
+<span class="cmt">// 让输出恢复用户 batch 里的顺序（recurrent 模型尤其需要）</span>
+<span class="kw">if</span> (!sorted_output &amp;&amp; n_outputs &gt; <span class="nu">1</span>) {
+    <span class="cmt">// selection sort，最小化交换次数（wiki: selection sort）</span>
+    <span class="kw">for</span> (<span class="kw">uint32_t</span> i = <span class="nu">0</span>; i &lt; n_outputs - <span class="nu">1</span>; ++i) {
+        <span class="kw">uint32_t</span> j_min = i;
+        <span class="kw">for</span> (<span class="kw">uint32_t</span> j = i + <span class="nu">1</span>; j &lt; n_outputs; ++j) {
+            <span class="kw">if</span> (out_ids[j] &lt; out_ids[j_min]) { j_min = j; }
+        }
+        <span class="kw">if</span> (j_min == i) { <span class="kw">continue</span>; }
+        std::swap(out_ids[i], out_ids[j_min]);
+        <span class="cmt">// 记下交换，等到读 logits/embd 时才应用</span>
+        output_swaps.push_back({ i, j_min });
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 两个反直觉的设计。① 用 O(n²) 的选择排序而不是 O(n log n)——注释写明目标是「最小化交换次数」，因为每次交换都要记录到 output_swaps，交换越少越好；② <strong>交换是惰性应用的</strong>：decode 结束时不真的移动数据，而是在调用方 <code class="inline">llama_get_logits_ith</code> 读第 i 个输出时，按 swaps 链条找到它实际存放的位置。单 token decode（最常见情形）完全零开销。</div>
+    <div class="callout info">
+      <b class="tag">为什么需要重排</b>
+      recurrent（Mamba/GDN 类）模型按序列处理，ubatch 内的输出顺序由内部实现决定；KV unified 模式下多序列交错也同理。调用方（llama-server 的 slot）期望「我提交的第 k 个请求的输出在位置 k」——约定不能破，就在出口处还原。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>对照：FreeToken 的 decode</h2>
+    <p>FreeToken 没有这样一个巨型函数，它的 decode 分散在三层。调度层（<code class="inline">python/freetoken/scheduler/decode.py</code>，全文 39 行）只有一件小事——把运行中的请求排成 batch：</p>
+    <div class="code-title">python/freetoken/scheduler/decode.py:9-39 — DecodeManager（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="nd">@dataclass</span>
+<span class="kw">class</span> <span class="cl">DecodeManager</span>:
+    page_size: <span class="cl">int</span>
+    running_reqs: <span class="cl">Set</span>[<span class="cl">Req</span>] = field(default_factory=set)
+
+    <span class="nd">@property</span>
+    <span class="kw">def</span> <span class="fn">inflight_tokens</span>(self) -&gt; <span class="cl">int</span>:
+        <span class="cmt"># 每个 decode 请求预留 1 页增长余量</span>
+        tokens_reserved = (self.page_size - <span class="nu">1</span>) * len(self.running_reqs)
+        <span class="kw">return</span> sum(req.remain_len <span class="kw">for</span> req <span class="kw">in</span> self.running_reqs) + tokens_reserved
+
+    <span class="kw">def</span> <span class="fn">schedule_next_batch</span>(self) -&gt; <span class="cl">Batch</span> | <span class="kw">None</span>:
+        <span class="kw">if not</span> self.runnable: <span class="kw">return</span> <span class="kw">None</span>
+        <span class="kw">return</span> <span class="cl">Batch</span>(reqs=sorted(self.running_reqs, key=lambda req: req.uid),
+                     phase=<span class="st">"decode"</span>)</pre>
+    <div class="annotation"><b>对照读：</b> llama.cpp 的 decode 是「引擎内一次调用的完整生命周期」；FreeToken 的 decode 是「调度器循环里的一个阶段」（<code class="inline">scheduler.py:197 overlap_loop</code>，第 10 章展开）。前者单请求深度优先，后者多请求时间片轮转——服务形态决定的：llama-server 的 slot 是「一个序列独占一个上下文」，FreeToken 是「4 个并发请求共享一个引擎」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.7</span>小结</h2>
+    <ul>
+      <li>n_batch（逻辑批，≤2048）与 n_ubatch（物理批）分离；KV 找槽以 ubatch 为单位。</li>
+      <li>内存状态机：FAILED_PREPARE → 整理一次 → 重试一次 → 放弃。返回值正数=业务失败、负数=错误。</li>
+      <li>logits 异步拷回，多 ubatch 追加填写；output_swaps + 选择排序在读取时还原顺序，零额外拷贝。</li>
+      <li>FreeToken 把同样的逻辑摊到 scheduler/engine/graph 三层，多请求共享而非 slot 独占。</li>
+    </ul>
+    <p>下一章把「KV 找槽」展开：这个 decode 里最频繁失败的环节。<a href="04-kv-cache.html">第 4 章：KV cache 家族</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="02-gguf-loading.html">← GGUF 与模型加载</a>
+    <a href="04-kv-cache.html">下一步：KV cache 家族 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 03 decode循环 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

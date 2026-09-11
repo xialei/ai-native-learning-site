@@ -69,10 +69,10 @@ persistence, and model boundaries.</pre>
       <tr><td><code class="inline">subagent-spawn-in-process</code>（spawn）</td><td>进程内新子</td><td>从零开始的全新 agent</td></tr>
       <tr><td><code class="inline">subagent-fork-in-process</code>（fork）</td><td>进程内 fork</td><td>以父会话<strong>已完成历史</strong>为种子（inheritsParentContext: true）</td></tr>
       <tr><td><code class="inline">subagent-acp</code></td><td>跨进程</td><td>经 Agent Client Protocol 与外部 agent 通信</td></tr>
-      <tr><td><code class="inline">subagent-codex / claude-code</code></td><td>跨进程</td><td>驱动真实安装的 Codex / Claude Code</td></tr>
+      <tr><td><code class="inline">subagent-codex / claude-code</code></td><td>跨进程</td><td>驱动一个真正的、非交互的 Codex / Claude Code 会话——但可执行体<strong>不由宿主已装的 CLI 提供</strong>：Bundle 自带平台钉住的 native payload（README：「The installation brings the official wrapper and one compatible native platform payload into the Profile」），装的时候少了可选依赖、平台不支持或 payload 损坏，provider 就停在休眠态、第一次委派在 <code class="inline">initialize</code> 失败，<strong>没有 host-CLI 回退</strong></td></tr>
       <tr><td><code class="inline">subagent-dsh-sdk</code></td><td>跨进程</td><td>完整 Harness 运行时经 TypeScript SDK</td></tr>
     </table>
-    <div class="code-title">packages/subagent/subagent/src/types.ts:300 — SubagentProvider</div>
+    <div class="code-title">packages/subagent/subagent/src/types.ts:344 — SubagentProvider</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">SubagentProvider</span> {
   name: <span class="kw">string</span>                       <span class="cmt">// 唯一注册名（'spawn' | 'fork' | 'acp'…）</span>
   capabilities: <span class="cl">SubagentCapabilities</span>  <span class="cmt">// 启动期能力声明</span>
@@ -97,12 +97,12 @@ persistence, and model boundaries.</pre>
    */</span>
   prepareContinuable?(request: <span class="cl">ContinuableCreateRequest</span>): <span class="cl">Promise</span>&lt;<span class="cl">ContinuableCreateSpec</span>&gt;
 }</pre>
-    <div class="annotation"><b>「方法存在即能力」</b>：optional prepareContinuable 的有无就是 capability 位——不需要额外的 capability 枚举。one-shot 的责任分界画在「发布」这一刻：发布前 provider 全责（含清理半成品），发布后所有权与失败结算归返回的 SubagentRun。这与第 1 章「fulfillment is the single publication and ownership-transfer boundary」的设计一脉相承。</div>
+    <div class="annotation"><b>「方法存在即能力」</b>：optional prepareContinuable 的有无就是 capability 位——不需要额外的 capability 枚举。one-shot 的责任分界画在「发布」这一刻：发布前 provider 全责（含清理半成品），发布后所有权与失败结算归返回的 SubagentRun。这延续了第 1 章的「fulfillment is the single publication and ownership-transfer boundary」。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.3</span>continuable 子 agent：durable、可续聊、可冷恢复</h2>
-    <div class="code-title">packages/subagent/subagent/src/index.ts:221 — 注册表上的三个操作</div>
+    <div class="code-title">packages/subagent/subagent/src/index.ts:228 — 注册表上的三个操作</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 建立一个 durable continuable child 并送达初始 prompt。
     在子 inbox 接受 prompt 时即 resolve——不等 turn 开始、不等消息落日志。 */</span>
 <span class="kw">async</span> <span class="fn">startContinuable</span>(spec: <span class="cl">ContinuableStartSpec</span>): <span class="cl">Promise</span>&lt;<span class="cl">ContinuableStart</span>&gt;
@@ -112,9 +112,10 @@ persistence, and model boundaries.</pre>
     不在场的直接子从持久化冷恢复。 */</span>
 <span class="kw">async</span> <span class="fn">sendMessage</span>(sender: <span class="cl">Agent</span>, targetId: <span class="cl">SessionId</span>, content: <span class="cl">ContentBlock</span>[], options): <span class="cl">Promise</span>&lt;<span class="cl">MessageId</span>&gt;
 
-<span class="cmt">/** 在人类父授权下打断一个活跃 continuable 子的当前 turn */</span>
-<span class="kw">async</span> <span class="fn">interrupt</span>(…)</pre>
-    <div class="annotation"><b>与第 4 章的钩子严丝合缝</b>：sendMessage 的三种目标状态（running → 最近 step 边界 / idle → 启动 turn / absent → 冷恢复）分别对应第 4 章的 inbox 待处理注入、whenIdle/wakeDriver 路径、以及第 5 章的持久化重载。子 agent 的会话是独立的 Session log，parentSession 记录父 session id——发现与时序由两个 session 投影（subagentTimingProjection / subagentIdentityProjection）从日志折叠。 Adjacency（只许直系父子互发）由服务从「exact live sender」派生——模型不能伪造发送者。</div>
+<span class="cmt">/** 打断一个活跃 continuable 子的当前 turn。同步 void：只是投递打断意图，
+    宿主协议侧另有 @Remote('interruptByParent') 的异步面，让父 Agent 离线时子仍可被打断。 */</span>
+<span class="fn">interrupt</span>(targetSessionId: <span class="cl">SessionId</span>, authority: <span class="cl">SubagentInterruptAuthority</span>): <span class="kw">void</span></pre>
+    <div class="annotation"><b>与第 4 章的钩子一一对应</b>：sendMessage 的三种目标状态（running → 最近 step 边界 / idle → 启动 turn / absent → 冷恢复）分别对应第 4 章的 inbox 待处理注入、whenIdle/wakeDriver 路径、以及第 5 章的持久化重载。子 agent 的会话是独立的 Session log，parentSession 记录父 session id——发现与时序由 session 投影从日志折叠（subagentTimingProjection / subagentIdentityProjection；v0.1.5-rc 起新增第三个投影 subagentCatalog：父会话在子发布成功时追加一条 <code class="inline">subagent/catalog</code> 事件，直系子目录从这份父有的持久事实折叠，fork 继承前缀不计入）。 Adjacency（只许直系父子互发）由服务从「exact live sender」派生——模型不能伪造发送者。</div>
   </section>
 
   <section class="block">
@@ -138,7 +139,7 @@ The isolation is containment, not a security boundary —
 逃出 node:vm 上下文即恢复 worker 的进程权限。
 不要把 worker thread 当真正不受信脚本的沙箱——
 敌意代码需要独立进程或容器引擎。</pre>
-    <div class="annotation"><b>两层隔离声明</b>：worker thread 解决的是<strong>可用性</strong>（死循环脚本不卡宿主、可强制终止）而非<strong>安全性</strong>——README 明确划界。安全性走的是第 9 章的沙箱与审批。dsh-workflow 自身不执行任何脚本（「The package ships no execution engine」），dsh-workflow-worker-thread 是当前引擎——换一个隔离策略（独立进程、容器）不需要改 callers 或模型所见。这与 LLM 层（第 7 章）「协议与适配器分离」完全同构。agent() 的每次调用作为 published child run 归属到发起 agent（lifecycle 事件成对：established / settled），父 agent 因此能在会话日志里审计整棵 fan-out 树。</div>
+    <div class="annotation"><b>两层隔离声明</b>：worker thread 解决的是<strong>可用性</strong>（死循环脚本不卡宿主、可强制终止）而非<strong>安全性</strong>——README 明确划界。安全性走的是第 9 章的沙箱与审批。dsh-workflow 自身不执行任何脚本（README 原话：「The caller must supply an execution engine, allowing the isolation strategy to change without altering visible behavior.」），dsh-workflow-worker-thread 是当前引擎——换一个隔离策略（独立进程、容器）不需要改 callers 或模型所见。这与 LLM 层（第 7 章）「协议与适配器分离」完全同构。agent() 的每次调用作为 published child run 归属到发起 agent，父 agent 因此能在会话日志里审计整棵 fan-out 树。这里有两组生命周期事件，名字不要混：引擎自身发 <code class="inline">workflow/start</code> → <code class="inline">workflow/agent-start</code> → <code class="inline">workflow/agent-end</code> → <code class="inline">workflow/end</code>（后两个按 <code class="inline">agent.seq</code> 配对，一次 started 调用在每条停止路径上都恰好有一个 end，引擎强杀时合成的 end 带 <code class="inline">'cancelled'</code>）；tool-workflow 再把它们落成会话事件 <code class="inline">tool-workflow/run-start|agent-start|agent-end|run-end</code>。「established」「settled」是这两组事件的 JSDoc 用词，不是事件名。</div>
   </section>
 
   <section class="block">
@@ -160,6 +161,8 @@ The isolation is containment, not a security boundary —
     <span class="st">'Return one report with exact normalized strings…'</span>,
   ].<span class="fn">join</span>(<span class="st">'\n\n'</span>)
   <span class="kw">const</span> rawReport = <span class="kw">await</span> <span class="fn">agent</span>(prompt, { schema: reportSchema })
+  <span class="cmt">// …rawReport 为 null 时返回 round-failed（脚本原文，此处略过）…</span>
+  <span class="kw">const</span> report = <span class="fn">validateReport</span>(rawReport)   <span class="cmt">// ← 报告校验入口，防呆③ 就是它</span>
   <span class="kw">if</span> (report.status === <span class="st">'complete'</span>) <span class="kw">return</span> { status: <span class="st">'complete'</span>, roundsStarted: round, report }
   <span class="kw">if</span> (report.status === <span class="st">'blocked'</span>) <span class="kw">return</span> { status: <span class="st">'blocked'</span>, roundsStarted: round, report }
   previous = report
@@ -169,7 +172,7 @@ The isolation is containment, not a security boundary —
   </section>
 
   <section class="block">
-    <h2><span class="num">12.6</span>图 12-1：编排栈全景</h2>
+    <h2><span class="num">12.6</span>图 12-1：编排栈分层</h2>
     <div class="figure">
       <div class="svg-box">
         <svg viewBox="0 0 960 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="编排栈">
@@ -188,7 +191,7 @@ The isolation is containment, not a security boundary —
           <text x="160" y="193" text-anchor="middle" font-size="11" fill="#aebcff">tool-workflow · tool-ralph</text>
           <text x="160" y="215" text-anchor="middle" font-size="10" fill="#8890c0">编排脚本 · 新鲜 agent 循环</text>
           <text x="160" y="262" text-anchor="middle" font-size="10" fill="#8890c0">会话日志记录 lifecycle 事件对</text>
-          <text x="160" y="282" text-anchor="middle" font-size="10" fill="#8890c0">（established / settled）</text>
+          <text x="160" y="282" text-anchor="middle" font-size="10" fill="#8890c0">（run-start / agent-start / agent-end / run-end）</text>
 
           <rect x="360" y="20" width="270" height="130" rx="10" fill="#eceffe" stroke="#4156c8"/>
           <text x="495" y="46" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">ctx.subagents 注册表</text>
@@ -244,7 +247,7 @@ The isolation is containment, not a security boundary —
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

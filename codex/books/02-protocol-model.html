@@ -33,10 +33,10 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-1351-ga9519cbcdd</span>
+    <span class="version-badge">rusty-v8-v150.4.0-1950-gda20788df9</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 消息与协议模型</div>
     <h1>消息与协议模型：会话长什么样，内核与前端怎么对话</h1>
-    <div class="subtitle">Codex 用三套类型把「会话」和「通信」讲清楚：ResponseItem 是会话里的每一条记录，Op 是前端发给内核的指令，EventMsg 是内核回给前端的事件。理解这三者，就拿到了读懂整个代码库的钥匙。</div>
+    <div class="subtitle">Codex 用三套类型把「会话」和「通信」讲清楚：ResponseItem 是会话里的每一条记录，Op 是前端发给内核的指令，EventMsg 是内核回给前端的事件。理解这三者，后面所有章节的类型定义都要回到这里。</div>
   </div>
 
   <section class="block">
@@ -81,13 +81,13 @@
       </svg>
       <div class="fig-cap">图 2.1：前端与内核通过 Op/Event 双向通信；会话本身是一串 ResponseItem。</div>
     </div>
-    <p>一句话总结：<strong>Op 是「请做这件事」，Event 是「发生了这件事」，ResponseItem 是「会话里记下了这件事」。</strong> 三者共同构成了 Codex 的全部通信语义。</p>
+    <p>概括：<strong>Op 是「请做这件事」，Event 是「发生了这件事」，ResponseItem 是「会话里记下了这件事」。</strong> 三者共同构成了 Codex 的全部通信语义。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">2.2</span>ResponseItem：会话的最小单位</h2>
     <p>会话在 Codex 里不是一个字符串，而是一个 <code class="inline">ResponseItem</code> 列表。每个变体代表会话里的一种「记录」。这是整个协议里最重要的类型：</p>
-    <div class="code-title">codex-rs/protocol/src/models.rs:950 — ResponseItem 枚举（节选）</div>
+    <div class="code-title">codex-rs/protocol/src/models.rs:999 — ResponseItem 枚举（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema, TS)]</span>
 <span class="kw">#[serde(tag = </span><span class="st">"type"</span><span class="kw">, rename_all = </span><span class="st">"snake_case"</span><span class="kw">)]</span>
 <span class="kw">pub enum</span> ResponseItem {
@@ -96,25 +96,30 @@
         role: String,                 <span class="cmt">// "user" | "assistant" | "developer" | "system"</span>
         content: Vec&lt;ContentItem&gt;,
         phase: Option&lt;MessagePhase&gt;,  <span class="cmt">// "commentary" | "final_answer"</span>
+        <span class="cmt">// ...（另有 internal_chat_message_metadata_passthrough 等透传字段）</span>
     },
     Reasoning {                       <span class="cmt">// 模型的推理过程（chain-of-thought）</span>
         id: Option&lt;ResponseItemId&gt;,
         summary: Vec&lt;ReasoningItemReasoningSummary&gt;,
         content: Option&lt;Vec&lt;ReasoningItemContent&gt;&gt;,
         encrypted_content: Option&lt;String&gt;,
+        <span class="cmt">// ...</span>
     },
     FunctionCall {                    <span class="cmt">// 模型请求调用一个工具</span>
         id: Option&lt;ResponseItemId&gt;,
-        name: String,                 <span class="cmt">// 工具名，如 "shell"</span>
+        name: String,                 <span class="cmt">// 工具名，如 "exec_command"</span>
         namespace: Option&lt;String&gt;,
         arguments: String,            <span class="cmt">// JSON 字符串（注意：是字符串，不是对象）</span>
         call_id: String,
+        <span class="cmt">// ...（另有 encrypted_function_args 等）</span>
     },
     FunctionCallOutput {              <span class="cmt">// 工具执行结果，回填给模型</span>
         id: Option&lt;ResponseItemId&gt;,
         call_id: Option&lt;String&gt;,     <span class="cmt">// 对应上面的 FunctionCall</span>
         name: Option&lt;String&gt;,
+        namespace: Option&lt;String&gt;,
         output: FunctionCallOutputPayload,
+        <span class="cmt">// ...</span>
     },
     LocalShellCall { ... },           <span class="cmt">// 旧版 shell 调用（带 action/status）</span>
     CustomToolCall { ... },           <span class="cmt">// 自由格式工具调用</span>
@@ -132,7 +137,7 @@
   <section class="block">
     <h2><span class="num">2.3</span>Op：前端发给内核的指令</h2>
     <p><code class="inline">Op</code> 是前端向内核发出的请求。它是一个 <code class="inline">#[non_exhaustive]</code> 枚举，意味着可以持续扩展而不破坏下游。核心变体：</p>
-    <div class="code-title">codex-rs/protocol/src/protocol.rs:545 — Op 枚举（节选）</div>
+    <div class="code-title">codex-rs/protocol/src/protocol.rs:600 — Op 枚举（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[derive(Debug)]</span>
 <span class="kw">#[non_exhaustive]</span>
 <span class="kw">pub enum</span> Op {
@@ -172,7 +177,7 @@
   <section class="block">
     <h2><span class="num">2.4</span>Event / EventMsg：内核回给前端的事件</h2>
     <p>内核的回应包在 <code class="inline">Event</code> 里，它关联了 submission id，方便前端把事件与请求对应：</p>
-    <div class="code-title">codex-rs/protocol/src/protocol.rs:1278 — Event 结构</div>
+    <div class="code-title">codex-rs/protocol/src/protocol.rs:1346 — Event 结构</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub struct</span> Event {
     <span class="cmt">/// 这个事件关联的 submission id</span>
     <span class="kw">pub</span> id: String,
@@ -180,7 +185,7 @@
     <span class="kw">pub</span> msg: EventMsg,
 }</pre>
     <p>真正的内容在 <code class="inline">EventMsg</code> 枚举里。它有几十个变体，覆盖了 turn 生命周期的每个阶段：</p>
-    <div class="code-title">codex-rs/protocol/src/protocol.rs:1296 — EventMsg 枚举（节选）</div>
+    <div class="code-title">codex-rs/protocol/src/protocol.rs:1364 — EventMsg 枚举（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[serde(tag = </span><span class="st">"type"</span><span class="kw">, rename_all = </span><span class="st">"snake_case"</span><span class="kw">)]</span>
 <span class="kw">pub enum</span> EventMsg {
     Error(ErrorEvent),                         <span class="cmt">// 执行 submission 时出错</span>
@@ -208,7 +213,7 @@
     <div class="annotation"><b>读懂这段：</b> 一个 turn 的典型事件序列是：<code class="inline">TurnStarted → (AgentReasoning... → AgentMessage... → 工具事件...) → TurnComplete</code>。<strong>所有事件都关联 <code class="inline">id</code>（submission id）</strong>，前端可以安全地并发处理多个 turn 的事件而不串台。注意 <code class="inline">#[serde(rename = "task_started", alias = "turn_started")]</code>——这是为了同时兼容 v1/v2 线格式。</div>
     <div class="callout tip">
       <b class="tag">流式</b>
-      <code class="inline">AgentMessage</code> / <code class="inline">AgentReasoning</code> 在流式输出时会<strong>多次</strong>发射（增量 delta），不是一次性给完整文本。TUI 收到后做增量渲染。这奠定了第 3 章「流式采样」的事件基础。
+      流式增量走的是另一组事件：<code class="inline">AgentMessageContentDelta</code> / <code class="inline">ReasoningContentDelta</code> / <code class="inline">ReasoningRawContentDelta</code> 会随模型输出<strong>多次</strong>发射（每次一小段 delta），item 完成时再发 <code class="inline">AgentMessage</code> / <code class="inline">AgentReasoning</code> 这类完整文本事件。前端收到 delta 做增量渲染，收到完成事件做定稿。这奠定了第 3 章「流式采样」的事件基础。
     </div>
   </section>
 
@@ -250,7 +255,7 @@
         <line class="edge" x1="460" y1="312" x2="460" y2="328" marker-end="url(#arrow2)"></line>
 
         <rect class="node acc" x="20" y="330" width="880" height="26" rx="6"></rect>
-        <text class="lbl sm" x="40" y="348">模型给出最终回答 → Event::TurnComplete → reply 通道返回 TurnInputSubmission</text>
+        <text class="lbl sm" x="40" y="348">模型给出最终回答 → Event::TurnComplete（reply 通道在 turn 启动时已返回 TurnInputSubmission::Started）</text>
       </svg>
       <div class="fig-cap">图 2.5：Op 驱动 turn，Event 贯穿流式输出，ResponseItem 累积成会话历史。</div>
     </div>
@@ -260,7 +265,7 @@
     <h2><span class="num">2.6</span>小结与对自研的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      Codex 的协议设计有三个值得抄的点：<strong>① 把会话建模成结构化 item 列表，而非裸字符串</strong>（每个 item 自带 type 标签，可序列化、可回放）；<strong>② 请求-响应用 oneshot 通道关联</strong>（Op 带 reply，Event 带 id），并发安全；<strong>③ 类型独立成 crate</strong>，内核与前端编译期对齐，杜绝手写 schema 漂移。
+      Codex 的协议设计做对了三件事：<strong>① 把会话建模成结构化 item 列表，而非裸字符串</strong>（每个 item 自带 type 标签，可序列化、可回放）；<strong>② 请求-响应用 oneshot 通道关联</strong>（Op 带 reply，Event 带 id），并发安全；<strong>③ 类型独立成 crate</strong>，内核与前端编译期对齐，杜绝手写 schema 漂移。
     </div>
     <div class="callout tip">
       <b class="tag">自研 checklist</b>
@@ -275,7 +280,7 @@
 </div>
 
 <footer>
-  Codex CLI · 02 消息与协议模型 · 版本 rusty-v8-v150.4.0-1351-ga9519cbcdd · 所有引用代码路径以仓库最新为准
+  Codex CLI · 02 消息与协议模型 · 版本 rusty-v8-v150.4.0-1950-gda20788df9 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

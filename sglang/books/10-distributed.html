@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 分布式推理 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a class="active" href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 分布式推理</div>
+    <h1>分布式推理：TP / PP / DP / EP 各管什么</h1>
+    <div class="subtitle">SGLang 的分布式不是一个东西，而是四个正交的维度：TP 切权重、PP 切层、DP 复制整个模型、EP 切专家。这一章讲清每个维度切的是什么、通信发生在哪，以及 dp_size&gt;1 时那个专门的分发进程在做什么。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>一分钟版本</h2>
+    <p>四个维度切的对象不同，通信模式也不同：</p>
+    <ul>
+      <li><strong>TP（张量并行）</strong>：把每一层的权重矩阵切开，每卡持有一份分片，一次前向每层做 1~2 次 allreduce。解决「单卡装不下 / 算不快一个大模型」。</li>
+      <li><strong>PP（流水线并行）</strong>：按层分段，各 stage 之间只传激活张量。解决「跨机带宽跑不动 TP」。</li>
+      <li><strong>DP（数据并行）</strong>：整个模型复制多份，每个 DP 组服务不同的请求。解决吞吐，不解决模型大小。</li>
+      <li><strong>EP（专家并行）</strong>：MoE 模型把专家分到不同卡，token 按路由结果跨卡传输。解决专家参数总量放不下单卡。</li>
+    </ul>
+    <p>对应到 SGLang 的进程模型（第 1 章）：<strong>每个 TP rank 一个 Scheduler 子进程</strong>，TP 组内各 rank 通过 NCCL/自定义 allreduce 同步；<code class="inline">dp_size &gt; 1</code> 时多了一个 <code class="inline">DataParallelController</code>，按负载均衡策略把请求路由到某个 DP 组；PP 有自己独立的事件循环；EP 则藏在 MoE 层内部，不改变进程结构。</p>
+    <table class="tbl">
+      <tr><th>维度</th><th>切什么</th><th>通信发生在哪</th><th>什么时候用</th></tr>
+      <tr><td>TP</td><td>每层权重矩阵（列/行并行）</td><td>每层前向 1~2 次 allreduce（NCCL 或 custom allreduce）</td><td>单卡放不下权重或想降延迟</td></tr>
+      <tr><td>PP</td><td>层序列分段</td><td>stage 边界点对点传激活（pp_proxy_tensors）</td><td>跨机、机间带宽有限</td></tr>
+      <tr><td>DP</td><td>不切模型，切请求</td><td>请求级路由（ZMQ），组间无集合通信</td><td>吞吐不够、模型已能放进一组卡</td></tr>
+      <tr><td>EP</td><td>MoE 的专家列表</td><td>token 按专家路由分发（all-to-all 类通信）</td><td>MoE 模型专家总数过大</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>拓扑图：dp_size=2 × tp_size=2</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t10 d10">
+        <title id="t10">SGLang DP × TP 拓扑</title>
+        <desc id="d10">DataParallelController 把请求路由到两个 DP 组，每组内两个 TP rank 组成一条完整模型</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 主进程 -->
+        <rect class="node acc" x="20" y="20" width="900" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#16648f">主进程 · TokenizerManager → DataParallelController</text>
+        <rect class="node" x="40" y="56" width="200" height="44" rx="6"></rect>
+        <text class="lbl" x="140" y="82" text-anchor="middle">TokenizerManager</text>
+        <rect class="node core" x="290" y="56" width="240" height="44" rx="6"></rect>
+        <text class="lbl" x="360" y="82" text-anchor="middle">DataParallel</text>
+        <text class="lbl sm" x="360" y="96" text-anchor="middle">Controller</text>
+        <rect class="node" x="600" y="56" width="300" height="44" rx="6"></rect>
+        <text class="lbl" x="750" y="82" text-anchor="middle">负载均衡策略（4 选 1）</text>
+        <line class="edge" x1="240" y1="78" x2="288" y2="78"></line>
+        <line class="edge" x1="540" y1="78" x2="598" y2="78"></line>
+        <text class="lbl sm" x="40" y="122">职责：占住 TokenizerManager 发往 Scheduler 的那个 ZMQ 端点，按策略改发到某个 DP 组</text>
+
+        <!-- DP 组 0 -->
+        <rect class="node core" x="20" y="170" width="440" height="240" rx="10"></rect>
+        <text class="lbl" x="40" y="196" font-weight="bold" fill="#b34a10">DP 组 0 · tp_size=2（完整模型的一份分片）</text>
+        <rect class="node" x="40" y="212" width="180" height="52" rx="6"></rect>
+        <text class="lbl" x="130" y="234" text-anchor="middle">Scheduler tp0</text>
+        <text class="lbl sm" x="130" y="250" text-anchor="middle">GPU 0</text>
+        <rect class="node" x="260" y="212" width="180" height="50" rx="6"></rect>
+        <text class="lbl" x="350" y="234" text-anchor="middle">Scheduler tp1</text>
+        <text class="lbl sm" x="350" y="250" text-anchor="middle">GPU 1</text>
+        <line class="edge" x1="220" y1="237" x2="258" y2="237"></line>
+        <text class="lbl code" x="130" y="290" text-anchor="middle">NCCL allreduce</text>
+        <text class="lbl sm" x="40" y="316">每层前向各 rank 同步一次；</text>
+        <text class="lbl sm" x="40" y="334">权重按 TP 切分，KV 池按 rank 独立</text>
+        <text class="lbl sm" x="40" y="378">一个请求从进组到出组，全程不跨组</text>
+
+        <!-- DP 组 1 -->
+        <rect class="node core" x="480" y="170" width="440" height="240" rx="10"></rect>
+        <text class="lbl" x="500" y="196" font-weight="bold" fill="#b34a10">DP 组 1 · tp_size=2（再复制一份模型）</text>
+        <rect class="node" x="500" y="212" width="180" height="52" rx="6"></rect>
+        <text class="lbl" x="590" y="234" text-anchor="middle">Scheduler tp0</text>
+        <text class="lbl sm" x="590" y="250" text-anchor="middle">GPU 2</text>
+        <rect class="node" x="720" y="212" width="180" height="50" rx="6"></rect>
+        <text class="lbl" x="810" y="234" text-anchor="middle">Scheduler tp1</text>
+        <text class="lbl sm" x="810" y="250" text-anchor="middle">GPU 3</text>
+        <line class="edge" x1="680" y1="237" x2="718" y2="237"></line>
+        <text class="lbl code" x="590" y="290" text-anchor="middle">NCCL allreduce</text>
+        <text class="lbl sm" x="500" y="316">两组之间只共享一个东西：路由策略</text>
+
+        <!-- DPC 到两组的分发箭头 -->
+        <line class="edge acc" x1="360" y1="100" x2="240" y2="168"></line>
+        <line class="edge acc" x1="460" y1="100" x2="700" y2="168"></line>
+        <text class="lbl code" x="150" y="140">zmq PUSH · Req</text>
+        <text class="lbl code" x="640" y="140">zmq PUSH · Req</text>
+
+        <!-- 负载快照 -->
+        <rect class="node warn" x="300" y="450" width="340" height="56" rx="8"></rect>
+        <text class="lbl" x="470" y="474" text-anchor="middle">DPBudget · 负载快照（共享内存）</text>
+        <text class="lbl sm" x="470" y="492" text-anchor="middle">num_running_reqs / num_total_tokens，各 Scheduler 定期发布</text>
+        <line class="edge back" x1="240" y1="410" x2="240" y2="470"></line>
+        <line class="edge" x1="242" y1="470" x2="298" y2="470"></line>
+        <line class="edge back" x1="700" y1="410" x2="700" y2="470"></line>
+        <line class="edge" x1="698" y1="470" x2="642" y2="470"></line>
+        <path class="edge back" d="M 640 490 L 930 490 L 930 76 L 922 76"></path>
+        <text class="lbl sm" x="795" y="468">快照回流：controller 据此选组</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>DP 组（一组 TP rank 跑一份完整模型）</span>
+        <span class="lg-item"><span class="sw acc"></span>主进程 / 请求路由路径</span>
+        <span class="lg-item"><span class="sw warn"></span>负载状态</span>
+        <span class="lg-item"><span class="sw"></span>组内通信</span>
+      </div>
+      <div class="fig-cap">图 10.2：dp_size=2 × tp_size=2 的四卡拓扑。虚线是负载快照的回流路径——各 Scheduler 把运行状态写进共享内存，controller 读快照做路由决策，方向与请求流相反。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>DataParallelController：dp_size&gt;1 时的邮差</h2>
+    <p>回顾第 1 章的 <code class="inline">_launch_scheduler_processes</code>：只要 <code class="inline">dp_size &gt; 1</code>（或弹性 EP 的 <code class="inline">ep_join_mode == "scale"</code>），进程编排就走 DataParallelController 分支。它做的事很集中——把 TokenizerManager 发来的请求按策略转发给某个 DP 组：</p>
+    <div class="code-title">python/sglang/srt/managers/data_parallel_controller.py — 负载均衡方法与分发表（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LoadBalanceMethod</span>(<span class="cl">Enum</span>):
+    <span class="st">"""Load balance method."""</span>
+
+    ROUND_ROBIN = <span class="fn">auto</span>()
+    FOLLOW_BOOTSTRAP_ROOM = <span class="fn">auto</span>()
+    TOTAL_REQUESTS = <span class="fn">auto</span>()
+    TOTAL_TOKENS = <span class="fn">auto</span>()
+
+<span class="cmt"># __init__ 里注册四个分发函数</span>
+self.round_robin_counter = <span class="nu">0</span>
+dispatch_lookup = {
+    <span class="cl">LoadBalanceMethod</span>.ROUND_ROBIN: self.round_robin_scheduler,
+    <span class="cl">LoadBalanceMethod</span>.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
+    <span class="cl">LoadBalanceMethod</span>.TOTAL_REQUESTS: self.total_requests_scheduler,
+    <span class="cl">LoadBalanceMethod</span>.TOTAL_TOKENS: self.total_tokens_scheduler,
+}
+self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
+
+    <p>后两种方法基于一份负载快照选目标。快照不是 controller 自己猜的，而是各 Scheduler 定期发布、经共享内存回流（图 10.2 的虚线），<code class="inline">DPBudget.dispatch</code> 拿它做选择：</p>
+    <div class="code-title">python/sglang/srt/managers/data_parallel_controller.py — DPBudget.dispatch（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">dispatch</span>(self, method: <span class="cl">LoadBalanceMethod</span>, estimated_tokens: <span class="cl">int</span> = <span class="nu">0</span>):
+    <span class="kw">if</span> method == <span class="cl">LoadBalanceMethod</span>.TOTAL_REQUESTS:
+        target_rank = self.total_requests.<span class="fn">index</span>(<span class="fn">min</span>(self.total_requests))
+    <span class="kw">elif</span> method == <span class="cl">LoadBalanceMethod</span>.TOTAL_TOKENS:
+        <span class="cmt"># token 数相同时用请求数决出先后</span>
+        target_rank = <span class="fn">min</span>(
+            <span class="fn">range</span>(self.dp_size),
+            key=<span class="kw">lambda</span> i: (self.total_tokens[i], self.total_requests[i]),
+        )
+    <span class="kw">else</span>:
+        <span class="kw">return</span> <span class="kw">None</span>
+
+    <span class="cmt"># 先记账再发送：刚选中的 rank 立刻加一，避免连发打到同一组</span>
+    self.total_requests[target_rank] += <span class="nu">1</span>
+    self.total_tokens[target_rank] += estimated_tokens
+    <span class="kw">return</span> target_rank</pre>
+
+    <p>四种方法的适用场景。注意 <code class="inline">--load-balance-method</code> 的字段默认值是 <code class="inline">"auto"</code>，在 <code class="inline">handle_load_balance_method</code> 里才解析成上表的具体方法：非 PD 与 PD decode 落到 <code class="inline">round_robin</code>，PD prefill 落到 <code class="inline">follow_bootstrap_room</code>（prefill 侧必须把请求送到 decode 侧等着的那一组，不能自己均衡）：</p>
+    <table class="tbl">
+      <tr><th>方法</th><th>选择依据</th><th>适用场景</th></tr>
+      <tr><td>round_robin</td><td>轮询计数器</td><td>请求长短均匀；<code class="inline">auto</code> 在非 PD 与 PD decode 下的落点</td></tr>
+      <tr><td>total_requests</td><td>各组的运行+排队请求数取最少</td><td>请求负载以条数计</td></tr>
+      <tr><td>total_tokens</td><td>各组总 token 数（按输入长度预估）取最少</td><td>长 prompt 混短 prompt，条数均衡会失真</td></tr>
+      <tr><td>follow_bootstrap_room</td><td><code class="inline">req.bootstrap_room % 组数</code>，不做均衡</td><td>PD 分离：prefill 与 decode 实例必须命中同一个请求</td></tr>
+    </table>
+
+    <p>最后一种最特殊。它不看负载，只看请求自带的路由号：</p>
+    <div class="code-title">python/sglang/srt/managers/data_parallel_controller.py — follow_bootstrap_room_scheduler（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">follow_bootstrap_room_scheduler</span>(self, req: <span class="cl">Req</span>):
+    <span class="kw">if</span> self.maybe_external_dp_rank_routing(req):
+        <span class="kw">return</span>
+
+    <span class="kw">assert</span> req.bootstrap_room <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>, (
+        <span class="st">"req.bootstrap_room should not be None. Do not send requests directly to "</span>
+        <span class="st">"prefill or decode instances; send to the router instead."</span>
+    )
+    target_rank = req.bootstrap_room % <span class="fn">len</span>(self.workers)
+    <span class="fn">sock_send</span>(self.workers[target_rank], req)</pre>
+    <div class="annotation"><b>读懂这段：</b> bootstrap room 是 PD 分离部署里 prefill 实例与 decode 实例约定的「会面房间号」（第 12 章展开）。断言文案本身说明了约束：不要绕过 router 直接给 prefill/decode 实例发请求——房间号是 router 分配的，绕过它房间号对不上。</div>
+
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么 TP 不需要一个 controller，DP 需要？因为两者是不同层面的问题。TP 组内所有 rank 必须逐层执行<strong>同一个 batch</strong>，靠集合通信（allreduce）在数据面强制同步；DP 组之间彼此独立，各跑各的 batch，唯一要做的只是决定「这条请求发给谁」——一个控制面的路由问题。所以 TP 的正确性由 NCCL 保证，DP 的正确性只由这个 ZMQ 邮差保证。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>TP 通信：GroupCoordinator 与 allreduce 选路</h2>
+    <p>TP 组内的同步集中在 <code class="inline">GroupCoordinator</code>——它包着 PyTorch 的 ProcessGroup，但所有集合操作先经过它路由。<code class="inline">all_reduce</code> 是最热的一条路（每层前向 1~2 次），选路逻辑按平台和消息大小分流：</p>
+    <div class="code-title">python/sglang/srt/distributed/parallel_state.py — GroupCoordinator.all_reduce 的选路（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">all_reduce</span>(self, input_: <span class="cl">torch.Tensor</span>) -&gt; <span class="cl">torch.Tensor</span>:
+    <span class="cmt"># 单卡直接返回</span>
+    <span class="kw">if</span> self.world_size == <span class="nu">1</span>:
+        <span class="kw">return</span> input_
+
+    <span class="kw">if</span> input_.is_cpu:
+        <span class="kw">if</span> <span class="fn">is_shm_available</span>(input_.dtype, self.world_size, self.local_size):
+            torch.ops.sgl_kernel.<span class="fn">shm_allreduce</span>(input_, REDUCE_OP_SUM)
+        <span class="kw">else</span>:
+            torch.distributed.<span class="fn">all_reduce</span>(input_, group=self.device_group)
+        <span class="kw">return</span> input_
+
+    <span class="cmt"># 各平台专用通信器（hpu / xpu / npu）逐一尝试，命中即返回</span>
+    <span class="kw">if</span> self.hpu_communicator <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> self.hpu_communicator.disabled:
+        <span class="kw">return</span> self.hpu_communicator.<span class="fn">all_reduce</span>(input_)
+    <span class="kw">if</span> self.xpu_communicator <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> self.xpu_communicator.disabled:
+        <span class="fn">inplace_all_reduce</span>(input_, group_name=self.unique_name)
+        <span class="kw">return</span> input_
+    <span class="kw">if</span> self.npu_communicator <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> self.npu_communicator.disabled:
+        <span class="kw">return</span> self.npu_communicator.<span class="fn">all_reduce</span>(input_)
+
+    <span class="cmt"># 编译态（CUDA Graph / torch.compile）下不能按张量形状分支，</span>
+    <span class="cmt"># 否则每个 shape 都要重新编译——统一交给运行时的 opaque 自定义算子</span>
+    <span class="kw">if</span> torch.compiler.<span class="fn">is_compiling</span>():
+        <span class="kw">if</span> self.<span class="fn">_can_use_flashinfer_allreduce</span>(input_):
+            <span class="kw">return</span> <span class="fn">flashinfer_allreduce</span>(input_, group_name=self.unique_name)
+        <span class="kw">if</span> (self.ca_comm <span class="kw">is</span> <span class="kw">None</span> <span class="kw">and</span> self.qr_comm <span class="kw">is</span> <span class="kw">None</span>
+                <span class="kw">and</span> self.pymscclpp_comm <span class="kw">is</span> <span class="kw">None</span>
+                <span class="kw">and</span> self.torch_symm_mem_comm <span class="kw">is</span> <span class="kw">None</span>
+                <span class="kw">and</span> self.pynccl_comm <span class="kw">is</span> <span class="kw">None</span>):
+            <span class="fn">inplace_all_reduce</span>(input_, group_name=self.unique_name)
+            <span class="kw">return</span> input_
+        <span class="kw">return</span> <span class="fn">outplace_all_reduce</span>(input_, ..., method=<span class="st">"auto"</span>)
+
+    should_use_custom_allreduce = (
+        self.ca_comm <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>
+        <span class="kw">and</span> <span class="kw">not</span> self.ca_comm.disabled
+        <span class="kw">and</span> self.ca_comm.<span class="fn">should_custom_ar</span>(input_)
+    )
+    ...  <span class="cmt"># 非编译态：pymscclpp → symmetric memory pynccl → flashinfer →</span>
+    <span class="cmt"># _resolve_outplace_all_reduce_method，逐个排除后落到 torch 默认</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 单卡短路和 CPU 短路写在最前面，都是为了让常见情形不付检查成本。custom allreduce 只在「消息够小 + 链路够好」时才赢，所以判定函数被压成一个布尔量提前算出来。</div>
+    <div class="annotation"><b>这不是二选一，是六路选择：</b> 早先读这段容易得到「custom allreduce 还是 NCCL」的二元印象，现在的实际路径是：平台专用通信器（hpu / xpu / npu）→ 编译态分支 → <code class="inline">pymscclpp</code> → symmetric-memory 的 pynccl → flashinfer allreduce → <code class="inline">_resolve_outplace_all_reduce_method</code> → torch 默认。<strong>其中编译态那一段最值得注意</strong>：源码注释写得很清楚，按字节大小和链路选路的逻辑（<code class="inline">_pick_algo</code> / <code class="inline">should_mscclpp_allreduce</code>）在编译态下会 guard 到符号化的 token 维度上，<strong>每换一个 shape 就要重新编译一次</strong>，所以整段判断被推迟到运行时——统一发一个 <code class="inline">method="auto"</code> 的 opaque 自定义算子，由算子内部再决定。另外 symmetric-memory 的原地路径在编译态下被<strong>刻意绕开</strong>：它的裸 pynccl 调用不可追踪（fullgraph 下直接报错），而且原地语义塞不进 outplace 自定义算子的契约。</div>
+
+    <p>custom allreduce 的适用条件写在 <code class="inline">should_custom_ar</code> 里，是个纯字节级的判断：</p>
+    <div class="code-title">python/sglang/srt/distributed/device_communicators/custom_all_reduce.py — should_custom_ar（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">should_custom_ar</span>(self, inp: <span class="cl">torch.Tensor</span>):
+    <span class="kw">if</span> self.disabled:
+        <span class="kw">return</span> <span class="kw">False</span>
+    inp_size = inp.<span class="fn">numel</span>() * inp.<span class="fn">element_size</span>()
+    <span class="cmt"># custom allreduce requires input byte size to be multiples of 16</span>
+    <span class="kw">if</span> inp_size % <span class="nu">16</span> != <span class="nu">0</span>:
+        <span class="kw">return</span> <span class="kw">False</span>
+    <span class="kw">if</span> <span class="kw">not</span> <span class="fn">is_weak_contiguous</span>(inp):
+        <span class="kw">return</span> <span class="kw">False</span>
+    <span class="cmt"># for 4 or more non NVLink-capable GPUs, custom allreduce provides</span>
+    <span class="cmt"># little performance improvement over NCCL.</span>
+    <span class="kw">if</span> <span class="kw">not</span> _is_hip:
+        <span class="kw">if</span> self.world_size == <span class="nu">2</span> <span class="kw">or</span> self.full_nvlink:
+            <span class="kw">return</span> inp_size &lt;= self.max_size
+        <span class="kw">return</span> <span class="kw">False</span>
+
+    <span class="cmt"># AMD 侧（HIP）：确定性实现无条件放行；否则同样要求全互联 + 消息够小</span>
+    <span class="kw">if</span> _is_hip:
+        <span class="kw">if</span> self.use_amd_deterministic_impl:
+            <span class="kw">return</span> <span class="kw">True</span>
+        <span class="kw">if</span> self.full_nvlink:
+            <span class="kw">return</span> inp_size &lt;= self.max_size
+        <span class="kw">return</span> <span class="kw">False</span>
+
+    <span class="kw">return</span> <span class="kw">False</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 决策三要素：<strong>消息字节大小</strong>（小消息走 custom allreduce，直接读对端注册的 IPC 缓冲区，一次往返完成；超过 max_size 落回 NCCL）、<strong>链路</strong>（要 NVLink 全互联或仅 2 卡，PCIe 上收益趋零）、<strong>对齐</strong>（16 字节倍数）。decode 阶段 batch 小、激活小，几乎每层都命中 custom allreduce——这是小 batch 延迟的重要来源之一。TP 的另一处集合通信在词表并行：<code class="inline">lm_head</code> 按列切分后各 rank 只有一段词表的 logits，需要 all_gather 拼回完整分布。</div>
+    <div class="annotation"><b>HIP 分支是后加的：</b> 注意 <code class="inline">_is_hip</code> 出现了两次——一次是 NVIDIA 侧提前返回，一次是 AMD 侧单独判断。AMD 路径多出一个短路条件 <code class="inline">use_amd_deterministic_impl</code>：开了确定性实现就<strong>无条件放行</strong>，不再看链路和消息大小。这是个值得留意的形状——「确定性」在这里不是靠牺牲正确性换的，而是换了一条实现路径，代价（性能）由用户自己权衡，所以判断条件从「能不能快」变成了「用户要不要这个保证」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>dp_attention：注意力复制、MoE 分片</h2>
+    <p>DeepSeek 这类 MLA 模型有个不对称性：注意力的 KV 很小（每 token 只存一个 latent 向量加 rope），而 MoE 层的参数和计算占大头。把注意力也切成 TP 会引入频繁的 allreduce，收益却小。<code class="inline">--enable-dp-attention</code> 的思路是反着来：<strong>注意力侧按 DP 复制（每个 rank 持有自己的请求和 KV），MoE 侧仍按 TP/EP 分片</strong>。</p>
+    <p>token 在两种并行模式之间的搬运靠一对 gather/scatter：进入 MoE 前，把各 DP rank 的本地 token 拼成一个全局缓冲区；MoE 算完后再切回各自的本地段：</p>
+    <div class="code-title">python/sglang/srt/layers/dp_attention.py — dp_gather_partial 与 dp_scatter（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">dp_gather_partial</span>(
+    global_tokens: <span class="cl">torch.Tensor</span>,
+    local_tokens: <span class="cl">torch.Tensor</span>,
+    forward_batch: <span class="cl">ForwardBatch</span>,
+):
+    <span class="cmt"># 本地 token → 全局缓冲区（all_gatherv 类操作）</span>
+    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=<span class="kw">True</span>)
+
+<span class="kw">def</span> <span class="fn">dp_scatter</span>(
+    local_tokens: <span class="cl">torch.Tensor</span>,  <span class="cmt"># 输出：本 rank 的那一段</span>
+    global_tokens: <span class="cl">torch.Tensor</span>,  <span class="cmt"># 输入：拼好的全局 token</span>
+    forward_batch: <span class="cl">ForwardBatch</span>,
+):
+    local_start_pos, local_num_tokens = <span class="fn">get_dp_local_info</span>(forward_batch)
+    local_tokens.<span class="fn">fill_</span>(<span class="nu">0</span>)
+    ...
+    <span class="kw">if</span> local_tokens.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
+        <span class="fn">memcpy</span>(local_tokens, global_tokens,
+               <span class="nu">0</span>, local_start_pos, local_num_tokens, <span class="kw">True</span>)</pre>
+    <div class="annotation"><b>读懂这段：</b> 每层前向的模式就固定成三步：注意力各 rank 算各自的（无通信）→ <code class="inline">dp_gather</code> 汇总 → MoE 在全局 token 上计算 → <code class="inline">dp_scatter</code> 切回。CUDA Graph 要求形状固定，所以全局/本地缓冲区长度有 max/sum 两种填充模式（<code class="inline">get_dp_padding_mode</code>）。这套机制下每张卡仍然是一个完整的 Scheduler 进程，只是并行组划分变了：<code class="inline">attn_tp_size = tp_size // attn_dp_size // attn_cp_size</code>，注意力组与 MoE 组是同一批卡的不同切法。</div>
+    <div class="annotation"><b>布局约束常被误传：</b> 流传较广的说法是「只支持 <code class="inline">attn_tp_size == 1</code>、<code class="inline">tp_size == dp_size</code>」，但这只对了一部分。源码在 <code class="inline">parallel_hook.py:186</code> 里只断言 <code class="inline">tp_size % dp_size == 0</code>，此外 <code class="inline">tp_size % (dp_size * attn_cp_size) == 0</code>（第 76 行）——并<strong>不要求</strong>两者相等。<code class="inline">attn_tp_size &gt; 1</code> 是一条活跃支持的路径：<code class="inline">layers/communicator.py</code> 与 <code class="inline">layers/logits_processor.py:422</code> 都有 <code class="inline">attn_tp_size &gt; 1</code> 的分支，<code class="inline">arg_groups/model_hook.py:234</code> 还会为这种形状专门打一条提示日志（"DSA with TP mode is active… attention weights will be sharded across N ranks"）。<code class="inline">tp_size == dp_size</code> 这个约束只对 <strong>flashinfer MegaMoE</strong> 成立。<strong>「注意力 TP 与 DP 正交」才是这套设计的一般形态</strong>，tp8dp8 只是 <code class="inline">attn_tp_size=1</code> 的那个特例。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.6</span>PP 与 EP：层间流水线与专家分片</h2>
+    <h3>PP：一个循环跑多个 microbatch</h3>
+    <p>PP 不改 Scheduler 的职责，只换事件循环：<code class="inline">event_loop_pp</code> 维护 <code class="inline">pp_loop_size</code> 个 microbatch 槽位轮转，stage 之间用点对点通信传请求和激活（<code class="inline">pp_proxy_tensors</code>），发送是异步的、接收是同步的，避免 stage 间失步：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler_pp_mixin.py — event_loop_pp（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">event_loop_pp</span>(self: <span class="cl">Scheduler</span>):
+    self.<span class="fn">init_pp_loop_state</span>()
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="kw">for</span> mb_id <span class="kw">in</span> <span class="fn">range</span>(self.pp_loop_size):
+            self.running_batch = self.running_mbs[mb_id]
+            self.last_batch = self.last_mbs[mb_id]
+            ...
+            recv_reqs = self.<span class="fn">ingest_requests</span>()
+            <span class="kw">if</span> <span class="kw">not</span> self.pp_group.is_last_rank:
+                self.<span class="fn">_pp_commit_comm_work</span>(self.send_req_work)
+                <span class="cmt"># 异步把请求发往下一 stage</span>
+                self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                    recv_reqs, async_send=<span class="kw">True</span>,
+                )
+            plan = self.<span class="fn">get_next_batch_to_run</span>(...)
+            self.mbs[mb_id] = plan.batch_to_run
+            ...
+            <span class="kw">if</span> cur_batch:
+                pp_proxy_tensors = self._pp_recv_proxy_tensors()
+            ...
+            result, self.launch_event = self._pp_launch_batch(
+                mb_id, cur_batch, pp_proxy_tensors, ...)</pre>
+    <div class="annotation"><b>读懂这段：</b> 每个 microbatch 槽位独立维护自己的 running_batch / last_batch，相当于把第 2 章的事件循环复制了 N 份交错执行——stage 0 在算 mb_2 时，stage 1 在算 mb_1，流水线才能填满。<code class="inline">pp_async_batch_depth</code> 让最后一 stage 在 GPU 计算期间先处理上一个 microbatch 的结果，削掉尾部的 rank 空转。</div>
+
+    <h3>EP：专家怎么分、弹性扩缩怎么算</h3>
+    <p>EP 把 MoE 的专家列表按 <code class="inline">moe_ep_size</code> 均分，每个 rank 持有一段专家；token 按路由结果发到持有目标专家的 rank。常规情况下「存储分片」和「运行时分片」是一回事，但弹性 EP（<code class="inline">ep_join_mode == "scale"</code>）把两者拆开——专家按<strong>初始规模</strong>落盘，运行时按<strong>当前规模</strong>计算归属，这样 EP 组扩容/缩容时不用重新分片权重：</p>
+    <div class="code-title">python/sglang/srt/layers/moe/fused_moe_triton/layer.py — 专家的存储分片与运行时分片（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> <span class="fn">get_exec</span>().moe.ep_join_mode == <span class="st">"scale"</span>:
+    storage_ep_size = <span class="fn">get_parallel</span>().elastic_ep_initial_size
+    <span class="kw">assert</span> storage_ep_size <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>
+    self._expert_storage_rank = (
+        <span class="fn">get_parallel</span>().ep_join_rank_offset + self.moe_ep_rank
+    )
+<span class="kw">else</span>:
+    storage_ep_size = self.moe_ep_size
+    self._expert_storage_rank = self.moe_ep_rank
+<span class="kw">assert</span> self._num_global_routed % storage_ep_size == <span class="nu">0</span>
+self._num_local_routed = self._num_global_routed // storage_ep_size</pre>
+    <div class="annotation"><b>读懂这段：</b> 弹性模式下，本 rank 的专家按「初始规模 + rank 偏移」从存储定位，而路由按当前运行规模算——两套编号并存，是支撑在线扩缩的代价。这也解释了 <code class="inline">_launch_scheduler_processes</code> 里那个条件：<code class="inline">use_dp_controller = dp_size &gt; 1 or ep_join_mode == "scale"</code>——弹性 EP 扩缩需要 controller 参与进程编排，不只是路由请求。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.7</span>对「自研引擎」的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      并行顺序别排错：<strong>单卡跑到瓶颈，先上 TP</strong>——它只需要列/行并行切权重加每层 1~2 次 allreduce，改动集中在 Linear 层；<strong>吞吐还不够再上 DP</strong>——SGLang 证明了 DP 路由层可以薄到几百行：一个 ZMQ 分发器加一份共享内存负载快照；一个独立部署的 router 进程（如 sgl-model-gateway）能替代它，还免去进程内耦合。<strong>EP 只在 MoE 模型上考虑</strong>；<strong>PP 仅当跨机带宽撑不起 TP 时</strong>——它的 microbatch 轮转和 stage 间握手引入的复杂度，是四个维度里最高的。下一步进入 <a href="11-hicache.html">第 11 章：HiCache 分层缓存</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="09-serving-entry.html">← 上一章：服务入口</a>
+    <a href="11-hicache.html">下一步：HiCache 分层缓存 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 10 分布式 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -27,6 +27,7 @@
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
       <a href="13-agentic-gateway.html">实战·网关</a>
+      <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
 </header>
@@ -43,7 +44,7 @@
     你提到的三个名字，对照本仓库最新代码，有两个有小出入：
     <ul style="margin:8px 0 0 18px">
       <li><strong>deepseek-v4-flash</strong> → 真实即 <strong>DeepSeek-V4</strong>（DSA 稀疏 MLA 架构）。其中 <code class="inline">flash</code> 不是单独的模型，而是<strong>FlashMLA 稀疏注意力后端</strong>（<code class="inline">DeepseekV4FlashMLABackend</code>，位于 <code class="inline">vllm/models/deepseek_v4/</code>）。</li>
-      <li><strong>glm-5.2</strong> → 真实即 <strong>GLM-5.2</strong>，复用 DeepSeek 的 DSA 设计思路服务：架构名 <code class="inline">GlmMoeDsaForCausalLM</code> 注册在 <code class="inline">deepseek_v2.py</code>（按 <code class="inline">config.model_type == "glm_moe_dsa"</code> 触发 DSA 路径）；DeepSeek-V3.2 的 DSA 模型在 <code class="inline">vllm/models/deepseek_v32/</code>，其 <code class="inline">__init__.py:7</code> 注释写道 "serves any DSA checkpoint, including GLM-5.2"。</li>
+      <li><strong>glm-5.2</strong> → 真实即 <strong>GLM-5.2</strong>，复用 DeepSeek 的 DSA 设计思路服务：架构名 <code class="inline">GlmMoeDsaForCausalLM</code> 在注册表里指向 <code class="inline">vllm.models.deepseek_v32</code>（CUDA 上就是 <code class="inline">DeepseekV32ForCausalLM</code> 的别名；<code class="inline">deepseek_v2.py</code> 里同名类只是非 CUDA 的回退实现）；按 <code class="inline">config.model_type == "glm_moe_dsa"</code> 触发 GLM-5.2 特有路径。DeepSeek-V3.2 的 DSA 模型在 <code class="inline">vllm/models/deepseek_v32/</code>，其 <code class="inline">__init__.py:7</code> 注释写道 "serves any DSA checkpoint, including GLM-5.2"。</li>
       <li><strong>kimi2.7</strong> → 仓库里<strong>没有 2.7</strong>。真实支持的是 <strong>Kimi K2.5</strong>（<code class="inline">vllm/model_executor/models/kimi_k25.py</code>，<code class="inline">KimiK25ForConditionalGeneration</code>）与 <strong>Kimi-K2.6</strong>（<code class="inline">vllm/env_override.py</code> 提及）。下文以 K2.5 为准，机制完全相同。</li>
     </ul>
   </div>
@@ -67,17 +68,20 @@
   <section class="block">
     <h2><span class="num">12.2</span>认出模型：ModelConfig 与注册表 ModelRegistry</h2>
     <p>万事第一步：给定一个 HF 路径（如 <code class="inline">deepseek-ai/DeepSeek-V3.2</code>），vLLM 怎么知道该用哪一份 Python 模型代码？答案藏在 <code class="inline">config.json</code> 的 <code class="inline">architectures</code> 字段 + 注册表。</p>
-    <div class="code-title">vllm/model_executor/models/registry.py — 注册表核心数据结构与注册接口（摘录）</div>
+    <div class="code-title">vllm/model_executor/models/registry.py — 注册表核心数据结构与注册接口（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">_ModelRegistry</span>:
     <span class="cmt"># Keyed by model_arch  ← 键是 HF 的 architectures 字符串</span>
     models: dict[str, _BaseRegisteredModel] = field(default_factory=<span class="fn">dict</span>)
 
     <span class="kw">def</span> <span class="fn">register_model</span>(self, model_arch: str, model_cls) -&gt; <span class="kw">None</span>:
-        <span class="cmt"># model_cls 可以是 nn.Module 类，或 "&lt;module&gt;:&lt;class&gt;" 懒加载字符串</span>
+        <span class="cmt"># 注册一个「外部的」模型；model_cls 可以是 nn.Module 类，</span>
+        <span class="cmt"># 或 "&lt;module&gt;:&lt;class&gt;" 懒加载字符串</span>
         ...
 
-ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
-    <p>于是「<strong>HF 架构名 → vLLM 模型类</strong>」的映射就是一张 <code class="inline">ModelRegistry.models</code> 字典。各模型文件通过装饰器把自己的 <code class="inline">architectures</code> 注册进去——例如 Kimi-K2.5 注册了 <code class="inline">KimiK25ForConditionalGeneration</code>，GLM 家族注册 <code class="inline">GLM4VForCausalLM</code> 等（见 <code class="inline">chatglm.py:441</code> 的 <code class="inline">hf_overrides = {"architectures": ["GLM4VForCausalLM"]}</code>）。启动时解析 <code class="inline">config.json</code> 拿到架构名，再从注册表 <code class="inline">load_model_cls()</code>（<code class="inline">registry.py:920</code>）取出对应的类。</p>
+ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时由静态表构建</span>
+    {arch: _LazyRegisteredModel(...) <span class="kw">for</span> arch, (mod, cls) <span class="kw">in</span> _VLLM_MODELS.items()}
+)</pre>
+    <p>于是「<strong>HF 架构名 → vLLM 模型类</strong>」的映射就是一张 <code class="inline">ModelRegistry.models</code> 字典。关键在于它<strong>不是靠装饰器凑出来的</strong>：文件顶部有一张手写的静态表 <code class="inline">_VLLM_MODELS</code>（<code class="inline">registry.py:764</code>，由 <code class="inline">_TEXT_GENERATION_MODELS</code>、<code class="inline">_MULTIMODAL_MODELS</code> 等分表合并），形如 <code class="inline">"GlmMoeDsaForCausalLM": ("deepseek_v32", "DeepseekV32ForCausalLM")</code>；导入 registry 时用一张推导式把整张表灌进 <code class="inline">ModelRegistry</code>（上方代码）。<code class="inline">register_model()</code> 的文档串写的是 "Register an <strong>external</strong> model"，服务的是树外/运行时注册（<code class="inline">config/model.py:1067</code>），内置模型并不走它。启动时解析 <code class="inline">config.json</code> 拿到架构名，再从注册表 <code class="inline">load_model_cls()</code>（<code class="inline">registry.py:939</code>）取出对应的类。</p>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg">
@@ -89,8 +93,8 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
         <text class="lbl sm" x="130" y="60" text-anchor="middle">model 代码文件</text>
         <text class="lbl sm" x="130" y="78" text-anchor="middle">DeepseekV3/DSA 模型</text>
         <line class="edge" x1="230" y1="66" x2="360" y2="66"></line>
-        <text class="lbl sm" x="295" y="58" text-anchor="middle">@register /</text>
-        <text class="lbl sm" x="295" y="72" text-anchor="middle">register_model</text>
+        <text class="lbl sm" x="295" y="58" text-anchor="middle">静态表 _VLLM_MODELS</text>
+        <text class="lbl sm" x="295" y="72" text-anchor="middle">在 registry.py 中集中声明</text>
         <rect class="node core" x="362" y="40" width="180" height="52" rx="6"></rect>
         <text class="lbl sm" x="452" y="60" text-anchor="middle">ModelRegistry.models</text>
         <text class="lbl sm" x="452" y="78" text-anchor="middle">{arch → model_cls}</text>
@@ -107,18 +111,18 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
         <text class="lbl sm" x="452" y="200" text-anchor="middle">返回模型类</text>
         <line class="edge" x1="542" y1="188" x2="640" y2="188"></line>
         <rect class="node acc" x="642" y="162" width="200" height="52" rx="6"></rect>
-        <text class="lbl sm" x="742" y="182" text-anchor="middle">构建模型实例</text>
-        <text class="lbl sm" x="742" y="200" text-anchor="middle">from_config(vllm_config)</text>
+        <text class="lbl sm" x="742" y="182" text-anchor="middle">initialize_model()</text>
+        <text class="lbl sm" x="742" y="200" text-anchor="middle">model_class(vllm_config, prefix)</text>
       </svg>
       <div class="fig-cap">图 12.1：注册表把 HF 的 architectures 字符串映射到 vLLM 的模型类。（同一 GLM 架构名 → 不同路径同名）</div>
     </div>
-    <div class="annotation"><b>看懂：</b>这一步只是<strong>选代码</strong>，还没碰权重。DSA 架构名不止一个：DeepSeek-V3.2 走 <code class="inline">DeepseekV32ForCausalLM</code>（<code class="inline">deepseek_v32</code>），GLM-5.2 走独立的 <code class="inline">GlmMoeDsaForCausalLM</code>（<code class="inline">deepseek_v2.py</code>，按 <code class="inline">config.model_type == "glm_moe_dsa"</code> 触发 DSA 路径）。二者复用的是同一套 DSA 设计思路，而非同一个类。</div>
+    <div class="annotation"><b>看懂：</b>这一步只是<strong>选代码</strong>，还没碰权重。DSA 架构名不止一个：DeepSeek-V3.2 走 <code class="inline">DeepseekV32ForCausalLM</code>（<code class="inline">deepseek_v32</code>），GLM-5.2 走 <code class="inline">GlmMoeDsaForCausalLM</code>——注册表把它也指向 <code class="inline">vllm.models.deepseek_v32</code>（CUDA 上即 <code class="inline">DeepseekV32ForCausalLM</code> 的别名，见 <code class="inline">deepseek_v32/__init__.py:21</code>；<code class="inline">deepseek_v2.py</code> 里的同名类只是非 CUDA 回退）。按 <code class="inline">config.model_type == "glm_moe_dsa"</code> 触发 GLM-5.2 特有路径。二者复用同一套 DSA 实现，靠 model_type 区分调优。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.3</span>选加载器：load_format 决定走哪条管线</h2>
     <p>模型类确定后，还要决定<strong>权重从哪来、怎么流进显存</strong>。一个 <code class="inline">--load-format</code> / <code class="inline">--load-format=…</code> 参数决定了 loader 的选择。全在 <code class="inline">get_model_loader</code> 这张表里：</p>
-    <div class="code-title">vllm/model_executor/model_loader/__init__.py:50 — load_format → 加载器映射（摘录）</div>
+    <div class="code-title">vllm/model_executor/model_loader/__init__.py:50 — load_format → 加载器映射（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>_LOAD_FORMAT_TO_MODEL_LOADER = {
     <span class="st">"auto"</span>: DefaultModelLoader,          <span class="cmt"># 默认：按文件类型自动判断</span>
     <span class="st">"hf"</span>: DefaultModelLoader,
@@ -170,15 +174,15 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
         <rect class="node core" x="682" y="144" width="170" height="40" rx="5"></rect>
         <text class="lbl sm" x="767" y="169" text-anchor="middle">get_model_loader(...)</text>
       </svg>
-      <div class="fig-cap">图 12.2：加载器主流程与调用链。Executor→Worker→ModelRunner→loader（gpu_worker.py:485 / model_runner.py:374）。</div>
+      <div class="fig-cap">图 12.2：加载器主流程与调用链。Executor→Worker→ModelRunner→loader（gpu_worker.py:495 / model_runner.py:386）。</div>
     </div>
-    <div class="annotation"><b>逐层追源码：</b><code class="inline">gpu_runner.load_model</code> 里 <code class="inline">model_loader = get_model_loader(self.load_config)</code>，再 <code class="inline">model_loader.load_model(vllm_config, model_config)</code>（<code class="inline">model_runner.py:381</code>）；而 <code class="inline">BaseModelLoader.load_model</code>（<code class="inline">base_loader.py:43</code>）依次做「构建结构 → load_weights → 量化收尾 → <code class="inline">model.eval()</code>」。</div>
+    <div class="annotation"><b>逐层追源码：</b><code class="inline">gpu_runner.load_model</code> 里 <code class="inline">model_loader = get_model_loader(self.load_config)</code>，再 <code class="inline">model_loader.load_model(vllm_config, model_config)</code>（<code class="inline">model_runner.py:398</code>）；而 <code class="inline">BaseModelLoader.load_model</code>（<code class="inline">base_loader.py:43</code>）依次做「构建结构 → load_weights → 量化收尾 → <code class="inline">model.eval()</code>」。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.4</span>DefaultModelLoader：权重从磁盘进显存</h2>
     <p>默认走 <code class="inline">DefaultModelLoader</code>。它的活分两步：<strong>找文件</strong>（<code class="inline">_prepare_weights</code>）和<strong>喂给模型</strong>（<code class="inline">load_weights</code>）。</p>
-    <div class="code-title">vllm/model_executor/model_loader/default_loader.py — 核心两段（摘录）</div>
+    <div class="code-title">vllm/model_executor/model_loader/default_loader.py — 核心两段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 1) 准备权重文件：按 load_format 选 pattern，本地直接列、远端下载，再精简</span>
 <span class="kw">def</span> <span class="fn">_prepare_weights</span>(self, model_name_or_path, subfolder, revision,
                   fall_back_to_pt, allow_patterns_overrides):
@@ -198,9 +202,9 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">12.5</span>真正的魔法：load_weights 的参数重映射</h2>
+    <h2><span class="num">12.5</span>load_weights 的参数重映射</h2>
     <p>模型框架 <code class="inline">initialize_model</code> 建好后，HF 权重还散在磁盘里。真正把「HF 参数名 → vLLM 内部参数名」对齐的，是每个模型自己实现的 <code class="inline">load_weights</code>。vLLM 为了<strong>跑得快</strong>，常常把多个 HF 权重<strong>融合成一个</strong>，例如 <code class="inline">q_a_proj</code> + <code class="inline">kv_a_proj_with_mqa</code> 合并为 <code class="inline">fused_qkv_a_proj</code>。这段映射在 DSA 模型里写得非常直白，以 DeepSeek-V3.2 为例（GLM-5.2 的 <code class="inline">GlmMoeDsaForCausalLM</code> 继承自同族基类，思路一致）：</p>
-    <div class="code-title">vllm/models/deepseek_v32/nvidia/model.py:314 — DSA 模型的参数重映射（摘录）</div>
+    <div class="code-title">vllm/models/deepseek_v32/nvidia/model.py:314 — DSA 模型的参数重映射（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">load_weights</span>(self, weights) -&gt; <span class="kw">set</span>[str]:
     <span class="cmt"># 熔断式参数映射： (vLLM 参数名, HF 权重名前半段, 切到哪个 shard)</span>
     stacked_params_mapping = [
@@ -253,14 +257,14 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">12.6</span>让它「跑得好」：量化 + KV cache + 稀疏后端的组合拳</h2>
+    <h2><span class="num">12.6</span>让它「跑得好」：量化 + KV cache + 稀疏后端一起调</h2>
     <p>权重加载进来了。但「跑得好」还差最后一层：<strong>用什么 dtype 存权重、用什么格式存 KV、用哪个注意力后端</strong>。三者必须配合，DeepSeek-V4 / GLM 这类 DSA 稀疏模型尤其如此。</p>
     <ul>
       <li><strong>权重量化</strong>：FP8 / MXFP4 等。<code class="inline">vllm/models/deepseek_v4/quant_config.py</code> 是 DeepSeek-V4 的量化配置；GLM-5.2 也常见 <code class="inline">amd/GLM-5.2-MXFP4</code> 这类已量化 checkpoint（见 <code class="inline">quark/utils.py</code> 注释）。权重越小，I/O 越省、显存越够。</li>
-      <li><strong>KV cache dtype</strong>：稀疏 MLA 用的是 <code class="inline">--kv-cache-dtype fp8_ds_mla</code> 的专用分页布局（FlashMLA 稀疏）。见 <code class="inline">vllm/v1/attention/backends/mla/sparse_swa.py:101-118</code>——<code class="inline">fp8_ds_mla</code> 还需要 576B 对齐。</li>
+      <li><strong>KV cache dtype</strong>：稀疏 MLA 用的是 <code class="inline">--kv-cache-dtype fp8_ds_mla</code> 的专用分页布局（FlashMLA 稀疏）。见 <code class="inline">vllm/v1/attention/backends/mla/sparse_swa.py:108-120</code>——<code class="inline">fp8_ds_mla</code> 还需要 576B 对齐。</li>
       <li><strong>注意力后端</strong>：<code class="inline">DeepseekV4FlashMLABackend</code>（FlashMLA 稀疏）等通过 <code class="inline">vllm/v1/attention/backends/registry.py</code> 注册，按平台选 NVIDIA/AMD/XPU 的实现。</li>
     </ul>
-    <div class="code-title">vllm/v1/attention/backends/registry.py:90 — DSA 稀疏后端登记在枚举里（摘录）</div>
+    <div class="code-title">vllm/v1/attention/backends/registry.py:90 — DSA 稀疏后端登记在枚举里（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">AttentionBackendEnum</span>(Enum):  <span class="cmt"># 后端路径是枚举成员的值，运行时可被覆盖</span>
     FLASHMLA = <span class="st">"vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"</span>
     ...
@@ -402,7 +406,7 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
       </tr>
       <tr>
         <td><strong>GLM-5.2</strong></td>
-        <td>复用 DSA 重映射思路<br>架构类在 <code class="inline">deepseek_v2.py</code></td>
+        <td>复用 DSA 重映射思路<br>架构类经 <code class="inline">deepseek_v32</code>（CUDA 别名）</td>
         <td><code class="inline">GlmMoeDsaForCausalLM</code></td>
         <td>常直接加载 <code class="inline">amd/GLM-5.2-MXFP4</code> 已量化权重；与 DeepSeek 同为 DSA，重映射思路相通（具体映射表因模型而异）</td>
       </tr>
@@ -410,7 +414,7 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
         <td><strong>Kimi-K2.5</strong><br>(你问的 kimi2.7)</td>
         <td>MLA + 长上下文截断<br><code class="inline">kimi_k25.py</code></td>
         <td><code class="inline">KimiK25ForConditionalGeneration</code></td>
-        <td>多模态（<code class="inline">KimiK25MediaPixelInputs</code>）；<code class="inline">load_weights</code> 在 <code class="inline">kimi_k25.py:708</code>；仓库无 K2.7</td>
+        <td>多模态（<code class="inline">KimiK25MediaPixelInputs</code>）；<code class="inline">load_weights</code> 在 <code class="inline">kimi_k25.py:709</code>；仓库无 K2.7</td>
       </tr>
     </table>
     <div class="callout warn">
@@ -430,7 +434,7 @@ ModelRegistry = _ModelRegistry()   <span class="cmt"># 全局单例</span></pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 12 实战·权重加载 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 12 实战·权重加载 · 版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -27,6 +27,7 @@
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
       <a href="13-agentic-gateway.html">实战·网关</a>
+      <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
 </header>
@@ -94,7 +95,7 @@
       <div class="fig-cap">图 8.1：显存三块——权重与 activation 是固定开销，KV 是“吃剩下的”。比例仅为示意。</div>
     </div>
     <p>划总预算的开关是 <code class="inline">CacheConfig.gpu_memory_utilization</code>：0~1 之间，表示「这份 GPU 显存的多少比例拿来给本实例」。注意：<strong>当前代码里默认值是 0.92</strong>，而不是很多人以为的 0.9，它是可配置的（<code class="inline">--gpu-memory-utilization</code>）。</p>
-    <div class="code-title">vllm/config/cache.py — CacheConfig（摘录）</div>
+    <div class="code-title">vllm/config/cache.py — CacheConfig（摘录；前半为官方英文注释，后半为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">CacheConfig</span>:
     <span class="cl">DEFAULT_BLOCK_SIZE</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">16</span>          <span class="cmt"># 每块 16 个 token</span>
 
@@ -109,7 +110,7 @@
     <h2><span class="num">8.2</span>内存 profile / warm-up：KV 预算怎么“量出来”</h2>
     <p>vLLM 不是「猜一个 KV 大小」，而是<strong>真在 GPU 上跑一遍</strong>。启动时它用 <code class="inline">memory_profiling</code> 上下文量好权重+activation 的峰值，然后算「还能腾多少给 KV」。</p>
     <p>实测口径在 <code class="inline">vllm/v1/worker/gpu_worker.py</code>：先记录初始空闲显存 <code class="inline">init_snapshot</code>，把「请求的总预算」记为 <code class="inline">requested_memory</code>；profile 过后量出 <code class="inline">non_kv_cache_memory</code>（权重 + activation），相减就是可给 KV 的字节数：</p>
-    <div class="code-title">vllm/v1/worker/gpu_worker.py — KV 预算计算（摘录）</div>
+    <div class="code-title">vllm/v1/worker/gpu_worker.py — KV 预算计算（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>self.total_consumed = profile_result.total_consumed
 <span class="cmt"># 权重 + activation 峰值（profile 中实测出的占用）</span>
 self.peak_activation_memory = (...)
@@ -121,7 +122,7 @@ self.available_kv_cache_memory_bytes = (
 )
 <span class="cmt"># 之后据这个字节数算 num_blocks，见 8.3</span></pre>
     <p>而「怎么把能用的显存试出来」靠两大段 warm-up。其一：<code class="inline">GPUModelRunner.profile_run()</code> 在 profile 期间用一个 <code class="inline">_dummy_run(max_num_tokens)</code> 的假前向把 weights + activation 的<strong>峰值</strong>顶出来（第 5 章讲过这个假前向）。其二：<code class="inline">vllm/v1/worker/gpu/warmup.py</code> 里跑一批真实的 <code class="inline">warmup_kernels</code>，把要用的 kernel 都点亮，并用 <code class="inline">run_mixed_prefill_decode_warmup</code> 专门验证「KV 块够不够塞下我准备调的 batch」：</p>
-    <div class="code-title">vllm/v1/worker/gpu/warmup.py — 用 KV 块数决定 warmup 批大小（摘录）</div>
+    <div class="code-title">vllm/v1/worker/gpu/warmup.py — 用 KV 块数决定 warmup 批大小（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>num_reqs = <span class="fn">min</span>(
     model_runner.scheduler_config.max_num_seqs,
     model_runner.scheduler_config.max_num_batched_tokens
@@ -145,7 +146,7 @@ self.available_kv_cache_memory_bytes = (
     2 × 32 × 8 × 128 × 2 = <strong>131,072 字节 ≈ 128 KiB / token</strong>。<br>
     一条 4K 的序列就要 128 KiB × 4096 ≈ 512 MiB；GPU 里想塞 10 条这样的，KV 就得 5 GiB 起步。</p>
     <p>vLLM 按「块」来装这些 token。每块 <code class="inline">block_size</code>（默认 16）个 token，那么一块的字节就是「每 token 字节 × 16」。块数和可用显存的关系，在 <code class="inline">kv_cache_utils.py</code> 里就是一句除法：</p>
-    <div class="code-title">vllm/v1/core/kv_cache_utils.py — 可用显存 ÷ 每块字节（摘录）</div>
+    <div class="code-title">vllm/v1/core/kv_cache_utils.py — 可用显存 ÷ 每块字节（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_kv_cache_config_from_groups</span>(vllm_config, kv_cache_groups,
                                            available_memory):
     <span class="cmt"># 每个块占多少字节（把该组所有层、所有 KV 头的 K+V 都算进去）</span>
@@ -161,7 +162,7 @@ self.available_kv_cache_memory_bytes = (
   <section class="block">
     <h2><span class="num">8.4</span>max_num_seqs / max_num_batched_tokens：每步能跑多少</h2>
     <p>KV 预算回答了「显存够不够」，但每一步实际跑多少请求、多少个 token，由 <code class="inline">SchedulerConfig</code> 的两个上限管着：</p>
-    <div class="code-title">vllm/config/scheduler.py — SchedulerConfig（摘录）</div>
+    <div class="code-title">vllm/config/scheduler.py — SchedulerConfig（摘录；前半为官方英文注释，后半为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cl">DEFAULT_MAX_NUM_BATCHED_TOKENS</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">2048</span>
 <span class="cl">DEFAULT_MAX_NUM_SEQS</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">128</span>
 
@@ -188,12 +189,12 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
     <h2><span class="num">8.5</span>前缀缓存 prefix caching：相同开头 → 复用已算 KV</h2>
     <p>对话应用里，很多请求有<strong>相同的开头</strong>（system prompt、历史、few-shot 例子都一模一样）。naive 引擎每个请求都要从头 prefill 一遍，纯属浪费。vLLM 的前缀缓存的关键：<strong>块满后，把块的「内容」算一个哈希，同一个哈希的物理块只算一次、让多个请求共用一个物理块</strong>。</p>
     <p>哈希与查找都落在 <code class="inline">vllm/v1/core/block_pool.py</code> 的 <code class="inline">BlockHashToBlockMap</code>——一个 <code class="inline">{block_hash: KVCacheBlock(s)}</code> 的映射。只有<strong>满块</strong>才进这个缓存；而每个块用自己的引用计数 <code class="inline">ref_cnt</code> 记录「有几个请求在用它」。复用逻辑由 <code class="inline">BlockPool.get_cached_block</code> 查询、<code class="inline">cache_full_blocks</code> 登记、<code class="inline">ref_cnt</code> 归零后再 <code class="inline">evict_blocks</code> 回收。</p>
-    <div class="code-title">vllm/v1/core/kv_cache_utils.py — KVCacheBlock 字段（摘录）</div>
+    <div class="code-title">vllm/v1/core/kv_cache_utils.py — KVCacheBlock 字段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">KVCacheBlock</span>:
     block_id: <span class="cl">int</span>        <span class="cmt"># 0 ~ num_gpu_blocks-1</span>
     ref_cnt: <span class="cl">int</span> = <span class="nu">0</span>    <span class="cmt"># 引用计数：几个请求正在共用这块</span>
     _block_hash: ... = <span class="kw">None</span> <span class="cmt"># 满块内容的哈希，只有已缓存时才有</span></pre>
-    <div class="code-title">vllm/v1/core/block_pool.py — BlockHashToBlockMap（摘录）</div>
+    <div class="code-title">vllm/v1/core/block_pool.py — BlockHashToBlockMap（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">BlockHashToBlockMap</span>:
     <span class="cmt">"""Cache of blocks that are used for prefix caching. It caches blocks</span>
     <span class="cmt">from hash directly to a block or multiple blocks (i.e. {block_hash: KVCacheBlocks})"""</span>
@@ -290,7 +291,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 </div>
 
 <footer>
-  深入浅出vLLM · 08 内存 · 版本 v0.28.1rc0-467-gc3ec0d29f5 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 08 内存 · 版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

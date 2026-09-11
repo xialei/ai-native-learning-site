@@ -35,24 +35,25 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 Manager-Based 环境内核</div>
     <h1>Manager-Based 环境内核：step() 的八步心跳</h1>
-    <div class="subtitle">第 8 章说「任务 = 配置类」，但配置只是剧本——真正让世界转起来的是 ManagerBasedRLEnv.step()：一个被 RL 训练循环每 50Hz 调用一次的心跳。它按固定顺序调度六个 Manager（动作→物理→终止→奖励→重置→指令→观测），顺序错一步，梯度就错。本章逐行走读这八步，并把 LiftCube 的每一份配置对号入座。</div>
+    <div class="subtitle">第 8 章说「任务 = 配置类」，但配置只是剧本——真正让世界转起来的是 ManagerBasedRLEnv.step()：一个被 RL 训练循环按控制节拍调用的心跳。它按固定顺序调度八个 Manager（动作→记录→物理→终止→奖励→重置→指令→观测），顺序错一步，梯度就错。本章逐行走读这八步，并把 Lift 任务的每一份配置对号入座。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">9.1</span>六大 Manager 与装配顺序</h2>
-    <p><code class="inline">ManagerBasedRLEnv.__init__</code> 做的第一件实事是 <code class="inline">load_managers</code>（isaaclab/envs/manager_based_rl_env.py:117）。装配顺序不是随意的：</p>
-    <div class="code-title">isaaclab/envs/manager_based_rl_env.py:117 — load_managers 的顺序即依赖</div>
+    <h2><span class="num">9.1</span>八大 Manager 与装配顺序</h2>
+    <p><code class="inline">ManagerBasedRLEnv.__init__</code> 做的第一件实事是 <code class="inline">load_managers</code>（isaaclab/envs/manager_based_rl_env.py:110）。装配顺序不是随意的：</p>
+    <div class="code-title">isaaclab/envs/manager_based_rl_env.py:110 — load_managers 的顺序即依赖</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">load_managers</span>(self):
     <span class="cmt"># command manager 先建：observation manager 计算时要读它的术语</span>
     self.command_manager = CommandManager(self.cfg.commands, self)
-    <span class="kw">super</span>().<span class="fn">load_managers</span>()        <span class="cmt"># 父类装 observation + action manager</span>
-    <span class="cmt"># 以下顺序有讲究：reward manager 计算时要查 termination 状态</span>
+    <span class="kw">super</span>().<span class="fn">load_managers</span>()        <span class="cmt"># 父类装 event + recorder + action + observation manager</span>
+    <span class="cmt"># 以下顺序有讲究：reward manager 计算时要查 termination 状态（源码注释原话）</span>
     self.termination_manager = TerminationManager(self.cfg.terminations, self)
     self.reward_manager = RewardManager(self.cfg.rewards, self)
     self.curriculum_manager = CurriculumManager(self.cfg.curriculum, self)
     <span class="cmt"># 启动时触发一次 "startup" 模式的 event（如初始域随机化）</span>
-    self.event_manager.apply(mode=<span class="st">"startup"</span>)   <span class="cmt"># :142</span></pre>
-    <div class="annotation"><b>依赖链：</b>observation 需要 command（LiftCube 观测里有 <code class="inline">generated_commands</code> 项）→ command 先装；reward 需要 termination（部分奖励函数读 <code class="inline">termination_manager</code> 判断步终止奖励）→ termination 先于 reward。这正是源码注释里写明的两条理由。启动末尾的 <code class="inline">apply(mode="startup")</code> 是域随机化的第一拍——比如给每个环境抽一套初始物体位姿。EventTerm 共四种 mode（event_manager.py 的 available_modes）：<code class="inline">prestartup</code>（场景实体存在前，改 USD 级参数）、<code class="inline">startup</code>（启动一次性随机化）、<code class="inline">reset</code>（每次 episode 重置时重抽）、<code class="inline">interval</code>（按时间间隔在 episode 中途扰动，如随机推一下物体）——第 10 章展开。</div>
+    <span class="kw">if</span> <span class="st">"startup"</span> <span class="kw">in</span> self.event_manager.available_modes:
+        self.event_manager.apply(mode=<span class="st">"startup"</span>)   <span class="cmt"># :136</span></pre>
+    <div class="annotation"><b>依赖链：</b>observation 需要 command（LiftCube 观测里有 <code class="inline">generated_commands</code> 项）→ command 先装；reward 需要 termination（部分奖励函数读 <code class="inline">termination_manager</code> 判断步终止奖励）→ termination 先于 reward。这正是源码注释里写明的两条理由。启动末尾的 <code class="inline">apply(mode="startup")</code> 是域随机化的第一拍——比如给每个环境抽一套初始物体位姿。EventTerm 共四种典型 mode（event_manager.py 的 available_modes；源码文档也说明可以自定义 mode，只要在环境实现里补上触发点）：<code class="inline">prestartup</code>（场景实体存在前，改 USD 级参数）、<code class="inline">startup</code>（启动一次性随机化）、<code class="inline">reset</code>（每次 episode 重置时重抽）、<code class="inline">interval</code>（按时间间隔在 episode 中途扰动，如随机推一下物体）——第 10 章展开。</div>
     <p>装配完成后，env 就有了这些随时可查的心跳组件：</p>
     <table class="tbl">
       <tr><th>Manager</th><th>配置来源</th><th>职责</th><th>step() 中被调用的时机</th></tr>
@@ -63,7 +64,7 @@
       <tr><td>CommandManager</td><td>CommandsCfg</td><td>目标指令采样与跟踪指标</td><td>⑦ 观测之前</td></tr>
       <tr><td>EventManager</td><td>EventCfg</td><td>域随机化（按 mode 分拍）</td><td>startup/reset/interval 各一拍</td></tr>
       <tr><td>ObservationManager</td><td>ObservationsCfg</td><td>拼观测张量（含历史）</td><td>⑧ 最后 compute</td></tr>
-      <tr><td>CurriculumManager</td><td>CurriculumCfg</td><td>随训练进度调难度</td><td>reset 时 + 步内</td></tr>
+      <tr><td>CurriculumManager</td><td>CurriculumCfg</td><td>随训练进度调难度</td><td>只在 _reset_idx 最前</td></tr>
     </table>
   </section>
 
@@ -78,55 +79,56 @@
             <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
           </marker>
         </defs>
-        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">一个控制步（0.02s）内部的完整时序 —— 行号对应 manager_based_rl_env.py:161-273</text>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">一个控制步内部的完整时序 —— 行号对应 manager_based_rl_env.py:176-308</text>
 
         <!-- step 1 -->
         <g>
           <rect class="node" x="30" y="44" width="840" height="52" rx="8"></rect>
-          <text class="lbl" x="46" y="66" font-weight="bold" fill="#0f5c4c">① 动作预处理  :193  action_manager.process_action(action)</text>
+          <text class="lbl" x="46" y="66" font-weight="bold" fill="#0f5c4c">① 动作预处理  :208  action_manager.process_action(action)</text>
           <text class="lbl sm" x="46" y="86">JointPosition: q* = offset + scale·action → 写入 PhysX；DiffIK: 解析关节速度；Binary: 阈值化夹爪指令</text>
         </g>
         <!-- step 2 -->
         <g>
           <rect class="node acc" x="30" y="108" width="840" height="72" rx="8"></rect>
-          <text class="lbl" x="46" y="130" font-weight="bold" fill="#0f5c4c">② 物理步进 ×decimation  :201-229</text>
-          <text class="lbl sm" x="46" y="150">for _ in range(decimation=2):  apply_action → write_data_to_sim → sim.step(render=False)</text>
-          <text class="lbl sm" x="46" y="168">新版向量化分支 _physics_handles_decimation：一次下发，循环内只 sim.step + scene.update；recorder 钩子穿插其间</text>
+          <text class="lbl" x="46" y="130" font-weight="bold" fill="#0f5c4c">② 物理步进 ×decimation  :217-244</text>
+          <text class="lbl sm" x="46" y="150">for _ in range(decimation):  apply_action → write_data_to_sim → sim.step(render=False)</text>
+          <text class="lbl sm" x="46" y="168">向量化分支 _physics_handles_decimation：一次下发，循环内只 sim.step + scene.update；recorder 钩子穿插其间</text>
         </g>
         <!-- step 3 -->
         <g>
           <rect class="node" x="30" y="192" width="840" height="52" rx="8"></rect>
-          <text class="lbl" x="46" y="214" font-weight="bold" fill="#0f5c4c">③ 计数器推进  :233-234</text>
+          <text class="lbl" x="46" y="214" font-weight="bold" fill="#0f5c4c">③ 计数器推进  :248-249</text>
           <text class="lbl sm" x="46" y="234">episode_length_buf += 1（每环境）；common_step_counter += 1（全局）—— 超时判定与课程进度的依据</text>
         </g>
         <!-- step 4 -->
         <g>
           <rect class="node" x="30" y="256" width="840" height="56" rx="8"></rect>
-          <text class="lbl" x="46" y="278" font-weight="bold" fill="#0f5c4c">④ 终止检查  :236-238  termination_manager.compute()</text>
+          <text class="lbl" x="46" y="278" font-weight="bold" fill="#0f5c4c">④ 终止检查  :251-253  termination_manager.compute()</text>
           <text class="lbl sm" x="46" y="298">time_out（时间截断，不算失败）与 terminated（object_dropping 高度 &lt; -0.05 等）分开返回 —— RL 库 bootstrapping 需要区分</text>
         </g>
         <!-- step 5 -->
         <g>
           <rect class="node" x="30" y="324" width="840" height="52" rx="8"></rect>
-          <text class="lbl" x="46" y="346" font-weight="bold" fill="#0f5c4c">⑤ 奖励计算  :240  reward = reward_manager.compute(dt)</text>
-          <text class="lbl sm" x="46" y="366">Σ weight_i · term_i(env, params) —— LiftCube 一步 ≈ 1·reach + 15·lift + 16·track + 5·track_fine − 抖动惩罚</text>
+          <text class="lbl" x="46" y="346" font-weight="bold" fill="#0f5c4c">⑤ 奖励计算  :255  reward = reward_manager.compute(dt)</text>
+          <text class="lbl sm" x="46" y="366">Σ weight_i · term_i(env, params) —— contrib LiftCube 一步 ≈ 1·reach + 15·lift + 16·track + 5·track_fine − 抖动惩罚</text>
         </g>
         <!-- step 6 -->
         <g>
           <rect class="node" x="30" y="388" width="840" height="56" rx="8"></rect>
-          <text class="lbl" x="46" y="410" font-weight="bold" fill="#0f5c4c">⑥ 按需重置  :248-261  reset_env_ids = reset_buf.nonzero()</text>
-          <text class="lbl sm" x="46" y="430">record_pre_reset → _reset_idx(死掉的环境) → 按需补渲染 → record_post_reset —— 只重置死掉的，其余照常推进</text>
+          <text class="lbl" x="46" y="410" font-weight="bold" fill="#0f5c4c">⑥ 按需重置  :263-279  reset_env_ids = reset_buf.nonzero()</text>
+          <text class="lbl sm" x="46" y="430">compute_final_obs（可配）→ record_pre_reset → _reset_idx(死掉的环境) → 按需补渲染 → record_post_reset</text>
+          <text class="lbl sm" x="46" y="448">另有 consume_reset_request 分支：UI 手动重置也走同一生命周期，并标记 terminated 让 RL wrapper 看到边界</text>
         </g>
         <!-- step 7+8 -->
         <g>
           <rect class="node" x="30" y="456" width="840" height="72" rx="8"></rect>
-          <text class="lbl" x="46" y="478" font-weight="bold" fill="#0f5c4c">⑦ 指令与事件  :263-267</text>
-          <text class="lbl sm" x="46" y="496">command_manager.compute（目标位姿超 5s 重采样）；event_manager.apply(mode="interval")（周期性扰动）</text>
-          <text class="lbl sm" x="46" y="514">⑧ 观测计算 :270  observation_manager.compute(update_history=True) → 帧队列追加，返回 (4096, obs_dim)</text>
+          <text class="lbl" x="46" y="478" font-weight="bold" fill="#0f5c4c">⑦ 指令与事件  :296-299</text>
+          <text class="lbl sm" x="46" y="496">command_manager.compute（目标位姿超重采样窗口重抽）；event_manager.apply(mode="interval")（周期性扰动）</text>
+          <text class="lbl sm" x="46" y="514">⑧ 观测计算 :305  observation_manager.compute(update_history=True) → 帧队列追加，返回 (4096, obs_dim)</text>
         </g>
 
         <rect class="node back" x="30" y="540" width="840" height="34" rx="8" stroke-dasharray="6 4"></rect>
-        <text class="lbl sm" x="46" y="562">返回五元组 :273 → obs, reward, terminated, time_outs, extras（extras["log"] 带 Episode_Reward 逐项统计 —— 第 10 章调参全靠它）</text>
+        <text class="lbl sm" x="46" y="562">返回五元组 :308 → obs, reward, terminated, time_outs, extras（extras["log"] 带 Episode_Reward 逐项统计 —— 第 10 章调参全靠它）</text>
       </svg>
       <div class="svg-legend">
         <span class="lg-item"><span class="sw"></span>常规步骤</span>
@@ -135,29 +137,30 @@
       </div>
       <div class="fig-cap">图 9.1：step() 八步。①-② 是「世界推进」，③-⑤ 是「评价」，⑥ 是「局部重生」，⑦-⑧ 是「下一轮感知」。顺序不可交换——比如 reward 若在 termination 前算，就看不到死前最后一步的信息。</div>
     </div>
-    <div class="annotation"><b>对照真实代码：</b>上面 ② 的两个分支是 2025 年版本的重构——旧实现是 <code class="inline">for _ in range(decimation)</code> 循环里每拍 <code class="inline">apply_action + sim.step</code>；新版当 <code class="inline">_physics_handles_decimation</code> 为真时改为「一次 apply + write_data_to_sim，循环内仅 sim.step(render=False)」，物理侧自行复用动作，省去 N−1 次 Python 侧调用。两条路径的对外语义一致：策略 50Hz，物理 100Hz。RecorderManager 的五个钩子（pre_step / 每物理步 post / decimation 后 / pre_reset / post_reset）让「录制数据」与「训练推进」解耦——第 11 章用它生成 VLA 微调数据。</div>
+    <div class="annotation"><b>对照真实代码：</b>上面 ② 的两个分支是 3.0 的重构——经典实现是 <code class="inline">for _ in range(decimation)</code> 循环里每拍 <code class="inline">apply_action + sim.step</code>；新分支当 <code class="inline">_physics_handles_decimation</code> 为真时改为「一次 apply + write_data_to_sim，循环内仅 sim.step(render=False)」，物理侧自行复用动作，省去 N−1 次 Python 侧调用。计数器多了一条轴：reset 模式的 event 改看 _sim_step_counter（物理步），除以 decimation 得到「环境步数」再传进去；common_step_counter 仍然每步自增（:249），课程术语 modify_reward_weight 读的也仍是它（envs/mdp/curriculums.py:43）。两条路径的对外语义一致：控制节拍 = 物理 dt × decimation。RecorderManager 的钩子（pre_step / 每物理步 post / pre_reset / post_reset）让「录制数据」与「训练推进」解耦——第 11 章用它生成 VLA 微调数据。⑥ 里还有一个容易漏看的开关：<code class="inline">compute_final_obs</code>（cfg 项）开启时，重置前会先算一帧观测塞进 extras["final_obs"]——「终止时刻的观测」对 credit assignment 和 Same-Step 自动重置都重要。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>_reset_idx：顺序敏感的九连 reset</h2>
-    <p>重置不是「一键复原」。_reset_idx（manager_based_rl_env.py:362）里九个调用各管一摊，<strong>顺序错了会互相污染</strong>：</p>
-    <div class="code-title">isaaclab/envs/manager_based_rl_env.py:362 — _reset_idx（节选，注释保留）</div>
+    <h2><span class="num">9.3</span>_reset_idx：顺序敏感的八连 reset</h2>
+    <p>重置不是「一键复原」。_reset_idx（manager_based_rl_env.py:406）里八个调用各管一摊，<strong>顺序错了会互相污染</strong>：</p>
+    <div class="code-title">isaaclab/envs/manager_based_rl_env.py:406 — _reset_idx（节选，注释保留）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_reset_idx</span>(self, env_ids):
     <span class="cmt"># curriculum 先行：根据当前平均 reward 调整课程（可能改变随机化范围）</span>
-    self.curriculum_manager.compute(env_ids)
+    self.curriculum_manager.compute(env_ids=env_ids)
     <span class="cmt"># 场景状态复位（root state / 关节 / 传感器时间戳）</span>
     self.scene.<span class="fn">reset</span>(env_ids)
     <span class="cmt"># "reset" 模式 event：域随机化在这批环境上重抽（物体质心、摩擦、初始位姿…）</span>
-    self.event_manager.apply(mode=<span class="st">"reset"</span>, env_ids=env_ids)
+    env_step_count = self._sim_step_counter // self.cfg.decimation
+    self.event_manager.apply(mode=<span class="st">"reset"</span>, env_ids=env_ids, global_env_step_count=env_step_count)
     <span class="cmt"># 然后按依赖顺序复位各 manager 的内部缓冲</span>
-    self._reset_buffers(env_ids)   <span class="cmt"># 依次：command → (父类) action/obs → termination</span>
+    <span class="cmt"># 依次：observation → action → reward → curriculum → command → event → termination → recorder</span>
     self.episode_length_buf[env_ids] = <span class="nu">0</span>   <span class="cmt"># 最后清零 episode 计数</span></pre>
-    <div class="annotation"><b>为什么 curriculum 必须最前：</b>它可能修改 EventTerm 的参数（例如扩大物体初始位姿范围），若在 event.apply 之后跑，这批环境就用旧范围初始化了。为什么 command 在 obs 前：观测里的 <code class="inline">generated_commands</code> 依赖指令缓冲先就位。<strong>记忆钩子：</strong>「先定世界参数（curriculum→scene→event），再清记账本（各 manager→episode_length_buf）」。重置后紧跟一次 <code class="inline">render</code>（:258），保证录像/传感器的第一帧对齐新 episode 起点。</div>
+    <div class="annotation"><b>为什么 curriculum 必须最前：</b>它可能修改 EventTerm 的参数（例如扩大物体初始位姿范围），若在 event.apply 之后跑，这批环境就用旧范围初始化了。为什么 command 在 obs 前：观测里的 <code class="inline">generated_commands</code> 依赖指令缓冲先就位。<strong>记忆钩子：</strong>「先定世界参数（curriculum→scene→event），再清记账本（各 manager→episode_length_buf）」。重置后若有 RTX 传感器，紧跟 num_rerenders_on_reset 次 <code class="inline">render</code>（:274-277），保证相机传感器的第一帧对齐新 episode 起点。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.4</span>LiftCube 一轮 episode 走查</h2>
-    <p>把第 8 章的配置对号入座，跟一集 5 秒的 episode（250 物理步 / 100 控制步）：</p>
+    <p>把第 8 章的配置对号入座，跟一集 5 秒的 episode（500 物理步 / 250 控制步）：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t15 d15">
         <title id="t15">LiftCube episode 时间线</title>
@@ -182,7 +185,7 @@
         <g>
           <rect class="node acc" x="250" y="96" width="170" height="58" rx="6"></rect>
           <text class="lbl sm" x="335" y="118" text-anchor="middle">reaching_object 主导</text>
-          <text class="lbl sm" x="335" y="136" text-anchor="middle">exp(-d²/0.1²)·1.0</text>
+          <text class="lbl sm" x="335" y="136" text-anchor="middle">(1−tanh(d/0.1))·1.0</text>
         </g>
         <g>
           <rect class="node acc" x="450" y="96" width="170" height="58" rx="6"></rect>
@@ -221,12 +224,12 @@
       </div>
       <div class="fig-cap">图 9.2：LiftCube 一集时间线。奖励设计是「接力棒」式塑形：够近→抬起→粗跟踪→细跟踪，每一段只在上一段达成后才成为主导信号。</div>
     </div>
-    <div class="annotation"><b>几个容易忽略的工程细节：</b>①<code class="inline">ObservationManager.compute(update_history=True)</code> 在 step 末尾才跑——所以策略看到的观测是「本次动作执行完之后」的世界，与 gym 的「step 返回 next_obs」语义一致（源码注释：done after reset to get the correct observations for reset envs）。② <code class="inline">enable_corruption=True</code>（lift_env_cfg.py:113）给 joint_pos 等项加传感器噪声——默认就开，刻意让策略别依赖完美感知。③「两个时钟」的心算：max_episode_length = ceil(episode_length_s / step_dt)（:109-111）= 5.0 / 0.02 = <strong>250 个控制步</strong>；episode_length_buf 每 step() +1，物理 dt=0.01、decimation=2，所以物理上确实推进了 250×2=500 步 × 0.01s = 5 秒，自洽。④ 若有 recorder 术语激活，step() 会在 reset 之前额外补一次 observation compute（:242-245）——录制数据用的帧必须与记录时刻一致，这是给数据生成专用的旁路。</div>
+    <div class="annotation"><b>几个容易忽略的工程细节：</b>①<code class="inline">ObservationManager.compute(update_history=True)</code> 在 step 末尾才跑——所以策略看到的观测是「本次动作执行完之后」的世界，与 gym 的「step 返回 next_obs」语义一致（源码注释：done after reset to get the correct observations for reset envs）。② <code class="inline">enable_corruption=True</code>（contrib/lift/lift_env_cfg.py:110）给 joint_pos 等项加传感器噪声——默认就开，刻意让策略别依赖完美感知。③「两个时钟」的心算：max_episode_length = ceil(episode_length_s / step_dt)（manager_based_rl_env.py:102-104）= 5.0 / 0.02 = <strong>250 个控制步</strong>；episode_length_buf 每 step() +1，物理 dt=0.01、decimation=2，所以物理上确实推进了 250×2=500 步 × 0.01s = 5 秒，自洽。core 新版节拍不同：decimation=4、sim.dt=1/120 → 控制 30Hz、episode_length_s=12.0 → 360 个控制步（1440 物理步）。④ 若有 recorder 术语激活，step() 会在 reset 之前额外补一次 observation compute（:257-260）——录制数据用的帧必须与记录时刻一致，这是给数据生成专用的旁路。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.5</span>Manager vs 直接式环境：何时自己写 step()</h2>
-    <p>Isaac Lab 还有 <code class="inline">direct/</code> 风格任务（DirectRLEnv）：自己写 step/reset、自己算 reward。两者取舍：</p>
+    <p>Isaac Lab 还有 DirectRLEnv 风格任务（direct_rl_env.py）：自己写 step/reset、自己算 reward。两者取舍：</p>
     <table class="tbl">
       <tr><th>维度</th><th>ManagerBasedRLEnv</th><th>DirectRLEnv</th></tr>
       <tr><td>上手速度</td><td>改配置即可换任务/机器人/奖励</td><td>全部手写</td></tr>
@@ -263,7 +266,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 09 Manager-Based 环境内核 · 基于 isaac-sim/IsaacLab（v3.0.0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 09 Manager-Based 环境内核 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ 4a961d71）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

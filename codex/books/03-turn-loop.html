@@ -33,10 +33,10 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-1351-ga9519cbcdd</span>
+    <span class="version-badge">rusty-v8-v150.4.0-1950-gda20788df9</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 Turn 循环</div>
     <h1>★ Turn 循环：一个 prompt 在 Codex 里到底怎么跑</h1>
-    <div class="subtitle">这是整个代码库的心脏。一个 turn 不是一次 LLM 调用，而是一个「采样 → 解析工具 → 执行工具 → 把结果塞回历史 → 再采样」的循环，直到模型不再请求工具为止。本章从 CodexThread 一路追到 run_turn 的 loop {}，看清流式、重试、中断、steering 全怎么咬合。</div>
+    <div class="subtitle">这是整个代码库最核心的执行路径。一个 turn 不是一次 LLM 调用，而是一个「采样 → 解析工具 → 执行工具 → 把结果塞回历史 → 再采样」的循环，直到模型不再请求工具为止。本章从 CodexThread 一路追到 run_turn 的 loop {}，看清流式、重试、中断、steering 分别发生在哪个环节。</div>
   </div>
 
   <div class="epigraph">
@@ -66,20 +66,20 @@
         <line class="edge" x1="470" y1="64" x2="470" y2="80" marker-end="url(#arrow)"></line>
 
         <rect class="node core" x="30" y="82" width="880" height="44" rx="8"></rect>
-        <text class="lbl" x="470" y="102" text-anchor="middle">② CodexThread.submit_turn_input → 提交队列派发 → RegularTask::run</text>
+        <text class="lbl" x="470" y="102" text-anchor="middle">② CodexThread.start_or_steer_turn → 提交队列派发 → RegularTask::run</text>
         <text class="lbl sm" x="470" y="118" text-anchor="middle">codex_thread.rs → tasks/regular.rs</text>
 
         <line class="edge" x1="470" y1="126" x2="470" y2="142" marker-end="url(#arrow)"></line>
 
         <rect class="node core" x="30" y="144" width="880" height="44" rx="8"></rect>
         <text class="lbl" x="470" y="164" text-anchor="middle">③ run_turn：前置压缩 → 捕获 step context → 记录输入 → 进入 loop {}</text>
-        <text class="lbl sm" x="470" y="180" text-anchor="middle">session/turn.rs:156 —— ★ Agent 心脏（工具 → 再采样循环）</text>
+        <text class="lbl sm" x="470" y="180" text-anchor="middle">session/turn.rs:423 —— ★ Agent 主循环（工具 → 再采样）</text>
 
         <line class="edge" x1="470" y1="188" x2="470" y2="204" marker-end="url(#arrow)"></line>
 
         <rect class="node" x="30" y="206" width="880" height="44" rx="8"></rect>
         <text class="lbl" x="470" y="226" text-anchor="middle">④ run_sampling_request：流式采样 + 工具执行（内部 loop 仅重试流式错误）</text>
-        <text class="lbl sm" x="470" y="242" text-anchor="middle">session/turn.rs:1362 —— build_prompt → 调 LLM → 执行工具 → 返回 needs_follow_up</text>
+        <text class="lbl sm" x="470" y="242" text-anchor="middle">session/turn.rs:1538 —— build_prompt → 调 LLM → 执行工具 → 返回 needs_follow_up</text>
 
         <line class="edge" x1="470" y1="250" x2="470" y2="266" marker-end="url(#arrow)"></line>
 
@@ -91,18 +91,19 @@
         <rect class="node warn" x="30" y="320" width="880" height="36" rx="8"></rect>
         <text class="lbl sm" x="470" y="343" text-anchor="middle">若无工具调用（!needs_follow_up）→ 循环结束 → TurnComplete；若有 → 回到 ③</text>
       </svg>
-      <div class="fig-cap">图 3.1：Turn 调用链。run_turn 的 loop {} 是 Agent 的真正心脏。</div>
+      <div class="fig-cap">图 3.1：Turn 调用链。Agent 循环就落在 run_turn 的 loop {} 里。</div>
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.2</span>run_turn：turn 的前置准备</h2>
     <p><code class="inline">run_turn</code> 是 turn 的入口，它负责「采样前」的所有准备：前置压缩、捕获 step context、记录用户输入、构建技能/插件注入。真正采样在它调用的 <code class="inline">run_sampling_request</code> 里。</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:153 — run_turn 签名与前置压缩</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:163 — run_turn 签名与前置压缩（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) async fn</span> run_turn(
     sess: Arc&lt;Session&gt;,
     turn_context: Arc&lt;TurnContext&gt;,
-    input: Vec&lt;TurnInput&gt;,
+    mut input: Vec&lt;TurnInput&gt;,
+    mcp_startup_requirements: &amp;mut McpStartupRequirements,
     prewarmed_client_session: Option&lt;ModelClientSession&gt;,
     cancellation_token: CancellationToken,
 ) -&gt; CodexResult&lt;Option&lt;String&gt;&gt; {
@@ -130,36 +131,56 @@
 
   <section class="block">
     <h2><span class="num">3.3</span>两个 loop：run_turn 的「再采样」与 run_sampling_request 的「重试」</h2>
-    <p>要厘清「Agent 循环」，必须区分两个 <code class="inline">loop {}</code>：<strong>run_turn 的 loop 驱动「工具 → 再采样」</strong>——每完成一轮采样，若模型请求了工具（<code class="inline">needs_follow_up</code>），执行完工具、把结果回填历史后再进下一轮采样；而 <strong>run_sampling_request 内部的 loop 只负责流式重试</strong>——它遇到可重试的流式错误才继续，一旦采样成功就立即返回。<code class="inline">run_turn</code> 的循环才是 Agent 的心脏：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:304 — run_turn 的采样循环（节选）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// ★ Agent 心脏：工具 → 再采样</span>
-    <span class="cmt">// 1. 取会话历史（首次用传入的 input，之后从 session 克隆）</span>
+    <p>要厘清「Agent 循环」，必须区分两个 <code class="inline">loop {}</code>：<strong>run_turn 的 loop 驱动「工具 → 再采样」</strong>——每完成一轮采样，若模型请求了工具（<code class="inline">needs_follow_up</code>），执行完工具、把结果回填历史后再进下一轮采样；而 <strong>run_sampling_request 内部的 loop 只负责流式重试</strong>——它遇到可重试的流式错误才继续，一旦采样成功就立即返回。<code class="inline">run_turn</code> 的循环才是通常所说的「Agent 循环」：</p>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:423 — run_turn 的采样循环（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// ★ Agent 循环：工具 → 再采样</span>
+    <span class="cmt">// 1. 取走队列里 pending 的 steering 输入（首轮通常为空）</span>
+    <span class="kw">let</span> pending_input = <span class="kw">if</span> can_drain_pending_input {
+        sess.input_queue.get_pending_input(&amp;sess.active_turn).await.0
+    } <span class="kw">else</span> {
+        Vec::new()
+    };
+
+    <span class="cmt">// 2. 每个 step 捕获一次 step context（首轮复用 run_turn 前面捕获的那份）</span>
+    <span class="kw">let</span> step_context = match next_step_context.take() { ... };
+
+    <span class="cmt">// 3. 克隆会话历史，交给 run_sampling_request（内部构建 prompt、调 LLM、执行工具）</span>
+    <span class="kw">let</span> sampling_request_input = sess.clone_history().await
+        .for_prompt(&amp;step_context.settings.model_info.input_modalities);
+    <span class="kw">let</span> sampling_request_result = run_sampling_request(
+        ..., sampling_request_input, cancellation_token.child_token(),
+    ).await;
+
+    <span class="kw">match</span> sampling_request_result {
+        Ok((output, sampling_request_input)) =&gt; {   <span class="cmt">// 第二项是本次实际送入的 history，后供 after-agent hook 使用</span>
+            <span class="kw">let</span> SamplingRequestResult { needs_follow_up: model_needs_follow_up, .. } = output;
+            <span class="kw">let</span> needs_follow_up = model_needs_follow_up || has_pending_input;
+            <span class="cmt">// needs_follow_up：模型本轮是否请求了工具（工具已在 run_sampling_request 内执行完）</span>
+
+            <span class="kw">if</span> !needs_follow_up {
+                <span class="cmt">// 模型给出了不含工具调用的最终回答 → 结束 turn</span>
+                <span class="kw">break</span>;
+            }
+            <span class="cmt">// 采样成功后若 token 触顶，先 mid-turn 压缩再继续；</span>
+            <span class="cmt">// 有工具调用 / 待处理输入：结果已回填历史，回到 loop 顶部再采样一轮</span>
+            <span class="kw">continue</span>;
+        }
+        Err(err) =&gt; { ... <span class="cmt">// TurnAborted / 超窗 / 通用错误分支</span> }
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> <strong>每轮 <code class="inline">loop</code> 重新克隆历史</strong>——工具执行结果已经被追加进 session 历史，下一轮采样自然能看到（构建 prompt 发生在 <code class="inline">run_sampling_request</code> 内部，不是这里）。<strong>循环退出条件</strong>是 <code class="inline">!needs_follow_up</code>，其中 <code class="inline">needs_follow_up = model_needs_follow_up || has_pending_input</code>——除工具调用外，队列里还有待处理输入也会驱动循环继续。<strong>工具执行</strong>发生在 <code class="inline">run_sampling_request</code> 内部（它调 <code class="inline">try_run_sampling_request</code>，在那里流式产出 ResponseItem、执行工具、累加 <code class="inline">needs_follow_up</code>），所以一轮 <code class="inline">run_turn</code> loop = 一次「采样 + 工具执行」，工具结果回填后回到 loop 顶部再采样。</div>
+    <p>那 <code class="inline">run_sampling_request</code> 自己的 <code class="inline">loop {}</code> 干什么？它只做<strong>流式重试</strong>：</p>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1566 — run_sampling_request 的重试循环（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// 仅流式重试，非工具→再采样</span>
+    <span class="cmt">// 取历史（首轮用传入的 input，之后从 session 克隆）并构建 prompt</span>
     <span class="kw">let</span> prompt_input = <span class="kw">if let</span> Some(input) = initial_input.take() {
         input
     } <span class="kw">else</span> {
-        sess.clone_history().await.for_prompt(&amp;modalities)
+        sess.clone_history().await
+            .for_prompt(&amp;step_context.settings.model_info.input_modalities)
     };
-
-    <span class="cmt">// 2. 构建 prompt（历史 + base instructions + 上下文片段）</span>
     <span class="kw">let</span> prompt = build_prompt(prompt_input, step_context.as_ref(), base_instructions.clone());
 
-    <span class="cmt">// 3. 调用 run_sampling_request（内部流式调 LLM、执行工具、处理结果）</span>
-    <span class="kw">let</span> sampling_request_output = run_sampling_request(..., &amp;prompt, ...).await?;
-
-    <span class="kw">let</span> SamplingRequestResult { needs_follow_up, last_agent_message } = sampling_request_output;
-    <span class="cmt">// needs_follow_up：模型本轮是否请求了工具（工具已在 run_sampling_request 内执行完）</span>
-
-    <span class="kw">if</span> !needs_follow_up {
-        <span class="cmt">// 模型给出了不含工具调用的最终回答 → 结束 turn</span>
-        <span class="kw">break</span>;
-    }
-    <span class="cmt">// 4. 有工具调用 / 待处理输入：结果已回填历史，回到 loop 顶部再采样一轮</span>
-    <span class="kw">continue</span>;
-}</pre>
-    <div class="annotation"><b>读懂这段：</b> 这就是「Agent 循环」的全部秘密。<strong>每轮 <code class="inline">loop</code> 重新克隆历史并构建 prompt</strong>——工具执行结果已经被追加进 session 历史，下一轮采样自然能看到。<strong>循环退出条件</strong>是 <code class="inline">!needs_follow_up</code>（模型给出了不含工具调用的最终回答）。<strong>工具执行</strong>发生在 <code class="inline">run_sampling_request</code> 内部（它调 <code class="inline">try_run_sampling_request</code>，在那里流式产出 ResponseItem、执行工具、累加 <code class="inline">needs_follow_up</code>），所以一轮 <code class="inline">run_turn</code> loop = 一次「采样 + 工具执行」，工具结果回填后回到 loop 顶部再采样。</div>
-    <p>那 <code class="inline">run_sampling_request</code> 自己的 <code class="inline">loop {}</code> 干什么？它只做<strong>流式重试</strong>：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1390 — run_sampling_request 的重试循环（节选）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// 仅流式重试，非工具→再采样</span>
     <span class="kw">match</span> try_run_sampling_request(..., &amp;prompt, ...).await {
         Ok(output) =&gt; <span class="kw">return</span> Ok((output, ...)),   <span class="cmt">// 采样成功 → 立即返回（工具也在这内部执行完）</span>
         Err(err) =&gt; <span class="kw">match</span> err.details() {
@@ -176,7 +197,7 @@
     <div class="annotation"><b>读懂这段：</b> <code class="inline">run_sampling_request</code> 的 <code class="inline">loop</code> 只在<strong>可重试的流式错误</strong>时继续——采样一成功就 <code class="inline">return Ok</code>，把控制权交回 <code class="inline">run_turn</code>。<strong>重试逻辑</strong>内建在这个循环里：流式出错时，按 <code class="inline">is_retryable()</code> 决定是重试（继续 loop）还是上报（返回 Err）。别把它和 <code class="inline">run_turn</code> 的「工具→再采样」循环搞混。</div>
     <div class="callout warn">
       <b class="tag">关键</b>
-      注意 <code class="inline">ContextWindowExceeded</code> 会直接返回错误而非重试——它先 <code class="inline">set_total_tokens_full</code> 标记窗口已满，再上抛。上抛后该 turn 走通用错误分支：发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续），<strong>并不在同一个 turn 内自动压缩重试</strong>。真正的压缩防线上移到了采样之前——<code class="inline">run_pre_sampling_compact</code>（见第 6 章）在构建 prompt 前就检查预算；而采样成功后若 token 仍触顶（<code class="inline">should_roll_over</code>），会在 mid-turn 触发一次 <code class="inline">run_auto_compact</code> 为下一轮腾空间。即「压缩」主要跑在成功路径上，而非作为超窗错误的兜底重试。
+      注意 <code class="inline">ContextWindowExceeded</code> 会直接返回错误而非重试——它先 <code class="inline">set_total_tokens_full</code> 标记窗口已满，再上抛。上抛后该 turn 走通用错误分支：发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续），<strong>并不在同一个 turn 内自动压缩重试</strong>。真正的压缩防线上移到了采样之前——<code class="inline">run_pre_sampling_compact</code>（见第 6 章）在构建 prompt 前就检查预算；而采样成功后若 token 仍触顶（<code class="inline">should_roll_over</code>），会在 mid-turn 触发一次 <code class="inline">run_auto_compact</code> 为下一轮腾空间。即「压缩」主要跑在成功路径上，而非作为超窗错误的兜底重试。（例外：Guardian 审查预算耗尽后触发的超窗，会先压缩一次再继续采样。）
     </div>
   </section>
 
@@ -198,11 +219,11 @@
 
         <rect class="node" x="30" y="74" width="270" height="50" rx="6"></rect>
         <text class="lbl sm" x="165" y="95" text-anchor="middle">ResponseItem::Reasoning</text>
-        <text class="lbl sm" x="165" y="112" text-anchor="middle">→ EventMsg::AgentReasoning</text>
+        <text class="lbl sm" x="165" y="112" text-anchor="middle">→ ReasoningContentDelta / AgentReasoning</text>
 
         <rect class="node" x="315" y="74" width="270" height="50" rx="6"></rect>
         <text class="lbl sm" x="450" y="95" text-anchor="middle">ResponseItem::Message(assistant)</text>
-        <text class="lbl sm" x="450" y="112" text-anchor="middle">→ EventMsg::AgentMessage（增量 delta）</text>
+        <text class="lbl sm" x="450" y="112" text-anchor="middle">→ AgentMessageContentDelta（增量 delta）</text>
 
         <rect class="node warn" x="600" y="74" width="270" height="50" rx="6"></rect>
         <text class="lbl sm" x="735" y="95" text-anchor="middle">ResponseItem::FunctionCall</text>
@@ -218,13 +239,13 @@
       </svg>
       <div class="fig-cap">图 3.4：流式产出。每个 ResponseItem 边产边发 Event，工具结果回填后触发下一轮。</div>
     </div>
-    <p><code class="inline">client.rs</code> 把 provider 的 SSE 流解析成 <code class="inline">ResponseItem</code> 流，并通过 <code class="inline">sess.send_event</code> 实时广播。TUI 收到 <code class="inline">AgentMessage</code> 的增量 delta 就立刻渲染——这就是你看到 Codex「逐字打字」的原因。</p>
+    <p><code class="inline">codex-api</code>（<code class="inline">codex-api/src/sse/responses.rs</code>）把 provider 的 SSE 流解析成 ResponseEvent 流，<code class="inline">client.rs</code> 消费并转发它，<code class="inline">try_run_sampling_request</code> 消费它并通过 <code class="inline">sess.send_event</code> 实时广播。TUI 收到 <code class="inline">AgentMessageContentDelta</code> 的增量 delta 就立刻渲染——这就是你看到 Codex「逐字打字」的原因。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">3.5</span>Steering：Agent 跑着时怎么插话</h2>
     <p>Codex 允许在 turn 运行时插入新输入，这叫 <strong>steering（转向）</strong>。它由 <code class="inline">TurnInputMode</code> 控制：</p>
-    <div class="code-title">codex-rs/protocol/src/turn_input.rs:129 — TurnInputMode</div>
+    <div class="code-title">codex-rs/protocol/src/turn_input.rs:133 — TurnInputMode</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// Core 应该如何路由提交的 turn 输入。</span>
 <span class="kw">pub enum</span> TurnInputMode {
     <span class="cmt">/// 空闲时启动新 turn；否则转向当前活动 turn。</span>
@@ -234,7 +255,7 @@
     <span class="cmt">/// 仅当指定的 turn 仍活动时才转向。</span>
     Steer { expected_turn_id: String },
 }</pre>
-    <div class="code-title">codex-rs/protocol/src/turn_input.rs:161 — 提交结果</div>
+    <div class="code-title">codex-rs/protocol/src/turn_input.rs:184 — 提交结果（节选，start_or_steer 路径）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> TurnInputSubmission {
     <span class="cmt">/// Core 启动了一个 turn</span>
     Started { turn_id: String },
@@ -243,11 +264,11 @@
     <span class="cmt">/// Core 拒绝了输入</span>
     NotSubmitted { reason: NotSubmittedReason },
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 当你在一个跑着的 turn 里再发一条消息，Codex 不是开新 turn，而是 <strong>steer</strong> 当前 turn——新输入被塞进 <code class="inline">input_queue</code>，在当前工具执行完后的合适时机送达模型。<code class="inline">NotSubmittedReason</code> 列出了拒绝原因（<code class="inline">NoActiveTurn</code>、<code class="inline">ExpectedTurnMismatch</code>、<code class="inline">ActiveTurnNotSteerable</code> 等），让前端能精确反馈。注意 <strong>并非所有 turn 都可 steer</strong>——某些 turn kind（<code class="inline">NonSteerableTurnKind</code>）拒绝转向。</div>
-    <p>steering 输入通过 <code class="inline">input_queue.rs</code> 的 <code class="inline">VecDeque</code> 排队，由 <code class="inline">MailboxDeliveryPhase</code> 控制送达时机（通常在当前工具完成后、下一次采样前）：</p>
+    <div class="annotation"><b>读懂这段：</b> 当你在一个跑着的 turn 里再发一条消息，Codex 不是开新 turn，而是 <strong>steer</strong> 当前 turn——新输入被塞进 <code class="inline">input_queue</code>，在当前工具执行完后的合适时机送达模型。<code class="inline">NotSubmittedReason</code> 列出了拒绝原因（<code class="inline">NoActiveTurn</code>、<code class="inline">ExpectedTurnMismatch</code>、<code class="inline">ActiveTurnNotSteerable</code>、<code class="inline">ServerDraining</code>、<code class="inline">PendingTriggerTurn</code> 等），让前端能精确反馈。注意 <strong>并非所有 turn 都可 steer</strong>——某些 turn kind（<code class="inline">NonSteerableTurnKind</code>，如 Review、Compact）拒绝转向。</div>
+    <p>steering 输入排在 <code class="inline">input_queue.rs</code> 的 <code class="inline">TurnInputQueue</code>（内部是 <code class="inline">Vec&lt;TurnInput&gt;</code>；同文件的 <code class="inline">VecDeque</code> 存的是 Agent 间通信邮件，不是 steering），由 <code class="inline">MailboxDeliveryPhase</code>（<code class="inline">core/src/state/turn.rs</code>）控制送达时机（通常在当前工具完成后、下一次采样前）：</p>
     <div class="code-title">codex-rs/core/src/session/input_queue.rs:22 — 队列里的输入类型</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> TurnInput {
-    UserInput { content: Vec&lt;UserInput&gt;, client_id: Option&lt;String&gt; },
+    UserInput { content: Vec&lt;UserInput&gt;, client_id: Option&lt;String&gt;, acceptance_order: Option&lt;u64&gt; },
     FunctionCallOutput(ResponseItem),               <span class="cmt">// 工具输出直接注入</span>
     ResponseItem(ResponseItemEnvelope),             <span class="cmt">// 注入一个会话条目（带注入 API 元数据）</span>
     InterAgentCommunication(InterAgentCommunication), <span class="cmt">// 多 Agent 间消息</span>
@@ -256,8 +277,8 @@
 
   <section class="block">
     <h2><span class="num">3.6</span>中断与恢复</h2>
-    <p>用户可以发 <code class="inline">Op::Interrupt</code> 中断当前 turn。中断不是杀死进程，而是触发 <code class="inline">CancellationToken</code>，让循环在合适点优雅退出：</p>
-    <div class="code-title">codex-rs/protocol/src/protocol.rs:1749 — AgentStatus 状态</div>
+    <p>用户可以发 <code class="inline">Op::Interrupt</code> 中断当前 turn。中断不是杀死进程，而是触发 <code class="inline">CancellationToken</code>，让循环在合适的安全点退出：</p>
+    <div class="code-title">codex-rs/protocol/src/protocol.rs:1828 — AgentStatus 状态</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> AgentStatus {
     PendingInit,                 <span class="cmt">// 等待初始化</span>
     Running,                     <span class="cmt">// 正在跑</span>
@@ -286,14 +307,14 @@
         _ =&gt; None,
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 状态完全由事件驱动推导——<code class="inline">TurnStarted</code> → Running，<code class="inline">TurnComplete</code> → Completed（无错误时）/ Errored（携带终端错误时，<code class="inline">ev.error</code>），<code class="inline">TurnAborted</code> 按原因分到 Interrupted 或 Errored。<strong>中断后的 turn 是可恢复的</strong>：前端可发 <code class="inline">Op::RecoverTurn</code> 让采样在原 <code class="inline">turn_id</code> 下继续。这是「崩溃可恢复」的基础（配合第 4 章的 rollout 持久化）。</div>
+    <div class="annotation"><b>读懂这段：</b> 状态完全由事件驱动推导——<code class="inline">TurnStarted</code> → Running，<code class="inline">TurnComplete</code> → Completed（无错误时）/ Errored（携带终端错误时，<code class="inline">ev.error</code>），<code class="inline">TurnAborted</code> 按原因分到 Interrupted 或 Errored。<strong>中断后的 turn 是可恢复的</strong>：线程空闲时前端可发 <code class="inline">Op::RecoverTurn</code>（走 <code class="inline">recover_turn_if_idle</code>），复用已记录的 <code class="inline">turn_id</code> 重新采样，不产生新的用户输入。这是「崩溃可恢复」的基础（配合第 4 章的 rollout 持久化）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.7</span>小结：turn 循环的完整心智模型</h2>
     <div class="callout warn">
       <b class="tag">一张图记牢</b>
-      <code class="inline">run_turn</code>（准备：压缩 / step context / 记录输入）→ <code class="inline">run_turn</code> 的 <code class="inline">loop {}</code>（取历史 → build_prompt → 调 <code class="inline">run_sampling_request</code>：流式调 LLM → 产 ResponseItem → 发 Event → 若有 FunctionCall 则执行工具、结果回填历史 → 返回 <code class="inline">needs_follow_up</code>）→ 有工具调用则回到 loop 顶部再采样，否则 <code class="inline">TurnComplete</code>。
+      <code class="inline">run_turn</code>（准备：压缩 / step context / 记录输入）→ <code class="inline">run_turn</code> 的 <code class="inline">loop {}</code>（取 pending 输入 → 捕获 step context → 克隆历史 → 调 <code class="inline">run_sampling_request</code>：在其重试循环里 build_prompt → 流式调 LLM → 产 ResponseItem → 发 Event → 若有 FunctionCall 则执行工具、结果回填历史 → 返回 <code class="inline">needs_follow_up</code>）→ 有工具调用或有待处理输入则回到 loop 顶部再采样，否则 <code class="inline">TurnComplete</code>。
     </div>
     <div class="callout tip">
       <b class="tag">对自研的启示</b>
@@ -308,7 +329,7 @@
 </div>
 
 <footer>
-  Codex CLI · 03 Turn 循环 · 版本 rusty-v8-v150.4.0-1351-ga9519cbcdd · 所有引用代码路径以仓库最新为准
+  Codex CLI · 03 Turn 循环 · 版本 rusty-v8-v150.4.0-1950-gda20788df9 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

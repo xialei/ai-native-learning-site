@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 采样 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 采样</div>
+    <h1>采样：logits 到 token 的最后一公里</h1>
+    <div class="subtitle">llama.cpp 把采样做成「责任链」：每个 sampler 看一遍候选数组，或截断、或改概率、或直接选中。链的组装顺序不是随意的——便宜的过滤器放在前面，浪费的工作更少。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>责任链：一个数组走到底</h2>
+    <p>llama.cpp 采样的核心数据结构只有一个：llama_token_data_array（id、logit、p 三元组数组）。每个 sampler 实现 apply(cur_p)，按序施加。链的组装在 common/sampling.cpp：</p>
+    <div class="code-title">common/sampling.cpp:340-400 — 链的组装（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (params.mirostat == <span class="nu">0</span>) {
+
+    <span class="kw">bool</span> use_adaptive_p = <span class="kw">false</span>;
+
+    <span class="cmt">// params.samplers 是用户声明要启用的 sampler 列表，逐个 push</span>
+    <span class="kw">for</span> (<span class="kw">const auto</span> &amp; cnstr : params.samplers) {
+        <span class="kw">switch</span> (cnstr) {
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_DRY:
+                ...  <span class="cmt">// llama_sampler_init_dry(...)：重复检测</span>
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_TOP_K:
+                samplers.push_back(<span class="fn">llama_sampler_init_top_k</span>(params.top_k));
+                <span class="kw">break</span>;
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_TOP_P:
+                samplers.push_back(<span class="fn">llama_sampler_init_top_p</span>(params.top_p, params.min_keep));
+                <span class="kw">break</span>;
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                samplers.push_back(<span class="fn">llama_sampler_init_top_n_sigma</span>(params.top_n_sigma));
+                <span class="kw">break</span>;
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_MIN_P:
+                samplers.push_back(<span class="fn">llama_sampler_init_min_p</span>(params.min_p, params.min_keep));
+                <span class="kw">break</span>;
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_XTC:
+                ...  <span class="cmt">// 概率性剪枝</span>
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_TYPICAL_P:
+                ...
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_TEMPERATURE:
+                samplers.push_back(<span class="fn">llama_sampler_init_temp_ext</span>(params.temp, params.dynatemp_range, params.dynatemp_exponent));
+                <span class="kw">break</span>;
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_INFILL:
+                ...
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_PENALTIES:
+                ...  <span class="cmt">// repeat/frequency/presence</span>
+            <span class="kw">case</span> COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                <span class="cmt">// adaptive-p 与 dist/mirostat 一样「直接选出 token」，</span>
+                <span class="cmt">// 所以默认仍在链尾放 dist；用户显式包含 adaptive-p</span>
+                <span class="cmt">// 时才以它替代链尾</span>
+                use_adaptive_p = <span class="kw">true</span>;
+                <span class="kw">break</span>;
+            ...
+        }
+    }
+    <span class="kw">if</span> (use_adaptive_p) {
+        samplers.push_back(llama_sampler_init_adaptive_p(...));
+    } <span class="kw">else</span> {
+        <span class="cmt">// 默认：从分布中抽一个 token</span>
+        samplers.push_back(<span class="fn">llama_sampler_init_dist</span>(params.seed));
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个容易忽略的点。① 链头还有 logit_bias：合并用户偏置与模型 suppress tokens（置 -INFINITY），在 mirostat==0 分支之前 push；② dist 是链尾默认值——过滤链只<strong>改数组</strong>不选 token，总得有人掷骰子；③ mirostat 分支直接替换整条链：mirostat v1/v2 各自与 temp 组成两件套，不走过滤链。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>运行时：apply 顺序即加工顺序</h2>
+    <p>链的运行时入口是 common_sampler_sample（common/sampling.cpp:594-676）：</p>
+    <div class="code-title">common/sampling.cpp:609-660 — 采样主流程（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 1) 后端采样器可能已经在 GPU 图里选好了 token —— 直接返回</span>
+id = <span class="fn">llama_get_sampled_token_ith</span>(ctx, idx);
+<span class="kw">if</span> (id != LLAMA_TOKEN_NULL) {
+    GGML_ASSERT(!gsmpl-&gt;grmr &amp;&amp;
+        <span class="st">"using grammar in combination with backend sampling is not supported"</span>);
+    ...
+    <span class="kw">return</span> id;
+}
+
+<span class="cmt">// 2) reasoning budget 先行</span>
+llama_sampler_apply(rbudget, &amp;cur_p);
+<span class="cmt">// 3) grammar_first 时 grammar 先于链</span>
+<span class="kw">if</span> (grammar_first &amp;&amp; <span class="fn">grammar_should_apply</span>(gsmpl)) {
+    llama_sampler_apply(grmr, &amp;cur_p);
+}
+<span class="cmt">// 4) 主链</span>
+llama_sampler_apply(chain, &amp;cur_p);
+id = cur_p.data[cur_p.selected].id;
+
+<span class="cmt">// 5) grammar 后置校验：选出的 token 不合法 → 重采样</span>
+{
+    llama_token_data       single_token_data       = { id, <span class="nu">1.0f</span>, <span class="nu">0.0f</span> };
+    llama_token_data_array single_token_data_array = { &amp;single_token_data, <span class="nu">1</span>, -<span class="nu">1</span>, <span class="kw">false</span> };
+    llama_sampler_apply(grmr, &amp;single_token_data_array);
+
+    <span class="kw">const</span> <span class="kw">bool</span> is_valid = single_token_data_array.data[<span class="nu">0</span>].logit != -INFINITY;
+    <span class="kw">if</span> (is_valid) { <span class="kw">return</span> id; }
+}
+<span class="cmt">// 6) 不合法 → 重置 logits，grammar 先行，重新走一遍链</span></pre>
+    <div class="annotation"><b>读懂这段：</b> ① <strong>backend sampler</strong>：新版把部分采样搬进 GPU 计算图（llama-context.cpp:253 注释「Initialize backend samplers here so they are part of the sampling graph」）——链在 CPU 走完之前 GPU 可能已出 token，grammar 相关逻辑被完全跳过；② grammar 的默认模式是「先采样后校验」：链选出 token，grammar 只说行/不行，不行就重置 logits 重新走链；③ reasoning budget（控制思考长度）永远最先施加——它管「思考块抑制」，是逻辑层不是分布层。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>三个新 sampler 的算法</h2>
+    <p>近年加入的几个 sampler 各有巧思，值得单独看一眼。</p>
+    <p><strong>top_n_sigma</strong>（src/llama-sampler.cpp:3237）：按统计截断——</p>
+    <div class="code-title">src/llama-sampler.cpp — top_n_sigma（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (ctx-&gt;n &lt;= <span class="nu">0.0f</span> || cur_p-&gt;size &lt;= <span class="nu">1</span>) { <span class="kw">return</span>; }
+
+<span class="cmt">// 找 max logit 与均值（跳过 -INFINITY）</span>
+<span class="kw">float</span> max = cur_p-&gt;data[<span class="nu">0</span>].logit;
+...
+<span class="kw">float</span> mean = valid_count &gt; <span class="nu">0</span> ? logits_sum/valid_count : <span class="nu">0</span>;
+<span class="cmt">// 算标准差，只保留 [max - n*sigma, +inf) 的候选</span></pre>
+    <p><strong>mirostat v2</strong>（src/llama-sampler.cpp:2573）：自适应截断，目标「把每次选择的意外度钉在 tau」：</p>
+    <div class="code-title">src/llama-sampler.cpp — mirostat v2（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="fn">llama_sampler_softmax_impl</span>(cur_p, <span class="kw">true</span>);
+
+<span class="cmt">// 意外度 = -log2(p)：大于 mu 的候选全部截掉</span>
+cur_p-&gt;size = std::<span class="fn">distance</span>(cur_p-&gt;data,
+    std::<span class="fn">find_if</span>(cur_p-&gt;data, cur_p-&gt;data + cur_p-&gt;size,
+        [&amp;](<span class="kw">const</span> llama_token_data &amp; candidate) {
+            <span class="kw">return</span> -log2f(candidate.p) &gt; ctx-&gt;mu;
+        }));
+
+<span class="kw">if</span> (cur_p-&gt;size == <span class="nu">0</span>) { cur_p-&gt;size = <span class="nu">1</span>; }   <span class="cmt">// 至少留一个</span>
+...
+<span class="kw">const</span> <span class="kw">int</span> idx = <span class="fn">llama_sample_dist</span>(cur_p, ctx-&gt;rng);
+cur_p-&gt;selected = idx;
+
+<span class="cmt">// 观察意外度与目标 tau 求差，按学习率 eta 更新 mu</span>
+<span class="kw">float</span> observed_surprise = -log2f(cur_p-&gt;data[idx].p);
+<span class="kw">float</span> e = observed_surprise - ctx-&gt;tau;
+ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
+    <div class="annotation"><b>读懂这段：</b> mirostat v2 就是一个一维控制器：mu 是「当前容忍的意外度上限」，实际意外度高于目标就调低 mu（变保守）、低于就调高（变奔放）。对比固定 top_p 的问题：不同位置的概率分布尖锐程度天差地别，固定比例截断时而过严时而过松——mirostat 用反馈回路替代静态阈值。</div>
+    <p><strong>DRY</strong>（Don't Repeat Yourself，src/llama-sampler.cpp:3317 起）：针对<strong>逐字重复</strong>——最近输出里出现过的序列若正被延续（重复长度超过 allowed_length），按指数衰减惩罚其下一个 token。与 penalties 的区别：penalties 惩罚 token 出现次数（不管上下文），DRY 惩罚「正在形成重复序列」——所以它需要 sequence breakers（换行、章节号等「合理重复」的分隔符）。</p>
+    <p><strong>adaptive-p</strong>（src/llama-sampler.cpp:3727 起）：比 mirostat 更新的思路——按目标 p 值直接挑「累计概率刚好达到目标」的候选集，无需训练地把输出分布的熵稳定在目标附近。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>对照：FreeToken 的批量采样</h2>
+    <p>llama.cpp 的采样是 CPU 上对整个词表的标量循环；FreeToken 把它做成一个 GPU kernel（python/freetoken/engine/sample.py:24-50）：</p>
+    <div class="code-title">python/freetoken/engine/sample.py:24-50 — sample_impl（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">sample_impl</span>(logits, temperatures, top_k, top_p) -&gt; torch.Tensor:
+    <span class="cmt"># flashinfer 装了用 flashinfer，否则自研 triton kernel</span>
+    <span class="kw">if</span> is_flashinfer_installed():
+        <span class="kw">import</span> flashinfer.sampling <span class="kw">as</span> sampling
+    <span class="kw">else</span>:
+        <span class="kw">import</span> freetoken.kernel.triton.sampling <span class="kw">as</span> sampling
+
+    probs = sampling.<span class="fn">softmax</span>(logits, temperatures, enable_pdl=is_sm90_supported())
+    <span class="kw">if</span> top_k <span class="kw">is</span> <span class="kw">None</span> <span class="kw">and</span> top_p <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> sampling.<span class="fn">sampling_from_probs</span>(probs)
+    <span class="kw">if</span> top_p <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> sampling.<span class="fn">top_k_sampling_from_probs</span>(probs, top_k)
+    <span class="kw">if</span> top_k <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span> sampling.<span class="fn">top_p_sampling_from_probs</span>(probs, top_p)
+    <span class="kw">return</span> sampling.<span class="fn">top_k_top_p_sampling_from_probs</span>(probs, top_k, top_p)</pre>
+    <p>上层接口把「每个请求一份采样配置」压成批量张量：</p>
+    <div class="code-title">python/freetoken/engine/sample.py:58-73 — Sampler.prepare（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">prepare</span>(self, batch: <span class="cl">Batch</span>) -&gt; BatchSamplingArgs:
+    params = [r.sampling_params <span class="kw">for</span> r <span class="kw">in</span> batch.reqs]
+    <span class="kw">if</span> all(p.<span class="fn">is_greedy</span> <span class="kw">for</span> p <span class="kw">in</span> params):
+        <span class="kw">return</span> <span class="cl">BatchSamplingArgs</span>(temperatures=<span class="kw">None</span>)  <span class="cmt"># 全 greedy → argmax 特例</span>
+
+    <span class="cmt"># 数值地板：防 0 温度 / 0 概率把 softmax 打出 NaN</span>
+    MIN_P = MIN_T = <span class="nu">1e-6</span>
+    ts = [max(<span class="nu">0.0</span> <span class="kw">if</span> p.is_greedy <span class="kw">else</span> p.temperature, MIN_T) <span class="kw">for</span> p <span class="kw">in</span> params]
+    top_ks = [p.top_k <span class="kw">if</span> p.top_k &gt;= <span class="nu">1</span> <span class="kw">else</span> self.vocab_size <span class="kw">for</span> p <span class="kw">in</span> params]
+    top_ps = [min(max(p.top_p, MIN_P), <span class="nu">1.0</span>) <span class="kw">for</span> p <span class="kw">in</span> params]
+    ...
+    <span class="cmt"># 只有存在非默认值时才上传对应张量</span>
+    <span class="kw">if</span> any(k != self.vocab_size <span class="kw">for</span> k <span class="kw">in</span> top_ks):
+        top_k = make_device_tensor(top_ks, torch.int32, self.device)
+    ...</pre>
+    <div class="annotation"><b>对照读：</b> ① <strong>全 greedy 特例</strong>：temperatures is None → 直接 argmax，连 softmax 都省；② <strong>数值地板</strong>：1e-6 下限防止 top_p=0 的请求把分布打空；③ <strong>条件上传</strong>：没有任何请求用 top_k 时这个张量根本不上传——batch 里 4 个请求全默认参数时 GPU 采样只剩 softmax + multinomial。llama.cpp 的可组合责任链 vs FreeToken 的固定 kernel 菜单：前者灵活（grammar/mirostat/DRY 随意组合），后者快（一个 kernel 一件事）且没有 CPU↔GPU 往返——但 grammar 约束在 GPU 采样下无从谈起，FreeToken 的 grammar 支持在 API 层做（第 9 章对照）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>小结</h2>
+    <ul>
+      <li>责任链：过滤链改数组，dist/adaptive-p/mirostat 选 token；链序 = 加工顺序。</li>
+      <li>后端 sampler 让 GPU 图直接出 token；grammar 与它互斥，走 CPU 链时用「采样后校验 + 重采样」。</li>
+      <li>mirostat v2 = 意外度反馈控制器；DRY 惩罚「正在形成的重复」；top_n_sigma 按统计截断。</li>
+      <li>FreeToken：greedy argmax 特例 + flashinfer/triton kernel + per-request 参数压成批量张量。</li>
+    </ul>
+    <p>采样快了还不够，能不能一次算多个 token？下一章投机解码。<a href="08-speculative.html">第 8 章：投机解码</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="06-multi-device.html">← 多设备</a>
+    <a href="08-speculative.html">下一步：投机解码 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 07 采样 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 图与调度 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 图与调度</div>
+    <h1>计算图与调度：张量怎么落到正确的设备上</h1>
+    <div class="subtitle">模型 forward 不是一段段手写的循环，而是一张 ggml 计算图。本章讲三件事：图怎么被复用、显存怎么被预留、节点怎么被分配到 CPU/GPU 并切图。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>图复用：为什么 decode 第二步起不用重建图</h2>
+    <p>每个 ubatch 的图拓扑只由「形状参数」决定——token 数、序列数、输入种类。参数不变，图就不变，于是 llama.cpp 缓存上一张图，先问一句「还能用吗」：</p>
+    <div class="code-title">src/llama-context.cpp:1341-1382 — process_ubatch 的图复用（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * res = gf_res_prev.get();
+<span class="kw">auto</span> * gf  = res-&gt;<span class="fn">get_gf</span>();
+
+<span class="cmt">// 图的完整拓扑由这些参数唯一决定 —— 参数相同 ⇒ 拓扑相同</span>
+<span class="kw">const</span> <span class="kw">auto</span> gparams = <span class="fn">graph_params</span>(res, ubatch, mctx, gtype);
+
+<span class="kw">if</span> (!graph_reuse_disable &amp;&amp; res-&gt;<span class="fn">can_reuse</span>(gparams)) {
+    <span class="cmt">// pipeline parallel 时上一张图可能还在 GPU 上跑，必须先同步</span>
+    <span class="cmt">// 才能覆写它正在读的输入张量</span>
+    <span class="kw">if</span> (cparams.pipeline_parallel) {
+        <span class="fn">ggml_backend_sched_synchronize</span>(sched.get());
+    }
+    n_reused++;
+} <span class="kw">else</span> {
+    res-&gt;<span class="fn">reset</span>();
+    <span class="fn">ggml_backend_sched_reset</span>(sched.get());
+    <span class="fn">ggml_backend_sched_set_eval_callback</span>(sched.get(), cparams.cb_eval, ...);
+
+    gf = model.<span class="fn">build_graph</span>(gparams);          <span class="cmt">// 真正重建：逐层 append op</span>
+    ...
+    <span class="kw">if</span> (!<span class="fn">ggml_backend_sched_alloc_graph</span>(sched.get(), gf)) {
+        LLAMA_LOG_ERROR(<span class="st">"%s: failed to allocate graph\n"</span>, __func__);
+        ret = GGML_STATUS_ALLOC_FAILED;
+        <span class="kw">return</span> <span class="kw">nullptr</span>;
+    }
+}
+
+<span class="cmt">// 无论新建还是复用，输入都要重新填写</span>
+res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
+    <p><code class="inline">can_reuse</code> 的判定分两层。外层先比形状参数（<code class="inline">src/llama-graph.h:815-824</code>）：</p>
+    <div class="code-title">src/llama-graph.h — allow_reuse 的 ubatch 检查（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// return true if the "other" params would result in a graph with the same topology</span>
+<span class="kw">bool</span> <span class="fn">allow_reuse</span>(<span class="kw">const</span> llm_graph_params &amp; other) <span class="kw">const</span> {
+    <span class="cmt">// first check the ubatch</span>
+    <span class="kw">bool</span> can_reuse_ubatch =
+        ubatch.<span class="fn">equal_seqs</span>() == other.ubatch.<span class="fn">equal_seqs</span>() &amp;&amp;
+        ubatch.n_tokens     == other.ubatch.n_tokens &amp;&amp;
+        ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &amp;&amp;
+        ubatch.n_seqs       == other.ubatch.n_seqs &amp;&amp;
+        ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &amp;&amp;
+        (( !ubatch.token &amp;&amp; !other.ubatch.token) ||
+         ( !ubatch.embd  &amp;&amp; !other.ubatch.embd)  ||
+         ( ubatch.token &amp;&amp; other.ubatch.token &amp;&amp; ubatch.embd &amp;&amp; other.ubatch.embd));
+    ...</pre>
+    <p>内层逐个检查图的输入节点（embd、pos、out_ids、KV mask、recurrent state……每种输入类各自实现 <code class="inline">can_reuse</code>），例如 KV mask 比对的就是上一章那几个量（<code class="inline">src/llama-graph.cpp:48-68</code>）：</p>
+    <div class="code-title">src/llama-graph.cpp — can_reuse_kq_mask（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">static bool</span> <span class="fn">can_reuse_kq_mask</span>(
+        ggml_tensor * kq_mask,
+        <span class="kw">const</span> llama_kv_cache_context * mctx,
+        <span class="kw">const</span> llama_ubatch &amp; ubatch,
+        <span class="kw">const</span> llama_cparams &amp; cparams) {
+    <span class="kw">const auto</span> n_kv     = mctx-&gt;<span class="fn">get_n_kv</span>();
+    <span class="kw">const auto</span> n_tokens = ubatch.n_tokens;
+    <span class="kw">const auto</span> n_stream = cparams.kv_unified ? <span class="nu">1</span> : ubatch.n_seqs_unq;
+
+    <span class="kw">bool</span> res = <span class="kw">true</span>;
+    res &amp;= (kq_mask-&gt;ne[<span class="nu">0</span>] == n_kv);            <span class="cmt">// KV 窗口长度变了 → 图要重建</span>
+    res &amp;= (kq_mask-&gt;ne[<span class="nu">1</span>] == n_tokens/n_stream);
+    res &amp;= (kq_mask-&gt;ne[<span class="nu">2</span>] == <span class="nu">1</span>);
+    res &amp;= (kq_mask-&gt;ne[<span class="nu">3</span>] == n_stream);
+    <span class="kw">return</span> res;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 复用不是「跳过计算」，是「跳过 CPU 上的建图 + 分配」这两个 CPU 密集步骤，GPU 计算照跑。注意 decode 单 token 场景下形状几乎恒定（n_tokens=1、n_kv 渐增——n_kv 变了 mask 形状就变，所以窗口涨的时候还是要重建；这正是 KV padding 到 256 对齐的动机之一：让 n_kv 阶梯状跳变，多数步复用成立）。计数器 <code class="inline">n_reused</code> 会在 llama_perf 里报告为「graphs reused」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>sched_reserve：三次 reserve 的启动仪式</h2>
+    <p>启动时 llama.cpp 会用「最坏情况」图把计算缓冲一次性预留到位，推理期间 galloc 只在其中做原地分配。reserve 序列是 pp → tg → pp 三次：</p>
+    <div class="code-title">src/llama-context.cpp:623-681 — 三次 reserve（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 先用 pp（prompt processing）图预留 —— 缓冲只分配一次</span>
+{
+    <span class="kw">auto</span> * gf = <span class="fn">graph_reserve</span>(n_tokens, n_seqs, n_outputs_pp, mctx.get(), ...);
+    <span class="kw">if</span> (!gf) {
+        <span class="kw">if</span> (cparams.pipeline_parallel) {
+            LLAMA_LOG_WARN(<span class="st">"%s: compute buffer allocation failed, retrying without pipeline parallelism\n"</span>, ...);
+            cparams.pipeline_parallel = <span class="kw">false</span>;   <span class="cmt">// 退一步重试</span>
+            ...
+        }
+        ...
+    }
+    n_splits_pp = <span class="fn">ggml_backend_sched_get_n_splits</span>(sched.get());
+    n_nodes_pp  = <span class="fn">ggml_graph_n_nodes</span>(gf);
+}
+
+<span class="cmt">// 再用 tg（token generation，bs=1）图 —— 只为拿到 splits/nodes 计数</span>
+{
+    <span class="kw">auto</span> * gf = <span class="fn">graph_reserve</span>(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+    ...
+    n_splits_tg = <span class="fn">ggml_backend_sched_get_n_splits</span>(sched.get());
+    n_nodes_tg  = <span class="fn">ggml_graph_n_nodes</span>(gf);
+}
+
+<span class="cmt">// 最后再用 pp 图 reserve 一遍 —— 避免 ggml-alloc 在推理期间重新分配</span>
+{
+    ggml_cgraph * gf = <span class="kw">nullptr</span>;
+    <span class="kw">switch</span> (model.arch) {
+        <span class="kw">case</span> LLM_ARCH_MINIMAX_01:
+            <span class="cmt">// 特例：inp_diag_decay 随 n_seq_tokens^2 增长，n_seqs==1 反而更耗</span>
+            gf = <span class="fn">graph_reserve</span>(n_tokens, <span class="nu">1</span>, n_outputs_pp, mctx.get(), ...);
+            <span class="kw">break</span>;
+        <span class="kw">default</span>:
+            gf = <span class="fn">graph_reserve</span>(n_tokens, n_seqs, n_outputs_pp, mctx.get(), ...);
+    };
+    ...
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 启动日志里的两行输出「compute buffer size = xxx MiB」「graph nodes = N (with bs=512), M (with bs=1)」就是这里打出来的。三次 reserve 的逻辑：① pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；② 跑一遍 tg 图测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；③ 再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>split_graph：把一张图切给多个后端</h2>
+    <p>多设备（或 CPU+GPU 混跑）时，一张图的不同节点会落在不同后端上。<code class="inline">ggml_backend_sched_split_graph</code>（<code class="inline">ggml/src/ggml-backend.cpp:1066</code>）用五遍扫描完成分配（前三遍定后端归属，后两遍补剩余 src 与切图找拷贝点）：</p>
+    <div class="code-title">ggml/src/ggml-backend.cpp:1087-1102 — pass 1：预分配输入优先（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 1: assign backends to ops with pre-allocated inputs</span>
+<span class="cmt">// （权重、KV cache 这些「已经住」在某块缓冲里的张量是锚点）</span>
+<span class="kw">for</span> (int i = <span class="nu">0</span>; i &lt; graph-&gt;n_leafs; ++i) {
+    ggml_tensor * leaf = graph-&gt;leafs[i];
+    int * leaf_backend_id = &amp;<span class="fn">tensor_backend_id</span>(leaf);
+    <span class="cmt">// do not overwrite user assignments</span>
+    <span class="kw">if</span> (*leaf_backend_id == -<span class="nu">1</span>) {
+        *leaf_backend_id = <span class="fn">ggml_backend_sched_backend_id_from_cur</span>(sched, leaf);
+    }
+}
+<span class="cmt">// nodes 同理：能从张量所在缓冲推断后端的，先定下来</span></pre>
+    <div class="code-title">ggml/src/ggml-backend.cpp:1124-1131 — pass 2：扩张（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 2: expand current backend assignments</span>
+<span class="cmt">// assign the same backend to adjacent nodes</span>
+<span class="cmt">// expand gpu backends (i.e. non last prio) up and down, ignoring cpu (the lowest priority backend)</span>
+<span class="cmt">// thus, cpu will never be used unless weights are on cpu, or there are no gpu ops between cpu ops</span>
+<span class="cmt">// ops unsupported by the backend being expanded will be left unassigned ...</span></pre>
+    <div class="code-title">ggml/src/ggml-backend.cpp:1204-1263 — pass 3：升级与兜底（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 3: upgrade nodes to higher prio backends with compatible buffer types</span>
+<span class="kw">for</span> (int i = <span class="nu">0</span>; i &lt; graph-&gt;n_nodes; ++i) {
+    ggml_tensor * node = graph-&gt;nodes[i];
+    ...
+    <span class="kw">if</span> (*node_backend_id == -<span class="nu">1</span>) {
+        <span class="cmt">// 未分配：找「支持的输入最多」的后端兜底</span>
+        <span class="kw">int</span> n_supported_best = -<span class="nu">1</span>;
+        <span class="kw">for</span> (int b = <span class="nu">0</span>; b &lt; sched-&gt;n_backends; ++b) {
+            <span class="kw">if</span> (<span class="fn">ggml_backend_supports_op</span>(sched-&gt;backends[b], node)) {
+                ...  <span class="cmt">// 数一数多少个 src 已经在 b 的缓冲类型里</span>
+            }
+        }
+    } <span class="kw">else</span> {
+        <span class="cmt">// 已分配：若更高优先级后端的缓冲类型相同且支持该 op → 升级</span>
+        <span class="kw">for</span> (int b = <span class="nu">0</span>; b &lt; *node_backend_id; ++b) {
+            <span class="kw">if</span> (sched-&gt;bufts[b] == sched-&gt;bufts[*node_backend_id] &amp;&amp;
+                    <span class="fn">ggml_backend_supports_op</span>(sched-&gt;backends[b], node)) { ... }
+        }
+    }
+}</pre>
+    <div class="code-title">ggml/src/ggml-backend.cpp:1265-1290 — pass 4：从 dst / view_src 补剩余 src（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 4: assign backends to remaining src from dst and view_src</span>
+<span class="kw">for</span> (int i = <span class="nu">0</span>; i &lt; graph-&gt;n_nodes; i++) {
+    ggml_tensor * node = graph-&gt;nodes[i];
+    <span class="cmt">// view 无自己的数据，跟随 view_src 所在后端</span>
+    <span class="kw">if</span> (node-&gt;view_src != <span class="cl">NULL</span> &amp;&amp; *cur_backend_id == -<span class="nu">1</span>) {
+        *cur_backend_id = <span class="fn">tensor_backend_id</span>(node-&gt;view_src);
+    }
+    <span class="cmt">// 其余未定的 src：跟随「消费它的 dst」，避免多插一次拷贝</span>
+    <span class="kw">for</span> (int j = <span class="nu">0</span>; j &lt; GGML_MAX_SRC; j++) { ... }
+}</pre>
+    <div class="code-title">ggml/src/ggml-backend.cpp:1297 — pass 5：切图找拷贝点（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 5: split graph, find tensors that need to be copied</span>
+<span class="cmt">// 沿节点序扫描，后端归属一变就切一刀；跨越切点的张量在 sched 里插 copy op</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 各遍的分工：pass 1 锚定「数据在哪，算就在哪」；pass 2 把 GPU 节点成片扩张（注释里那句很关键——<strong>CPU 是最低优先级，只有权重在 CPU 上、或图里 GPU 段之间没有 CPU 空隙时才会用到</strong>，这避免了无谓的 CPU/GPU 往返）；pass 3 把同缓冲类型的节点升级到更高优先级后端（BLAS 和 CPU 可以共用 host 内存缓冲类型）；pass 4 给前三遍没覆盖到的 src 收尾——view 跟随 view_src、孤立 src 跟随消费它的 dst，<strong>目的是少插拷贝</strong>；pass 5 才真正沿节点序切图、标出跨切点张量。前三遍决定「谁在哪个后端」，后两遍决定「在哪里切开、切开后补哪些拷贝」——切点之间的边界就是拷贝点，两张图之间的张量会在 sched 里插 copy op。第 2 章讲过的按层切分（i_gpu_start）就是这套机制在模型加载期的静态版本。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>对照：FreeToken 的 CUDA Graph</h2>
+    <p>llama.cpp 的图是「每次推理现建的张量 DAG」（哪怕复用也要填输入）；FreeToken 把 decode 前向<strong>整段录制成 CUDA Graph</strong>，运行时一次 replay 消掉上千次 kernel launch 的 CPU 开销。先看 batch 尺寸候选怎么定（<code class="inline">python/freetoken/engine/graph.py:68-87</code>，函数体到 :87）：</p>
+    <div class="code-title">python/freetoken/engine/graph.py — bs 候选（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_determine_cuda_graph_bs</span>(cuda_graph_bs, cuda_graph_max_bs, free_memory):
+    <span class="kw">if</span> cuda_graph_bs <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="kw">return</span> cuda_graph_bs
+
+    free_memory_gb = free_memory / (<span class="nu">1</span> &lt;&lt; <span class="nu">30</span>)
+    <span class="kw">if</span> cuda_graph_max_bs <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">if</span> free_memory_gb &gt; <span class="nu">80</span>:  <span class="cmt"># H200</span>
+            cuda_graph_max_bs = <span class="nu">256</span>
+        <span class="kw">else</span>:
+            cuda_graph_max_bs = <span class="nu">160</span>
+
+    candidates = [<span class="nu">1</span>, <span class="nu">2</span>, <span class="nu">4</span>] + list(range(<span class="nu">8</span>, cuda_graph_max_bs + <span class="nu">1</span>, <span class="nu">8</span>))
+    <span class="kw">return</span> [bs <span class="kw">for</span> bs <span class="kw">in</span> candidates <span class="kw">if</span> bs &lt;= cuda_graph_max_bs]</pre>
+    <p>捕捉阶段每个 bs 录一张图，共享同一个内存池：</p>
+    <div class="code-title">python/freetoken/engine/graph.py:158-198 — capture 与 replay（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> bs <span class="kw">in</span> pbar:
+    graph = torch.cuda.<span class="cl">CUDAGraph</span>()
+    batch = <span class="cl">Batch</span>(reqs=[self.dummy_req] * bs, phase=<span class="st">"decode"</span>)
+    ...
+    <span class="kw">with</span> get_global_ctx().<span class="fn">forward_batch</span>(batch):
+        self.buffer.logits[:bs] = model.<span class="fn">forward</span>()
+        <span class="cmt"># 先跑一遍「热身」再录：保证 offload cache 已热，</span>
+        <span class="cmt"># 否则录制下来的图会带着冷缓存的专家拷贝</span>
+        <span class="kw">with</span> torch.cuda.<span class="fn">graph</span>(graph, pool=pool, stream=self.stream):
+            self.buffer.logits[:bs] = model.<span class="fn">forward</span>()
+        self.<span class="fn">_reset_moe_offload_cache</span>()
+    <span class="kw">if</span> pool <span class="kw">is</span> <span class="kw">None</span>:
+        pool = graph.<span class="fn">pool</span>()  <span class="cmt"># 复用同一块 graph 内存池，省显存</span>
+    self.graph_map[bs] = graph
+
+<span class="kw">def</span> <span class="fn">replay</span>(self, batch: <span class="cl">Batch</span>) -&gt; torch.Tensor:
+    <span class="kw">assert</span> self.<span class="fn">can_use_cuda_graph</span>(batch)
+    self.buffer.<span class="fn">copy_from</span>(batch)               <span class="cmt"># 输入写进固定的捕捉缓冲</span>
+    g = self.graph_map[batch.padded_size]
+    self.attn_backend.<span class="fn">prepare_for_replay</span>(batch)
+    g.<span class="fn">replay</span>()
+    <span class="kw">return</span> self.buffer.logits[: batch.size]</pre>
+    <div class="annotation"><b>对照读：</b> 两种「图」解决的问题不同：llama.cpp 的 can_reuse 省的是<strong>建图 + 分配</strong>（CPU 上的张量拓扑搭建），CUDA Graph 省的是<strong>kernel launch</strong>（每秒上万次小提交的驱动开销）。FreeToken 能录整张图的前提是形状完全静态：bs 用 <code class="inline">padded_size</code> 补齐到候选档位、GDN 槽位经由 copy_from 写入、每档捕捉前先跑一遍热身 forward 把 offload cache 烘热——源码注释说得很直白：「Resetting here forces CUDA graph capture to replay cold-cache expert copies」，所以 reset 只能放在<strong>捕捉之后</strong>，为下一档复位。代价是一段可观捕捉时间和一块固定池显存——消费级卡上 max_bs=160 的候选要录 20+ 张。llama.cpp 走的是另一极：图每次可变、灵活但 CPU 开销大。第 13 章会把这个对照收进自研清单。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>小结</h2>
+    <ul>
+      <li>图拓扑由 ubatch 形状参数唯一决定 → can_reuse 逐输入类校验，decode 常态复用。</li>
+      <li>sched_reserve 用 pp→tg→pp 三次 reserve 一次性预留计算缓冲；个别架构最坏情况不是 bs 最大时。</li>
+      <li>split_graph 五遍扫描：预分配锚定 → GPU 成片扩张（CPU 只兜底）→ 同缓冲类型升级 → 从 dst/view_src 补剩余 src → 切图找拷贝点。</li>
+      <li>FreeToken 用 CUDA Graph 换掉另一类开销（launch），前提是把一切形状焊死成候选档位。</li>
+    </ul>
+    <p>图的节点为什么能落在不同设备上？下一章讲多设备切分。<a href="06-multi-device.html">第 6 章：多设备</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="04-kv-cache.html">← KV cache 家族</a>
+    <a href="06-multi-device.html">下一步：多设备 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

@@ -36,6 +36,8 @@
 | [`deepseek-harness/`](deepseek-harness/) | [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | [`../deepseek-harness`](../deepseek-harness) |
 | [`langgraph/`](langgraph/) | [langchain-ai/langgraph](https://github.com/langchain-ai/langgraph) | [`../langgraph`](../langgraph) |
 | [`vllm-engine/`](vllm-engine/) | [vllm-project/vllm](https://github.com/vllm-project/vllm) | [`../vllm`](../vllm) |
+| [`on-device/`](on-device/) | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) · FreeToken（本地仓库） | [`../llama.cpp`](../llama.cpp) · [`../FreeToken`](../FreeToken) |
+| [`sglang/`](sglang/) | [sgl-project/sglang](https://github.com/sgl-project/sglang) | [`../sglang`](../sglang) |
 | [`robotics/`](robotics/) | [huggingface/lerobot](https://github.com/huggingface/lerobot) · [isaac-sim/IsaacLab](https://github.com/isaac-sim/IsaacLab) · [TRI-ML/prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) · unifolm-vla | [`../robotics`](../robotics) |
 
 ## 阅读方式
@@ -59,6 +61,6 @@
 
 本站涉及主题:
 
-`ai-native` `llm` `agent` `ai-agent` `agent-runtime` `agent-harness` `context-engine` `context-engineering` `rag` `retrieval-augmented-generation` `knowledge-graph` `context-window` `compaction` `multi-agent` `tool-use` `function-calling` `observability` `llm-inference` `vllm` `langgraph` `langchain` `typescript-agent` `claude-code` `codex` `codex-cli` `rust-agent` `coding-agent` `agentic-coding` `sandbox` `hooks` `mcp` `model-context-protocol` `source-code-reading` `learn-to-code` `中文技术文档` `源码精读`
+`ai-native` `llm` `agent` `ai-agent` `agent-runtime` `agent-harness` `context-engine` `context-engineering` `rag` `retrieval-augmented-generation` `knowledge-graph` `context-window` `compaction` `multi-agent` `tool-use` `function-calling` `observability` `llm-inference` `vllm` `sglang` `langgraph` `langchain` `typescript-agent` `claude-code` `codex` `codex-cli` `rust-agent` `coding-agent` `agentic-coding` `sandbox` `hooks` `mcp` `model-context-protocol` `source-code-reading` `learn-to-code` `中文技术文档` `源码精读`
 
 </details>

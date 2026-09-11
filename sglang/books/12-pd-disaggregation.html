@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · PD 分离部署 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a class="active" href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 PD 分离部署</div>
+    <h1>PD 分离：prefill 和 decode 拆成两套实例</h1>
+    <div class="subtitle">prefill 吃算力、decode 吃显存带宽，两者的资源画像相反。PD 分离把两个阶段部署在独立实例池上，中间传 KV。SGLang 的实现方式很克制：不是另写一套引擎，而是在同一个 Scheduler 里加了两条事件循环和三个队列。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>一分钟版本</h2>
+    <p>混合部署（一套实例同时跑 prefill 和 decode）有两个已知的调度问题，官方文档 <code class="inline">docs/docs/advanced_features/pd_disaggregation.mdx</code> 一开始就点名：</p>
+    <ul>
+      <li><strong>prefill 打断 decode</strong>：一条长 prompt 进来，占用一整个前向步（几百毫秒），这期间所有 decode 请求的 token 间隔（ITL）集体被拉长。</li>
+      <li><strong>DP attention 不均衡</strong>：开 dp_attention 时，一个 DP rank 在跑 prefill、另一个在跑 decode，做 MLP 同步时快的要等慢的，decode 延迟跟着 prefill 走。</li>
+    </ul>
+    <p>PD 分离的解法：<code class="inline">--disaggregation-mode prefill</code> 和 <code class="inline">--disaggregation-mode decode</code> 启动两套实例。prefill 实例算完输入的 KV 后，通过 RDMA 把 KV 传给 decode 实例，decode 实例接着自回归生成。请求级别的粘合点是 <strong>DisaggregationMode 枚举 + 两条专用事件循环 + 三个队列</strong>（bootstrap / prealloc / transfer），全部内联在现有 Scheduler 里，而不是一套新进程模型。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>一次请求的完整时序</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
+        <title id="t12">PD 分离请求时序</title>
+        <desc id="d12">从 router 到 prefill 实例、经 KV 传输、到 decode 实例接管的完整握手与数据流</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 泳道头 -->
+        <rect class="node acc" x="20" y="20" width="200" height="40" rx="8"></rect>
+        <text class="lbl" x="120" y="45" text-anchor="middle">Router（sgl-model-gateway）</text>
+        <rect class="node core" x="250" y="20" width="220" height="40" rx="8"></rect>
+        <text class="lbl" x="360" y="45" text-anchor="middle">Prefill 实例 Scheduler</text>
+        <rect class="node" x="500" y="20" width="160" height="40" rx="8"></rect>
+        <text class="lbl" x="580" y="45" text-anchor="middle">传输引擎（RDMA）</text>
+        <rect class="node core" x="690" y="20" width="230" height="40" rx="8"></rect>
+        <text class="lbl" x="805" y="45" text-anchor="middle">Decode 实例 Scheduler</text>
+        <line class="edge" x1="40" y1="60" x2="40" y2="520"></line>
+        <line class="edge" x1="360" y1="60" x2="360" y2="520"></line>
+        <line class="edge" x1="580" y1="60" x2="580" y2="520"></line>
+        <line class="edge" x1="805" y1="60" x2="805" y2="520"></line>
+
+        <!-- 1. 路由 -->
+        <line class="edge" x1="120" y1="90" x2="352" y2="90"></line>
+        <text class="lbl sm" x="130" y="82">1. 转发请求（带 rid）</text>
+
+        <!-- 2. bootstrap 握手 -->
+        <line class="edge acc" x1="360" y1="130" x2="797" y2="130"></line>
+        <text class="lbl sm" x="380" y="122">2. bootstrap 握手：分配 bootstrap_room，decode 侧预注册接收方（host/port/room）</text>
+        <rect class="node" x="270" y="150" width="180" height="36" rx="6"></rect>
+        <text class="lbl sm" x="360" y="172" text-anchor="middle">PrefillBootstrapQueue 等待</text>
+
+        <!-- 3. prefill 前向 -->
+        <line class="edge" x1="40" y1="212" x2="352" y2="212"></line>
+        <text class="lbl sm" x="130" y="204">3. bootstrap 完成 → 进 waiting_queue</text>
+        <rect class="node warn" x="270" y="230" width="180" height="36" rx="6"></rect>
+        <text class="lbl sm" x="360" y="252" text-anchor="middle">chunked prefill 前向</text>
+
+        <!-- 4. KV 分层传输 -->
+        <line class="edge core" x1="360" y1="300" x2="572" y2="300"></line>
+        <text class="lbl sm" x="380" y="292">4. send_kv_chunk：逐层写出 KV（可提前发送缓存前缀）</text>
+        <line class="edge core" x1="588" y1="300" x2="797" y2="300"></line>
+        <text class="lbl sm" x="600" y="292">RDMA write 到预注册的 KV 缓冲</text>
+
+        <!-- 5. decode 接管 -->
+        <rect class="node warn" x="700" y="230" width="210" height="36" rx="6"></rect>
+        <text class="lbl sm" x="805" y="252" text-anchor="middle">PreallocQueue 先占 KV 槽位</text>
+        <rect class="node warn" x="700" y="330" width="210" height="36" rx="6"></rect>
+        <text class="lbl sm" x="805" y="352" text-anchor="middle">TransferQueue 轮询 KVPoll</text>
+        <line class="edge back" x1="805" y1="266" x2="805" y2="328"></line>
+        <line class="edge" x1="40" y1="390" x2="797" y2="390"></line>
+        <text class="lbl sm" x="130" y="382">5. KV 到齐（KVPoll.Success）→ 进 waiting_queue → 常规 decode</text>
+
+        <!-- 6. 输出回传 -->
+        <line class="edge" x1="120" y1="440" x2="120" y2="470"></line>
+        <line class="edge" x1="805" y1="430" x2="805" y2="470"></line>
+        <line class="edge" x1="797" y1="470" x2="128" y2="470"></line>
+        <text class="lbl sm" x="300" y="462">6. decode 产生的 token 直接经 Detokenizer 流式回给客户端（prefill 实例不再参与）</text>
+
+        <!-- 失败重试 -->
+        <line class="edge back" x1="797" y1="505" x2="368" y2="505"></line>
+        <text class="lbl sm" x="420" y="497">KVPoll.Failed：对端死亡/传输失败 → 放弃或重新排队（prefill 走乐观重试）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>实例 Scheduler</span>
+        <span class="lg-item"><span class="sw warn"></span>三个队列（bootstrap / prealloc / transfer）</span>
+        <span class="lg-item"><span class="sw acc"></span>握手与控制流</span>
+        <span class="lg-item"><span class="sw"></span>请求/数据流</span>
+        <span class="lg-item"><span class="sw back"></span>失败/等待路径</span>
+      </div>
+      <div class="fig-cap">图 12.2：一次请求在 PD 分离下的生命周期。注意第 6 步——输出完全由 decode 实例回传，prefill 实例在交出 KV 后就不再碰这条请求。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">python/sglang/srt/disaggregation/prefill.py</code> → prefill 侧 mixin + bootstrap 队列；
+      <code class="inline">python/sglang/srt/disaggregation/decode.py</code> → decode 侧 mixin + prealloc/transfer 队列；
+      <code class="inline">python/sglang/srt/disaggregation/mooncake/</code>、<code class="inline">nixl/</code>、<code class="inline">common/conn.py</code> → 传输引擎；
+      <code class="inline">python/sglang/srt/managers/scheduler.py</code> 的 <code class="inline">dispatch_event_loop</code> → 模式分发入口。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>模式与循环：同一个 Scheduler，两套事件循环</h2>
+    <p>第 1 章已经看到 <code class="inline">dispatch_event_loop</code> 的分发矩阵，PD 分离占了其中六格（PREFILL/DECODE × PP/overlap/normal）。两条 <code class="inline">event_loop_*_disagg_*</code> 循环不在 scheduler.py 里，而是以 mixin 形式定义——这是 SGLang 控制代码规模的做法：不改 Scheduler 主体，把 PD 逻辑全部外挂：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/prefill.py — event_loop_normal_disagg_prefill（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">event_loop_normal_disagg_prefill</span>(self: <span class="cl">Scheduler</span>) -&gt; <span class="kw">None</span>:
+    <span class="st">"""A normal scheduler loop for prefill worker in disaggregation mode."""</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        self.<span class="fn">ingest_requests</span>()
+        <span class="kw">if</span> self._engine_paused:
+            ...
+            <span class="kw">continue</span>
+        <span class="cmt"># 与普通循环的关键差异 ①：只把「握手完成」的请求放进 waiting_queue</span>
+        self.waiting_queue.<span class="fn">extend</span>(
+            self.disagg_prefill_bootstrap_queue.<span class="fn">pop_bootstrapped</span>()
+        )
+
+        <span class="cmt"># 调度入口换成了 disagg 版本（内部仍走 get_new_batch_prefill）</span>
+        plan = self.<span class="fn">get_next_disagg_prefill_batch_to_run</span>(...)
+        batch = plan.batch_to_run
+        batch = self.ngram_embedding_manager.<span class="fn">prepare_for_forward</span>(batch)
+
+        <span class="kw">if</span> batch:
+            <span class="kw">if</span> self.enable_staging:
+                self.<span class="fn">maybe_prefetch_staging_for_batch</span>(batch)
+            result = self.<span class="fn">run_batch</span>(batch)
+            self.<span class="fn">process_batch_result</span>(batch, result)
+        <span class="kw">else</span>:
+            self.<span class="fn">on_idle</span>()
+
+        <span class="cmt"># 关键差异 ②：每轮驱动「传输中」队列（KV 写出、轮询完成态）</span>
+        self.<span class="fn">process_disagg_prefill_inflight_queue</span>()
+
+        self.last_batch = batch</pre>
+    <div class="annotation"><b>读懂这段：</b> 和 <code class="inline">event_loop_normal</code>（第 2 章）逐行对照，只有两处新增：入口处从 bootstrap 队列取「握手完成」的请求；尾部驱动 KV 传输队列。decode 侧的 <code class="inline">event_loop_normal_disagg_decode</code>（<code class="inline">disaggregation/decode.py:2500</code>）结构相同，差异是把 <code class="inline">process_decode_queue()</code> 插在调度之前。这就是「复用引擎主体」的含义：调度、内存、前向代码一行没动，动的只有请求进出的边界。</div>
+    <p><code class="inline">DisaggregationMode</code> 本身是三值枚举（<code class="inline">NULL / PREFILL / DECODE</code>），挂在 Scheduler 上，所有 if 分支都围绕它展开。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>prefill 侧：握手队列与 KV 写出</h2>
+    <p>prefill 实例收到请求后不能立刻调度——要先等 decode 侧的握手确认（对端注册了接收缓冲）。这段时间请求停在 <code class="inline">PrefillBootstrapQueue</code>：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/prefill.py — PrefillBootstrapQueue.pop_bootstrapped（摘录，docstring 原文）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PrefillBootstrapQueue</span>:
+    <span class="st">"""
+    Store the requests in bootstrapping
+    """</span>
+    <span class="cmt"># 构造参数（译注）：KV 池、元数据缓冲、TP/PP rank、gloo 组、传输后端等</span>
+    <span class="kw">def</span> <span class="fn">pop_bootstrapped</span>(self, ...) -&gt; <span class="cl">List</span>[<span class="cl">Req</span>] | ...:
+        <span class="st">"""
+        pop the reqs which has finished bootstrapping
+        """</span>
+        <span class="cmt"># 轮询每个请求的 KVPoll 状态；到 Success 的移入 bootstrapped_reqs，</span>
+        <span class="cmt"># Failed 的进入失败处理（PP 下还有跨 rank 共识：good_rids / bad_rids）</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 「bootstrap」这个词在代码里指 decode 侧的接收准备（缓冲注册 + 元数据交换），完成状态由 <code class="inline">KVPoll</code> 枚举驱动（见 12.6）。每个请求自带的 <code class="inline">bootstrap_room / bootstrap_host / bootstrap_port</code> 三个字段（<code class="inline">schedule_batch.py:1277-1279</code>）就是握手凭据。</div>
+
+    <p>prefill 完成后，KV 的写出有两种时机。一是 <code class="inline">process_batch_result_disagg_prefill</code>（prefill 前向结束后整体发送）；二是可选的提前发送——radix cache 命中的前缀 KV 不用等本轮前向，先发出去，让传输和计算重叠。这个开关带一整套防竞态处理，值得看一眼：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/prefill.py — maybe_send_cached_prefix_chunk（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">maybe_send_cached_prefix_chunk</span>(self: <span class="cl">Scheduler</span>, req: <span class="cl">Req</span>) -&gt; <span class="kw">None</span>:
+    <span class="kw">if</span> <span class="kw">not</span> envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.<span class="fn">get</span>():
+        <span class="kw">return</span>
+
+    <span class="cmt"># staging 按位置网格发送，提前发送的边界必须在请求的各个 batch 之间保持稳定：</span>
+    <span class="cmt"># 所以在第一个 batch 上把驻留前缀快照下来。非 staging 则读实时前缀。</span>
+    <span class="kw">if</span> self.enable_staging <span class="kw">and</span> req.early_send_prefix_end <span class="kw">is</span> <span class="kw">None</span>:
+        req.early_send_prefix_end = <span class="fn">max</span>(
+            <span class="nu">0</span>, <span class="fn">len</span>(req.prefix_indices) - req.host_hit_length
+        )
+
+    <span class="kw">if</span> req.pending_bootstrap:
+        <span class="kw">return</span>
+
+    <span class="cmt"># 只发设备驻留的前缀；页对齐以保证 start_send_idx 精确</span>
+    cached_end = (
+        req.early_send_prefix_end
+        <span class="kw">if</span> self.enable_staging
+        <span class="kw">else</span> <span class="fn">len</span>(req.prefix_indices) - req.host_hit_length
+    )
+    <span class="kw">if</span> cached_end &lt;= req.start_send_idx:
+        <span class="kw">return</span>
+    <span class="kw">if</span> cached_end % self.token_to_kv_pool_allocator.page_size != <span class="nu">0</span>:
+        <span class="cmt"># DCP radix 命中可能落在不完整的物理页上；常规最终发送会覆盖全量，</span>
+        <span class="cmt"># 这里只跳过这个可选的提前发送优化</span>
+        <span class="kw">return</span>
+    <span class="cmt"># 提前发送在本步前向入队之前发出 KV 读请求，但 overlap 调度下上一步的</span>
+    <span class="cmt"># prefill 前向可能还在 forward_stream 上写这些前缀页。记录完成事件，</span>
+    <span class="cmt"># 让传输线程先等写入完成再发起 RDMA 读，避免与写竞争。</span>
+    <span class="kw">if</span> self.enable_overlap:
+        ev = torch.cuda.<span class="fn">Event</span>()
+        ev.<span class="fn">record</span>(self.forward_stream)
+        req.disagg_kv_sender._early_send_wait_event = ev
+    self.<span class="fn">send_kv_chunk</span>(req, last_chunk=<span class="kw">False</span>, end_idx=cached_end)</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个细节都有生产含义：① 只发页对齐的边界（传输协议按页为单位）；② overlap 调度下「读 KV」和「写 KV」在不同 CUDA stream 上，必须用 event 先后排序；③ 这段优化由 <code class="inline">SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX</code> 控制，<strong>默认开着</strong>（<code class="inline">EnvBool(True)</code>）——它是快路径而非实验开关，所以上面那两个 <code class="inline">return</code> 的保守语义很重要：宁可少发这一次，也不留半页歧义，因为常规的最终发送会兜住全量。</div>
+    <div class="annotation"><b>staging 带来的额外一层：</b> 开头那段快照逻辑是后加的。非 staging 时 <code class="inline">cached_end</code> 直接读 <code class="inline">len(req.prefix_indices)</code> 的实时值；staging 路径不行，因为它的暂存缓冲是<strong>按位置切格</strong>的：一个网格槽的宽度是 <code class="inline">staging_grid_tokens(chunked_prefill_size, page_size)</code>（即 chunked prefill 大小按页对齐，默认 8192 对齐到页），<code class="inline">compute_grid_segments</code> 在 <code class="inline">base + k * grid_tokens</code> 这些网格边界上切段，「每段恰好落进一个暂存槽」。而一个请求要占几个网格槽（<code class="inline">num_chunks</code>）是在预取时<strong>按传输总页数一次算定的</strong>——所以此前发送的边界必须在请求的各 batch 之间保持稳定，否则前后两次发送对不上同一套槽位。源码那两行注释写的就是这个约束。于是改成在第一个 batch 上把 <code class="inline">early_send_prefix_end</code> 快照一次，后续 batch 都读这个定值。<code class="inline">req.pending_bootstrap</code> 的提前返回也是同一类考虑：握手还没完成，decode 侧根本没有可以接收的槽位。<strong>同一个函数里，「实时值」和「快照值」两种取法并存</strong>——这是加 staging 时留下的形状，不是冗余。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.5</span>decode 侧：先占坑，再收货</h2>
+    <p>decode 实例的顺序是反的：收到握手就先在 KV 池里把槽位占住（prealloc），等 KV 真正到达再合并进请求。两条队列的分工写在类 docstring 里：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/decode.py — DecodePreallocQueue 与 DecodeTransferQueue（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">DecodePreallocQueue</span>:
+    <span class="st">"""
+    Store the requests that are preallocating.
+    """</span>
+    <span class="cmt"># 持有 req_to_token_pool / allocator / tree_cache；预分配按</span>
+    <span class="cmt"># num_reserved_decode_tokens 预留 decode 步数所需的 KV 槽位</span>
+    <span class="cmt"># _ensure_retry_count / _max_ensure_retries=15：与对端房间建立失败的</span>
+    <span class="cmt"># 重试记账（按调度周期计数，间隔 1s）</span>
+
+<span class="kw">class</span> <span class="cl">DecodeTransferQueue</span>:
+    <span class="st">"""
+    Store the requests that is polling kv
+    """</span>
+    <span class="cmt"># add()/extend()：预分配完成的请求转入此队列轮询 KV 到达</span>
+    <span class="cmt"># _commit_transfer_to_req()：KV 元数据（logits/logprobs/hidden_states 等）</span>
+    <span class="cmt">#   随最后一块 KV 一起到达，在这里一次性合并进 Req</span>
+    <span class="cmt"># enable_deferred_kv_release：被 abort 的请求其 KV 页延迟释放，</span>
+    <span class="cmt">#   等在途传输排空或超时，防止对端写到已回收内存</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 「prealloc」解决的是资源确定性——如果等 KV 到了再分配，decode 池可能已经没有空间，一条传了一半的 KV 只能扔掉。先占坑意味着传输失败的代价只是释放预留，而不是浪费已传输的数据。<code class="inline">retracted_queue</code> 和 <code class="inline">resume_retracted_reqs</code> 则把第 4 章的 retraction 机制接了进来：内存不足时 decode 请求也能被收回重排。</div>
+
+    <p>队列由 <code class="inline">process_decode_queue</code>（每轮循环驱动）串联，注意轮询频率是可配置的节流：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/decode.py — process_decode_queue（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">process_decode_queue</span>(self: <span class="cl">Scheduler</span>):
+    ...
+    <span class="cmt"># 有被收回的请求在等空间时，不再预分配新请求</span>
+    <span class="kw">if</span> <span class="fn">len</span>(self.disagg_decode_prealloc_queue.retracted_queue) &gt; <span class="nu">0</span>:
+        <span class="kw">return</span>
+
+    self.polling_count = (self.polling_count + <span class="nu">1</span>) % self.polling_interval
+    <span class="kw">if</span> self.polling_count % self.polling_interval == <span class="nu">0</span>:
+        req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
+        self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)
+        transferred_reqs = (
+            self.disagg_decode_transfer_queue.<span class="fn">pop_transferred</span>()
+        )  <span class="cmt"># KV 已到达的请求</span>
+        self.waiting_queue.<span class="fn">extend</span>(transferred_reqs)</pre>
+    <p>KV 到达后请求进入 <code class="inline">waiting_queue</code>，由 <code class="inline">get_new_prebuilt_batch</code> 打包成 <code class="inline">ForwardMode.PREBUILT</code> 的 ScheduleBatch——名字里的「fake completed prefill」说明它的前向被跳过，直接以 decode 身份并入 <code class="inline">running_batch</code>。从这里开始，这条请求走的完全是第 2~4 章讲过的普通路径。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么 prefill 的最后一步计算在 prefill 实例上做，而不是把输入 ids 传过去让 decode 实例 prefill？因为 KV 是「算一遍就要占一遍显存」的资产：在 prefill 侧算完再传，decode 侧只需要等一块连续缓冲；反过来传 ids 则要求 decode 侧同时具备 prefill 的峰值算力配置，混合负载下又回到老问题。分离的意义就是把峰值算力和峰值带宽拆到不同的机器上。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.6</span>传输引擎：Mooncake 与 NIXL</h2>
+    <p>传输层被抽象成 <code class="inline">disaggregation/base/conn.py</code> 的几个基类 + 一族可替换的后端实现。选择在后端枚举里：</p>
+    <div class="code-title">python/sglang/srt/disaggregation/utils.py — TransferBackend（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">TransferBackend</span>(<span class="cl">Enum</span>):
+    MOONCAKE = <span class="st">"mooncake"</span>
+    MORI = <span class="st">"mori"</span>
+    NIXL = <span class="st">"nixl"</span>
+    ASCEND = <span class="st">"ascend"</span>
+    FAKE = <span class="st">"fake"</span></pre>
+    <p>枚举五个值在 <code class="inline">utils.py</code> 的 <code class="inline">get_kv_class</code> 里<strong>全部有分派分支</strong>——五个 <code class="inline">TransferBackend</code> 各对应一组 <code class="inline">{Manager, Sender, Receiver, BootstrapServer}</code>，只有 <code class="inline">KVArgs</code> 是所有后端共用一个。书里只细讲生产上最常用的两个：<code class="inline">mooncake/conn.py</code> 的 <code class="inline">MooncakeKVManager</code> 和 <code class="inline">nixl/conn.py</code> 的 <code class="inline">NixlKVManager</code>，两者都继承自 <code class="inline">common/conn.py</code> 的 <code class="inline">CommonKVManager</code>（<code class="inline">MORI</code> 是 AMD 侧的传输栈，<code class="inline">ASCEND</code> 走华为 NPU，<code class="inline">FAKE</code> 只用于测试）。共同的基础设施：</p>
+    <ul>
+      <li><strong>缓冲区注册</strong>：启动时把 KV 池的显存段注册给传输引擎（GPU 直接 RDMA 读写，不经过 CPU 拷贝）。</li>
+      <li><strong>KVArgs / TransferInfo</strong>：描述「哪些层、哪些槽位、什么形状」的传输清单，经 ZMQ 在两实例间交换。</li>
+      <li><strong>KVPoll 状态机</strong>：<code class="inline">Failed → Bootstrapping → WaitingForInput → Transferring → Success</code>（<code class="inline">base/conn.py:100</code>），两侧队列都靠轮询它推进。</li>
+    </ul>
+    <div class="code-title">python/sglang/srt/disaggregation/mooncake/conn.py — send_kvcache 签名（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">send_kvcache</span>(
+    self,
+    mooncake_session_id: <span class="cl">str</span>,
+    prefill_kv_indices: npt.NDArray[np.int32],
+    dst_kv_ptrs: <span class="cl">list</span>[<span class="cl">int</span>],
+    dst_kv_indices: npt.NDArray[np.int32],
+    executor: concurrent.futures.<span class="cl">ThreadPoolExecutor</span>,
+    dst_layer_ids: <span class="cl">Optional</span>[<span class="cl">List</span>[<span class="cl">int</span>]] = <span class="kw">None</span>,
+    dst_device_kv_indices: <span class="cl">Optional</span>[npt.NDArray[np.int32]] = <span class="kw">None</span>,
+    dst_kv_item_len: <span class="cl">Optional</span>[<span class="cl">int</span>] = <span class="kw">None</span>,
+    dst_attn_tp_size: <span class="cl">Optional</span>[<span class="cl">int</span>] = <span class="kw">None</span>,
+):
+    <span class="cmt"># 把 prefill 侧 KV 池中 prefill_kv_indices 指定的页，按层切片后</span>
+    <span class="cmt"># RDMA 写到 decode 侧 dst_kv_ptrs 指向的缓冲；线程池并发提交</span></pre>
+    <p>分层传输是让传输「不成气泡」的关键：每算完一层就能传一层，传输时间藏进后续层的计算时间里。对 hybrid 模型（如带 SWA/Mamba 层）还有一处细节——full-attention 层与总层数的序号换算（<code class="inline">_transfer_start_layer</code>），因为对端池里只有 full-attention 层的缓冲。</p>
+    <p>路由侧由 <code class="inline">sgl-model-gateway</code>（Rust）承担：以 <code class="inline">--pd-disaggregation</code> 启动时，router 把请求路由到 prefill 实例，并维护 prefill/decode 实例的负载与存活；decode 实例的挑选依据 bootstrap 信息回传。也就是说 <strong>请求级路由在 Rust router，KV 级路由在 bootstrap 房间握手</strong>，两层各管各的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.7</span>对「自研引擎」的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      PD 分离是运维面翻倍的架构决策：两套实例、一套传输引擎、router 配置、RDMA 组网，都是新增故障点。自研引擎在单实例的混合调度调优（chunked prefill 配比、priority scheduling）走到头之前，不值得上。但有两个设计现在就能记下：<strong>① bootstrap 房间握手</strong>——用唯一 id（room）让两侧队列在无共享状态下对齐，这个模式适用于任何「生产者算完再交给消费者」的跨进程交接；<strong>② 先占坑再收货</strong>——接收侧先预留资源再收数据，失败时退资源而不是扔数据。传输部分（逐层 RDMA 写、预注册缓冲）本质是把第 11 章 HiCache 的「显存↔外部」搬运换成了「显存↔显存」，两者共用同一套 KVArgs 描述语言。下一步进入 <a href="13-speculative.html">第 13 章：投机解码</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="13-speculative.html">下一步：投机解码 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

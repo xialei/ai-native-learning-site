@@ -110,12 +110,12 @@
         <td>退回第 3 章的 <code class="inline">agentLoop</code>：能跑一轮，但——<strong>不落盘</strong>（进程一退会话全没）、<strong>流式中无法安全追加/打断</strong>用户输入（没有 steer/followUp）、<strong>遇到错误或超长不会自救</strong>（没有重试/溢出压缩）、<strong>扩展挂不进去</strong>（没有 before_agent_start / input 等钩子）、<strong>运行中无法换会话</strong>（没有 teardown/apply 协议）。用户感知到的"Agent 越跑越稳、从不崩、能续上"，几乎全部来自这层壳，而不是 LLM 本身。</td>
       </tr>
     </table>
-    <div class="annotation"><b>一句话记住：</b> harness 用<strong>固化流程</strong>把"会跑的循环"变成"跑得稳、跑得久、跑得能被观测和介入"的运行时。下面 8.2~8.6 逐段拆这条流程的每个闸门；8.7 再把它收成一张清单。</div>
+    <div class="annotation"><b>概括：</b> harness 用<strong>固化流程</strong>把"会跑的循环"变成"跑得稳、跑得久、跑得能被观测和介入"的运行时。下面 8.2~8.6 逐段拆这条流程的每一段；8.7 再把它收成一张清单。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.2</span>一次 prompt 的完整旅程</h2>
-    <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间过了十几个闸门。全程时序如下：</p>
+    <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间要过十几个环节。全程时序如下：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
         <title id="t8b">AgentSession.prompt 完整旅程</title>
@@ -243,11 +243,11 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
   <section class="block">
     <h2><span class="num">8.3</span>流式时的双消息队列：steer vs followUp</h2>
     <p>最难的地方：<strong>Agent 正在跑（流式），用户又发了一条消息，怎么办？</strong>Pi 用「双队列」解决，打破了你朴素的一声一答模型。先看关键判断——<code class="inline">prompt()</code> 检测到流式中时，强制你要么 <code class="inline">steer</code> 要么 <code class="inline">followUp</code>：</p>
-    <div class="code-title">agent-session.ts · 流式时入队</div>
+    <div class="code-title">agent-session.ts · 流式时入队（注释为译注）</div>
     <pre class="code"><code><span class="cmt">// 正在流式：必须显式声明是打断还是等待</span>
 <span class="kw">if</span> (<span class="fn">this</span>.isStreaming) {
   <span class="kw">if</span> (!options?.streamingBehavior) {
-    <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(<span class="st">"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp')."</span>);
+    <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">Error</span>(<span class="st">"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."</span>);
   }
   <span class="kw">if</span> (options.streamingBehavior === <span class="st">"followUp"</span>) {
     <span class="kw">await</span> <span class="fn">this</span>._queueFollowUp(expandedText, currentImages);
@@ -258,16 +258,24 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
   <span class="kw">return</span>;
 }</code></pre>
     <p>两种入队的差别，看底层实现（AgentSession 维护两条数组，再转发给基础包的 Agent）：</p>
-    <div class="code-title">agent-session.ts · _queueSteer / _queueFollowUp</div>
+    <div class="code-title">agent-session.ts · _queueSteer / _queueFollowUp（注释为译注）</div>
     <pre class="code"><code><span class="kw">private</span> <span class="kw">async</span> _queueSteer(text: string, images?: ImageContent[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
   <span class="fn">this</span>._steeringMessages.push(text);      <span class="cmt">// 记录待投递（用于 UI 展示）</span>
   <span class="fn">this</span>._emitQueueUpdate();
-  <span class="kw">await</span> <span class="fn">this</span>.agent.steer({ text, images }); <span class="cmt">// 打断正在进行的动作</span>
+  <span class="kw">const</span> content: (TextContent | ImageContent)[] = [{ type: <span class="st">"text"</span>, text }];
+  <span class="kw">if</span> (images) {
+    content.push(...images);
+  }
+  <span class="fn">this</span>.agent.steer({ role: <span class="st">"user"</span>, content, timestamp: <span class="fn">Date</span>.now() });  <span class="cmt">// 只入队，不 await</span>
 }
 <span class="kw">private</span> <span class="kw">async</span> _queueFollowUp(text: string, images?: ImageContent[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
   <span class="fn">this</span>._followUpMessages.push(text);
   <span class="fn">this</span>._emitQueueUpdate();
-  <span class="kw">await</span> <span class="fn">this</span>.agent.followUp({ text, images }); <span class="cmt">// 等当前动作做完再投</span>
+  <span class="kw">const</span> content: (TextContent | ImageContent)[] = [{ type: <span class="st">"text"</span>, text }];
+  <span class="kw">if</span> (images) {
+    content.push(...images);
+  }
+  <span class="fn">this</span>.agent.followUp({ role: <span class="st">"user"</span>, content, timestamp: <span class="fn">Date</span>.now() });  <span class="cmt">// 等当前动作做完再投</span>
 }</code></pre>
     <p>区分与投递时机：</p>
     <table class="tbl">
@@ -279,7 +287,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
       </tbody>
     </table>
     <p>基础包的 <code class="inline">Agent</code> 类实际维护着这些队列，并提供两种投递模式：</p>
-    <div class="code-title">packages/agent/src/agent.ts · 队列模式</div>
+    <div class="code-title">packages/agent/src/agent.ts · 队列模式（伪代码，注释为本书说明）</div>
     <pre class="code"><code><span class="cmt">// QueueMode: "all" 或 "one-at-a-time"</span>
 <span class="cmt">// agent-loop 在每个边界（tool call / 一轮结束）检查队列：</span>
 <span class="cmt">//   one-at-a-time：每次只投最新一条 steer + 最新一条 followUp</span>
@@ -438,7 +446,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
   <span class="kw">await</span> <span class="fn">this</span>.finishSessionReplacement(options?.withSession);
   <span class="kw">return</span> { cancelled: <span class="kw">false</span> };
 }</code></pre>
-    <p>拆旧顺序是整页最值得抄的一段：</p>
+    <p>拆旧顺序是整页最应当照着做的一段：</p>
     <div class="code-title">agent-session-runtime.ts · teardownCurrent —— 优雅收尾</div>
     <pre class="code"><code><span class="kw">private async</span> <span class="fn">teardownCurrent</span>(reason, targetSessionFile?) {
   <span class="cmt">// 1. 先把当前响应的工具结果等落盘（abort 会妥善收尾）</span>
@@ -479,7 +487,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

@@ -51,7 +51,7 @@
 
   <section class="block">
     <h2><span class="num">7.2</span>StreamChunk：流的封闭词汇表</h2>
-    <div class="code-title">packages/llm/llm/src/types.ts:378</div>
+    <div class="code-title">packages/llm/llm/src/types.ts:390</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">StreamChunk</span> =
   | { type: <span class="st">'block-start'</span>; index: <span class="kw">number</span>; blockType: <span class="cl">ContentBlockType</span> }
   | { type: <span class="st">'text-delta'</span>; index: <span class="kw">number</span>; text: <span class="kw">string</span> }
@@ -94,6 +94,7 @@
    */</span>
   purpose?: <span class="st">'compaction'</span> | <span class="st">'session-title'</span>
 }</pre>
+    <div class="annotation"><b>还没定案的事：哪些字段算 epoch 级</b>：循环构建请求时用的 config 是 <code class="inline">LlmCallConfig</code>（call-config.ts:23）——provider/model/reasoningEffort/temperature/maxTokens/stop 六个字段，每个请求从日志 header 重建而非逐调用传入。哪些字段该进这个集合，作者自己留了 <code class="inline">TODO(call-config-shape)</code>（call-config.ts:15）：「Revisit which fields are epoch-level for cache reuse and where provider-specific request options belong」。为什么这个问题不好答：字段越多，header 变化越频繁（第 3 章 reason 'change' 的触发条件），每次变化都可能打断 KV 缓存前缀；字段越少，供应商特有的采样选项又没有安放位置。目前的分界线是「影响缓存复用的请求头状态」——temperature 和 maxTokens 都在集合里，所以改采样参数会记一条 request/header change，这是有意为之的可见性而非遗漏。</div>
   </section>
 
   <section class="block">
@@ -113,7 +114,7 @@
 }</pre>
     <table class="tbl">
       <tr><th>码</th><th>来源</th><th>可重试（默认策略）</th></tr>
-      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:953）</td><td>否</td></tr>
+      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:966）</td><td>否</td></tr>
       <tr><td><code class="inline">MISSING_CREDENTIAL</code></td><td>请求时解析不到 API key（区别于 AUTH：修法不同——前者补凭据，后者换凭据）</td><td>否</td></tr>
       <tr><td><code class="inline">AUTH</code></td><td>HTTP 401/403</td><td>否</td></tr>
       <tr><td><code class="inline">RATE_LIMIT</code></td><td>HTTP 429（尊重 Retry-After）</td><td>是</td></tr>
@@ -122,7 +123,7 @@
       <tr><td><code class="inline">CONTEXT_WINDOW_EXCEEDED</code></td><td>400 且命中上下文超限特征</td><td>否（触发 compaction，见第 11 章）</td></tr>
       <tr><td><code class="inline">EMPTY_RESPONSE</code></td><td>2xx 但无任何内容</td><td>是</td></tr>
     </table>
-    <div class="code-title">packages/llm/llm-deepseek/src/adapter.ts:329 — httpErrorCode()</div>
+    <div class="code-title">packages/llm/llm-deepseek/src/adapter.ts:339 — httpErrorCode()</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">httpErrorCode</span>(status: <span class="kw">number</span>, error?: <span class="cl">WireError</span>[<span class="st">'error'</span>]): <span class="kw">string</span> {
   <span class="kw">if</span> (status === <span class="nu">401</span> || status === <span class="nu">403</span>) <span class="kw">return</span> <span class="st">'AUTH'</span>
   <span class="kw">if</span> (status === <span class="nu">413</span>) <span class="kw">return</span> <span class="st">'INVALID_REQUEST'</span>
@@ -184,26 +185,37 @@
   <span class="kw">if</span> (policy === <span class="kw">undefined</span>) <span class="kw">return</span> next()
   <span class="cmt">// …normal 模式：code ∈ retryableCodes 且未超 maxRetries 时安排退避重试；</span>
   <span class="cmt">//   always 模式：融合 signal 与插件 lifetime，每次失败都重试…</span>
-  agent.session.<span class="fn">append</span>(<span class="st">'llm/retry-started'</span>, { retryId, turn, step, retry })
+  agent.session.<span class="fn">append</span>(<span class="st">'llm/retry'</span>, eventData)          <span class="cmt">// ← 先记账：失败的完整事实</span>
+  <span class="kw">if</span> (!<span class="kw">await</span> <span class="fn">cancellableDelay</span>(delayMs, fusedSignal)) <span class="kw">return</span>
+  agent.session.<span class="fn">append</span>(<span class="st">'llm/retry-started'</span>, { retryId, turn, step, retry })  <span class="cmt">// ← 等待后才写</span>
   <span class="kw">return</span> { kind: <span class="st">'retry'</span> }
 }</pre>
-    <div class="annotation"><b>关注点分离</b>：循环只定义「失败后问监听器怎么办」这个钩子（agent/request-error waterfall，第 4 章表格）；<strong>策略</strong>（哪些码可重试、退避曲线）由供应商适配器解析并提供；<strong>执行</strong>（等待、记账、决定 retry）由这个插件完成，且每次调度重试前先持久化 <code class="inline">llm/retry-started</code> 事件——「cancellable wait 之前先持久」，崩溃后重试历史可审计。想换重试实现（比如接进自己的熔断器），换监听器即可，循环与适配器都不动。</div>
+    <div class="annotation"><b>关注点分离</b>：循环只定义「失败后问监听器怎么办」这个钩子（agent/request-error waterfall，第 4 章表格）；<strong>策略</strong>（哪些码可重试、退避曲线）由供应商适配器解析并提供；<strong>执行</strong>（等待、记账、决定 retry）由这个插件完成。持久化分两步：决定重试时立刻写一条 <code class="inline">llm/retry</code>，把失败码、退避时长、策略键、第几次重试这些事实先落盘——「cancellable wait 之前先记账」；退避等待<strong>成功走完</strong>、确实要发下一次请求时，才写 <code class="inline">llm/retry-started</code>。所以若进程在退避期间被杀，日志里留下的是「打算重试但没开始」，而不是「重试已开始」。想换重试实现（比如接进自己的熔断器），换监听器即可，循环与适配器都不动。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.5</span>DeepSeek 官方适配器</h2>
     <p><code class="inline">packages/llm/llm-deepseek</code> 注册唯一的 provider 路由 <code class="inline">deepseek-official</code>：</p>
-    <div class="code-title">packages/llm/llm-deepseek/src/index.ts</div>
+    <div class="code-title">packages/llm/llm-deepseek/src/index.ts（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">DEFAULT_API_KEY_ENV</span> = <span class="st">'DEEPSEEK_API_KEY'</span>
 <span class="cmt">/** 本插件拥有的唯一 provider 路由。 */</span>
 <span class="kw">const</span> <span class="cl">PROVIDER</span> = <span class="st">'deepseek-official'</span>
 
 <span class="kw">const</span> <span class="cl">DEFAULT_MODELS</span>: <span class="cl">DeepSeekCatalogModel</span>[] = [
   {
+    id: <span class="st">'deepseek-flash'</span>,
+    name: <span class="st">'DeepSeek-V41-Flash'</span>,
+    contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,      <span class="cmt">// 1_000_000（adapter.ts:147）</span>
+    inputModalities: [<span class="st">'text'</span>, <span class="st">'image'</span>],          <span class="cmt">// 图像输入</span>
+    imagePixelBudget: <span class="cl">DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET</span>,
+    imageMaxBytes: <span class="cl">DEFAULT_REQUEST_IMAGE_MAX_BYTES</span>,
+    systemPromptUpdate: <span class="st">'in-history'</span>,           <span class="cmt">// 会话中途换系统提示词时随历史追加，不重写首条</span>
+  },
+  {
     id: <span class="st">'deepseek-v4-flash'</span>,
     name: <span class="st">'DeepSeek-V4-Flash'</span>,
     description: <span class="st">'Fast, efficient, and economical; suited to focused, routine, or parallel tasks.'</span>,
-    contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,      <span class="cmt">// 1_000_000（adapter.ts:140）</span>
+    contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,
   },
   {
     id: <span class="st">'deepseek-v4-pro'</span>,
@@ -220,6 +232,8 @@
     imageMaxBytes: <span class="cl">DEFAULT_REQUEST_IMAGE_MAX_BYTES</span>,
   },
 ]
+<span class="cmt">// v0.1.5-rc 起默认目录 4 个模型：deepseek-flash（V41，带视觉 + systemPromptUpdate）排在首位，</span>
+<span class="cmt">// 其后依次为 V4 Flash / V4 Pro / V4 Flash Vision Exp；dsh-base 的默认路由（agent-default-model）也指向 deepseek-flash。</span>
 
 <span class="kw">export interface</span> <span class="cl">Config</span> {
   <span class="cmt">/** 凭据引用（环境变量名），逐请求解析；默认 DEEPSEEK_API_KEY。 */</span>
@@ -235,7 +249,7 @@
       <tr><td><code class="inline">DEFAULT_CONTEXT_WINDOW</code></td><td>1,000,000</td><td>模型目录默认上下文窗口</td></tr>
       <tr><td><code class="inline">DEFAULT_MAX_TOKENS</code></td><td>256,000</td><td>默认输出上限</td></tr>
       <tr><td><code class="inline">DEFAULT_STREAM_IDLE_TIMEOUT_MS</code></td><td>300,000（5 分钟）</td><td>流空闲超时（超时 → TIMEOUT 码 → 可重试）</td></tr>
-      <tr><td><code class="inline">DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES</code></td><td>20 MB</td><td>超过则走 Files API 卸载（vision 模型）</td></tr>
+      <tr><td><code class="inline">DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES</code></td><td>20 MB</td><td>内联 base64 图像负载的上界——vision 模型默认走 Files API，只有上传失败<strong>退回到 base64</strong> 时才受这个预算约束（adapter.ts:151 注释原话：bound on accumulated base64 image payload after Files API fallback）</td></tr>
     </table>
     <p>线上请求的组装（<code class="inline">packages/llm/llm-deepseek/src/serialize.ts</code>）：</p>
     <div class="code-title">packages/llm/llm-deepseek/src/serialize.ts — 线上请求（节选）</div>
@@ -275,7 +289,7 @@ dsh_session_log 请求字段与持久事件 session-log-deepseek/delivery-accept
   并发接受可乱序；折叠最大匹配 throughSeq 防止游标回退。</pre>
     <div class="callout info">
       <b class="tag">看懂这个设计</b>
-      这是「能力缝」思想在 LLM 协议层的体现：适配器不写死任何请求字段语义，而是开放一个带 accept 回调的注册缝。服务端因此能拿到<strong>完整的 canonical 会话日志后缀</strong>（服务端可做更好的缓存/回放），而客户端用持久水位线事件保证至少一次投递且不回退。另一个注册在缝上的字段是 dsh_plugin_packages（插件清单上报，由 plugin-package-inventory 提供）。
+      这条扩展缝就是第 1 章能力缝三角色模型的又一次落地：适配器不写死任何请求字段语义，而是开放一个带 accept 回调的注册缝。服务端因此能拿到<strong>完整的 canonical 会话日志后缀</strong>（服务端可做更好的缓存/回放），而客户端用持久水位线事件保证至少一次投递且不回退。另一个注册在缝上的字段是 dsh_plugin_packages（插件清单上报，由 plugin-package-inventory 提供）。
     </div>
   </section>
 
@@ -295,7 +309,7 @@ dsh_session_log 请求字段与持久事件 session-log-deepseek/delivery-accept
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.1.3-alpha.1 (HEAD d347e70390) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

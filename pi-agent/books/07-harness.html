@@ -96,7 +96,7 @@
       <li><strong>韧性</strong>：过程崩溃了怎么恢复？中途被要求挂起（deferred）怎么续跑？</li>
     </ul>
     <div class="callout">
-      <strong>一句话定位：</strong><code class="inline">packages/agent/src/harness/agent-harness.ts</code>（622 行）是<strong>纯类型契约</strong>——Result 类型、事件载荷、钩子签名、<code class="inline">AgentLane</code>/<code class="inline">AgentHarness</code> 接口，<strong>一行实现代码都没有</strong>。实现是同包 <code class="inline">runtime/harness.ts</code> 里的 <code class="inline">Harness</code> 类（经 <code class="inline">AgentHarness.create</code> 导出），配 <code class="inline">runtime/lane.ts</code> 的 <code class="inline">Lane</code> 与 <code class="inline">runtime/drive/</code> 的状态机。L2 的 <code class="inline">AgentSession</code>（第 8 章）是<strong>另一条自主实现线</strong>，不复用这套运行时。先记住这条，下面所有内容都是「契约长什么样 + 官方运行时怎么兑现」。
+      <strong>定位：</strong><code class="inline">packages/agent/src/harness/agent-harness.ts</code>（622 行）是<strong>纯类型契约</strong>——Result 类型、事件载荷、钩子签名、<code class="inline">AgentLane</code>/<code class="inline">AgentHarness</code> 接口，<strong>一行实现代码都没有</strong>。实现是同包 <code class="inline">runtime/harness.ts</code> 里的 <code class="inline">Harness</code> 类（经 <code class="inline">AgentHarness.create</code> 导出），配 <code class="inline">runtime/lane.ts</code> 的 <code class="inline">Lane</code> 与 <code class="inline">runtime/drive/</code> 的状态机。L2 的 <code class="inline">AgentSession</code>（第 8 章）是<strong>另一条自主实现线</strong>，不复用这套运行时。先记住这条，下面所有内容都是「契约长什么样 + 官方运行时怎么兑现」。
     </div>
   </section>
 
@@ -321,7 +321,7 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
       </svg>
       <div class="fig-cap">图 7.4：编排现场 = 一个可覆写的单值 <code class="inline">pi.op.state</code>（13 叶状态机）。drive 是「读叶子 → 执行阶段 → 写下一叶」的循环；恢复不是日志重放，而是<strong>直接读回单值</strong> + <code class="inline">stateMatchesIntent()</code> 一致性校验。快照消费侧另有一个 <code class="inline">reduceLaneSnapshot()</code> 把事件流归约成 <code class="inline">LaneSnapshot</code>（7.5）。</div>
     </div>
-    <div class="annotation"><b>读懂这段：</b> 这才是 <code class="inline">suspended → resume()</code> 能成立的真正原因——挂起就是盘上的 <code class="inline">deferred.suspended</code> 叶子（含 <code class="inline">DeferredHandle</code>），<code class="inline">resume()</code> 从盘上读回它接着跑，内存里什么都不需要有。还有一个容易忽略的细节：<strong>effect_pending 家族</strong>（assistant/deferred/summary 各一）专门表达「效果做了、但账没落稳」——比如 LLM 响应已收到、条目已写入，但用量/结算还没核完；重启后 drive 会先走 recover* 路径核账再前进，<strong>宁可重查也不重复扣</strong>。对自研者：这是整个 harness 最值得抄的一条——<strong>把编排现场做成可从盘上精确重建的值 + 显式的"效果未落稳"状态，而不是在内存里维护易失状态</strong>。第 8 章的 <code class="inline">AgentSession</code> 是另一条实现线，不共用这套状态机。</div>
+    <div class="annotation"><b>读懂这段：</b> 这才是 <code class="inline">suspended → resume()</code> 能成立的真正原因——挂起就是盘上的 <code class="inline">deferred.suspended</code> 叶子（含 <code class="inline">DeferredHandle</code>），<code class="inline">resume()</code> 从盘上读回它接着跑，内存里什么都不需要有。还有一个容易忽略的细节：<strong>effect_pending 家族</strong>（assistant/deferred/summary 各一）专门表达「效果做了、但账没落稳」——比如 LLM 响应已收到、条目已写入，但用量/结算还没核完；重启后 drive 会先走 recover* 路径核账再前进，<strong>宁可重查也不重复扣</strong>。对自研者：这是整个 harness 最应当照着做的一条——<strong>把编排现场做成可从盘上精确重建的值 + 显式的"效果未落稳"状态，而不是在内存里维护易失状态</strong>。第 8 章的 <code class="inline">AgentSession</code> 是另一条实现线，不共用这套状态机。</div>
   </section>
 
   <section class="block">
@@ -398,12 +398,12 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
 <span class="kw">export interface</span> <span class="cl">Events</span> {
   on&lt;TType <span class="kw">extends</span> <span class="cl">HarnessEventType</span>&gt;(type, listener): () =&gt; <span class="kw">void</span>;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 对自研者：<strong>钩子是"策略注入点"</strong>，把可变策略（上下文改写、工具拦截、压缩触发）从主循环里抽出来。两个实现细节值得抄：其一，钩子的 event/result 都是<strong>带类型的映射表</strong>（<code class="inline">HookMap</code>），<code class="inline">Hooks.on</code> 按名字自动推导 handler 签名——比 <code class="inline">(payload: any)</code> 强得多；其二，<code class="inline">before_drive</code> 挂在 drive 循环的第一步（7.3），是「操作就要开始推了」的统一哨口。<code class="inline">events</code> 则是被动观察（run_start / tool_end / compaction_end…），不干预、只广播；订阅回调收到的每个事件都带 <code class="inline">lane</code> 与可选 <code class="inline">recovery</code> 标记（recovery = 恢复路径重发的历史事件）。第 5 章见过的 <code class="inline">transform_context</code> 就接在 <code class="inline">buildSessionContext</code> 产出之后、发给模型之前。</div>
+    <div class="annotation"><b>读懂这段：</b> 对自研者：<strong>钩子是"策略注入点"</strong>，把可变策略（上下文改写、工具拦截、压缩触发）从主循环里抽出来。两个实现细节值得照着做：其一，钩子的 event/result 都是<strong>带类型的映射表</strong>（<code class="inline">HookMap</code>），<code class="inline">Hooks.on</code> 按名字自动推导 handler 签名——比 <code class="inline">(payload: any)</code> 强得多；其二，<code class="inline">before_drive</code> 挂在 drive 循环的第一步（7.3），是「操作就要开始推了」的统一哨口。<code class="inline">events</code> 则是被动观察（run_start / tool_end / compaction_end…），不干预、只广播；订阅回调收到的每个事件都带 <code class="inline">lane</code> 与可选 <code class="inline">recovery</code> 标记（recovery = 恢复路径重发的历史事件）。第 5 章见过的 <code class="inline">transform_context</code> 就接在 <code class="inline">buildSessionContext</code> 产出之后、发给模型之前。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.7</span>契约 vs 运行时：一个包里的两层</h2>
-    <p>把 7.1 那条结论展开成清单。<code class="inline">agent-harness.ts</code>（622 行）是<strong>纯契约模块</strong>：Result 类型、事件载荷联合、<code class="inline">HookMap</code>、<code class="inline">AgentLane</code>/<code class="inline">AgentHarness</code> 接口，<strong>一行实现代码都没有</strong>。实现全在旁边的 <code class="inline">runtime/</code> 目录，两者通过一个导出点缝合：</p>
+    <p>把 7.1 那条结论展开成清单。<code class="inline">agent-harness.ts</code>（622 行）是<strong>纯契约模块</strong>：Result 类型、事件载荷联合、<code class="inline">HookMap</code>、<code class="inline">AgentLane</code>/<code class="inline">AgentHarness</code> 接口，<strong>一行实现代码都没有</strong>。实现全在旁边的 <code class="inline">runtime/</code> 目录，两者通过一个导出点对接：</p>
     <div class="code-title">packages/agent/src/harness/agent-harness.ts — 契约的唯一实现导出点（614-622 行）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">AgentHarnessConstructor</span> {
   create&lt;TContext&gt;(options: <span class="cl">AgentHarnessOptions</span>&lt;TContext&gt;, context: Context)
@@ -438,7 +438,7 @@ toProviderMessages ?? convertToLlm;</pre>
 </div>
 
 <footer>
-  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

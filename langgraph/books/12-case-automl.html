@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · 实战案例 — 深入浅出LangGraph</title>
+<link rel="stylesheet" href="assets/lg-learn.css">
+<script src="assets/anim.js" defer></script>
+<script src="assets/scenes.js" defer></script>
+</head>
+
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出LangGraph</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-core-concepts.html">核心概念</a>
+      <a href="02-first-graph.html">第一个图</a>
+      <a href="03-state-reducers.html">状态·Reducer</a>
+      <a href="04-control-flow.html">控制流</a>
+      <a href="05-react-agent.html">ReAct Agent</a>
+      <a href="06-human-in-the-loop.html">人机协同</a>
+      <a href="09-checkpoint-store.html">持久化</a>
+      <a href="07-multi-agent.html">多智能体</a>
+      <a href="08-patterns.html">经典模式</a>
+      <a href="11-streaming.html">流式输出</a>
+      <a href="12-case-automl.html" style="color:var(--brand);font-weight:700;">实战案例</a>
+      <a href="10-agent-selector.html">选型指南</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 实战案例</div>
+    <h1>12 · 实战案例 — 尝试用 LangGraph 重构一条 AutoML 流水线</h1>
+    <div class="subtitle">前十一章讲「图怎么写」，本章讲「真实工程怎么用图」：把一条 26 节点 AutoML 流水线里手写的并发、审批、持久化、日志，逐一换成图原语——两层图、分区 State、Send、interrupt、双通道 stream，前九章的概念各就各位。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>案例背景：一条已用 LangGraph、却没用到点子上的流水线</h2>
+    <p>案例是一条<strong>已存在的 AutoML 流水线</strong>：用户提交表格/时序预测任务，系统自动走完「理解问题 → 搜模型 → 建数据集 → 评估 → 调参迭代 → 注册交付」。它不是 demo——有软硬失败规则、人工审批点、一跑几小时到几天的长任务。</p>
+    <p>它<strong>已经用着 LangGraph，但只用了最浅的一层</strong>——好比买了智能手机只用来打电话：26 个节点平铺成一张大图，图覆盖不到的难点（并发、持久化、人机协同）全靠图外的手写机制在扛。用起来是什么体验？</p>
+    <ul>
+      <li><strong>任务停在等人审批，页面却显示「运行中」</strong>——没人知道该自己出手，任务能卡一整天。</li>
+      <li><strong>想知道第 3 个候选训练到第几轮？</strong>界面上没有，只能翻日志。</li>
+      <li><strong>任务半夜挂了想重试</strong>——从哪个节点续跑记在手写 JSON 里，对不上就从头再来。</li>
+    </ul>
+    <p>翻开代码，这些体验背后是五套手写机制：</p>
+    <ul>
+      <li><strong>状态</strong>：178 个字段平铺一个 dict，谁读谁写全靠约定，节点返回的 patch 一不小心就覆盖别人的字段。</li>
+      <li><strong>并发</strong>：Top-K 候选在节点内用 <code class="inline">ThreadPoolExecutor</code> 手动开线程，外面还套 <code class="inline">while True</code>。</li>
+      <li><strong>审批</strong>：自定义 <code class="inline">checkpoint_state.json</code> + resume 函数，暂停是「节点内一个文件写入」，业务状态机不知道。</li>
+      <li><strong>可观测</strong>：有个 9 节点 trial 子图用 <code class="inline">graph.invoke()</code> 调用——内部事件被整个吞掉。</li>
+      <li><strong>日志</strong>：<code class="inline">log_node_start/end</code> 手写几十处，漏一处可观测就断一截。</li>
+    </ul>
+    <p>每一套，前九章都有现成的图原语替换。本章做的就是这次替换——对照表既是问题清单，也是本章目录：</p>
+    <table class="tbl">
+      <thead><tr><th>手写机制（重构前）</th><th>图原语（重构后）</th><th>对应章节</th></tr></thead>
+      <tbody>
+        <tr><td>178 字段扁平 dict，整 patch 覆盖</td><td>分区 State + 自定义 reducer</td><td>03 状态·Reducer</td></tr>
+        <tr><td>26 节点平铺一张图 / mermaid 视觉分组</td><td>两层结构：顶层只显示 4 个阶段子图</td><td>07 多智能体（子图即节点）</td></tr>
+        <tr><td>节点内 <code class="inline">ThreadPoolExecutor</code> + <code class="inline">while True</code></td><td><code class="inline">Send</code> fan-out + 子图</td><td>04 控制流</td></tr>
+        <tr><td><code class="inline">checkpoint_state.json</code> + resume 函数</td><td><code class="inline">interrupt({type})</code> + <code class="inline">Command(resume=)</code></td><td>06 人机协同</td></tr>
+        <tr><td>手写 <code class="inline">save/load_workflow_checkpoint</code></td><td>SqliteSaver，<code class="inline">thread_id = task_id</code></td><td>09 持久化</td></tr>
+        <tr><td>子图 <code class="inline">invoke()</code> 事件被吞</td><td><code class="inline">stream_mode=["updates","custom"] + subgraphs</code></td><td>11 流式输出</td></tr>
+        <tr><td>26 个内联路由闭包</td><td>子图出口信号 + 顶层条件边</td><td>04 控制流</td></tr>
+      </tbody>
+    </table>
+    <div class="callout info"><b class="tag">范围声明</b> 重构目标刻意定为<strong>机械等价</strong>：换机制不换行为——链路、软硬失败规则、审批点位全保留，不引入 LLM 推理闭环。真实业务的流水线要先「换引擎不换行为」，等价性才可验证；智能体化是第二步（见 12.9）。本章代码均为按重构方案蒸馏的教学示例，不逐字对应原仓库。</div>
+
+    <div class="callout info"><b class="tag">本章结构</b> 12.2–12.7 是六个递进的决策——图怎么分层、状态怎么分区、并发怎么发、审批怎么停、断点怎么存、进度怎么看见；每个决策 = 一个手写机制 → 一个图原语。12.8 讲图之上的产品前端，12.9 收尾。若只关心某一环节，按 12.1 的对照表跳读即可。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>两层图结构：像浏览器书签栏一样组织节点</h2>
+    <p>第一个决策：<strong>图怎么分层</strong>。最初的拆法把 26 个大节点拆成 38 个细粒度节点、全部平铺一张图——结果只是把「26 个节点太乱」变成「38 个节点更乱」。真正的解法类似浏览器书签：<strong>38 个节点按业务阶段收进 4 个文件夹（compiled 子图），书签栏（顶层）只显示文件夹</strong>。点开文件夹才是细节点——这就是「下钻」。</p>
+    <ul>
+      <li><strong>stage_a · 理解与发现</strong>（10 节点）：init → 校验 → 搜模型 → 血缘解析</li>
+      <li><strong>stage_b · 数据与契约</strong>（3 节点）：特征元数据 → 物化数据集 → 问题契约</li>
+      <li><strong>stage_c · 评估门禁</strong>（6 节点）：评估 → 领域评估 → 过拟合诊断 → 门禁路由</li>
+      <li><strong>stage_d · 调优迭代</strong>（14 节点）：调优准备 → idea 库 → trial 循环 → 迭代编排 / Top-K 分支</li>
+      <li><strong>顶层尾</strong>（3 节点）：feature_analysis_post → cleanup → finalize</li>
+    </ul>
+    <p>子图内合计 36 节点，加 trial 内嵌子图自己的 9 个，即「约 38」的口径。顶层只呈现约 10 个节点，一屏读完——<strong>复杂度没有被藏起来，而是按读者分层</strong>：这条只显示文件夹的顶层主干，下面叫它「主脊」。非工程角色只看主脊，工程师按需下钻到子图内部。</p>
+
+    <p>分层有一条硬约束：<strong>cleanup 必须留在顶层</strong>。原流水线里任何节点失败都要跳到统一的 <code class="inline">cleanup</code> 做清理，而<strong>子图是黑盒：只能从入口进，跳不进中间节点</strong>——cleanup 若埋进 stage_a，stage_c 失败时就够不着它。由此得出边界判据：</p>
+    <div class="callout info"><b class="tag">子图边界判据</b> 需要被<strong>全图任意位置</strong>跳转/汇合的节点（cleanup、finalize）留在顶层；只被<strong>本阶段内</strong>读写的流程做成子图。先画跨子图的边，再给剩余节点分组——拓扑决定边界，而非业务名词。</div>
+
+    <p>另一个问题：<strong>子图内部的分叉，顶层怎么知道走了哪条</strong>。stage_c 的门禁有四向分流，但子图对外只有一个 END，顶层看不到内部走了哪条路。解法是<strong>出口信号字段</strong>：子图最末节点往状态写一个信号（如 <code class="inline">signals.eval_exit_route = "tune_required"</code>），顶层条件边读这个信号决定下一跳——子图内部怎么分叉是自己的事，结论用一个字段告诉顶层。重构前的 26 个内联路由闭包，就此收敛为「子图出口 + 顶层条件边」一个模式。</p>
+
+    <p><strong>动态演示</strong>——步进看主脊推进、出口信号如何被顶层条件边消费、以及下钻子图内部与顶层尾的边界约束：</p>
+    <div data-anim="two-layer-graph"></div>
+
+    <div class="code-title">子图作为节点嵌入 + 出口信号 + 顶层条件边（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
+
+<span class="cmt"># ---- 阶段子图：内部路由全部收敛到 END，只留一个出口信号 ----</span>
+<span class="kw">def</span> <span class="fn">build_stage_c</span>():
+    g = StateGraph(AutoMLState)
+    g.add_node(<span class="st">"run_evaluation"</span>, run_evaluation)
+    g.add_node(<span class="st">"overfitting_diagnosis"</span>, overfitting_diagnosis)
+    g.add_node(<span class="st">"gate_router"</span>, gate_router)      <span class="cmt"># 末节点：只写信号，不路由</span>
+    g.add_edge(START, <span class="st">"run_evaluation"</span>)
+    g.add_edge(<span class="st">"run_evaluation"</span>, <span class="st">"overfitting_diagnosis"</span>)
+    g.add_edge(<span class="st">"overfitting_diagnosis"</span>, <span class="st">"gate_router"</span>)
+    g.add_edge(<span class="st">"gate_router"</span>, END)               <span class="cmt"># 四向分流 → 收敛为一个信号字段</span>
+    <span class="kw">return</span> g.<span class="fn">compile</span>()
+
+<span class="kw">def</span> <span class="fn">gate_router</span>(state: AutoMLState) -&gt; dict:
+    <span class="cmt"># 内部分流逻辑照旧，但结论只写进出口信号字段</span>
+    route = compute_gate_route(state)   <span class="cmt"># pass_or_eval_only / tune_required / ...</span>
+    <span class="kw">return</span> {<span class="st">"runtime"</span>: {<span class="st">"signals"</span>: {<span class="st">"eval_exit_route"</span>: route}}}
+
+<span class="cmt"># ---- 顶层：子图当节点，条件边读信号决定下一跳 ----</span>
+top = StateGraph(AutoMLState)
+top.add_node(<span class="st">"stage_a"</span>, build_stage_a())
+top.add_node(<span class="st">"stage_c"</span>, build_stage_c())
+top.add_node(<span class="st">"stage_d"</span>, build_stage_d())
+top.add_node(<span class="st">"cleanup"</span>, cleanup)          <span class="cmt"># 失败短路汇合点：必须留顶层</span>
+top.add_edge(START, <span class="st">"stage_a"</span>)
+top.add_edge(<span class="st">"stage_a"</span>, <span class="st">"stage_c"</span>)
+top.add_edge(<span class="st">"stage_c"</span>, <span class="st">"stage_d"</span>)
+top.add_edge(<span class="st">"stage_d"</span>, <span class="st">"cleanup"</span>)</pre>
+    <div class="annotation"><b>读懂这段：</b>① <code class="inline">build_stage_c()</code> 返回 compiled graph 直接作为 <code class="inline">add_node</code> 参数——「子图即节点」（第 07 章同一机制，这里用于工程分层）；② gate_router 的返回值没有路由指令、只有信号——分流决策被数据化了；③ 顶层连边极简，四向语义藏在 <code class="inline">eval_exit_route</code> 取值里，条件边按信号跳转。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>分层 State：178 个扁平字段 → 7 个分区</h2>
+    <p>第二个决策：<strong>状态怎么组织</strong>。178 个字段平铺一个 dict，问题在更新语义：节点返回 patch、reducer 负责合并，扁平结构下返回 <code class="inline">{"tune": {...}}</code> 就可能覆盖 tune 的其他字段——像多个人共编一张表格，每次都要小心别碰坏别人的格子。解法是<strong>按读写边界分区</strong>：把字段分进 7 个分区，每个分区一个 reducer，节点只动自己分区的键。</p>
+    <div class="code-title">分区 State + 分区级合并 reducer（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated, TypedDict
+
+<span class="kw">def</span> <span class="fn">section_merge</span>(name: str):
+    <span class="st">"""分区级合并：只更新 patch 里出现的键，不动分区内的其他键。"""</span>
+    <span class="kw">def</span> <span class="fn">reducer</span>(old: dict | None, new: dict | None) -&gt; dict:
+        merged = dict(old or {})
+        merged.update(new or {})
+        <span class="kw">return</span> merged
+    <span class="kw">return</span> reducer
+
+<span class="cmt"># 每个分区是一个嵌套 TypedDict；reducer 一律挂在顶层 schema 的分区键上</span>
+<span class="cmt"># （LangGraph 只读顶层 Annotated——分区「内部」的 Annotated 不生效，实测验证）</span>
+<span class="kw">class</span> <span class="cl">TuneSection</span>(TypedDict, total=<span class="kw">False</span>):
+    idea_library: list
+    best_trial: dict     <span class="cmt"># 多写者字段：靠节点内显式比较取优（见下）</span>
+    iteration_pass: int  <span class="cmt"># 防并发更新回退：同上，显式 reconcile</span>
+
+<span class="kw">class</span> <span class="cl">SignalsSection</span>(TypedDict, total=<span class="kw">False</span>):
+    eval_exit_route: str          <span class="cmt"># stage_c 出口信号</span>
+    experiment_exit_route: str    <span class="cmt"># stage_d 出口信号</span>
+
+<span class="kw">class</span> <span class="cl">AutoMLState</span>(TypedDict, total=<span class="kw">False</span>):
+    runtime: RuntimeSection                  <span class="cmt"># 含 signals 子键</span>
+    problem: Annotated[dict, section_merge(<span class="st">"problem"</span>)]  <span class="cmt"># 契约级：目标列/任务类型/时序契约</span>
+    data:    Annotated[dict, section_merge(<span class="st">"data"</span>)]
+    model:   Annotated[dict, section_merge(<span class="st">"model"</span>)]
+    eval:    Annotated[dict, section_merge(<span class="st">"eval"</span>)]
+    tune:    Annotated[dict, section_merge(<span class="st">"tune"</span>)]</pre>
+    <div class="annotation"><b>读懂这段：</b>分区靠<strong>读写证据</strong>划分：grep 每个字段被谁读谁写，高频共读共写的归一个分区。这会暴露反直觉的归属——<code class="inline">target_column</code> 名字像数据字段，但它建契约后定型、被下游只读传播，本质是契约，应上移到 <code class="inline">problem</code>。另注意一个实测验证的框架边界：<strong>reducer 只看顶层 schema 的 <code class="inline">Annotated</code></strong>——写在分区 TypedDict 内部的 <code class="inline">Annotated[dict, best_reducer]</code> 不生效。</div>
+
+    <p>三个配套设计：</p>
+    <ul>
+      <li><strong>出口信号单独一个 signals 分区</strong>：<code class="inline">eval_exit_route</code> 这类信号被顶层条件边读，不归属任何业务分区——单独放 <code class="inline">runtime.signals</code>（last-write-wins），不污染业务分区的 reducer 边界。</li>
+      <li><strong>多写者字段显式 reconcile</strong>：<code class="inline">best_trial</code> 被四个节点写，「后来者覆盖」会丢历史最优。解法是双保险：<code class="inline">section_merge</code> 兜住「不同键互不覆盖」，节点内（prepare_tuning/trial_loop/finalize）比较主指标、只留最优——第 03 章「为字段选对合并语义」在分区结构下的落地。<code class="inline">iteration_pass</code> 防回退同理，节点内 <code class="inline">max()</code> 后写。</li>
+      <li><strong>迁移期留兼容层</strong>：<code class="inline">flatten_state(sectioned) -&gt; legacy_flat</code> 让新旧 state 并存，节点逐个迁移，迁完再删——第 09 章的灰度思路。</li>
+    </ul>
+    <div class="callout warn"><b class="tag">经验</b> 分区边界最怕按业务名词直觉分。用读写证据说话：字段被谁写、被谁读、读写是否在同一阶段。证据会告诉你哪些字段「名字在这、家在别处」——那些正是扁平时代留下的隐式耦合，分区化是让它们显式化的机会。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>Send fan-out：替掉 ThreadPoolExecutor</h2>
+    <p>第三个决策：<strong>并发怎么做</strong>。Top-K 调优是唯一的真并发场景——选 K 个候选模型，每个独立跑完整调优子流程，最后汇总选优。重构前塞在一个节点函数里，<code class="inline">ThreadPoolExecutor</code> 手动开 K 个线程、每线程串调 4 个节点函数；线程没有界面、没有断点、异常互相污染。重构后换成 <code class="inline">Send</code>：</p>
+    <div class="code-title">Top-K 并发：Send fan-out + 子图（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">import</span> operator
+<span class="kw">from</span> langgraph.types <span class="kw">import</span> Send, Command
+
+<span class="cmt"># 汇聚槽挂在顶层 schema 上（operator.add 才会生效——见 12.3 的框架边界）</span>
+<span class="kw">class</span> <span class="cl">AutoMLState</span>(TypedDict, total=<span class="kw">False</span>):
+    candidate_results: Annotated[list, operator.add]
+
+<span class="cmt"># fan-out 有两种等价写法（均实测可跑）：</span>
+
+<span class="cmt"># 写法一：条件边的 path 函数返回 Send 列表（第 04 章的标准姿势）</span>
+<span class="kw">def</span> <span class="fn">topk_fanout</span>(state: AutoMLState) -&gt; list[Send]:
+    <span class="kw">return</span> [
+        Send(<span class="st">"tune_candidate_subgraph"</span>, {<span class="st">"candidate"</span>: c,
+                                          <span class="st">"problem"</span>: state[<span class="st">"problem"</span>],
+                                          <span class="st">"data"</span>: state[<span class="st">"data"</span>]})
+        <span class="kw">for</span> c <span class="kw">in</span> state[<span class="st">"model"</span>][<span class="st">"topk_candidates"</span>]
+    ]
+top.add_conditional_edges(<span class="st">"search_bridge"</span>, topk_fanout)   <span class="cmt"># 从上游节点 fan-out</span>
+
+<span class="cmt"># 写法二：普通节点直接返回 Command(goto=[Send...])</span>
+<span class="kw">def</span> <span class="fn">topk_fanout_node</span>(state: AutoMLState) -&gt; Command:
+    <span class="kw">return</span> Command(goto=[Send(<span class="st">"tune_candidate_subgraph"</span>, {...})
+                         <span class="kw">for</span> c <span class="kw">in</span> state[<span class="st">"model"</span>][<span class="st">"topk_candidates"</span>]])
+
+top.add_edge(<span class="st">"tune_candidate_subgraph"</span>, <span class="st">"topk_promote"</span>)   <span class="cmt"># 汇聚选优</span></pre>
+    <div class="annotation"><b>读懂这段：</b>对照第 04 章 map-reduce，结构一模一样——变的只是 map 目标从函数变成子图。每个候选得到独立状态投影（只读 <code class="inline">problem</code>/<code class="inline">data</code>，写 <code class="inline">candidate_results</code>），K 个子图实例同一 super-step 并发，结果经 <code class="inline">operator.add</code> 归并。易踩的坑：<strong>Send 只能从条件边 path 函数或 <code class="inline">Command(goto=)</code> 发出</strong>——普通节点直接 <code class="inline">return [Send(...)]</code> 会被当成 state patch，实测抛 <code class="inline">InvalidUpdateError</code>。</div>
+
+    <p>换掉线程换来三件事，都源于「并发单元从线程变成了图节点」：</p>
+    <ul>
+      <li><strong>可观测</strong>：每个候选每步都是图节点，<code class="inline">updates</code> 天然可见——线程时代想知道 3 号候选跑到哪只能翻日志。</li>
+      <li><strong>可中断</strong>：任意候选内 <code class="inline">interrupt()</code>，整图挂起、checkpoint 落盘，恢复后从断点继续。</li>
+      <li><strong>失败可续跑</strong>：一个候选抛异常，整次 invoke 以异常结束（默认取消同批其他任务，见 <code class="inline">_should_stop_others</code>）——但已完成候选的写入已随 checkpoint 落盘，同 thread_id 重新 invoke，只补跑失败的那个。线程时代恢复位置全靠手写记录。</li>
+    </ul>
+    <div class="callout warn"><b class="tag">Send 的隔离契约要先定</b> 「候选子图只读 problem/data/model、写独立 candidate_results」这个契约在状态分层落地时就定稿，而不是并发改造时才定——它决定子图接口形状，是后续拆分的前提。拖到最后才发现隔离方式不对，返工波及全部已完成的拆分。接口先行，实现后行。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.5</span>interrupt({type})：把 HITL 从文件约定变成类型契约</h2>
+    <p>第四个决策：<strong>人机协同怎么做</strong>。流水线有三种人工审批点：调参 idea 审批、领域指标确认、test 集确认。重构前用自定义 JSON 文件 + resume 函数实现，缺陷前面已经见过：<strong>暂停等人时 status 仍标 "running"</strong>，没人知道该出手，任务能卡一整天。根因：暂停只是节点内一个文件写入，业务状态机根本不知道。</p>
+    <p>重构后三种审批点统一为原生 <code class="inline">interrupt()</code>，且每个 interrupt 的 value 都带 <code class="inline">type</code> 字段：</p>
+    <table class="tbl">
+      <thead><tr><th>审批点</th><th>interrupt type</th><th>前端渲染</th><th>resume 载荷</th></tr></thead>
+      <tbody>
+        <tr><td>idea 审批</td><td><code class="inline">idea_approval</code></td><td>idea 列表卡片（勾选批准）</td><td>批准的 idea id 列表</td></tr>
+        <tr><td>领域指标确认</td><td><code class="inline">domain_metric_confirm</code></td><td>指标确认卡（建议指标 + 修改）</td><td>确认的指标集</td></tr>
+        <tr><td>test 集确认</td><td><code class="inline">test_confirm</code></td><td>指标对比卡（valid vs test）</td><td>yes/no</td></tr>
+      </tbody>
+    </table>
+    <div class="annotation"><b>为什么 type 字段重要：</b>interrupt 的 value 本来就是任意 JSON——结构化价值全在消费端。前端拿到 <code class="inline">__interrupt__</code> 事件后按 <code class="inline">value.type</code> 选渲染组件。「<strong>一种 type 一种 UI 组件</strong>」的映射表就是图后端和前端的契约：新加审批点 = 图里一处 interrupt + 前端一个组件，两边各自声明、互不渗透。</div>
+
+    <div class="code-title">idea 审批：interrupt 带类型化载荷（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.types <span class="kw">import</span> interrupt, Command
+
+<span class="kw">def</span> <span class="fn">generate_idea_library</span>(state: AutoMLState) -&gt; dict:
+    ideas = build_idea_library(state)
+    high_risk = [i <span class="kw">for</span> i <span class="kw">in</span> ideas <span class="kw">if</span> i.risk <span class="kw">in</span> (<span class="st">"MEDIUM"</span>, <span class="st">"HIGH"</span>)]
+    <span class="kw">if</span> high_risk <span class="kw">and not</span> state[<span class="st">"tune"</span>].get(<span class="st">"approved_idea_ids"</span>):
+        <span class="cmt"># 第一次执行：抛给前端；resume 后从这里拿到批准列表</span>
+        approved = interrupt({
+            <span class="st">"type"</span>: <span class="st">"idea_approval"</span>,     <span class="cmt"># 前端据 type 选 UI 组件</span>
+            <span class="st">"ideas"</span>: high_risk,           <span class="cmt"># 结构化载荷</span>
+        })
+        ideas = apply_approvals(ideas, approved)
+    <span class="kw">return</span> {<span class="st">"tune"</span>: {<span class="st">"idea_library"</span>: ideas}}
+
+<span class="cmt"># ---- 前端审批服务：按 type 分发，resume 回传 ----</span>
+<span class="kw">def</span> <span class="fn">approve</span>(thread_id: str, decision: dict):
+    config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: thread_id}}
+    graph.<span class="fn">invoke</span>(Command(resume=decision[<span class="st">"approved_ids"</span>]), config)</pre>
+    <div class="annotation"><b>读懂这段：</b>第 06 章的三条纪律全部生效：<strong>副作用在 interrupt 之后</strong>（apply_approvals 拿到批准列表后才改写 ideas）；<strong>节点会从头重跑</strong>（interrupt 前不能有不可重复副作用——build_idea_library 是纯计算，实测执行两次，可接受）；<strong>interrupt 数量与顺序两次执行间不能变</strong>（if 判断的「是否已有批准记录」在两次执行间不变，分支走向稳定，安全）。</div>
+
+    <p><strong>status 语义怎么修</strong>：旧机制 status 留 "running" 的根因是暂停只是节点内一个文件写入，业务状态机不知道。换成 <code class="inline">interrupt()</code> 后暂停变成<strong>可从快照推导</strong>的一等状态：读 <code class="inline">get_state(config)</code>，<code class="inline">snapshot.interrupts</code> 非空 = 在等人。前端审批徽标有了可信数据源，不用每个审批点自己维护标志位。</p>
+
+    <p><strong>动态演示</strong>——步进看 interrupt 如何穿过「图 → 事件 → 卡片 → resume」变成一次完整的产品交互：</p>
+    <div data-anim="interrupt-ux"></div>
+
+    <div class="callout warn"><b class="tag">兼容旧暂停任务</b> 切到 <code class="inline">interrupt()</code> 时可能有任务还卡在旧暂停文件上。两个选项：一次性迁移脚本把旧暂停点换算成新 checkpointer 状态，或双轨并行至旧任务清零。先盘点存量暂停态，再选迁移策略，别直接切。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.6</span>Checkpointer：一个任务一条 thread</h2>
+    <p>第五个决策：<strong>断点存哪、怎么恢复</strong>。手写 checkpoint 时代，「存什么、存哪、怎么恢复」是自定义 JSON 的私有约定；换图后这些全交给 Checkpointer，自己只做一个决定——<strong><code class="inline">thread_id = task_id</code></strong>。重试 = 同一 thread_id 重新 invoke，图从最后一个 checkpoint 自动恢复。</p>
+    <div class="code-title">SqliteSaver + thread_id=task_id（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> sqlite3
+<span class="kw">from</span> langgraph.checkpoint.sqlite <span class="kw">import</span> SqliteSaver  <span class="cmt"># pip install langgraph-checkpoint-sqlite</span>
+
+<span class="cmt"># 常驻服务用裸连接构造（from_conn_string 返回的是上下文管理器，适合脚本一次性跑）</span>
+conn = sqlite3.connect(<span class="st">"automl_checkpoints.db"</span>, check_same_thread=<span class="kw">False</span>)
+checkpointer = <span class="cl">SqliteSaver</span>(conn)
+graph = top.<span class="fn">compile</span>(checkpointer=checkpointer)
+
+<span class="cmt"># 提交任务：thread_id 用任务 ID——重试/恢复/审批共用这一个键</span>
+config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: task_id}}
+graph.<span class="fn">invoke</span>(initial_state, config)
+
+<span class="cmt"># 任务失败重试：同一个 thread_id 重新 invoke，从断点续跑</span>
+graph.<span class="fn">invoke</span>(<span class="kw">None</span>, config)          <span class="cmt"># None = 不带新输入，从 checkpoint 继续</span>
+
+<span class="cmt"># HITL 恢复：还是同一个键</span>
+graph.<span class="fn">invoke</span>(Command(resume=decision), config)</pre>
+    <div class="annotation"><b>读懂这段：</b>thread_id 是「状态隔离边界 + 恢复寻址依据」（第 09 章），这里把粒度定在「一个业务任务」——不是一次调用、不是一个会话。AutoML 任务跑几小时到几天，穿插部署、审批、重试，task_id 把这条任务的一切执行历史钉在一起。粒度选什么，取决于你的「可恢复执行单元」是什么。</div>
+    <p>两个落地细节：① <code class="inline">SqliteSaver</code> 来自独立的 <code class="inline">langgraph-checkpoint-sqlite</code> 包，引入要加依赖；② 手写的 <code class="inline">save/load_workflow_checkpoint</code> 不必立刻删——迁移期改造成 Checkpointer 薄封装，保留旧「从哪重试」解析给存量任务，迁完再删（与 12.3 同一个灰度思路）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.7</span>可观测：双通道 stream 驱动进度 UI</h2>
+    <p>第六个决策：<strong>进度怎么让人看见</strong>。12.1 的问题还记着：想知道第 3 个候选训练到第几轮，只能翻日志——两层结构下顶层 stage_d 是黑盒，用户恰恰最关心黑盒里的 trial 进度。图的答案是<strong>组合 stream_mode</strong>：</p>
+    <div class="code-title">双通道 stream：updates 管全景，custom 管下钻（蒸馏示例）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.config <span class="kw">import</span> get_stream_writer
+
+<span class="cmt"># 子图内部节点：每轮训练结束主动推一条 custom 事件</span>
+<span class="kw">def</span> <span class="fn">train_one_trial</span>(state):
+    writer = <span class="fn">get_stream_writer</span>()            <span class="cmt"># 子图内取 writer</span>
+    <span class="kw">for</span> rnd <span class="kw">in</span> range(max_rounds):
+        metric = train_and_eval(state, rnd)
+        writer({<span class="st">"kind"</span>: <span class="st">"trial_progress"</span>,
+                <span class="st">"trial"</span>: state[<span class="st">"trial_id"</span>], <span class="st">"round"</span>: rnd,
+                <span class="st">"metric"</span>: metric})
+    ...
+
+<span class="cmt"># 服务端：一条 stream，双通道分发（subgraphs=True 是拿到子图事件的关键）</span>
+<span class="kw">for</span> ns, mode, payload <span class="kw">in</span> graph.stream(state, config,
+                                      stream_mode=[<span class="st">"updates"</span>, <span class="st">"custom"</span>],
+                                      subgraphs=<span class="kw">True</span>):
+    <span class="kw">if</span> mode == <span class="st">"updates"</span> <span class="kw">and not</span> ns:
+        update_ridge_ui(payload)             <span class="cmt"># ns 为空 = 顶层主脊：✓ / ● / ○</span>
+    <span class="kw">elif</span> mode == <span class="st">"custom"</span>:
+        append_trial_row(payload)            <span class="cmt"># 子图冒泡上来的 trial 进度</span></pre>
+    <div class="annotation"><b>读懂这段：</b>对照第 11 章：updates 是框架自动吐的节点级 patch，custom 是节点用 <code class="inline">get_stream_writer()</code> 主动推的数据。一条 stream 两个频道。两个实测验证的要点：① <strong>custom 默认不冒泡</strong>——不加 <code class="inline">subgraphs=True</code>，子图内推的事件一条都收不到；加上后事件带 <code class="inline">ns</code> 标明来自哪层。② 组合模式 + <code class="inline">subgraphs=True</code> 时输出是 <code class="inline">(ns, mode, payload)</code> 三元组，解包按这个形状来。不需要轮询接口，不需要自建事件总线。</div>
+
+    <p><strong>动态演示</strong>——步进看一条 stream 的两类事件如何分别驱动主脊着色与 trial 级下钻面板：</p>
+    <div data-anim="stream-observability"></div>
+
+    <div class="callout info"><b class="tag">为什么这套可观测是「送的」</b> 手写时代可观测靠每个节点自觉打日志，漏写一处断一截。换图后节点边界即事件边界：<strong>updates 是执行模型的自然产物，零额外代码</strong>；custom 只在需要细粒度处补几行 writer 调用。可观测性从「约定」变成「结构性质」——本章所有重构里 ROI 最高的一项。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.8</span>给图做前端：中断语义如何变成产品交互</h2>
+    <p>前六节讲「把流水线搬上图」。本节换视角：<strong>图确定之后，产品前端长什么样</strong>。案例项目的做法是<strong>先做纯前端交互原型</strong>（setInterval 模拟 stream、内存 store 模拟暂停/恢复），把「创建 → 推进 → 下钻 → 审批 → 恢复 → 交付」动线在浏览器里走通，产品、前后端三方对齐后再实现真图。原型沉淀出三张映射表：</p>
+
+    <h3 class="subhead">映射一：interrupt type → 审批 UI</h3>
+    <p>12.5 的三行表在这里变成前端注册表：每个 <code class="inline">type</code> 对应一个卡片组件 + 一个 resume 载荷结构。新审批点 = 图里一处 interrupt + 前端一个组件。</p>
+
+    <h3 class="subhead">映射二：图结构 → 信息架构</h3>
+    <table class="tbl">
+      <thead><tr><th>图概念</th><th>产品概念</th></tr></thead>
+      <tbody>
+        <tr><td>顶层主干（主脊，~10 节点）</td><td>实验详情页的「进度脊」——给管理者/非工程角色看全链路</td></tr>
+        <tr><td>阶段子图内部节点</td><td>点任一主脊步骤后的「下钻面板」——给工程师看细节</td></tr>
+        <tr><td>trial 子图（两层嵌套）</td><td>调优步骤内的 trial 追踪表——每轮训练一行实时刷新</td></tr>
+        <tr><td><code class="inline">interrupts</code> 非空</td><td>全局「待审批」徽标 + 卡片入口</td></tr>
+        <tr><td>thread_id</td><td>实验 ID——审批深链、重试按钮的寻址键</td></tr>
+      </tbody>
+    </table>
+    <div class="annotation"><b>读懂这张表：</b>产品信息架构就是图结构的一次投影：两层图 → 两级视图，出口信号 → 步骤流转语义，interrupt → 审批工作流。反过来：如果产品需要一个「图结构表达不了」的视图（如跨实验对比），要么图粒度不对，要么它不该由单次执行提供——这种张力在评审期暴露，比实现期便宜十倍。</div>
+
+    <h3 class="subhead">映射三：状态推导 → 状态语义</h3>
+    <p>status 不由节点各自维护，统一从快照推导：<code class="inline">snapshot.interrupts</code> 非空 → interrupted；<code class="inline">snapshot.next</code> 非空且有事件在流 → running；stream 正常结束 → completed。修正了手写时代最大的状态 bug（暂停时标 running），每个状态徽标都有了单一真相来源。</p>
+
+    <div class="callout info"><b class="tag">方法论小结</b> 图原语的 UI 形态（interrupt 卡片、子图下钻、暂停徽标）是<strong>设计决策</strong>，不是实现细节。用假 stream 在纯前端定稿，成本几天；在真图上边实现边改，成本几周。LangGraph 原语语义恰好给原型足够保真度——模拟器只需忠实翻译这些语义，不需理解业务。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.9</span>收尾：从等价重构到 Agentic 闭环</h2>
+    <p>六个决策做完，对照 12.1 的三个用户体验问题逐条验收：</p>
+    <table class="tbl">
+      <thead><tr><th>能力</th><th>重构前</th><th>重构后</th><th>受益方</th></tr></thead>
+      <tbody>
+        <tr><td>读图</td><td>26 节点平铺，新同事读一天</td><td>顶层 10 节点，一屏读完；细节按需下钻</td><td>所有人</td></tr>
+        <tr><td>可观测</td><td>手写日志，子图内部不可见</td><td>updates 全景 + custom 下钻，双通道</td><td>运维/前端</td></tr>
+        <tr><td>可中断</td><td>自定义文件约定，status 语义错</td><td>原生 interrupt + 推导式 status</td><td>审批人</td></tr>
+        <tr><td>可恢复</td><td>手写 save/load + 重试入口表</td><td>Checkpointer + thread_id 自动续跑</td><td>运维</td></tr>
+        <tr><td>可并发</td><td>ThreadPoolExecutor 手写</td><td>Send fan-out，候选状态投影隔离 + 失败可从 checkpoint 续跑</td><td>用户（更快出结果）</td></tr>
+      </tbody>
+    </table>
+    <p>回到开头三个体验问题：「等人却显示运行中」→ interrupt + 推导式 status；「候选训练进度看不到」→ custom 事件下钻；「重试不知道从哪续」→ thread_id 自动续跑。<strong>而图的真正回报在下一步</strong>：等价重构把每个环节变成了<strong>细粒度、带类型化接口的图节点</strong>——这正是智能体化的前提。Agentic 闭环（评估 → 诊断 → 假设 → 再评估）本质是在现有节点上叠一个「推理环」：<code class="inline">overfitting_diagnosis</code> 的输出喂给 LLM 节点生成假设，假设经审批变成新 idea，进入既有 trial 循环。<strong>环的每一站都是已存在的节点</strong>——软失败语义、出口信号契约、interrupt 点位全部直接复用。</p>
+    <div class="callout info"><b class="tag">呼应第 10 章</b> 这个案例是第 10 章决策树的活体样本：不需要 create_react_agent（没有自由工具循环），不需要 Supervisor（没有角色分工对话）；需要的是 StateGraph 底层原语。判断依据从来不是「是不是 AI 应用」，而是<strong>任务有没有结构化流程、副作用和中断语义</strong>。判据普适：流程越重、越需要 HITL 与可恢复，越该下钻到图原语；纯对话助手从 prebuilt 起步即可。</div>
+
+    <h3 class="subhead">如果只带走五条</h3>
+    <ul>
+      <li><strong>先等价、再进化</strong>：换引擎不换行为，等价性可验证之后，才谈叠加智能行为。</li>
+      <li><strong>边界由拓扑决定</strong>：子图边界看「跨组跳转的边」，不看业务名词；cleanup 这类全图汇合点必须留顶层。</li>
+      <li><strong>接口先行</strong>：Send 的隔离契约、interrupt 的 type 协议、stream 的事件 schema——这些跨边界的契约在动工前定稿，返工成本最低。</li>
+      <li><strong>状态语义从快照推导</strong>：interrupts/next/stream 事件是唯一真相来源，别让业务节点各自维护状态标志。</li>
+      <li><strong>UI 是图结构的投影</strong>：先在纯前端原型上定稿「中断态长什么样」，再实现真图——设计决策不应该发生在实现期。</li>
+    </ul>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="11-streaming.html">← 流式输出</a>
+    <a href="10-agent-selector.html">选型指南 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出LangGraph · 12 实战案例 · 基于本代码库源码 · 所有 API 引用以仓库最新为准
+</footer>
+
+</body>
+</html>

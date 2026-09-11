@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 请求全生命周期 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a class="active" href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 请求全生命周期</div>
+    <h1>请求全生命周期：一次 /generate 走到哪几步</h1>
+    <div class="subtitle">这一章跟着一条请求走完全程：HTTP 进程收请求并分词，Scheduler 子进程把它排进 batch，GPU 前向产出 token，Detokenizer 反分词，最后以 SSE 流式帧回到客户端。四个泳道，五次跨进程消息。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>一分钟版本</h2>
+    <p>一次 <code class="inline">POST /generate</code> 在 SGLang 里经过这些站：</p>
+    <ol>
+      <li><strong>http_server.py</strong> 的 <code class="inline">generate_request</code> 收到 <code class="inline">GenerateReqInput</code>。若是流式请求，立刻挂一个 SSE 的 <code class="inline">StreamingResponse</code>，并注册后台 abort 任务。</li>
+      <li><strong>TokenizerManager</strong> 分词，得到 <code class="inline">TokenizedGenerateReqInput</code>，经 ZMQ 发给 Scheduler。</li>
+      <li><strong>Scheduler</strong> 的 <code class="inline">handle_generate_request</code> 把它包成 <code class="inline">Req</code> 放进 <code class="inline">waiting_queue</code>，事件循环在下一拍把它（可能与其他请求一起）装进 <code class="inline">ScheduleBatch</code>，转成 <code class="inline">ForwardBatch</code> 喂给 <code class="inline">TpModelWorker</code>。</li>
+      <li><strong>ModelRunner</strong> 执行 GPU 前向与采样，吐出新 token id。</li>
+      <li><strong>DetokenizerManager</strong> 收到 <code class="inline">BatchTokenIDOutput</code>，增量反分词成文本，以 <code class="inline">BatchStrOutput</code> 发回主进程。</li>
+      <li><strong>TokenizerManager</strong> 的 <code class="inline">_handle_batch_output</code> 按 rid 找到 <code class="inline">ReqState</code>，把输出塞进 <code class="inline">out_list</code> 并 set event；等待中的 <code class="inline">_stream_one_response</code> 被唤醒，产出 SSE 帧。</li>
+    </ol>
+    <p>注意一个不对称：去程和回程走的通道不同。<strong>去程是 HTTP→Scheduler（token id），回程是 Scheduler→Detokenizer→TokenizerManager→HTTP（token id 先、文本后）</strong>。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>泳道图：一条请求经过的四个进程</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t2 d2">
+        <title id="t2">SGLang 请求生命周期泳道图</title>
+        <desc id="d2">一条流式请求经过 HTTP、Scheduler、GPU、Detokenizer 四个泳道的完整路径</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 泳道表头 -->
+        <rect class="node acc" x="20" y="16" width="220" height="34" rx="6"></rect>
+        <text class="lbl" x="130" y="38" text-anchor="middle">① 主进程 · HTTP/TM</text>
+        <rect class="node core" x="250" y="16" width="220" height="34" rx="6"></rect>
+        <text class="lbl" x="360" y="38" text-anchor="middle">② Scheduler 子进程</text>
+        <rect class="node" x="480" y="16" width="220" height="34" rx="6"></rect>
+        <text class="lbl" x="590" y="38" text-anchor="middle">③ TpModelWorker · GPU</text>
+        <rect class="node" x="710" y="16" width="210" height="34" rx="6"></rect>
+        <text class="lbl" x="815" y="38" text-anchor="middle">④ Detokenizer 子进程</text>
+
+        <!-- 泳道分隔线 -->
+        <line class="st" x1="245" y1="50" x2="245" y2="520"></line>
+        <line class="st" x1="475" y1="50" x2="475" y2="520"></line>
+        <line class="st" x1="705" y1="50" x2="705" y2="520"></line>
+
+        <!-- ① 节点 -->
+        <g>
+          <rect class="node acc" x="30" y="70" width="200" height="46" rx="8"></rect>
+          <text class="lbl" x="140" y="90" text-anchor="middle">POST /generate</text>
+          <text class="lbl sm" x="140" y="106" text-anchor="middle">GenerateReqInput</text>
+        </g>
+        <g>
+          <rect class="node acc" x="30" y="150" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="140" y="170" text-anchor="middle">tokenize</text>
+          <text class="lbl sm" x="140" y="186" text-anchor="middle">ReqState 注册 rid</text>
+        </g>
+        <g>
+          <rect class="node" x="30" y="430" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="140" y="450" text-anchor="middle">_stream_one_response</text>
+          <text class="lbl sm" x="140" y="466" text-anchor="middle">SSE: data: {...}\n\n</text>
+        </g>
+
+        <!-- ② 节点 -->
+        <g>
+          <rect class="node core" x="260" y="70" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="360" y="90" text-anchor="middle">waiting_queue</text>
+          <text class="lbl sm" x="360" y="106" text-anchor="middle">Req 对象入队</text>
+        </g>
+        <g>
+          <rect class="node core" x="260" y="150" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="360" y="170" text-anchor="middle">get_next_batch_to_run</text>
+          <text class="lbl sm" x="360" y="186" text-anchor="middle">PrefillAdder 预算检查</text>
+        </g>
+        <g>
+          <rect class="node core" x="260" y="230" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="360" y="250" text-anchor="middle">prepare_for_extend</text>
+          <text class="lbl sm" x="360" y="266" text-anchor="middle">组装 ScheduleBatch</text>
+        </g>
+        <g>
+          <rect class="node core" x="260" y="360" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="360" y="380" text-anchor="middle">process_batch_result</text>
+          <text class="lbl sm" x="360" y="396" text-anchor="middle">发 BatchTokenIDOutput</text>
+        </g>
+
+        <!-- ③ 节点 -->
+        <g>
+          <rect class="node" x="490" y="230" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="590" y="250" text-anchor="middle">ForwardBatch.init_new</text>
+          <text class="lbl sm" x="590" y="266" text-anchor="middle">from ScheduleBatch</text>
+        </g>
+        <g>
+          <rect class="node" x="490" y="300" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="590" y="320" text-anchor="middle">model_runner.forward</text>
+          <text class="lbl sm" x="590" y="336" text-anchor="middle">+ sample → token ids</text>
+        </g>
+
+        <!-- ④ 节点 -->
+        <g>
+          <rect class="node" x="715" y="360" width="200" height="46" rx="6"></rect>
+          <text class="lbl" x="815" y="380" text-anchor="middle">增量 detokenize</text>
+          <text class="lbl sm" x="715" y="396" text-anchor="middle">BatchStrOutput</text>
+        </g>
+
+        <!-- 主链路箭头 -->
+        <line class="edge" x1="140" y1="116" x2="140" y2="148"></line>
+        <line class="edge acc" x1="230" y1="170" x2="272" y2="92"></line>
+        <text class="lbl code" x="185" y="140" text-anchor="middle">zmq PUSH</text>
+        <text class="lbl code" x="185" y="153" text-anchor="middle">TokenizedGenerateReqInput</text>
+        <line class="edge" x1="360" y1="116" x2="360" y2="148"></line>
+        <line class="edge" x1="360" y1="196" x2="360" y2="228"></line>
+        <line class="edge" x1="460" y1="253" x2="488" y2="253"></line>
+        <line class="edge" x1="590" y1="276" x2="590" y2="298"></line>
+        <line class="edge back" x1="590" y1="346" x2="470" y2="372"></line>
+        <text class="lbl sm" x="530" y="375" text-anchor="middle">GenerationBatchResult</text>
+        <line class="edge acc" x1="660" y1="383" x2="713" y2="383"></line>
+        <text class="lbl code" x="688" y="373" text-anchor="middle">zmq</text>
+        <line class="edge back" x1="715" y1="410" x2="232" y2="452"></line>
+        <text class="lbl code" x="470" y="440" text-anchor="middle">zmq PUSH → 主进程 handle_loop</text>
+
+        <!-- abort 虚线 -->
+        <line class="edge back" x1="130" y1="470" x2="130" y2="500"></line>
+        <line class="edge back" x1="130" y1="500" x2="360" y2="500"></line>
+        <line class="edge back" x1="360" y1="500" x2="360" y2="345"></line>
+        <text class="lbl sm" x="360" y="516" text-anchor="middle">AbortReq（断连/超时触发）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw acc"></span>主进程入口/出口</span>
+        <span class="lg-item"><span class="sw core"></span>Scheduler 调度</span>
+        <span class="lg-item"><span class="sw"></span>执行与反分词</span>
+        <span class="lg-item"><span class="sw" style="border-style:dashed"></span>虚线 = 回传 / 异常路径</span>
+      </div>
+      <div class="fig-cap">图 2.2：一条流式请求的泳道图。去程只有一条消息（tokenized 请求），回程在生成期间会反复走「③→②→④→①」这条循环：每个输出步一帧。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>入口：/generate 的 SSE 包装</h2>
+    <p>路由函数本身不做分词，只做两件事：<strong>把 async 生成器包装成 SSE 帧</strong>，以及<strong>挂一个断连后自动 abort 的后台任务</strong>：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — generate_request（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">generate_request</span>(obj: <span class="cl">GenerateReqInput</span>, request: <span class="cl">Request</span>):
+    <span class="cmt"># 可选：用 HTTP header 覆盖请求字段（需 env 开关）</span>
+    <span class="kw">if</span> envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.<span class="fn">get</span>():
+        <span class="fn">apply_header_overrides</span>(obj, request.headers)
+
+    <span class="kw">if</span> obj.stream:
+        <span class="kw">async def</span> <span class="fn">stream_results</span>() -&gt; <span class="cl">AsyncIterator</span>[<span class="cl">bytes</span>]:
+            <span class="kw">try</span>:
+                <span class="kw">async for</span> out <span class="kw">in</span> _global_state.tokenizer_manager.<span class="fn">generate_request</span>(
+                    obj, request
+                ):
+                    <span class="kw">yield</span> <span class="st">b"data: "</span> + <span class="fn">dumps_json</span>(out) + <span class="st">b"\n\n"</span>
+            <span class="kw">except</span> <span class="cl">ValueError</span> <span class="kw">as</span> e:
+                <span class="cmt"># 客户端断连也会从这冒出来：这是客户端取消，不是服务端错误</span>
+                <span class="kw">if</span> request <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">await</span> request.<span class="fn">is_disconnected</span>():
+                    logger.<span class="fn">info</span>(<span class="st">f"[http_server] Client disconnected: {e}"</span>)
+                    <span class="kw">return</span>  <span class="cmt"># 请求已在上游 abort，这里静默收尾，不吐 400</span>
+                out = {<span class="st">"error"</span>: {<span class="st">"message"</span>: <span class="fn">str</span>(e), <span class="st">"type"</span>: <span class="st">"invalid_request_error"</span>, ...}}
+                logger.<span class="fn">error</span>(<span class="st">f"[http_server] Error: {e}"</span>)
+                <span class="kw">yield</span> <span class="st">b"data: "</span> + <span class="fn">dumps_json</span>(out) + <span class="st">b"\n\n"</span>
+            <span class="cmt"># [DONE] 挪到 try/except 之外：出错时也要正常收尾</span>
+            <span class="kw">yield</span> <span class="st">b"data: [DONE]\n\n"</span>
+
+        <span class="kw">return</span> <span class="cl">StreamingResponse</span>(
+            <span class="fn">stream_results</span>(),
+            media_type=<span class="st">"text/event-stream"</span>,
+            background=_global_state.tokenizer_manager.<span class="fn">create_abort_task</span>(obj),
+        )
+    <span class="kw">else</span>:
+        <span class="kw">try</span>:
+            ret = <span class="kw">await</span> _global_state.tokenizer_manager.<span class="fn">generate_request</span>(
+                obj, request
+            ).<span class="fn">__anext__</span>()
+            <span class="kw">return</span> <span class="fn">orjson_response</span>(ret)
+        <span class="kw">except</span> <span class="cl">ValueError</span> <span class="kw">as</span> e:
+            logger.<span class="fn">error</span>(<span class="st">f"[http_server] Error: {e}"</span>)
+            <span class="kw">return</span> <span class="fn">_create_error_response</span>(e)</pre>
+    <div class="annotation"><b>读懂这段：</b>
+      流式与否在 HTTP 层就分叉：流式走 <code class="inline">StreamingResponse</code>，每个 chunk 是 <code class="inline">data: {json}\n\n</code>，结束发 <code class="inline">data: [DONE]</code>；非流式只取异步生成器的第一项（也就是最终结果）。<code class="inline">create_abort_task</code> 是关键细节：客户端断连时 FastAPI 不会自动通知引擎，SGLang 用后台任务在响应结束后兜底调用 <code class="inline">abort_request</code>，把 GPU 上还在跑的请求收掉——断连不是错误，而是正常路径。</div>
+    <div class="annotation"><b>断连处理是后加的：</b> 上面流式分支里的 <code class="inline">try/except ValueError</code> 值得单独看。在早先的写法里，客户端断连会以 <code class="inline">ValueError</code> 的形式从异步生成器里冒出来，被当作普通错误转成一个 SSE 错误帧吐回去——日志里留下一串 <code class="inline">Error</code>，看着像服务端出问题，实际只是用户关掉了页面。现在多了一次 <code class="inline">request.is_disconnected()</code> 判断把这种情况分流出来：走 <code class="inline">logger.info</code> 然后静默 return，请求早已在上游被 abort，这里不需要再做什么。<code class="inline">[DONE]</code> 也从 <code class="inline">try</code> 块里挪了出来——原来只要中间抛错就永远发不出结束标记，SSE 客户端会一直挂着等。非流式分支同理套了一层 <code class="inline">try/except</code>，转成规规矩矩的 HTTP 错误响应而不是 500。<strong>这两处的形状都是「异常路径要显式收尾」</strong>，不是新增功能。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>TokenizerManager：注册状态、分词、发送、等待</h2>
+    <p><code class="inline">generate_request</code> 是一个很长的 async 生成器，主体是四步。先注册一个 <code class="inline">ReqState</code>（含 <code class="inline">asyncio.Event</code> 和 <code class="inline">out_list</code>），再分词：</p>
+    <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — _tokenize_one_request（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">_tokenize_one_request</span>(self, obj):
+    <span class="st">"""Tokenize one request."""</span>
+    input_text = obj.text
+    <span class="kw">if</span> obj.input_ids <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        input_ids = obj.input_ids          <span class="cmt"># 调用方已给 token id，跳过分词</span>
+    <span class="kw">else</span>:
+        input_ids, token_type_ids = <span class="kw">await</span> self.<span class="fn">_tokenize_texts</span>(
+            input_text, is_cross_encoder_request
+        )</pre>
+    <p>分词完成后经 <code class="inline">_send_one_request</code> 发给 Scheduler——注意这里对消息做了一系列「出发前的最后加工」（多模态准备、时间戳、pickle 字段打包），然后才 ZMQ 发出：</p>
+    <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — _send_one_request（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">_send_one_request</span>(self, tokenized_obj):
+    tokenized_obj.time_stats.<span class="fn">set_api_server_dispatch_time</span>()
+    tokenized_obj.<span class="fn">wrap_pickle_fields</span>()
+    self.<span class="fn">_dispatch_to_scheduler</span>(tokenized_obj)
+    self.<span class="fn">_mark_state_dispatched</span>(tokenized_obj.rid)</pre>
+    <p>之后这个协程就挂在 <code class="inline">_stream_one_response</code> 上等事件。<code class="inline">ReqState</code> 是整条回程的枢纽：</p>
+    <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — ReqState（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ReqState</span>:
+    <span class="st">"""Store the state a request."""</span>
+    out_list: <span class="cl">List</span>[<span class="cl">Dict</span>[<span class="cl">Any</span>, <span class="cl">Any</span>]]   <span class="cmt"># 收到的每个输出步</span>
+    finished: <span class="cl">bool</span>
+    event: asyncio.<span class="cl">Event</span>            <span class="cmt"># 有新输出时被 set</span>
+    obj: <span class="cl">Union</span>[<span class="cl">GenerateReqInput</span>, <span class="cl">EmbeddingReqInput</span>]
+
+    dispatched: <span class="cl">bool</span> = <span class="kw">False</span>        <span class="cmt"># 是否已送达 Scheduler</span>
+    abort_sent: <span class="cl">bool</span> = <span class="kw">False</span>        <span class="cmt"># 防止重复发 abort</span>
+    last_output_offset: <span class="cl">int</span> = <span class="nu">0</span>    <span class="cmt"># 流式增量切片用</span></pre>
+    <p><code class="inline">_stream_one_response</code> 的消费模式是「等 event → 一次性清空 out_list → 唤醒生产者」：</p>
+    <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — _stream_one_response（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>is_stream = <span class="fn">getattr</span>(obj, <span class="st">"stream"</span>, <span class="kw">False</span>)
+<span class="kw">while</span> <span class="kw">True</span>:
+    <span class="kw">try</span>:
+        <span class="kw">await</span> asyncio.<span class="fn">wait_for</span>(state.event.wait(),
+                              timeout=_REQUEST_STATE_WAIT_TIMEOUT)
+    <span class="kw">except</span> asyncio.<span class="cl">TimeoutError</span>:
+        <span class="cmt"># 断连检查放在超时分支里：等不到输出才有必要问一句</span>
+        <span class="kw">if</span> request <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> obj.background \
+                <span class="kw">and</span> <span class="kw">await</span> request.<span class="fn">is_disconnected</span>():
+            self.<span class="fn">abort_request</span>(obj.rid)
+            <span class="cmt"># 用异常拆掉整个调用栈和 asyncio task</span>
+            <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">f"Request is disconnected ... (type 1)"</span>)
+        <span class="kw">continue</span>
+
+    <span class="cmt"># 原子清空：拿走全部 pending 输出再清 event</span>
+    out_list = state.out_list
+    state.out_list = []
+    finished = state.finished
+    state.event.<span class="fn">clear</span>()
+
+    <span class="cmt"># 增量流式：多个 pending chunk 要合并，否则会丢 token id</span>
+    <span class="kw">if</span> incremental_stream <span class="kw">and</span> <span class="fn">len</span>(out_list) &gt; <span class="nu">1</span>:
+        out = self.<span class="fn">_coalesce_streaming_chunks</span>(out_list, obj.rid, ...)
+    <span class="kw">else</span>:
+        out = out_list[-<span class="nu">1</span>]
+
+    <span class="cmt"># 中间块的 text 是 None（免得每步重建整串文本变成 O(n²)），</span>
+    <span class="cmt"># 到这里才补上全量文本</span>
+    <span class="kw">if</span> is_stream <span class="kw">and</span> <span class="kw">not</span> incremental_stream <span class="kw">and</span> out.get(<span class="st">"text"</span>) <span class="kw">is</span> <span class="kw">None</span>:
+        out[<span class="st">"text"</span>] = state.<span class="fn">get_text</span>()
+
+    <span class="kw">if</span> out.<span class="fn">get</span>(<span class="st">"beam_results"</span>) <span class="kw">and</span> <span class="kw">not</span> finished:
+        <span class="kw">continue</span>      <span class="cmt"># beam 的中间结果先不吐，等收敛</span>
+
+    <span class="kw">if</span> is_stream:
+        <span class="kw">yield</span> out          <span class="cmt"># 交给 http 层打 SSE 帧</span>
+    <span class="kw">if</span> finished:
+        <span class="kw">break</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 这是经典的「event + drain」模式：生产者（<code class="inline">_handle_batch_output</code>）只往 <code class="inline">out_list</code> 追加并 set 事件，不直接 yield；消费者一次性取走全部积压输出。好处是一个 batch 的多个输出步不会丢帧，也避免了每个 token 一次协程切换。<br><br><b>四处后来才长出来的细节，每一处背后都有一个坑：</b><br>① <strong>断连检查在 <code class="inline">except TimeoutError</code> 里</strong>（而不是循环开头）。这个位置很讲究：等到了输出就说明客户端还在收，没必要付一次 <code class="inline">is_disconnected()</code> 的代价；<code class="inline">wait_for</code> 超时说明<strong>一段时间没有任何输出</strong>——可能是请求卡在等待队列里，那正是客户端最可能已经关页面的时候。所以只在超时时问一次，问完没断就 <code class="inline">continue</code> 接着等。<code class="inline">not obj.background</code> 也一并排除了后台请求（没有客户端可断）。<br>② <strong>抛 <code class="inline">ValueError</code> 是当「拆栈工具」用的</strong>，不是表达业务错误——源码注释写着 <em>Use exception to kill the whole call stack and asyncio task</em>。断连的请求已经在上游 <code class="inline">abort_request</code> 处理完了，这里只需要让这个协程彻底停掉，异常是最省事的做法。所以看到这个 <code class="inline">ValueError</code> 不要当成「出错了」，它就是这条路径的正常终止方式。<br>③ <strong><code class="inline">_coalesce_streaming_chunks</code> 是增量流式独有的</strong>：增量模式下每个 chunk 是 delta，攒批窗口里积压多个 chunk 时不能只取最后一个（会丢 token），必须合并；非增量模式取 <code class="inline">out_list[-1]</code> 就够，因为每块都是全量快照。<br>④ <strong><code class="inline">out["text"] = state.get_text()</code> 是一笔性能债的偿还</strong>：<code class="inline">_handle_batch_output</code> 给中间块写的是 <code class="inline">"text": None</code>，源码注释解释了原因——每步都重建整串文本会让总代价变成 O(n²)。但 HTTP 层需要一个完整的 <code class="inline">text</code> 字段，所以在这里（每次 drain 后）只补一次。<code class="inline">beam_results</code> 那个 <code class="inline">continue</code> 同理：束搜索的中间结果不是可用的最终答案，跳过。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>Scheduler 侧：入队与事件循环</h2>
+    <p>消息到达 Scheduler 后，由 <code class="inline">TypeBasedDispatcher</code> 路由到 <code class="inline">handle_generate_request</code>。它把 <code class="inline">TokenizedGenerateReqInput</code> 转成运行时对象 <code class="inline">Req</code> 并放进等待队列：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — handle_generate_request（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">handle_generate_request</span>(self, recv_req: <span class="cl">TokenizedGenerateReqInput</span>, ...):
+    <span class="cmt"># 普通请求或 radix-native 会话请求</span>
+    req = <span class="cl">Req</span>(
+        recv_req.rid,
+        recv_req.input_text,
+        recv_req.input_ids,
+        recv_req.sampling_params,
+        return_logprob=recv_req.return_logprob,
+        stream=recv_req.stream,
+        lora_id=recv_req.lora_id,
+        ...
+    )
+    self._add_request_to_queue(req)     <span class="cmt"># 进 waiting_queue</span></pre>
+    <div class="annotation"><b>中间省略的是一道校验关卡：</b> 上面把构造和入队并排摆着，是为了看清「<code class="inline">TokenizedGenerateReqInput</code> → <code class="inline">Req</code> → 队列」这条主干。实际源码里这两行之间夹着十几处提前返回的错误分支——会话不存在、多模态输入错、投机算法（dflash / uno）的请求校验、<code class="inline">return_sampling_mask</code> 的准入检查（第 8 章）等等。这些分支的形状几乎一样：<code class="inline">set_finish_with_abort</code> 挂错误 → <code class="inline">init_req_max_new_tokens</code> → <code class="inline">_add_request_to_queue</code> ——<strong>失败的请求照样入队</strong>，只是带了一个已完成的 abort 状态，由事件循环在下一拍把它当作已完成请求把错误吐回客户端。所以「入队」不等于「要跑模型」。</div>
+    <p>之后完全由事件循环接管。<code class="inline">event_loop_normal</code>（非 overlap 版本，最容易读）主干是四步一循环——收请求、挑批次、跑前向、收尾，但入口附近的几条守卫让它比「四步」读起来更长：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — event_loop_normal（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">event_loop_normal</span>(self):
+    <span class="st">"""A normal scheduler loop."""</span>
+    <span class="kw">while</span> <span class="kw">True</span>:
+        <span class="kw">if</span> self.gracefully_exit:
+            <span class="kw">break</span>
+
+        self.<span class="fn">ingest_requests</span>()                <span class="cmt"># 1) 从 ZMQ 收请求入队</span>
+        <span class="kw">if</span> self._engine_paused:
+            self.<span class="fn">_record_scheduler_state_for_paused_engine</span>()
+            <span class="kw">continue</span>
+
+        plan = self.<span class="fn">get_next_batch_to_run</span>(    <span class="cmt"># 2) 决定这一步跑什么</span>
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+        self.cur_batch_for_debug = batch
+
+        <span class="kw">if</span> batch:
+            result = self.<span class="fn">run_batch</span>(batch)            <span class="cmt"># 3) GPU 前向</span>
+            self.<span class="fn">process_batch_result</span>(batch, result)  <span class="cmt"># 4) 发输出、更新状态</span>
+        <span class="kw">else</span>:
+            <span class="cmt"># 空闲：做自检并重置部分状态</span>
+            self._sched_idled = <span class="kw">True</span>
+            self.<span class="fn">on_idle</span>()
+
+        self.last_batch = batch
+        <span class="kw">if</span> envs.<span class="cl">SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY</span>.<span class="fn">get</span>():
+            self.invariant_checker.<span class="fn">self_check_during_busy</span>()</pre>
+    <div class="annotation"><b>读懂这段：</b> 这个循环是整本书的主干，后面每章都挂在它上面：第 3 章（RadixCache）和第 4 章（调度策略）藏在 <code class="inline">get_next_batch_to_run</code> 里；第 5 章（内存池）在 <code class="inline">prepare_for_extend</code> 里被调用；第 6 章（ModelRunner）就是 <code class="inline">run_batch</code> 的下潜；第 8 章（采样）发生在 <code class="inline">run_batch</code> 尾部。真正默认启用的是 <code class="inline">event_loop_overlap</code>——CPU 处理上一批结果与 GPU 跑下一批并行，第 2.6 节先给出直觉。<br><br><b>三条容易忽略的守卫：</b>① <code class="inline">_engine_paused</code> 时不再挑批次，只记录状态然后 <code class="inline">continue</code>——引擎被外部（如权重更新、RL 侧同步）暂停时，不能继续消费 KV 池里的空间。② <code class="inline">self.cur_batch_for_debug = batch</code> 是给调试接口（<code class="inline">/get_scheduler_snapshot</code> 一类）留的引用，注意它<strong>持有 batch 对象</strong>，这也是排障时能看到「上一批是谁」的原因。③ 循环末尾的 <code class="inline">self_check_during_busy</code> 由环境变量控制，默认关闭——它是内存不变量的开发期断言，跑在热路径上，只在怀疑内存泄漏时打开。</div>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么 <code class="inline">get_next_batch_to_run</code> 返回一个 <code class="inline">plan</code>（running_batch + batch_to_run），而不是直接一个 batch？因为「挑选」和「执行」共享状态：这次挑选可能把 prefill batch 合并进 running_batch、可能产生 chunked_req。把两个 batch 一起返回，避免函数内部用 self 暗改状态——这是 overlap 化重构留下的接口痕迹，旧签名只返回一个 batch。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>输出回流：token id → 文本 → SSE</h2>
+    <p>前向与采样结束后，Scheduler 侧把整个 batch 的输出打包成一条 <code class="inline">BatchTokenIDOutput</code>。它按请求携带增量 token、反分词上下文和计量信息（精简后的字段）：</p>
+    <div class="code-title">python/sglang/srt/managers/io_struct.py — BatchTokenIDOutput（字段摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">BatchTokenIDOutput</span>(<span class="cl">BaseBatchReq</span>, kw_only=<span class="kw">True</span>):
+    finished_reasons: <span class="cl">List</span>[<span class="cl">Optional</span>[<span class="cl">FinishReasonDict</span>]]
+    decoded_texts: <span class="cl">List</span>[<span class="cl">str</span>]          <span class="cmt"># 增量反分词需要的上下文</span>
+    decode_ids: <span class="cl">List</span>[<span class="cl">array</span>]           <span class="cmt"># 本步新增 token id</span>
+    read_offsets: <span class="cl">List</span>[<span class="cl">int</span>]
+    output_ids: <span class="cl">Optional</span>[<span class="cl">List</span>[<span class="cl">array</span>]]  <span class="cmt"># 仅 --skip-tokenizer-init 时用</span>
+    <span class="cmt"># 反分词配置（原本散在别处，集中成一组）</span>
+    skip_special_tokens: <span class="cl">List</span>[<span class="cl">bool</span>]
+    spaces_between_special_tokens: <span class="cl">List</span>[<span class="cl">bool</span>]
+    no_stop_trim: <span class="cl">List</span>[<span class="cl">bool</span>]
+
+    prompt_tokens: <span class="cl">List</span>[<span class="cl">int</span>]
+    reasoning_tokens: <span class="cl">List</span>[<span class="cl">int</span>]         <span class="cmt"># 推理模型单独计数的 thinking token</span>
+    completion_tokens: <span class="cl">List</span>[<span class="cl">int</span>]
+    cached_tokens: <span class="cl">List</span>[<span class="cl">int</span>]          <span class="cmt"># RadixCache 命中数（第 3 章）</span></pre>
+    <p>这条消息先到 DetokenizerManager。它维护每个请求的增量解码状态，把 token id 变成文本后打包为 <code class="inline">BatchStrOutput</code>（核心字段就是 <code class="inline">output_strs</code>），发回主进程。主进程的 <code class="inline">handle_loop</code> 收到后按 rid 分发：</p>
+    <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — handle_loop 与 _handle_batch_output（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">handle_loop</span>(self):
+    <span class="kw">while</span> <span class="kw">True</span>:
+        recv_obj = <span class="kw">await</span> <span class="fn">async_sock_recv</span>(self.recv_from_detokenizer)
+        <span class="kw">if</span> isinstance(recv_obj, (BatchStrOutput, ..., BatchTokenIDOutput)):
+            <span class="kw">await</span> self.<span class="fn">_handle_batch_output</span>(recv_obj)
+        <span class="kw">else</span>:
+            self._result_dispatcher(recv_obj)
+
+<span class="kw">async def</span> <span class="fn">_handle_batch_output</span>(self, recv_obj):
+    <span class="kw">for</span> i, rid <span class="kw">in</span> enumerate(recv_obj.rids):
+        state = self.rid_to_state.<span class="fn">get</span>(rid, <span class="kw">None</span>)
+        ...
+        state.out_list.<span class="fn">append</span>(out)   <span class="cmt"># 生产者只追加</span>
+        pending_notify[rid] = state      <span class="cmt"># 注意 key 是 rid，不是 state</span>
+
+    <span class="cmt"># 攒够 batch_notify_size 个再统一 set 事件，唤醒 _stream_one_response</span>
+    <span class="kw">if</span> <span class="fn">len</span>(pending_notify) &gt;= batch_notify_size:
+        <span class="kw">for</span> s <span class="kw">in</span> pending_notify.<span class="fn">values</span>():
+            s.event.<span class="fn">set</span>()
+        pending_notify = {}
+        <span class="kw">await</span> asyncio.<span class="fn">sleep</span>(<span class="nu">0</span>)    <span class="cmt"># 让出控制权给等待中的协程</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 两种输出结构各走一段通道：<code class="inline">BatchTokenIDOutput</code> 是 Scheduler → Detokenizer 的「id 通道」；<code class="inline">BatchStrOutput</code> 是 Detokenizer → TokenizerManager 的「文本通道」。<code class="inline">--skip-tokenizer-init</code> 模式下 Detokenizer 被跳过，id 直接回主进程由客户端自己解码。abort 也是一条消息：<code class="inline">abort_request</code> 构造 <code class="inline">AbortReq</code> 经 ZMQ 发给 Scheduler，Scheduler 在收请求阶段处理并释放 KV——客户端断连、超时、显式取消最终都收敛到这一条路径。<br><br><b>为什么是「攒批唤醒」而不是「来一条 set 一条」：</b>每个请求都有一个 <code class="inline">asyncio.Event</code>，消费侧 <code class="inline">_stream_one_response</code> 在 event 上等待。<code class="inline">_handle_batch_output</code> 是生产侧，它把本批要通知的请求放进 <code class="inline">pending_notify</code> 字典，攒够 <code class="inline">batch_notify_size</code> 个再一次性 <code class="inline">set</code> 全部、清空、然后 <code class="inline">await asyncio.sleep(0)</code> 让出去。逐条 set 会让事件循环在「唤醒—切换—再切回来」之间反复抖动，攒批把 N 次上下文切换压成一次，代价是最多等 <code class="inline">batch_notify_size</code> 个请求——这是吞吐与首 token 延迟之间一个显式的旋钮。<br><br>字典的 key 用 <code class="inline">rid</code> 而不是 <code class="inline">state</code>：同一请求可能在攒批窗口内被追加多条输出，用 <code class="inline">state</code> 当 key 也能去重，但那要求 state 可哈希且身份稳定；用 rid 更直白，且万一同一个 state 被两个 rid 引用（不该发生，但排障时需要能看出来），用 rid 不会把它悄悄吃掉。值仍然是 state，因为 set 事件要用它的 <code class="inline">event</code>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.7</span>对自研引擎的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      这一章有三个可以照抄的结构。<strong>① id 通道与文本通道分离</strong>：调度层只传 token id，反分词独立成进程/任务，流式协议因此不受调度影响；<strong>② event + drain 的流式缓冲</strong>：生产者 append + set event，消费者一次性清空，天然支持 batch 化且不丢帧；<strong>③ abort 当成一等消息</strong>：客户端断连不是异常路径而是常规消息，注册 rid 状态时就把 abort 发送/去重（<code class="inline">abort_sent</code>）设计进去。overlap 事件循环的细节见 <a href="04-scheduler.html">第 4 章</a>；下一步先看回程里那个 <code class="inline">cached_tokens</code> 从哪来：<a href="03-radix-cache.html">第 3 章：RadixCache 前缀缓存</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="01-architecture.html">← 上一章：整体架构</a>
+    <a href="03-radix-cache.html">下一步：RadixCache 前缀缓存 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 02 请求生命周期 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

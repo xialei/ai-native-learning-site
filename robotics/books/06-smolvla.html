@@ -99,7 +99,7 @@
 
         <rect class="node" x="620" y="60" width="240" height="130" rx="8"></rect>
         <text class="lbl" x="740" y="90" text-anchor="middle">动作专家塔（suffix）</text>
-        <text class="lbl sm" x="740" y="112" text-anchor="middle">宽度 ×0.75 的 Gemma</text>
+        <text class="lbl sm" x="740" y="112" text-anchor="middle">宽度 ×0.75 的 SmolVLM2 文本塔副本</text>
         <text class="lbl sm" x="740" y="130" text-anchor="middle">输入：噪声动作块 + 时间嵌入</text>
         <text class="lbl sm" x="740" y="148" text-anchor="middle">cross-attn 读 VLM 的 KV cache</text>
         <text class="lbl sm" x="740" y="166" text-anchor="middle">输出：速度场 v_t</text>
@@ -132,7 +132,7 @@
       </div>
       <div class="fig-cap">图 6.1：双塔分工——「看懂」交给 VLM 塔（一次前向缓存 KV），「动手」交给小专家塔（每个去噪步只跑它）。这就是 VLA 推理能压到消费级显卡的关键：贵的部分不重复算。</div>
     </div>
-    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>动作专家与 VLM 共享同一 transformer 结构但宽度砍半（smolvlm_with_expert.py:110 <code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>，默认 0.75，论文推荐 0.5），层数对齐 VLM 的前 16 层（<code class="inline">num_vlm_layers=16</code>）。专家通过 <strong>cross-attention 读 VLM 的 KV cache</strong>（attention_mode="cross_attn"，k/v proj 重塑成与 VLM 同维度，smolvlm_with_expert.py:122-135）——它继承了 VLM 对图像和语言的理解，自己只学「怎么动」。参数量约 450M，但微调时只训专家一半，显存需求进一步减半。</div>
+    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>动作专家与 VLM 共享同一 transformer 结构但宽度更窄（smolvlm_with_expert.py:110 <code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>，配置默认 0.75——configuration_smolvla.py:98），层数对齐 VLM 的前 16 层（<code class="inline">num_vlm_layers=16</code>）。专家通过 <strong>cross-attention 读 VLM 的 KV cache</strong>（attention_mode="cross_attn"，k/v proj 重塑成与 VLM 同维度，smolvlm_with_expert.py:122-135）——它继承了 VLM 对图像和语言的理解，自己只学「怎么动」。参数量约 450M，但微调时只训专家一半，显存需求进一步减半。</div>
     <div class="callout info"><b>KV cache 是什么：</b>transformer 注意力用到的 Key/Value 向量。若每步重算整个前缀序列的 K/V，代价随序列长度平方增长；把它们缓存起来（use_cache=True），后续只需算新 token 的注意力——这里即「VLM 看一遍图像和指令，缓存理解结果；十步去噪每步只跑小专家塔」。不熟悉的话记住结论即可：贵的部分只算一次，便宜的部分反复用。</div>
   </section>
 
@@ -225,7 +225,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
         <text class="lbl sm" x="450" y="104" text-anchor="middle">目标 u_t = noise − actions（恒定的直线速度）</text>
 
         <line class="edge" x1="636" y1="130" x2="264" y2="130" stroke-dasharray="2 3"></line>
-        <text class="lbl sm" x="450" y="150" text-anchor="middle">推理：从噪声出发，v_t 只在局部可知 → 欧拉法走 10 步近似</text>
+        <text class="lbl sm" x="450" y="150" text-anchor="middle">推理：从噪声 t=1 出发走到 t=0，v_t 只在局部可知 → 欧拉法走 num_steps 步近似（SmolVLA 默认 10）</text>
 
         <g>
           <circle class="node" cx="264" cy="130" r="4"></circle>
@@ -237,7 +237,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
         </g>
 
         <text class="lbl sm" x="60" y="200">对比 diffusion：训练同样一步（加噪→预测噪声），但路径是「曲线」（每步噪声等级不同）；流匹配路径是直线，</text>
-        <text class="lbl sm" x="60" y="220">推理步数可以从 100 压到 10 而不严重掉质量——这是 SmolVLA 30Hz 部署的算力前提。</text>
+        <text class="lbl sm" x="60" y="220">推理步数可以从 100 压到 10 而不严重掉质量——这是 VLA 策略做到高控制频率的算力前提（SmolVLA 配置 num_steps=10）。</text>
         <text class="lbl sm" x="60" y="246">时间采样用 Beta(1.5, 1)（偏大 t）而非均匀分布——靠近噪声端更难预测，多给训练权重。</text>
       </svg>
       <div class="svg-legend">
@@ -246,7 +246,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
       </div>
       <div class="fig-cap">图 6.2：流匹配一句话——「训练时已知两端学方向（MSE），推理时只知道方向走欧拉」。与第 5 章 diffusion 对比：目标从「噪声 ε」换成「速度 u_t」，去噪步数从 100 降到 10。</div>
     </div>
-    <div class="annotation"><b>读法：</b><code class="inline">x_t = t·noise + (1−t)·actions</code> 把「噪声→动作」的路修成直线，任意 t 处的真速度恒为 <code class="inline">noise − actions</code>。模型只要学会「在任意位置指对方向」，推理时就能从纯噪声一路走直线到动作。与 diffusion 的两个实用差异：① 推理步数少一个数量级（10 vs 100），实时机器人控制买得起；② 时间步采样用 Beta 分布（<code class="inline">sample_time_beta</code>，α=1.5 偏向大 t，flow_matching.py:54）——噪声端的插值点更「陌生」，多练。π0、π05、SmolVLA 共用这套 <code class="inline">euler_integrate</code>（flow_matching.py 注释：openpi 衍生策略历史上各带一份拷贝，现已收敛为公共实现），还预留了 RTC 钩子（rtc_processor 参数）——第 11 章展开。</div>
+    <div class="annotation"><b>读法：</b><code class="inline">x_t = t·noise + (1−t)·actions</code> 把「噪声→动作」的路修成直线，任意 t 处的真速度恒为 <code class="inline">noise − actions</code>。模型只要学会「在任意位置指对方向」，推理时就能从纯噪声一路走直线到动作。与 diffusion 的两个实用差异：① 推理步数少一个数量级（10 vs 100），实时机器人控制买得起；② 时间步采样用 Beta 分布（<code class="inline">sample_time_beta</code>，α=1.5 偏向大 t，flow_matching.py:54）——噪声端的插值点更「陌生」，多练。π0、π05、SmolVLA 共用这套 <code class="inline">euler_integrate</code>（flow_matching.py 注释：openpi 衍生策略历史上各带一份拷贝，现已收敛为公共实现），还预留了 RTC 钩子（<code class="inline">rtc_processor</code> 参数，目前由 evo1 策略实际接入）。</div>
   </section>
 
   <section class="block">
@@ -281,7 +281,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
       <tr><td>双塔架构</td><td>VLM 塔（SmolVLM2 500M，前 16 层）+ 动作专家塔（宽度 ×0.75）；专家 cross-attn 读 VLM KV cache</td><td>smolvla/modeling_smolvla.py:466; smolvlm_with_expert.py:74,110</td></tr>
       <tr><td>prefix/suffix</td><td>prefix 一次前向缓存 KV；denoise_step 每步只跑 suffix 并 crop 缓存</td><td>modeling_smolvla.py:744,775,805</td></tr>
       <tr><td>流匹配训练</td><td>x_t = t·noise + (1−t)·actions；目标 u_t = noise−actions；MSE</td><td>modeling_smolvla.py:699-701,723</td></tr>
-      <tr><td>流匹配推理</td><td>euler_integrate：t 从 1 走到 0，10 步；时间采样 Beta(1.5,1)</td><td>common/flow_matching.py:61; modeling_smolvla.py:550</td></tr>
+      <tr><td>流匹配推理</td><td>euler_integrate：t 从 1 走到 0 走 num_steps 步（SmolVLA 默认 10）；训练时间采样 Beta(1.5,1)</td><td>common/flow_matching.py:61,100; modeling_smolvla.py:550; configuration_smolvla.py:63</td></tr>
       <tr><td>微调冻结</td><td>vision encoder + VLM 全冻结，只训专家与 state_proj</td><td>configuration_smolvla.py:69-71</td></tr>
       <tr><td>缺相机补位</td><td>缺失相机补黑帧 + mask=0，行为平滑退化</td><td>modeling_smolvla.py:371-379</td></tr>
       <tr><td>processor</td><td>rename → batch → newline → tokenize → device → normalize 六步</td><td>processor_smolvla.py:65</td></tr>
@@ -299,7 +299,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
 </div>
 
 <footer>
-  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（3f2c29ef7e）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（b6ec0060）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 服务入口 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a class="active" href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 服务入口</div>
+    <h1>服务入口：HTTP、OpenAI 兼容层与离线 Engine</h1>
+    <div class="subtitle">第 2 章已经跟过一条请求从进入引擎到流式输出的完整路径。这一章看入口本身：http_server.py 里 80 多条路由怎么组织、/v1/* 兼容层做了什么、离线 Engine 如何绕开 HTTP 直接驱动同一套进程，以及 ServerArgs → runtime_context 的配置体系。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>一分钟版本</h2>
+    <p>进入 SGLang 引擎有三扇门，门后是同一个 <code class="inline">TokenizerManager</code>：</p>
+    <ul>
+      <li><strong>HTTP server（<code class="inline">launch_server</code>）</strong>：FastAPI 应用，注册 80 多条路由，覆盖生成、OpenAI 协议、运维和权重管理。</li>
+      <li><strong>OpenAI 兼容层（<code class="inline">/v1/chat/completions</code> 等）</strong>：不是独立服务，而是 HTTP 路由后挂的一组 <code class="inline">OpenAIServing*</code> 适配器，把 OpenAI 请求翻译成 <code class="inline">GenerateReqInput</code>。</li>
+      <li><strong>离线 Engine（<code class="inline">sgl.Engine</code>）</strong>：拉起完全相同的进程结构，但不启动 HTTP——Python 代码直接调用 <code class="inline">tokenizer_manager.generate_request()</code>。</li>
+    </ul>
+    <p>所有入口最终都汇到同一个调用：<code class="inline">tokenizer_manager.generate_request(obj)</code>。这意味着协议层的差异（SSE 帧、chat 模板、tool call 解析）全部被挡在 TokenizerManager 之外——调度器和 GPU 不关心请求来自 curl 还是 OpenAI SDK。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>路由总览</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t9 d9">
+        <title id="t9">SGLang 服务入口与路由分组</title>
+        <desc id="d9">三类客户端经 HTTP 路由汇入 TokenizerManager，离线 Engine 直连</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 客户端 -->
+        <rect class="node acc" x="30" y="20" width="190" height="46" rx="8"></rect>
+        <text class="lbl" x="125" y="48" text-anchor="middle">HTTP 客户端</text>
+        <rect class="node acc" x="250" y="20" width="190" height="46" rx="8"></rect>
+        <text class="lbl" x="345" y="48" text-anchor="middle">OpenAI SDK 客户端</text>
+        <rect class="node acc" x="470" y="20" width="170" height="46" rx="8"></rect>
+        <text class="lbl" x="555" y="48" text-anchor="middle">Ollama / Anthropic 客户端</text>
+        <line class="edge" x1="125" y1="66" x2="125" y2="108"></line>
+        <line class="edge" x1="325" y1="66" x2="325" y2="108"></line>
+        <line class="edge" x1="540" y1="66" x2="540" y2="108"></line>
+
+        <!-- HTTP server -->
+        <rect class="node acc" x="20" y="110" width="640" height="180" rx="10"></rect>
+        <text class="lbl" x="40" y="136" font-weight="bold" fill="#16648f">主进程 · http_server.py — FastAPI 应用，80 多条路由</text>
+        <rect class="node" x="40" y="150" width="170" height="48" rx="6"></rect>
+        <text class="lbl" x="125" y="170" text-anchor="middle">/generate</text>
+        <text class="lbl sm" x="125" y="188" text-anchor="middle">/encode · /classify</text>
+        <rect class="node" x="230" y="150" width="190" height="48" rx="6"></rect>
+        <text class="lbl" x="325" y="170" text-anchor="middle">/v1/chat/completions</text>
+        <text class="lbl sm" x="325" y="186" text-anchor="middle">/v1/completions · /v1/embeddings</text>
+        <rect class="node" x="440" y="150" width="200" height="48" rx="6"></rect>
+        <text class="lbl" x="540" y="170" text-anchor="middle">/api/chat（ollama 兼容）</text>
+        <text class="lbl sm" x="540" y="186" text-anchor="middle">/v1/messages（anthropic 兼容）</text>
+        <rect class="node warn" x="40" y="224" width="600" height="44" rx="6"></rect>
+        <text class="lbl" x="335" y="244" text-anchor="middle">运维路由：/flush_cache · /get_server_info · /update_weights_from_disk</text>
+        <text class="lbl sm" x="335" y="260" text-anchor="middle">/start_profile · /abort_request · /health /health_generate …</text>
+
+        <!-- OpenAI 适配层 -->
+        <rect class="node acc" x="230" y="330" width="210" height="48" rx="6"></rect>
+        <text class="lbl" x="335" y="350" text-anchor="middle">OpenAIServingChat 等</text>
+        <text class="lbl sm" x="335" y="366" text-anchor="middle">chat 模板 · tool call 解析</text>
+        <line class="edge" x1="325" y1="198" x2="325" y2="328"></line>
+        <line class="edge" x1="540" y1="198" x2="540" y2="354"></line>
+        <line class="edge" x1="540" y1="354" x2="442" y2="354"></line>
+
+        <!-- TokenizerManager -->
+        <rect class="node core" x="280" y="420" width="340" height="56" rx="8"></rect>
+        <text class="lbl" x="450" y="444" text-anchor="middle">TokenizerManager.generate_request</text>
+        <text class="lbl sm" x="450" y="462" text-anchor="middle">分词 → ZMQ 发给 Scheduler</text>
+        <line class="edge" x1="125" y1="198" x2="125" y2="442"></line>
+        <line class="edge" x1="125" y1="442" x2="278" y2="442"></line>
+        <line class="edge" x1="335" y1="378" x2="335" y2="418"></line>
+        <line class="edge" x1="630" y1="246" x2="630" y2="460"></line>
+        <line class="edge" x1="630" y1="460" x2="622" y2="460"></line>
+        <text class="lbl sm" x="640" y="350">运维路由调用</text>
+        <text class="lbl sm" x="640" y="366">TokenizerManager 的</text>
+        <text class="lbl sm" x="640" y="382">对应方法</text>
+
+        <!-- 离线 Engine -->
+        <rect class="node" x="700" y="330" width="220" height="60" rx="8"></rect>
+        <text class="lbl" x="810" y="354" text-anchor="middle">离线 Engine</text>
+        <text class="lbl sm" x="810" y="372" text-anchor="middle">engine.py · 无 HTTP</text>
+        <line class="edge core" x1="700" y1="374" x2="622" y2="420"></line>
+        <text class="lbl sm" x="700" y="410">Engine.generate() 直连</text>
+
+        <!-- Scheduler -->
+        <line class="edge acc" x1="450" y1="476" x2="450" y2="502"></line>
+        <rect class="node" x="280" y="504" width="340" height="44" rx="8"></rect>
+        <text class="lbl" x="450" y="532" text-anchor="middle">Scheduler 子进程（ZMQ）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw acc"></span>入口 / 协议适配层</span>
+        <span class="lg-item"><span class="sw core"></span>汇聚点（TokenizerManager）</span>
+        <span class="lg-item"><span class="sw warn"></span>运维路由（不走生成主链路）</span>
+        <span class="lg-item"><span class="sw"></span>一般组件</span>
+      </div>
+      <div class="fig-cap">图 9.2：三个入口汇到同一个 TokenizerManager。离线 Engine 是唯一不经 HTTP 的入口；运维路由虽然也进 TokenizerManager，但走的是 flush_cache、update_weights 这类专用方法。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">srt/entrypoints/http_server.py</code> → 路由与启动；
+      <code class="inline">srt/entrypoints/openai/serving_chat.py</code> 等 → 协议适配层；
+      <code class="inline">srt/entrypoints/engine.py</code> → 离线 Engine 与进程编排；
+      <code class="inline">srt/server_args.py</code>、<code class="inline">srt/runtime_context.py</code> → 配置体系。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>HTTP 层：路由清单、warmup 与看门狗</h2>
+    <p>80 多条路由不是一次性设计的，是按需求逐条长出来的。按功能分组看更清楚：</p>
+    <table class="tbl">
+      <tr><th>路由组</th><th>代表路径</th><th>去向</th></tr>
+      <tr><td>原生生成</td><td>/generate · /encode · /classify</td><td>TokenizerManager.generate_request</td></tr>
+      <tr><td>OpenAI 兼容</td><td>/v1/chat/completions · /v1/completions · /v1/embeddings · /v1/responses</td><td>OpenAIServing* 适配层</td></tr>
+      <tr><td>第三方兼容</td><td>/api/chat（ollama）· /v1/messages（anthropic）</td><td>转译后进 OpenAI 适配层</td></tr>
+      <tr><td>运维控制</td><td>/flush_cache · /get_server_info · /abort_request · /pause_generation</td><td>TokenizerManager 专用方法</td></tr>
+      <tr><td>权重更新</td><td>/update_weights_from_disk · /update_weights_from_tensor · /update_weights_from_distributed</td><td>TokenizerManager → Scheduler</td></tr>
+      <tr><td>可观测</td><td>/start_profile · /stop_profile · /set_trace_level · /freeze_gc</td><td>profiler / tracing</td></tr>
+      <tr><td>健康检查</td><td>/health · /health_generate · /ping</td><td>状态检查或单 token 生成</td></tr>
+      <tr><td>HiCache 管理</td><td>/hicache/storage-backend（GET/PUT/DELETE）</td><td>分层缓存后端热切换（第 11 章）</td></tr>
+    </table>
+
+    <p>路由的共同写法很薄——解析参数、调 TokenizerManager、包错误。以 <code class="inline">/flush_cache</code> 为例：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — 运维路由示例（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">@app</span>.<span class="fn">api_route</span>(<span class="st">"/flush_cache"</span>, methods=[<span class="st">"GET"</span>, <span class="st">"POST"</span>])
+<span class="kw">@auth_level</span>(<span class="cl">AuthLevel</span>.ADMIN_OPTIONAL)
+<span class="kw">async def</span> <span class="fn">flush_cache</span>(timeout: float = <span class="cl">Query</span>(<span class="nu">0.0</span>, ge=<span class="nu">0.0</span>)):
+    <span class="st">"""Flush the radix cache."""</span>
+    ret = <span class="kw">await</span> _global_state.tokenizer_manager.<span class="fn">flush_cache</span>(timeout_s=timeout)
+    <span class="kw">if</span> ret.success:
+        content = (
+            <span class="st">"Cache flushed.\nPlease check backend logs for more details. "</span>
+            <span class="st">"(When there are running or waiting requests, the operation will not be performed.)\n"</span>
+        )
+    <span class="kw">else</span>:
+        content = ret.message <span class="kw">or</span> <span class="st">"Flush cache failed.\n"</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 路由层不做业务，只做三件事：鉴权（<code class="inline">@auth_level</code>）、调用、包装响应。注意 flush 在有 running/waiting 请求时会拒绝执行——缓存清空请求和正在跑的请求之间存在一致性问题，调度器侧（第 4 章）会检查队列再动手。</div>
+
+    <p><code class="inline">launch_server</code> 在起 HTTP 之前会做一次 warmup：等模型就绪、发一条 max_new_tokens=8 的真实生成请求，把 CUDA Graph、内核编译这些首次成本在「服务器就绪」之前消化掉：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — _execute_server_warmup（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 等服务器起来，最多 120 秒</span>
+<span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(<span class="nu">120</span>):
+    time.<span class="fn">sleep</span>(<span class="nu">1</span>)
+    <span class="kw">try</span>:
+        res = requests.<span class="fn">get</span>(url + <span class="st">"/model_info"</span>, timeout=<span class="nu">5</span>, ...)
+        <span class="kw">assert</span> res.status_code == <span class="nu">200</span>
+        success = <span class="kw">True</span>
+        <span class="kw">break</span>
+    <span class="kw">except</span> (...):
+        pass
+
+<span class="kw">if</span> model_info[<span class="st">"is_generation"</span>]:
+    <span class="kw">if</span> is_vlm <span class="kw">and not</span> get_serving().skip_tokenizer_init:
+        request_name = <span class="st">"/v1/chat/completions"</span>   <span class="cmt"># 视觉模型走 chat 协议预热</span>
+    <span class="kw">else</span>:
+        request_name = <span class="st">"/generate"</span>
+<span class="kw">else</span>:
+    request_name = <span class="st">"/encode"</span>
+max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info[<span class="st">"is_generation"</span>] <span class="kw">else</span> <span class="nu">1</span></pre>
+
+    <p>子进程崩溃的防护在 <code class="inline">SubprocessWatchdog</code>。注释里点明了它存在的原因——C++ 层崩溃（比如 NCCL 超时触发 std::terminate）不会走 Python 异常处理，主进程会变成一个继续活着但不干活的僵尸服务：</p>
+    <div class="code-title">python/sglang/srt/utils/watchdog.py — SubprocessWatchdog（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">SubprocessWatchdog</span>:
+    <span class="st">"""Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
+
+    When a subprocess crashes (e.g., NCCL timeout causing C++ std::terminate()),
+    Python exception handlers never run, leaving the main process as a zombie
+    service. This watchdog polls subprocess liveness in a daemon thread and
+    sends SIGQUIT to trigger proper cleanup.
+    """</span></pre>
+
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么有 /health 和 /health_generate 两条？代码给出了答案：/health 默认只查进程状态，直接 200，负载均衡器高频轮询时零开销；/health_generate 会真的发一条 input_ids=[0]、max_new_tokens=1 的生成请求，验证「前向通路是好的」而不仅是「进程活着」。另外 /health 支持 SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION 开关把它也升级成真生成——是运维口径分裂后的收敛痕迹。
+    </div>
+
+    <p>还有一个值得注意的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server 的双分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> envs.SGLANG_RUST_SERVER.<span class="fn">get</span>():
+    <span class="cmt"># Rust 侧同时承担 api-server、tokenizer、detokenizer，</span>
+    <span class="cmt"># 主进程不再有 Python HTTP server / tokenizer manager</span>
+    <span class="kw">if not</span> get_serving().skip_server_warmup:
+        _execute_server_warmup(server_args)
+    logger.info(<span class="st">"The server is fired up and ready to roll!"</span>)
+    scheduler_init_result.<span class="fn">block_until_scheduler_exits</span>()
+<span class="kw">else</span>:
+    _setup_and_run_http_server(server_args, tokenizer_manager, ...)</pre>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>OpenAI 兼容层：不止是格式转换</h2>
+    <p><code class="inline">/v1/chat/completions</code> 的 handler 本身只有一行转发，真正的工作在 <code class="inline">OpenAIServingChat</code>：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — /v1 路由的薄转发（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">@app.post</span>(<span class="st">"/v1/chat/completions"</span>, dependencies=[<span class="cl">Depends</span>(validate_json_request)])
+<span class="kw">async def</span> <span class="fn">openai_v1_chat_completions</span>(
+    request: <span class="cl">ChatCompletionRequest</span>, raw_request: <span class="cl">Request</span>
+):
+    <span class="st">"""OpenAI-compatible chat completion endpoint."""</span>
+    <span class="kw">return await</span> raw_request.app.state.openai_serving_chat.<span class="fn">handle_request</span>(
+        request, raw_request
+    )</pre>
+    <div class="annotation"><b>读懂这段：</b> 每个 /v1 端点对应一个 <code class="inline">OpenAIServing*</code> 对象，启动时统一挂到 <code class="inline">fast_api_app.state</code> 上，构造参数都是同一个 TokenizerManager 加 TemplateManager。适配层要干的活比「转格式」多得多。</div>
+
+    <p>第一件重活是 chat 模板。messages 数组要按模型自带的 Jinja 模板渲染成 prompt token 序列，tools 定义也要拼进模板：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — chat 模板渲染（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">apply_chat_template</span>(
+    messages,
+    tokenize=<span class="kw">True</span>,
+    add_generation_prompt=<span class="kw">True</span>,
+    tools=request_tools,
+    return_dict=<span class="kw">False</span>,
+    **template_kwargs,
+)</pre>
+    <div class="annotation"><b>读懂这段：</b> 这里直接用 HF tokenizer 的 apply_chat_template 并 tokenize=True，产出的是 token id 而非文本——少一次 tokenize 往返。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      模板渲染出的东西怎么交给引擎，这里有过一次收敛。渲染结果可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是一个逐模型 <code class="inline">elif</code> 链：先特判 <code class="inline">kimi_k3</code>，再特判 <code class="inline">inkling</code>，剩下的走默认。现在抽成了一个独立方法 <code class="inline">_engine_prompt()</code>，判断依据从<strong>模型名字符串</strong>换成了能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>。<strong>每接一个特殊编码器就加一个 <code class="inline">elif</code>，是这类地方的典型退化路径</strong>；换成能力位之后，新模型只要在编码 spec 里声明自己的行为，这里不用再动。
+    </div>
+
+    <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — tool call 约束构建（摘录，注释为译注）</div>
+    <pre class="code"><span class="kw">if</span> self.tool_call_parser:
+    parser = <span class="cl">FunctionCallParser</span>(
+        effective_tools,
+        self.tool_call_parser,
+        tokenizer=self.tokenizer_manager.tokenizer,
+    )
+    tool_call_constraint = parser.<span class="fn">get_structure_constraint</span>(
+        request.tool_choice,
+        parallel_tool_calls=request.parallel_tool_calls,
+        thinking_mode=xgrammar_reasoning,
+    )
+    required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
+    <div class="annotation"><b>读懂这段：</b> tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>离线 Engine：同一套进程，不设 HTTP</h2>
+    <p><code class="inline">sgl.Engine</code> 的 docstring 与 launch_server 几乎逐字相同——同样的三个组件、同样的 ZMQ 通信，区别只在主进程不跑 FastAPI，由 Python 调用方直接持住 TokenizerManager：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/engine.py — Engine.generate 的流式包装（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>generator = self.tokenizer_manager.<span class="fn">generate_request</span>(obj, <span class="kw">None</span>)
+
+<span class="kw">if</span> stream:
+    <span class="kw">def</span> <span class="fn">generator_wrapper</span>():
+        <span class="kw">while True</span>:
+            <span class="kw">try</span>:
+                chunk = self.loop.<span class="fn">run_until_complete</span>(generator.<span class="fn">__anext__</span>())
+                <span class="kw">yield</span> chunk
+            <span class="kw">except</span> <span class="cl">StopAsyncIteration</span>:
+                <span class="kw">break</span>
+
+    <span class="kw">return</span> generator_wrapper()
+<span class="kw">else</span>:
+    ret = self.loop.<span class="fn">run_until_complete</span>(generator.<span class="fn">__anext__</span>())
+    <span class="kw">return</span> ret</pre>
+    <div class="annotation"><b>读懂这段：</b> 离线 Engine 把 asyncio 生成器包成同步生成器：内部跑自己的事件循环，逐块 run_until_complete。因为底层 API 与 HTTP 路径完全相同（同一个 generate_request 协程），离线压测得到的数据可以代表在线行为——这是「离线引擎优先」设计带来的直接好处。</div>
+
+    <p>进程编排入口是 <code class="inline">_launch_subprocesses</code>，开头几行值得细读——配置在发布给子进程前有一道「快照-恢复」保护：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/engine.py — _launch_subprocesses 开头（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>configure_logger(server_args)
+server_args.<span class="fn">resolve_once</span>()
+_set_envs_and_config(server_args)
+
+<span class="cmt"># publish 把 server_args 安装为本进程的全局配置，role 记录进程角色；</span>
+<span class="cmt"># snapshot/restore 保证启动失败时上下文回到发布前</span>
+context_before_publish = <span class="fn">snapshot_context</span>()
+<span class="fn">publish</span>(server_args, role=<span class="st">"tokenizer"</span>)</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">publish(role="tokenizer")</code> 之后，主进程内所有 <code class="inline">get_schedule()</code> 式的读取都有了着落。role 参数不只是元数据：每个角色有一张「允许读取哪些配置命名空间」的表（<code class="inline">ROLE_NAMESPACE_SETS</code>），<code class="inline">SGLANG_ROLE_NAMESPACES=enforce</code> 时表外的读取直接报错——这是把「哪类进程依赖哪些配置」显式写进了代码。</div>
+    <div class="annotation"><b>这张表目前还很宽松，原因写在注释里：</b> 查表会发现，<code class="inline">scheduler</code>、<code class="inline">tokenizer</code>、<code class="inline">detokenizer</code>、<code class="inline">encoder</code> 等角色的值都是 <code class="inline">None</code>——<code class="inline">None</code> 的语义是<strong>整棵树都可以读</strong>，不是「什么都不能读」。真正被收窄的只有一个：<code class="inline">dp_controller</code>，限定在 <code class="inline">{"exec", "parallel", "device", "disagg", "observability", "serving"}</code> 六个命名空间。<code class="inline">tokenizer</code> 那一项旁边留了一段注释解释为什么不收窄：做记录模式审计时只跑通了文本模型的几个端点，多模态处理器、LoRA / score 端点、disagg 角色、gRPC 桥都没覆盖到，「<strong>收窄需要把这些形态也审计完；写错的集合会让请求失败，而不是让测试失败</strong>」。所以这张表现在的实际作用是：框架就位、失败关闭（fail-closed）已经生效，但生产角色还没有一个真正被限制住。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.6</span>配置体系：ServerArgs 与 runtime_context</h2>
+    <p>SGLang 的启动参数有 200 多个，全部收在 <code class="inline">ServerArgs</code> 一个 msgspec Struct 里。它的字段声明方式有个特点：CLI flag 直接从字段名推导，帮助文本写在类型注解里：</p>
+    <div class="code-title">python/sglang/srt/server_args.py — ServerArgs 的字段注解约定（摘录，docstring 译文）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ServerArgs</span>:
+    <span class="st">"""
+    1. **Use the ``A[T, ...]`` annotation.** ``A`` is an alias for
+       ``typing.Annotated``. The primary CLI flag is auto-derived from the
+       field name (``tp_size`` → ``--tp-size``):
+
+           # Bare string — simplest form (just help text):
+           host: A[str, "The host of the HTTP server."] = "127.0.0.1"
+           trust_remote_code: A[bool, "Whether to allow custom models."] = False
+
+           # Arg(...) — when you need choices, aliases, type_parser, etc.:
+           load_format: A[str, Arg(help="...", choices=CHOICES)] = "auto"
+           model_path: A[str, Arg(help="...", aliases=["--model"])]
+    """</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 字段定义、CLI 注册、帮助文档三份信息合并成一处声明，加参数只改一个文件。这个文件本身也是配置演进的记录：代码里专门列出了哪些参数「必须手动注册」（废弃 flag 重定向、动态 choices），并按注释块分区（# Model and tokenizer、# LoRA……），新参数必须归入对应分区。</div>
+
+    <p>配置的<strong>读取</strong>端不在 ServerArgs 上，而是发布到一组进程级全局对象。Scheduler、ModelRunner、Sampler 里的代码到处在调 <code class="inline">get_schedule().page_size</code>、<code class="inline">get_memory().disable_radix_cache</code> 这类语句：</p>
+    <div class="code-title">python/sglang/srt/runtime_context.py — 配置命名空间的访问器（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每个访问器返回该命名空间的快照包；publish 之前调用会抛 ValueError</span>
+<span class="kw">def</span> <span class="fn">get_device</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"device"</span>)
+
+<span class="kw">def</span> <span class="fn">get_model</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"model"</span>)
+
+<span class="kw">def</span> <span class="fn">get_exec</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"exec"</span>)
+
+<span class="kw">def</span> <span class="fn">get_schedule</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"schedule"</span>)
+
+<span class="kw">def</span> <span class="fn">get_memory</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"memory"</span>)
+
+<span class="kw">def</span> <span class="fn">get_spec</span>() -&gt; <span class="cl">_ConfigBag</span>:
+    <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"spec"</span>)</pre>
+    <div class="annotation"><b>读懂这段：</b> 这是「全局配置包」方案：publish 时把 ServerArgs 投影成十几个命名空间包（device/model/exec/schedule/memory/spec/lora/mm/disagg/serving/observability），之后任何模块按需读取，不必把 server_args 一路穿进每个构造函数。代价是依赖被藏进了全局读取——所以仓库里配了 enforce 模式：SGLANG_ROLE_NAMESPACES=enforce 时，未在角色表里声明的读取会直接失败，用检查替代纪律。</div>
+
+    <div class="callout info">
+      <b class="tag">演进</b>
+      从代码注释能还原这次重构的动机：ServerArgs 的 docstring 写着「Construction leaves the record at what the caller asked for. Resolution is a separate act」——构造和解析分成两步（resolve_once 只跑一次），因为早期版本里解析函数不可重入（DP attention 会把 chunked_prefill_size 再砍一半）。而 runtime_context 的 publish/assert_published 机制则是为了让「子进程拿到的是哪个配置、谁发布的」变成可检查的事实，而不是口口相传的约定。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>对「自研引擎」的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      三个可迁移的决定：① <strong>离线 Engine 先行</strong>——先把 generate() 做对，HTTP 层只是它的一层皮，两边共用同一协程入口，压测和服务行为才不会分叉。② <strong>路由薄、适配层厚</strong>——路由只做参数解析和转发，chat 模板、tool call、reasoning 分离这类协议工作收敛到独立的 serving 对象；SGLang 的路由清单已经长到 80 多条，靠的就是每条路由都足够薄。③ <strong>配置可以全局读，但要把「谁读什么」写成表</strong>——全局包省掉了参数传递的机械劳动，角色-命名空间表让这种妥协保持可审计。下一步进入 <a href="10-distributed.html">第 10 章：分布式推理</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="08-sampling.html">← 上一章：采样与结构化输出</a>
+    <a href="10-distributed.html">下一步：分布式推理 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

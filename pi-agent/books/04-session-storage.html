@@ -252,34 +252,66 @@
   <section class="block">
     <h2><span class="num">4.5</span>Fork：从一棵树长出另一棵</h2>
     <p>fork 有两种 scope：<code class="inline">tree</code>（整树克隆，适合「保存副本」）与 <code class="inline">branch</code>（只复制到某个 entry 为止的路径，开一条新主线）。它不再「产出 mutation 序列再重放」，而是先<strong>捕获一个源快照</strong>（全部 entries + 全部簿记值），再纯函数地算出<strong>目标快照</strong>，最后把目标快照一次性写成新存储。</p>
-    <div class="code-title">packages/agent/src/harness/session/fork.ts — createForkSnapshot（节选）</div>
+    <div class="code-title">packages/agent/src/harness/session/fork.ts — createForkSnapshot（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> createForkSnapshot(source: <span class="cl">ForkSourceSnapshot</span>, options: <span class="cl">ForkOptions</span>): <span class="cl">ForkDestinationSnapshot</span> {
+  <span class="kw">const</span> sourceEntries = <span class="kw">new</span> <span class="cl">Map</span>(source.entries.map((entry) =&gt; [entry.id, entry]));
   <span class="kw">const</span> sourceTips = storedValuesInNamespace(source.scalarValues, branchTip(<span class="st">""</span>));  <span class="cmt">// 所有分支 tip</span>
-  <span class="kw">const</span> { entryIds, destinationTips } = selectForkContents(sourceEntries, sourceTips, options);
-  <span class="cmt">// branch scope：从 tip 沿 parentId 走到 entryId（position "before" 则停在它的父）</span>
-  <span class="kw">for</span> (<span class="kw">const</span> [branch, tipId] <span class="kw">of</span> destinationTips) {
-    <span class="kw">const</span> configuration = findStoredValue(source.scalarValues, laneConfig(branch));
-    store(branchTip(branch), tipId);                     <span class="cmt">// 复制分支 tip</span>
-    <span class="kw">if</span> (configuration !== <span class="kw">undefined</span>) {
-      store(laneConfig(branch), configuration.value);    <span class="cmt">// 复制 lane 配置</span>
-      store(laneState(branch), { currentOperationId: <span class="kw">null</span>, lastOperationId: <span class="kw">null</span>, inbox: [] });
-    }                                                    <span class="cmt">// lane 状态一律重置为空闲</span>
-  }
+  validateForkSourceSnapshot(source, sourceEntries, sourceTips, options);
+
+  <span class="kw">const</span> { entryIds, plan } = selectForkContents(sourceEntries, sourceTips, options);
+  <span class="cmt">// tree：entryIds 收全树；branch：从 tip 沿 parentId 走到 entryId，plan 记下 destinationTip</span>
+  <span class="kw">const</span> entries = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="kw">string</span>, <span class="cl">Entry</span>&gt;();
+  <span class="kw">for</span> (<span class="kw">const</span> id <span class="kw">of</span> entryIds) entries.set(id, sourceEntries.get(id)!);
+
+  <span class="cmt">// 逐条投影簿记值：该跟的跟、该丢的丢、该改写的改写（见下方 fork-policy.ts）</span>
+  <span class="kw">const</span> scalarValues: <span class="cl">StoredValue</span>&lt;<span class="kw">unknown</span>&gt;[] = [];
+  <span class="kw">let</span> nextSeq = Math.max(<span class="nu">0</span>, ...[...entries.values()].map((entry) =&gt; entry.seq)) + <span class="nu">1</span>;
   <span class="kw">for</span> (<span class="kw">const</span> stored <span class="kw">of</span> source.scalarValues) {
-    <span class="kw">switch</span> (classifyForkAddress(stored.address, options.scope, (entryId) =&gt; entryIds.has(entryId))) {
-      <span class="kw">case</span> <span class="st">"copy"</span>: store(stored.address, stored.value); <span class="kw">break</span>;
-      <span class="kw">case</span> <span class="st">"exclude"</span>:  <span class="kw">case</span> <span class="st">"reconstruct"</span>: <span class="kw">break</span>;   <span class="cmt">// op/pending/result 状态不带过去</span>
+    <span class="kw">const</span> projected = projectForkCurrentStateWrite(
+      { kind: <span class="st">"value"</span>, op: <span class="st">"set"</span>, seq: stored.seq, namespace: stored.address.namespace,
+        key: stored.address.key, value: stored.value },
+      plan,
+      (entryId) =&gt; entryIds.has(entryId),
+    );
+    <span class="kw">if</span> (projected !== <span class="kw">undefined</span>) {
+      scalarValues.push({ address: value(projected.namespace, projected.key), value: projected.value, seq: nextSeq++ });
     }
   }
   <span class="kw">return</span> { entries, scalarValues, nextSeq };
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> fork 的关键分界是 <code class="inline">classifyForkAddress</code> 的三分类：<code class="inline">copy</code>（数据类值：session name、entry label 跟过去）、<code class="inline">exclude</code>（操作现场：<code class="inline">pi.op.*</code>、<code class="inline">pi.pending.*</code>、<code class="inline">pi.result.*</code> 不带——新会话必须从「空闲」开始）、<code class="inline">reconstruct</code>（lane 状态：上面已用「空闲初始值」重建）。配置（<code class="inline">pi.lane.config</code>）跟着 lane 走，所以 fork 出的会话保留你的模型选择。<strong>会话从父会话继承 parentSessionId</strong>，形成家谱。seq 不重排——副本从源树继承 seq，<code class="inline">nextSeq</code> 取自最大值 +1。</div>
+    <div class="code-title">packages/agent/src/harness/session/fork-policy.ts — projectForkCurrentStateWrite（节选，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> projectForkCurrentStateWrite(
+  write: <span class="cl">CommittedValueSetWrite</span> | <span class="cl">CommittedListAppendWrite</span>,
+  plan: <span class="cl">ForkCurrentStatePlan</span>,
+  isEntryCopied: (entryId: <span class="kw">string</span>) =&gt; <span class="kw">boolean</span>,
+) {
+  <span class="kw">switch</span> (write.namespace) {
+    <span class="kw">case</span> <span class="st">"pi.session.name"</span>: <span class="kw">return</span> write;
+    <span class="kw">case</span> <span class="st">"pi.entry.label"</span>: <span class="kw">return</span> isEntryCopied(write.key) ? write : <span class="kw">undefined</span>;
+    <span class="kw">case</span> <span class="st">"pi.branch.tip"</span>:
+      <span class="kw">if</span> (plan.scope === <span class="st">"tree"</span>) <span class="kw">return</span> write;
+      <span class="kw">return</span> write.key === plan.branch ? { ...write, value: plan.destinationTip } : <span class="kw">undefined</span>;
+    <span class="kw">case</span> <span class="st">"pi.lane.config"</span>:
+      <span class="kw">return</span> plan.scope === <span class="st">"tree"</span> || write.key === plan.branch ? write : <span class="kw">undefined</span>;
+    <span class="kw">case</span> <span class="st">"pi.lane.state"</span>:
+      <span class="kw">return</span> plan.scope === <span class="st">"tree"</span> || write.key === plan.branch
+        ? { ...write, value: { currentOperationId: <span class="kw">null</span>, lastOperationId: <span class="kw">null</span>, inbox: [] } }
+        : <span class="kw">undefined</span>;
+    <span class="kw">case</span> <span class="st">"pi.result"</span>: <span class="kw">return</span> <span class="kw">undefined</span>;
+  }
+  <span class="kw">if</span> (write.namespace.startsWith(<span class="st">"pi.op."</span>) || write.namespace.startsWith(<span class="st">"pi.pending."</span>)) <span class="kw">return</span> <span class="kw">undefined</span>;
+  <span class="kw">if</span> (write.namespace === <span class="st">"pi"</span> || write.namespace.startsWith(<span class="st">"pi."</span>)) {
+    <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Unknown reserved fork namespace: ${write.namespace}`</span>);
+  }
+  <span class="kw">return</span> plan.scope === <span class="st">"tree"</span> ? write : <span class="kw">undefined</span>;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> fork 的关键分界是 <code class="inline">projectForkCurrentStateWrite</code> 对每个命名空间的投影决策：<code class="inline">pi.session.name</code> 直接跟过去；<code class="inline">pi.entry.label</code> 只在该 entry 被复制时跟过去；<code class="inline">pi.branch.tip</code> 在 branch scope 下只有目标分支自己保留，且值改写为 <code class="inline">destinationTip</code>（<code class="inline">position: "before"</code> 时停在父节点）；<code class="inline">pi.lane.config</code> 跟着目标 lane 走，所以 fork 出的会话保留你的模型选择；<code class="inline">pi.lane.state</code> 一律重置为空闲（两个操作 id 置 <code class="inline">null</code>、inbox 清空）；<code class="inline">pi.result</code>、<code class="inline">pi.op.*</code>、<code class="inline">pi.pending.*</code> 不带——新会话必须从「空闲」开始。遇到未知保留命名空间直接抛错，防止上游新增的簿记值被静默丢弃。<strong>会话从父会话继承 parentSessionId</strong>，形成家谱。seq 分两类处理：entries 原样保留源 seq；标量值从「最大 entry seq + 1」起重新编号。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.6</span>存储后端：内存 / JSONL / SQLite，共用一个 Storage 接口</h2>
     <p><code class="inline">StorageBackedSession</code> 是门面，真正读写靠 <code class="inline">Storage</code> 接口（commit/getEntries/getValue/scanBranch/scanEntries/scanUsage/...）。核心包自带两个实现：<code class="inline">MemoryStorage</code>（测试/示范用）与 <code class="inline">JsonlStorage</code>（生产默认）；SQLite 是独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>（<code class="inline">packages/session-backends/sqlite-node</code>），避免核心包硬依赖 node:sqlite。</p>
-    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — applyValidated（节选）</div>
+    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — applyValidated（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * Complete materialized session state for MemoryStorage and JsonlStorage.
  * This is intentionally unsuitable for database backends and long-running sessions
@@ -290,18 +322,27 @@
   applyValidated(writes: <span class="kw">readonly</span> <span class="cl">CommittedWrite</span>[]): <span class="cl">SessionStats</span> {
     <span class="kw">for</span> (<span class="kw">const</span> write <span class="kw">of</span> writes) {
       <span class="kw">switch</span> (write.kind) {
-        <span class="kw">case</span> <span class="st">"entry"</span>:
+        <span class="kw">case</span> <span class="st">"entry"</span>: {
+          <span class="kw">const</span> { kind: _kind, ...entry } = write;
           <span class="kw">this</span>.entries.set(entry.id, entry);
           <span class="kw">this</span>.entriesBySeq.push(entry);            <span class="cmt">// seq 有序数组，供 scanEntries</span>
-          <span class="kw">if</span> (entry.type === <span class="st">"message"</span>) <span class="kw">this</span>.stats.messageCount++;
-          <span class="kw">break</span>;
-        <span class="kw">case</span> <span class="st">"value"</span>: {
-          <span class="kw">const</span> key = physicalKey(write.namespace, write.key);  <span class="cmt">// namespace +   + key</span>
-          <span class="kw">if</span> (write.op === <span class="st">"delete"</span>) <span class="kw">this</span>.scalarValues.delete(key);
-          <span class="kw">else this</span>.scalarValues.set(key, { address, value: write.value, seq: write.seq });
+          <span class="kw">if</span> (entry.type === <span class="st">"message"</span>) <span class="kw">this</span>.stats = { ...<span class="kw">this</span>.stats, messageCount: <span class="kw">this</span>.stats.messageCount + <span class="nu">1</span> };
           <span class="kw">break</span>;
         }
-        <span class="cmt">// usage / list 同理……</span>
+        <span class="kw">case</span> <span class="st">"usage"</span>: {
+          <span class="kw">const</span> { kind: _kind, ...row } = write;
+          <span class="kw">this</span>.usage.set(row.id, row);
+          <span class="kw">this</span>.stats = { ...<span class="kw">this</span>.stats, usage: addUsage(<span class="kw">this</span>.stats.usage, row.usage) };
+          <span class="kw">break</span>;
+        }
+        <span class="kw">case</span> <span class="st">"value"</span>:
+          <span class="kw">if</span> (write.op === <span class="st">"delete"</span>) <span class="kw">this</span>.scalarValues.delete(physicalKey(write.namespace, write.key));
+          <span class="kw">else this</span>.applyValueSetOrListAppend(write);
+          <span class="kw">break</span>;
+        <span class="kw">case</span> <span class="st">"list"</span>:
+          <span class="kw">if</span> (write.op === <span class="st">"delete"</span>) <span class="kw">this</span>.listValues.delete(physicalKey(write.namespace, write.key));
+          <span class="kw">else this</span>.applyValueSetOrListAppend(write);   <span class="cmt">// list append 与 value set 落点相同</span>
+          <span class="kw">break</span>;
       }
       <span class="kw">this</span>.nextSeq = write.seq + <span class="nu">1</span>;               <span class="cmt">// 高水位推进</span>
     }
@@ -416,12 +457,16 @@
   }
 }</pre>
     <p><code class="inline">SessionMutation</code> 的语义由此而来：<code class="inline">beginMutation()</code> 在 MutationLine 上排队拿到一个<strong>独占能力</strong>，它<strong>只允许一次 commit</strong>（第二次直接拒绝），<code class="inline">end()</code> 等待提交落地并释放互斥线。JSONL 后端再加最后一道防线——每个事务<strong>原子发布</strong>：先写 <code class="inline">{path}.tmp</code>，再 <code class="inline">rename</code> 覆盖正式文件；启动时逐行重放，<strong>不完整的最后一行（撕裂写）直接截断丢弃</strong>——半条事务永远不会被算数：</p>
-    <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — open() 里的撕裂处理（节选）</div>
+    <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — openV4() 里的撕裂处理（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> { lines, torn } = splitCompleteLines(content);
 <span class="cmt">// ……校验 header（format 4：v/kind/id/storageVersion/createdAt/cwd）、逐行重放事务</span>
-<span class="kw">if</span> (torn) <span class="kw">await</span> publishFileAtomically(options.fileSystem, options.path, `${lines.join(<span class="st">"\n"</span>)}\n`, context);</pre>
+<span class="kw">if</span> (torn) {
+  <span class="kw">await</span> publishFileAtomically(options.fileSystem, options.path, context, (append) =&gt;
+    append(`${lines.join(<span class="st">"\n"</span>)}\n`),
+  );  <span class="cmt">// 只回写完整行，撕裂尾巴被截断丢弃</span>
+}</pre>
     <div class="callout">
-      <strong>为什么这值得抄？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
+      <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
     </div>
     <div class="code-title">harness/session/session.ts · assertJsonSerializable（节选）</div>
     <pre class="code"><code><span class="kw">export function</span> <span class="fn">assertJsonSerializable</span>(value: unknown): <span class="kw">void</span> {
@@ -445,7 +490,7 @@
 }</code></pre>
     <p>它防的坑都很「阴」——只靠 <code class="inline">JSON.stringify</code> 是无法发现的：稀疏数组、访问器（getter）、携带符号键或额外属性的数组、非平面原型对象、<code class="inline">NaN</code>/<code class="inline">Infinity</code>、循环引用。这些一旦混进 JSONL，轻则污染读出结果，重则让整个会话文件读不回来。它用的是<strong>显式栈</strong>而非递归——深对象不会爆栈。</p>
     <div class="callout">
-      <strong>为什么这值得抄？</strong>你的 Runtime 一旦要持久化到磁盘（本章 JSONL），「写前校验」就是第一道防线。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。一道显式校验器 + 引入即失败，成本极低、收益极高。
+      <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘（本章 JSONL），「写前校验」就是第一道防线。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。一道显式校验器 + 引入即失败，成本极低、收益极高。
     </div>
   </section>
 
@@ -464,7 +509,7 @@
 </div>
 
 <footer>
-  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.85.1-4-g9767ba275 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

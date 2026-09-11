@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · KV cache — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 KV cache</div>
+    <h1>KV cache 家族：槽位、双缓存与 context shift</h1>
+    <div class="subtitle">上一章的 FAILED_PREPARE 几乎都发生在这里。llama.cpp 的 KV cache 是一个「格子本」：每格记 pos 和一个序列集合，找槽就是在格子里划出连续空位。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>unified 与分序列：两种 KV 布局</h2>
+    <p>构造 KV cache 前先回答一个问题：所有序列共享一个大缓存，还是每序列一个独立缓存？<code class="inline">kv_unified</code> 参数决定：</p>
+    <div class="code-title">src/llama-context.cpp:287-302 — n_ctx_seq 的划分（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span>cparams.kv_unified = params.kv_unified;
+
+<span class="cmt">// ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732</span>
+cparams.n_ctx = GGML_PAD(cparams.n_ctx, <span class="nu">256</span>);
+
+<span class="kw">if</span> (cparams.kv_unified) {
+    cparams.n_ctx_seq = cparams.n_ctx;      <span class="cmt">// 共享：每序列可用全部 context</span>
+} <span class="kw">else</span> {
+    cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+    cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, <span class="nu">256</span>);
+    <span class="kw">if</span> (cparams.n_ctx_seq == <span class="nu">0</span>) {
+        <span class="kw">throw</span> std::runtime_error(<span class="st">"n_ctx_seq == 0"</span>);
+    }
+    <span class="cmt">// ...保证 n_ctx == n_ctx_seq * n_seq_max，余量不丢</span>
+}</pre>
+    <p>这个选择一路传到 cache 构造函数，变成「流」的数量：</p>
+    <div class="code-title">src/llama-kv-cache.cpp:84-88 — n_stream（摘录）</div>
+    <pre class="code"><span class="lang-tag">c++</span>model(model), hparams(hparams), v_trans(v_trans),
+    n_seq_max(n_seq_max), n_stream(unified ? <span class="nu">1</span> : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),</pre>
+    <div class="annotation"><b>读懂这段：</b> unified 模式下 n_stream=1——所有序列写进同一片 cells，靠 <code class="inline">find_slot</code> 动态分槽，总容量就是 n_ctx；分序列模式下 n_stream=n_seq_max，每片 cells 独占 n_ctx_seq 个格子，互不侵占。前者吞吐高（并发请求共享空间）但互相干扰，后者隔离好但容量利用率低。llama-server 默认开 unified（slot 共享一个 context 的前提）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>cells：格子本的数据结构</h2>
+    <p>每片 cells 是一个 <code class="inline">llama_kv_cells</code>——只存元信息，不存 K/V 数据本身：</p>
+    <div class="code-title">src/llama-kv-cells.h:34-50 — llama_kv_cells（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// meta information about KV cells that can be part of multiple</span>
+<span class="cmt">// sequences at the same time</span>
+<span class="kw">class</span> <span class="cl">llama_kv_cells</span> {
+<span class="kw">public</span>:
+    <span class="kw">using</span> <span class="cl">seq_set_t</span> = std::bitset&lt;LLAMA_MAX_SEQ&gt;;
+
+    <span class="kw">void</span> <span class="fn">reset</span>() {
+        <span class="kw">for</span> (uint32_t i = <span class="nu">0</span>; i &lt; pos.size(); ++i) {
+            pos[i]   = -<span class="nu">1</span>;          <span class="cmt">// -1 = 空格子</span>
+            ext[i].reset();
+            shift[i] =  <span class="nu">0</span>;
+            seq[i].reset();          <span class="cmt">// 序列集合：bitset，一格可属多个序列</span>
+        }
+        has_shift = <span class="kw">false</span>;
+        ...
+    }</pre>
+    <div class="annotation"><b>读懂这段：</b> 每个格子四件套：pos（该位置的 RoPE 位置，-1 空）、ext（多维位置：图像 token 的 x/y 坐标）、shift（待平移量，K-shift 用）、seq（bitset——一格可以同时属于多个序列，这是 prefix 复用的基础：两个请求共享的 prompt 片段只占一份格子）。「数据」（K/V 张量）与「记账」（cells）分离：cells 告诉你格子 i 存的是哪个序列的哪个 pos，K/V 只按 idx 寻址。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>find_slot：找槽算法</h2>
+    <p>decode 里每次 init_batch 都会调 <code class="inline">find_slot(ubatch, cont)</code>。核心是一个 head 指针的环形扫描：</p>
+    <div class="code-title">src/llama-kv-cache.cpp:1001-1018 — find_slot 回卷与连续槽（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span>uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+
+<span class="cmt">// head 前面还有足够空格子 → 回到开头找，期望把缓存「填满」</span>
+<span class="cmt">// （head 只增不减的话，环形空间会从尾部开始浪费）</span>
+<span class="kw">if</span> (head_cur &gt; cells.get_used() + <span class="nu">2</span>*n_tokens) {
+    head_cur = <span class="nu">0</span>;
+}
+
+<span class="kw">if</span> (n_tokens &gt; cells.size()) {
+    LLAMA_LOG_ERROR(<span class="st">"%s: n_tokens = %d &gt; size = %u\n"</span>, __func__, n_tokens, cells.size());
+    <span class="kw">return</span> { };
+}
+
+uint32_t n_tested = <span class="nu">0</span>;
+
+<span class="cmt">// 连续槽：一次测整个 ubatch 能否放下；非连续：逐个 token 测</span>
+<span class="kw">const</span> uint32_t n_test = cont ? n_tokens : <span class="nu">1</span>;</pre>
+    <p>格子可用性的判定（完整版，含 SWA 复用）：</p>
+    <div class="code-title">src/llama-kv-cache.cpp:1039-1061 — can_use 判定（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// can we use this cell? either:</span>
+<span class="cmt">//  - the cell is empty</span>
+<span class="cmt">//  - the cell is occupied only by one sequence:</span>
+<span class="cmt">//    - mask SWA, using current max pos for that sequence in the cache</span>
+<span class="cmt">//                always insert in the cell with minimum pos</span>
+<span class="kw">bool</span> can_use = cells.<span class="fn">is_empty</span>(idx);
+
+<span class="kw">if</span> (!can_use &amp;&amp; cells.<span class="fn">seq_count</span>(idx) == <span class="nu">1</span>) {
+    <span class="kw">const</span> llama_pos pos_cell = cells.<span class="fn">pos_get</span>(idx);
+
+    <span class="kw">if</span> (!can_use) {
+        <span class="kw">const</span> llama_seq_id seq_id_cell = cells.<span class="fn">seq_get</span>(idx);
+
+        <span class="cmt">// SWA mask：这个格子里的 pos 已经滑出滑动窗口 → 可覆盖</span>
+        <span class="kw">if</span> (llama_hparams::<span class="fn">is_masked_swa</span>(n_swa, swa_type, pos_cell,
+                cells.<span class="fn">seq_pos_max</span>(seq_id_cell) + <span class="nu">1</span>)) {
+            can_use = <span class="kw">true</span>;
+        }
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个要点。① <strong>head 回卷</strong>：`head &gt; used + 2*n_tokens` 时从头找——head 附近的「已用」格子其实早已被 SWA 滑出窗口或被 seq_rm 释放，从头扫能减少碎片；② <strong>cont 参数</strong>：因果注意力希望 ubatch 的 KV 落在连续格子上（注意力 kernel 按连续段 mask），失败就 clear 重来；非连续模式一格一格凑。<strong>说明</strong>：这条连续槽路径在当前锚点的所有调用点都传 <code class="inline">false</code>（src/llama-kv-cache.cpp:769、:2419），实现仍在、自动调度已不启用它；③ <strong>SWA 覆盖</strong>：滑动窗口外的格子等价于死数据，find_slot 直接把它当空位用——SWA 模型的 KV cache 自带「原地 recycling」。</div>
+    <p>全扫完还不够就返回空 slot_info——上一章看到的 FAILED_PREPARE 就是由这里触发的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>iswa：滑动窗口的双缓存</h2>
+    <p>Gemma-2/3 这类模型有「全局注意力层 + 滑窗注意力层」混合。llama.cpp 为它们造了两种 cache：</p>
+    <div class="code-title">src/llama-kv-cache-iswa.cpp:52-81 — 双缓存的尺寸计算（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// chain filters：按 is_swa(il) 把层分到两个 cache</span>
+<span class="kw">const</span> layer_filter_cb filter_base = [&amp;](int32_t il) {
+    <span class="kw">if</span> (filter &amp;&amp; !filter(il)) { <span class="kw">return</span> <span class="kw">false</span>; }
+    <span class="kw">return</span> !model.hparams.<span class="fn">is_swa</span>(il);        <span class="cmt">// 非滑窗层 → base cache</span>
+};
+
+<span class="kw">const</span> layer_filter_cb filter_swa  = [&amp;](int32_t il) {
+    <span class="kw">if</span> (filter &amp;&amp; !filter(il)) { <span class="kw">return</span> <span class="kw">false</span>; }
+    <span class="kw">return</span>  model.hparams.<span class="fn">is_swa</span>(il);        <span class="cmt">// 滑窗层 → swa cache</span>
+};
+
+<span class="kw">const</span> uint32_t size_base = kv_size;
+
+<span class="cmt">// note: the SWA cache is always padded to 256 for performance</span>
+<span class="cmt">//       https://github.com/ggml-org/llama.cpp/issues/17037</span>
+uint32_t size_swa = GGML_PAD(std::<span class="fn">min</span>(size_base,
+        hparams.n_swa*(unified ? n_seq_max : <span class="nu">1</span>) + n_ubatch), <span class="nu">256</span>);
+
+<span class="cmt">// when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size</span>
+<span class="kw">if</span> (swa_full) {
+    size_swa = size_base;
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> size_swa 的公式值得琢磨：滑窗层只需要 `n_swa + n_ubatch` 个格子（窗口 + 当前批），乘上序列数——相比 base cache 是巨大的节省。`--swa-full` 可以退回全尺寸（精度参考配置）。双缓存通过 <code class="inline">llama_memory_i</code> 同一接口对外（<code class="inline">class llama_kv_cache_iswa : public llama_memory_i</code>），decode 无感知；内部把 <code class="inline">seq_rm/seq_cp/seq_keep/seq_add/seq_div</code> 这些访问原语成对转发给两个子 cache，而 <code class="inline">prepare()</code> 则把 ubatch 拆成 <code class="inline">sinfos_base</code> / <code class="inline">sinfos_swa</code> 两组分头处理——按层切分的实质在这里。这里值得记住的模式：<strong>接口不变，实现按层切分</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>context shift：无限生成的诀窍</h2>
+    <p>长文本生成超过 n_ctx 时怎么办？llama-server 的答案：<strong>保住开头、丢掉中段</strong>，剩下的位置号整体前移。默认保留 <code class="inline">n_keep</code> 个开头 token（system prompt 等），从 <code class="inline">n_keep</code> 之后删掉约一半（<code class="inline">n_discard</code>，可由 <code class="inline">n_discard</code> 参数指定），再把后面的位置号整体减掉 <code class="inline">n_discard</code>。这是两步操作：</p>
+    <div class="code-title">tools/server/server-context.cpp:2912-2956 — slot 的 context shift（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 触发条件：prompt + 生成中，长度逼近 n_ctx</span>
+<span class="kw">if</span> (slot.state == SLOT_STATE_GENERATING &amp;&amp;
+        slot.prompt.n_tokens() + <span class="nu">1</span> &gt;= slot.n_ctx) {
+    ...
+    <span class="cmt">// n_keep：保住开头的 system prompt 不被丢弃</span>
+    <span class="kw">int</span> n_keep = slot.task-&gt;params.n_keep &lt; <span class="nu">0</span> ? slot.task-&gt;n_tokens() : slot.task-&gt;params.n_keep;
+    <span class="kw">if</span> (add_bos_token) { n_keep += <span class="nu">1</span>; }
+    n_keep = std::min(slot.n_ctx - <span class="nu">4</span>, n_keep);
+
+    <span class="kw">const</span> <span class="kw">int</span> n_left    = slot.prompt.n_tokens() - n_keep;
+    <span class="kw">int</span>       n_discard = slot.task-&gt;params.n_discard ? slot.task-&gt;params.n_discard : (n_left / <span class="nu">2</span>);
+
+    <span class="cmt">// ref: https://github.com/ggml-org/llama.cpp/pull/24786</span>
+    n_discard = std::clamp(n_discard, <span class="nu">0</span>, std::max(<span class="nu">0</span>, n_left - <span class="nu">1</span>));
+
+    SLT_WRN(slot, <span class="st">"slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n"</span>, ...);
+
+    <span class="cmt">// 第一步：删掉中段（keep 之后 discard 个 token）的 KV</span>
+    slot.mem.<span class="fn">seq_rm</span> (slot.id, n_keep,             n_keep + n_discard);
+    <span class="cmt">// 第二步：其余部分位置号整体前移 -n_discard</span>
+    slot.mem.<span class="fn">seq_add</span>(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+    ...
+}</pre>
+    <p>但位置号只是「记账」。K 向量里烘焙的 RoPE 相位是跟着旧 pos 走的——所以还需要一次<strong>K-shift</strong>：用计算图把所有 K 重新施加位置差：</p>
+    <div class="code-title">src/llama-kv-cache.cpp:857-883 — update() 里的 K-shift（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (do_shift) {
+    <span class="kw">if</span> (!get_can_shift()) {
+        GGML_ABORT(<span class="st">"The current KV cache / model configuration does not support K-shift"</span>);
+    }
+
+    <span class="cmt">// apply K-shift if needed</span>
+    <span class="kw">if</span> (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+        ggml_backend_sched_reset(sched);
+
+        <span class="kw">auto</span> * res = lctx-&gt;<span class="fn">get_gf_res_reserve</span>();
+        res-&gt;<span class="fn">reset</span>();
+
+        <span class="kw">auto</span> * gf = <span class="fn">build_graph_shift</span>(res, lctx);   <span class="cmt">// 单独为「平移 K」建一张图</span>
+        <span class="kw">if</span> (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LLAMA_LOG_ERROR(<span class="st">"%s: failed to allocate compute graph for K-shift\n"</span>, __func__);
+            <span class="kw">return</span> updated;
+        }
+        ...
+    }
+}</pre>
+    <div class="annotation"><b>读懂这段：</b> 「记 fibers」和「改数据」是两层：seq_rm/seq_add 改 cells 的 pos（O(n) 记账，瞬时）；build_graph_shift 建一张小图，把每个 K 向量按 shift[i] 重算 RoPE（一次前向计算的开销）。这也解释了 decode 状态机为什么敢「重试一次」——整理动作里 shift 是<strong>用算图的方式做的</strong>，不破坏 cache 的一致性。V 向量不需要 shift（V 不含位置信息）。旧版还有 defrag（碎片整理），现在已从代码里移除——<code class="inline">defrag_thold</code> 在 <code class="inline">include/llama.h:384</code> 已标 <code class="inline">[DEPRECATED]</code>，仅在 <code class="inline">llama_context_default_params()</code>（src/llama-context.cpp:3639）里保留一个 <code class="inline">-1.0f</code> 的默认值。</div>
+    <div class="callout warn">
+      <b class="tag">mmproj 不支持 shift</b>
+      server-context.cpp 里明确 <code class="inline">GGML_ABORT("not supported by multimodal")</code>——多模态 chunk 一个图像对应多个 token 位置，shift 会破坏图文对齐。加载了 mmproj 时 ctx_shift 被自动禁用。端侧多模态应用要么留足 context，要么自己管理丢弃。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>对照：FreeToken 的混合缓存</h2>
+    <p>FreeToken 面对的模型（DeepSeek-V4 类 hybrid）KV 是「全注意力 + 线性状态（GDN）」混合，prefix 复用要多带一份<strong>线性状态快照</strong>：<code class="inline">python/freetoken/kvcache/hybrid_radix_cache.py</code> 的 docstring 开门见山：</p>
+    <div class="code-title">python/freetoken/kvcache/hybrid_radix_cache.py — 模块 docstring（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt">"""Hybrid (full-attn KV + GDN linear-state) radix cache.
+
+A SEPARATE class from ``RadixPrefixCache`` (Option C) that REUSES the shared ``RadixTreeNode``
+and walk/split logic, so the production KV radix is untouched (zero risk to non-hybrid models).
+It adds a second "currency": an optional GDN state snapshot (``node.mamba_value`` = a
+LinearStatePool slot id) attached at chunk/page-aligned boundary nodes, with its own LRU
+eviction. Mirrors sglang ``MambaRadixCache`` (donate-not-copy, dual eviction, internal-node
+tombstone, ``full_ref &gt;= mamba_ref``) on FreeToken's tree.
+"""</span></pre>
+    <p>match_prefix 把可复用长度截断到「最近一个仍持有活快照的节点」——GDN 是循环状态，只能从存档点续跑：</p>
+    <div class="code-title">python/freetoken/kvcache/hybrid_radix_cache.py:76-88 — match_prefix（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">match_prefix</span>(self, input_ids: torch.Tensor) -&gt; <span class="cl">HybridMatch</span>:
+    <span class="cmt">"""Match the token prefix, then truncate the reusable length to the deepest node on
+    the path that still owns a LIVE snapshot (a continuation can only resume the GDN
+    recurrence from a checkpointed boundary)."""</span>
+    node, _ = self._walk(input_ids)
+    ...</pre>
+    <div class="annotation"><b>对照读：</b> llama.cpp 的复用单位是「KV 格子」（bitset 多序列共享），FreeToken 的复用单位是「radix 树节点 + 页对齐 KV 页 + GDN 快照槽」——三种资源各自记账。llama.cpp 的 context shift 丢中段保两端；FreeToken 的 hybrid 模型天然没有「无限生成长度」问题（线性状态恒定大小），但换来的约束是：prefix 复用必须在 CHUNK_SIZE 边界上——断言 `CHUNK_SIZE % page_size == 0` 就是为此写的。第 10 章展开。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.7</span>小结</h2>
+    <ul>
+      <li>unified（1 流，动态分槽）vs 分序列（n_seq_max 流，各占 n_ctx_seq）——服务吞吐与隔离的取舍。</li>
+      <li>cells 只存元信息：pos + seq bitset；一格多序列是 prefix 复用的基石。</li>
+      <li>find_slot：head 回卷 + 连续槽测试 + SWA 死区复用；失败即 FAILED_PREPARE。</li>
+      <li>iswa 双缓存按层切分：滑窗层 cache 只需 n_swa + n_ubatch 大小。</li>
+      <li>context shift = seq_rm/seq_add（记账）+ build_graph_shift（重算 K 的 RoPE）。</li>
+      <li>FreeToken 的混合模型多一份要管理的状态：GDN 快照，复用截断到快照边界。</li>
+    </ul>
+    <p>KV 装好后，计算从哪来？下一章进入 ggml 的图世界。<a href="05-graph-sched.html">第 5 章：计算图与调度</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="03-decode-loop.html">← decode 循环</a>
+    <a href="05-graph-sched.html">下一步：计算图与调度 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 04 KV cache · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

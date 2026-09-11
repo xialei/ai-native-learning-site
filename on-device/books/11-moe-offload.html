@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · MoE 专家缓存 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 MoE 专家缓存</div>
+    <h1>OffloadMoeCache：把 137 GiB 专家装进 12 GiB 显存</h1>
+    <div class="subtitle">KV cache 管的是「每个 token 一格」；专家缓存管的是「每个 (层,专家) 一格」——而且格子里的内容比 KV 重几百倍，搬一次的代价要用 LRU 摊平。这一章拆 FreeToken 最核心的部件：槽池、双映射、bank 布局、LRU、prefill 双缓冲，以及让这一切能跑起来的磁盘格式与显存预算。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>先算账：专家到底有多大</h2>
+    <p>拿 DeepSeek-V4 的配置（python/freetoken/models/deepseek_v4/args.py）算一遍：</p>
+    <div class="code-title">python/freetoken/models/deepseek_v4/args.py — 关键维度（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>dim: <span class="cl">int</span> = <span class="nu">4096</span>          <span class="cmt"># H，hidden size</span>
+moe_inter_dim: <span class="cl">int</span> = <span class="nu">2048</span>   <span class="cmt"># I，专家中间维</span>
+n_layers: <span class="cl">int</span> = <span class="nu">43</span>
+n_routed_experts: <span class="cl">int</span> = <span class="nu">256</span>
+n_activated_experts: <span class="cl">int</span> = <span class="nu">6</span>   <span class="cmt"># top_k</span></pre>
+    <p>每个专家是三个矩阵：gate_up（2I×H）、down（H×I），合计 3IH 个权重。乘上层数与专家数，就是 routed experts 的全部体积。OffloadMoeCache 把每专家字节数写成了公式表（moe/offload_cache.py:84-96）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:84-96 — 每专家字节公式（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># keyed by the config-time format tag (expert_quant / moe_weight_format), not
+# quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its
+# repacked variants</span>
+_BANK_BYTES_PER_EXPERT = {
+    <span class="st">"bf16"</span>: <span class="kw">lambda</span> H, I: <span class="nu">3</span> * I * H * <span class="nu">2</span>,
+    <span class="st">"fp8_block"</span>: <span class="kw">lambda</span> H, I: <span class="nu">3</span> * I * H + (...scale...),
+    <span class="st">"q4_0"</span>: <span class="kw">lambda</span> H, I: <span class="nu">2</span> * I * (H // <span class="nu">32</span>) * <span class="nu">18</span> + H * (I // <span class="nu">32</span>) * <span class="nu">18</span>,
+    <span class="st">"nvfp4"</span>: <span class="kw">lambda</span> H, I: <span class="nu">2</span> * I * (H//<span class="nu">2</span> + H//<span class="nu">16</span> + <span class="nu">2</span>) + H * (I//<span class="nu">2</span> + I//<span class="nu">16</span> + <span class="nu">2</span>),
+    <span class="st">"mxfp4"</span>: <span class="kw">lambda</span> H, I: <span class="nu">2</span> * I * (H//<span class="nu">2</span> + H//<span class="nu">32</span> + <span class="nu">2</span>) + H * (I//<span class="nu">2</span> + I//<span class="nu">32</span> + <span class="nu">2</span>),
+    <span class="st">"ds_fp4"</span>: <span class="kw">lambda</span> H, I: <span class="nu">2</span> * I * (H//<span class="nu">2</span> + H//<span class="nu">32</span>) + H * (I//<span class="nu">2</span> + I//<span class="nu">32</span>),
+}</pre>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>格式</th><th>每专家（H=4096, I=2048）</th><th>43 层 × 256 专家全部体积</th></tr></thead>
+        <tbody>
+          <tr><td>bf16</td><td>3IH×2 = 48 MiB</td><td>约 516 GiB</td></tr>
+          <tr><td>fp8_block</td><td>3IH + 块 scale ≈ 24 MiB</td><td>约 258 GiB</td></tr>
+          <tr><td>ds_fp4（DSV4 原生）</td><td>≈ 12.75 MiB</td><td>约 137 GiB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>137 GiB（最低量化）对上 8-24 GB 显存，差距是一个数量级。但注意 top_k=6：每层每步只激活 6/256 ≈ 2.3% 的专家。<strong>稀疏性给了缓存机会</strong>——如果在 GPU 上留一个 L×E 总量中一小部分的「槽池」，把热专家放里面，冷专家按需从 CPU 内存经 PCIe 搬进来，就能用远小于全量的显存吃到大部分命中。这个槽池就是 OffloadMoeCache。</p>
+    <div class="annotation"><b>读懂这段：</b> 这里的账目与 KV cache 完全不同量级：一个 KV 格子是 head_dim 级的几个 KB，一个专家槽是 12-48 MiB。<strong>搬错一次的代价是搬 KV 的上千倍</strong>，所以替换策略（LRU）、搬运方式（合并拷贝）、甚至磁盘格式（对齐到 O_DIRECT）都要为「减少搬运」服务。llama.cpp 没有这个问题——它从不把专家当可换入换出的资源，见 11.7。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>flat id 与双映射：一个扁平槽池</h2>
+    <p>OffloadMoeCache 的核心是三层结构：host 源（每层一份 [E, ...] 的 pinned 内存 bank）、GPU 槽池（每个 bank 一条 [cache_size, ...] 的显存）、以及两本映射账。注意 <strong>cache_size 是全部层的总槽位数</strong>，不是每层各留一份——热层多占、冷层少占，池子共享：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:169-185 — 双映射（摘录，注释为译注）</div>
+
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">self</span>.slot_for_id = torch.full(
+    (self.num_layers, self.num_experts),   <span class="cmt"># 正表：[L, E] -1=不在池中</span>
+    -<span class="nu">1</span>, dtype=torch.int32, device=self.device,
+)
+<span class="cmt"># Reverse map, in the flat id space flashlib's slot_cache works in:</span>
+<span class="cmt"># id == layer_id * num_experts + expert, so one array replaces the (layer,</span>
+<span class="cmt"># expert) pair and evicting a slot needs no decode.</span>
+<span class="kw">self</span>.id_of_slot = torch.full(
+    (self.cache_size,),                    <span class="cmt"># 反表：[cache_size] 槽→flat id</span>
+    -<span class="nu">1</span>, dtype=torch.int32, device=self.device,
+)
+<span class="kw">self</span>.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
+<span class="k self">self</span>.step = torch.zeros((), dtype=torch.int64, device=self.device)</pre>
+    <p>LRU 的全部机制就是最后两个量：每次 decode 步 <code class="inline">step += 1</code>，命中/载入的槽把 <code class="inline">usage[slot] = step</code> 盖个时间戳；要驱逐时取 <code class="inline">argmin(usage)</code>。没有链表、没有堆——设备端一个规约就够，且形状固定，可以编进 CUDA Graph。逐专家的 LRU 变体（hybrid 后端用）另有 <code class="inline">expert_recency [L, E]</code>（:196-201），按「专家最近何时被路由」而非「槽何时被写」挑该抓哪些缺失。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t11 d11">
+        <title id="t11">OffloadMoeCache 结构</title>
+        <desc id="d11">host bank 经 PCIe 进入扁平槽池，slot_for_id/id_of_slot 双映射，前 2E 槽被 prefill 双缓冲借用</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="30" y="40" width="240" height="110" rx="10"></rect>
+        <text class="lbl" x="150" y="70" text-anchor="middle">host banks（pinned）</text>
+        <text class="lbl sm" x="150" y="90" text-anchor="middle">每层 [E, ...row]，按 bank 分列</text>
+        <text class="lbl sm" x="150" y="108" text-anchor="middle">bf16 / fp8_block / nvfp4 / q4_0 / mxfp4 / ds_fp4</text>
+        <text class="lbl sm" x="150" y="126" text-anchor="middle">FTW 读盘 → O_DIRECT → pin-after-fill</text>
+
+        <rect class="node core" x="350" y="40" width="280" height="330" rx="10"></rect>
+        <text class="lbl" x="490" y="70" text-anchor="middle" font-weight="bold" fill="#1d6b4f">GPU 槽池 [cache_size, ...]（每 bank 一条）</text>
+        <rect class="node warn" x="380" y="88" width="220" height="56" rx="6"></rect>
+        <text class="lbl" x="490" y="110" text-anchor="middle">slot 0 … 2E-1</text>
+        <text class="lbl sm" x="490" y="128" text-anchor="middle">prefill 双缓冲借用区</text>
+        <text class="lbl sm" x="490" y="186" text-anchor="middle">…… 自由槽 ……</text>
+        <rect class="node acc" x="380" y="220" width="220" height="46" rx="6"></rect>
+        <text class="lbl" x="490" y="242" text-anchor="middle">slot cache_size-1</text>
+        <text class="lbl sm" x="490" y="258" text-anchor="middle">argmin(usage) = 驱逐候选</text>
+        <text class="lbl sm" x="490" y="308" text-anchor="middle">usage[slot]=step 盖时间戳</text>
+        <text class="lbl sm" x="490" y="326" text-anchor="middle">id_of_slot[slot]=layer*E+expert</text>
+
+        <rect class="node" x="700" y="120" width="210" height="76" rx="10"></rect>
+        <text class="lbl" x="805" y="148" text-anchor="middle">slot_for_id [L, E]</text>
+        <text class="lbl sm" x="805" y="166" text-anchor="middle">正查：(层,专家)→槽，-1=缺</text>
+        <line class="edge" x1="700" y1="158" x2="632" y2="140"></line>
+
+        <rect class="node" x="700" y="240" width="210" height="76" rx="10"></rect>
+        <text class="lbl" x="805" y="268" text-anchor="middle">id_of_slot [cache_size]</text>
+        <text class="lbl sm" x="805" y="286" text-anchor="middle">反查：槽→flat id</text>
+        <line class="edge" x1="700" y1="278" x2="632" y2="272"></line>
+
+        <text class="lbl sm" x="150" y="230" fill="#55685e">decode：ensure_experts 把 topk_ids</text>
+        <text class="lbl sm" x="150" y="248" fill="#55685e">就地改写为槽 id，缺的经 PCIe 搬入</text>
+        <line class="edge" x1="200" y1="152" x2="348" y2="130"></line>
+        <text class="lbl sm" x="252" y="112">PCIe（fused copy，一次 launch）</text>
+      </svg>
+      <div class="fig-cap">图 11.1：一个扁平槽池服务所有层的所有 bank。双映射让「路由改写」查 slot_for_id、「驱逐」查 id_of_slot 各走各的；前 2E 槽平时也当普通缓存用，prefill overlap 时被临时征用为双缓冲（11.5）。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>bank schemas：八种量化格式一个缓存机制</h2>
+    <p>「一个专家」不是一块连续内存，是若干个<strong>bank</strong>（权重 + scale 各自成列）。格式决定 bank 有几列、每列什么形状；而缓存机制对 bank 内部字节不感兴趣，只负责按行搬运。所有格式的 bank 名字集中在一张表里（offload_cache.py:32-78）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:32-78 — _BANK_SCHEMAS（节选，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># quant_format -&gt; bank names, in registration order: the single place a format's</span>
+<span class="cmt"># bank layout is declared. The cache machinery (copy_missing, the prefill double</span>
+<span class="cmt"># buffers, bank_views) iterates banks in this order ...</span>
+_BANK_SCHEMAS = {
+    <span class="st">"bf16"</span>: (<span class="st">"gate_up"</span>, <span class="st">"down"</span>),
+    <span class="cmt"># DeepSeek-V3-style 128x128 block-fp8 ... gate_up [L*E, 2I, H] fp8 + gate_up_scale</span>
+    <span class="st">"fp8_block"</span>: (<span class="st">"gate_up"</span>, <span class="st">"gate_up_scale"</span>, <span class="st">"down"</span>, <span class="st">"down_scale"</span>),
+    <span class="st">"q4_0"</span>: (<span class="st">"gate_up"</span>, <span class="st">"down"</span>),
+    <span class="cmt"># native ModelOpt rows ...: packed e2m1 codes + fp8-e4m3 per-16 block scales</span>
+    <span class="cmt"># + per-output-row fp16 globals (w1/w3 carry distinct globals, ...)</span>
+    <span class="st">"nvfp4"</span>: (<span class="st">"gate_up_packed"</span>, <span class="st">"gate_up_scale"</span>, <span class="st">"gate_up_global"</span>,
+              <span class="st">"down_packed"</span>, <span class="st">"down_scale"</span>, <span class="st">"down_global"</span>),
+    <span class="cmt"># pre-tiled layouts for the borrowed kernels; the globals are folded into the</span>
+    <span class="cmt"># block scales at repack time and collapse to [L*E] GPU-resident alpha vectors</span>
+    <span class="st">"nvfp4_marlin"</span>: (<span class="st">"gate_up_packed"</span>, <span class="st">"gate_up_scale"</span>, <span class="st">"down_packed"</span>, <span class="st">"down_scale"</span>),
+    <span class="st">"nvfp4_b12x"</span>: (...同上...),
+    <span class="cmt"># gpt-oss mxfp4, transposed split-K layout ...: blocks_t / scales_t / bias</span>
+    <span class="st">"mxfp4_triton"</span>: (<span class="st">"gate_up_blocks"</span>, <span class="st">"gate_up_scales"</span>, <span class="st">"gate_up_bias"</span>,
+                     <span class="st">"down_blocks"</span>, <span class="st">"down_scales"</span>, <span class="st">"down_bias"</span>),
+    <span class="cmt"># DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale</span>
+    <span class="st">"ds_fp4"</span>: (<span class="st">"gate_up_packed"</span>, <span class="st">"gate_up_scale"</span>, <span class="st">"down_packed"</span>, <span class="st">"down_scale"</span>),
+}</pre>
+    <p>机制与格式解耦的代价集中在拷贝路径。每个 bank 的「每行字节数」必须能对齐到 16 字节，才能把所有 bank 的拷贝融合成<strong>一次 launch</strong>（_build_fused_copy_plan，:380-441；退化路径是每 bank 一次 launch）。另一个格式相关的巧合约束是 marlin 内核的槽位上限：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:100-101 — marlin 槽位上限</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert</span>
+<span class="cmt"># dimension; moe_align_block_size requires round_up(experts, 32) &lt; 1024, i.e. &lt;= 992.</span>
+MARLIN_MAX_CACHE_SIZE = <span class="nu">992</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 992 这个数字的外来性值得停下来看：槽池明明是 FreeToken 自己的数据结构，上限却由「借用的 vLLM marlin 内核要求对齐后的 expert 维 &lt; 1024」倒逼出来——<code class="inline">moe_align_block_size</code> 要求 <code class="inline">round_up(experts, 32) &lt; 1024</code>，向上取整到 32 的倍数后仍小于 1024，上限就落在 992。nvfp4_marlin 格式下 cache_size 不得超过 992（validate_rebuild，:443-463 里强制），其他格式没有此限。<strong>复用别人的内核，就要接受别人的约束写进自己的配置</strong>——这是工程边界真实的样子。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>decode 路径：ensure_experts → copy_missing</h2>
+    <p>decode 时每层 MoE 的前向分三步（layers/moe.py:279-290）：改写路由 id、搬缺失、算 GEMM：</p>
+    <div class="code-title">python/freetoken/layers/moe.py — _decode_routed（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>cache.ensure_experts(<span class="kw">self</span>.layer_id, topk_ids)   <span class="cmt"># topk_ids 就地变槽 id</span>
+cache.copy_missing()                                <span class="cmt"># 缺失行经 PCIe 入槽</span>
+<span class="kw">return</span> <span class="kw">self</span>._expert_gemm(
+    cache, hidden_states, topk_weights, topk_ids,
+    views=cache.bank_views(),                       <span class="cmt"># 直接读整条 [cache_size] 槽池</span>
+    n=<span class="kw">None</span>, ...)</pre>
+    <p>ensure_experts 的实现在 CUDA 内核里（moe/offload_kernels.py 的 ensure_experts），但它的两个关键行为在 Python 侧注释里写得很清楚。其一，改写是<strong>就地</strong>的——路由直方图统计必须赶在改写之前做（offload_cache.py:843-853）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:843-853 — ensure_experts（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">ensure_experts</span>(self, layer_id: <span class="cl">int</span>, expert_ids: torch.Tensor) -&gt; <span class="kw">None</span>:
+    <span class="kw">if</span> self.collect_decode_freq:
+        <span class="cmt"># ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to</span>
+        <span class="cmt"># slot ids in place), so snapshot the routing histogram before that happens.</span>
+        ids = expert_ids.reshape(-<span class="nu">1</span>).long()
+        self.decode_freq[layer_id].scatter_add_(<span class="nu">0</span>, ids, torch.ones_like(ids))
+    self._pending_src_layer = layer_id
+    self._pending_whole_layer = <span class="kw">False</span>
+    ensure_experts(self, layer_id, expert_ids)</pre>
+    <p>其二，<code class="inline">_pending_src_layer</code> 是一层簿记：内核只负责选受害者（argmin usage）、写 evict_slots/src_indices/num_indices 三个设备端数组，真正的搬运留给随后的 copy_missing（:1011 起）。为什么不合并成一步？因为「选槽」在计算流上（要赶在 GEMM 前），而「搬运」可能要走 fused copy 内核或特殊的整层路径——分离后每一步都能被 CUDA Graph 捕获（copy_missing 见 :1011-1053）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:1011-1053 — copy_missing（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">copy_missing</span>(self) -&gt; <span class="kw">None</span>:
+    layer_id = self._pending_src_layer
+    <span class="kw">if</span> layer_id <span class="kw">in</span> self._unpinned_layers:
+        <span class="kw">if not</span> self._pending_whole_layer:
+            <span class="kw">raise</span> RuntimeError(
+                f<span class="st">"layer {layer_id} is unpinned: its only copy is the whole-layer "</span>
+                f<span class="st">"pageable materialize (position == expert id); ensure_experts's "</span>
+                f<span class="st">"LRU slot remap cannot be honored without a device alias"</span>
+            )
+        <span class="cmt"># 非 pinned 层唯一的搬运方式：整层同步 pageable H2D，</span>
+        <span class="cmt"># 槽位 = 专家 id，永不被 CUDA Graph 捕获</span>
+        <span class="kw">for</span> per_layer, cache <span class="kw">in</span> self.banks:
+            cache[: self.num_experts].copy_(per_layer[layer_id])
+        <span class="kw">return</span>
+    <span class="kw">if</span> self._copy_fused_ok:
+        <span class="cmt"># 一次 launch 搬所有 bank 的缺失行；evict/src/num 三数组跨 bank 共享</span>
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs, self._copy_src_ptrs[layer_id],
+            self._copy_feat_bytes, self.evict_slots,
+            self.src_indices, self.num_indices,
+        )
+        <span class="kw">return</span>
+    <span class="kw">from</span> freetoken.kernel <span class="kw">import</span> fast_index_copy_jit
+    <span class="kw">for</span> per_layer, cache <span class="kw">in</span> self.banks:
+        fast_index_copy_jit(cache, self.evict_slots, per_layer[layer_id],
+                            self.src_indices, self.num_indices)</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个细节撑起了「CUDA-graph 安全」这个硬约束：① 所有簿记数组（evict_slots、src_indices、num_indices）形状固定、内容设备端产生，图重放时直接复用；② fused copy 的指针描述符在 set_bank_sources 时固化成设备端 tensor（_copy_dst_ptrs 等），cache 生命周期内地址不变；③ 非 pinned 层（LOCKED/PAGEABLE，见第 12 章）没有设备别名，无法表达「把行搬到任意槽」，所以直接抛错——把不可能表达的约束在运行时喊出来，好过静默出错。注意 ensure_experts 与 copy_missing 之间没有同步原语：同一流上先 launch 后 launch 天然有序。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>prefill 路径：整层流式与双缓冲</h2>
+    <p>prefill 与 decode 的处境完全不同：一个 chunk 可达数千 token，几乎必然激活<strong>每层的全部 256 个专家</strong>（6/256 是每 token 的分布，乘上几千 token 后命中每一个专家的概率接近 1）。逐专家 LRU 毫无意义——干脆整层整层地搬。<strong>prefill 默认不走 LRU：槽位 = 专家 id，路由 id 原样通过</strong>（_prefill_routed，moe.py:347-350 的注释 "position == expert id, so the routing ids pass through unmapped"）。例外是 DeepSeek-V4：它 override 了 _prefill_routed，对小于整层的小 chunk 会退回 LRU 路径（models/deepseek_v4/moe.py:96-110），免得为几百 token 搬满整层。</p>
+    <p>整层搬运若串行，PCIe 时间会直接叠在 GEMM 时间上。prefill_overlap 的方案：把槽池<strong>最前面的 2×num_experts 个槽临时征用为双缓冲</strong>——层 L 用 L%2 号缓冲，层 L 的 GEMM 与层 L+1 的 H2D 并行：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:611-616 — 双缓冲借用槽池（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># The double buffers borrow the slot cache's first 2 * num_experts slots</span>
+<span class="cmt"># (one full expert layer per buffer), one view per registered bank.</span>
+self.prefill_bank_buffers = [
+    cache[: <span class="nu">2</span> * self.num_experts].view(<span class="nu">2</span>, self.num_experts, *cache.shape[<span class="nu">1</span>:])
+    <span class="kw">for</span> _, cache <span class="kw">in</span> self.banks
+]</pre>
+    <div class="code-title">python/freetoken/layers/moe.py:380-390 — 每层的双缓冲交替（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_wait_prefill_overlap</span>(self, cache) -&gt; tuple:
+    <span class="kw">if</span> self.layer_id == <span class="nu">0</span>:
+        cache.begin_prefill()
+    cache.prefetch_prefill_layer(self.layer_id)      <span class="cmt"># 本层已 prefetch 则直接跳过</span>
+    cache.prefetch_prefill_layer(self.layer_id + <span class="nu">1</span>)  <span class="cmt"># 排上下一层的 H2D</span>
+    <span class="kw">return</span> cache.wait_prefill_layer(self.layer_id)   <span class="cmt"># 等本层 ready event</span></pre>
+    <p>双缓冲交替有三件易错事，代码里各有一处防护。第一，缓冲复用必须先释放：buffer 的 release event 在 GEMM 完成后记录，复用方 wait 它（offload_cache.py:832-841），否则层 L+2 的拷贝会覆盖层 L 还在算的字节——复用前的断言 <code class="inline">_prefill_buffer_released</code>（:679-681）兜底。第二，<strong>跨 prefill 的栅栏</strong>。overlap 调度下，新 prefill 的第一个 prefetch 可能排进流里时，上一个 decode 批次还在跑，而那次 decode 刚把专家载入被借走的槽——不设栅栏，prefetch 会踩掉运行中 GEMM 正在读的字节（begin_prefill，:645-658 的 fence 段为 :650-658）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:650-658 — begin_prefill 的 fence（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> self.prefill_copy_stream <span class="kw">is not</span> <span class="kw">None</span>:
+    <span class="cmt"># Fence this prefill's copy-stream work behind everything already enqueued</span>
+    <span class="cmt"># on the compute stream. The release/ready events only order against the</span>
+    <span class="cmt"># *previous prefill*; under overlap scheduling a new prefill can be enqueued</span>
+    <span class="cmt"># while the preceding decode batch is still running, and that decode may</span>
+    <span class="cmt"># have loaded experts into the slots the buffers borrow -- without this</span>
+    <span class="cmt"># fence the first prefetch would stomp bytes a running GEMM is reading.</span>
+    self.prefill_begin_event.record(torch.cuda.current_stream(self.device))
+    self.prefill_copy_stream.wait_event(self.prefill_begin_event)</pre>
+    <p>第三，借用槽的缓存账必须清掉：_invalidate_prefill_buffer（:635-643）把这两个缓冲里所有槽的 slot_for_id 置回 -1、usage 清零——usage=0 让它们成为下次 argmin 的首选受害者。借用是「白拿」，归还时要把账抹平。</p>
+    <p>在此之上还有一个可选优化 <strong>hit-D2D</strong>（moe_prefill_hit_d2d，需 CUDA ≥ 13.0 的 cudaMemcpyBatchAsync——绑定的 8 参数签名是 13.0 才有的，12.8/12.9 多一个 failIdx 参数，因此代码在 JIT 编译前就按 <code class="inline">torch.version.cuda &lt; (13, 0)</code> 拦下）：chunk 开始时把 slot_for_id 快照到 pinned 主存（一次 host sync），之后每层把「已在槽池里的专家」用设备端 gather 直接 D2D 拼进缓冲，只让缺失行走 PCIe，且按连续 run 合并成一次 batch memcpy（_prefetch_split，:746-817）。小于 256KB 的 bank 不参与 gather——cudaMemcpyBatchAsync 混入小块会整体退化为同步拷贝（offload_cache.py:17-26 的注释实测 gpt-oss 2048tok 端到端 -22%）：</p>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:17-26 — 256KB 门槛的由来（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes</span>
+<span class="cmt"># large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,</span>
+<span class="cmt"># empirically bisected: a single 5-22KB entry beside one large entry blocks the</span>
+<span class="cmt"># calling thread for the full transfer; &gt;=253KB entries never do). ...</span>
+_SMALL_BANK_FEAT_BYTES = <span class="nu">256</span> * <span class="nu">1024</span></pre>
+    <div class="annotation"><b>读懂这段：</b> hit-D2D 的可用性判定（_hit_d2d_usable，:703-733，包含日志收尾到 :733）是一个可复用的模式：任何不可用条件（快照缓冲没建、fused copy 不可用、cache_size ≤ 2E、驱动缺 batch memcpy）都<strong>降级到整层拷贝路径，且在日志里喊一次</strong>（_hit_d2d_fallback_logged 防刷屏）。静默降级是性能调优最深的坑——用户以为开了优化，实际跑的是旧路径，数字对不上还查不出来。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.6</span>磁盘格式与显存预算：FTW 与 plan_cache_budget</h2>
+    <p>缓存机制跑得快，前提是 host bank 装得快。FreeToken 为此定义了自己的权重格式 <strong>FTW（FreeToken Weight）</strong>。动机在文件头写得直白（checkpoint/ftw.py:1-31）：</p>
+    <div class="code-title">python/freetoken/checkpoint/ftw.py — 模块 docstring（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt">"""FreeToken Weight (FTW) checkpoint: one O_DIRECT-friendly on-disk format for a whole model.
+
+... It exists because reading the original safetensors back fast is awkward:
+tensors are packed with no alignment, so an individual tensor can't be O_DIRECT-read at an
+arbitrary offset; ...
+
+* **Aligned.** Every tensor starts at a 4096-aligned region offset and is padded to 4096;
+  shards are cut at 4096-aligned boundaries. So any tensor ... is read with offset, length
+  (rounded up to 4096), and destination all block-aligned -- exactly what O_DIRECT requires.
+* **Unified.** It holds dense weights as kind="weight" ... and the offload expert state as
+  kind="experts_bank" ...
+"""</span>
+ALIGN = <span class="nu">4096</span>                <span class="cmt"># O_DIRECT block alignment</span>
+DEFAULT_SHARD_LIMIT = <span class="nu">8</span> &lt;&lt; <span class="nu">30</span>   <span class="cmt"># 8 GiB per shard</span></pre>
+    <p>读盘侧（FTWReader，:200-280）的选路有个不显眼的取舍：O_DIRECT 不可用时<strong>退到 mmap，而不是退到普通缓冲读</strong>——「整片 mmap + 内核预读」远快于「逐 chunk 走 page cache」。host bank 的分配也有讲究：先 mmap 出惰性匿名区、填满数据、再 cudaHostRegister（pin-after-fill，moe/host_banks.py:6-10）；顺序反过来（先注册后填）会先触发一轮全页 zero-fill，DSV4 的 137 GiB 会白白多花约 47 秒。</p>
+    <p>显存侧，专家槽池和 KV 页池是竞争者。<strong>谁让谁、让多少</strong>，集中在一段无副作用的小算术里（engine/cache_budget.py:48-95）：</p>
+    <div class="code-title">python/freetoken/engine/cache_budget.py — plan_cache_budget（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>hi = min(total_experts, max_slots)
+<span class="cmt"># Prefill overlap borrows two full expert-layer buffers, so it needs &gt;= 2*num_experts</span>
+<span class="cmt"># slots; disable it (and lower the floor) if the cap cannot fit that.</span>
+overlap = prefill_overlap <span class="kw">and</span> hi &gt;= <span class="nu">2</span> * num_experts
+lo = <span class="nu">2</span> * num_experts <span class="kw">if</span> overlap <span class="kw">else</span> num_experts
+
+kv_reserve_bytes = kv_reserve_pages * cache_per_page
+<span class="cmt"># MoE-priority: reserve KV first, then experts greedily take the remaining budget.</span>
+raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
+moe_cache_size = max(lo, min(raw, hi))
+...
+<span class="cmt"># A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is</span>
+<span class="cmt"># below the reserve (or negative), yielding a plan that exceeds budget_bytes.</span>
+<span class="cmt"># Reject here so --moe-cache-auto fails in arithmetic instead of OOMing in a</span>
+<span class="cmt"># later CUDA allocation.</span>
+total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+<span class="kw">assert</span> total &lt;= budget_bytes, (...)</pre>
+    <div class="annotation"><b>读懂这段：</b> 策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:41 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
+    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:766 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.7</span>对照：llama.cpp 的「专家放 CPU」是另一种解</h2>
+    <p>llama.cpp 也面临「专家装不进显存」，它的答案是 buffer 类型覆盖——把 expert 张量<strong>静态地</strong>指到 CPU 内存（common/arg.cpp:2755-2770）：</p>
+    <div class="code-title">common/arg.cpp — --cpu-moe / --n-cpu-moe（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span>{<span class="st">"-cmoe"</span>, <span class="st">"--cpu-moe"</span>},
+    <span class="st">"keep all Mixture of Experts (MoE) weights in the CPU"</span>,
+    [](<span class="cl">common_params</span> &amp; params, ...) {
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+    }
+...
+{<span class="st">"-ncmoe"</span>, <span class="st">"--n-cpu-moe"</span>}, <span class="st">"N"</span>,
+    <span class="st">"keep the Mixture of Experts (MoE) weights of the first N layers in the CPU"</span>, ...</pre>
+    <p>覆盖的正则与目标类型在 common/common.h:1131-1141：</p>
+    <div class="code-title">common/common.h — 覆盖规则（摘录）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">const</span> <span class="kw">char</span> * <span class="kw">const</span> LLM_FFN_EXPS_REGEX = <span class="st">"\\.ffn_(up|down|gate|gate_up)_(ch|)exps"</span>;
+...
+<span class="kw">inline</span> llama_model_tensor_buft_override <span class="fn">llm_ffn_exps_cpu_override</span>() {
+    <span class="kw">return</span> { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}</pre>
+    <p>名字里带 ffn_*_exps 的张量落到 CPU buffer，于是调度器把这几层的 MoE 算子分派给 CPU 后端，<strong>每一步 decode 都在 CPU 上算 routed experts</strong>——张量不动，计算过去。</p>
+    <div class="annotation"><b>对照读：</b> 两种解的差别是「张量不动计算动」vs「计算不动张量动」。llama.cpp 的粒度是<strong>静态配置</strong>：启动时定死哪几层的专家在 CPU，运行期零搬运、零缓存、零意外，代价是这几层每步都吃 CPU 内存带宽（第 12 章会看到 FreeToken 如何量化并利用这条带宽）。FreeToken 的粒度是<strong>动态缓存</strong>：全部层共享一个槽池，LRU 逐 token 决定谁在显存里。llama.cpp 的方案简单到不需要这一章的任何机制；FreeToken 的方案在 top_k/num_experts 小、路由偏斜、多请求共享热度时反超——两个设计各自押注了自己的典型负载。</div>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>维度</th><th>llama.cpp（--cpu-moe）</th><th>FreeToken（OffloadMoeCache）</th></tr></thead>
+        <tbody>
+          <tr><td>放置粒度</td><td>整层（正则匹配张量名）</td><td>单个 (层, 专家) 槽位</td></tr>
+          <tr><td>替换策略</td><td>无（静态，运行期不变）</td><td>全局 LRU（usage/step）</td></tr>
+          <tr><td>decode 路径</td><td>CPU 上算 GEMV，零搬运</td><td>PCIe 拉缺失行 + GPU GEMM</td></tr>
+          <tr><td>prefill 路径</td><td>同 decode（CPU 算或 mmap 读）</td><td>整层流式 + 双缓冲 + hit-D2D</td></tr>
+          <tr><td>显存预算</td><td>n_gpu_layers / buffer override 静态划分</td><td>plan_cache_budget 贪心 + 运行时重调</td></tr>
+          <tr><td>额外约束</td><td>无</td><td>overlap 需 ≥2E 槽；marlin ≤992 槽</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.8</span>小结</h2>
+    <ul>
+      <li>容量账：137 GiB（ds_fp4）vs 12 GiB 显存；top_k=6 的稀疏性让小槽池吃到高命中。</li>
+      <li>扁平槽池 + slot_for_id/id_of_slot 双映射；LRU = usage 时间戳 + argmin，无链表无堆，可进 CUDA Graph。</li>
+      <li>机制与格式解耦：8 种 quant_format 只在 _BANK_SCHEMAS 声明 bank 布局，缓存只按行搬字节。</li>
+      <li>decode 三步走：ensure_experts（选槽改写）→ copy_missing（fused copy）→ GEMM；簿记全在设备端。</li>
+      <li>prefill 整层流式：借槽池前 2E 槽当双缓冲，begin_prefill fence 防 decode 踩字节，hit-D2D 分流命中行。</li>
+      <li>FTW 把全模型排成 4096 对齐的连续字节区，O_DIRECT 直读；pin-after-fill 免掉一轮白搬。</li>
+      <li>预算 MoE 优先贪心 + 两段式运行时重调，拒绝在算术层发生而不是在 CUDA 分配上。</li>
+      <li>llama.cpp 的对照：静态 buffer override，张量不动计算动——简单，且不共享热度。</li>
+    </ul>
+    <p>槽池解决「谁在显存里」。下一步是「剩下的缺失怎么办」：PCIe 搬与 CPU 算这两条路怎么分、怎么并行。<a href="12-hybrid-exec.html">第 12 章：CPU/GPU 带宽协同</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="10-freetoken.html">← FreeToken 引擎总览</a>
+    <a href="12-hybrid-exec.html">下一步：CPU/GPU 带宽协同 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

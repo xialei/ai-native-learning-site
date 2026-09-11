@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构与进程模型 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a class="active" href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构与进程模型</div>
+    <h1>整体架构：SRT 由哪几个进程组成</h1>
+    <div class="subtitle">SGLang 的运行时叫 SRT（SGLang Runtime）。它最鲜明的选择是把「分词、调度、反分词」拆成独立进程，用 ZMQ 连起来。这一章先看清整台机器：谁在哪个进程、消息怎么走、为什么这么拆。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <p>SGLang 要解决的核心问题和其他推理引擎一样：<strong>一张 GPU 上并发跑很多请求，每个请求都要保有自己的 KV 状态</strong>。SRT 的做法是把系统拆成四个部分，分布在 2~N 个进程里：</p>
+    <ul>
+      <li><strong>HTTP 服务 + TokenizerManager（主进程）</strong>：收请求、分词、把 token id 发给调度器；输出回来时负责流式整理。</li>
+      <li><strong>Scheduler（子进程，每个 TP rank 一个）</strong>：整个引擎的「大头」——请求队列、RadixCache、KV 内存池分配、组装 batch、发起 GPU 前向，全在这一层。</li>
+      <li><strong>DetokenizerManager（子进程）</strong>：把 Scheduler 吐出的 token id 反分词成文本，统一发给 TokenizerManager。</li>
+      <li><strong>TpModelWorker / ModelRunner（在 Scheduler 进程内）</strong>：真正持有模型和 GPU 的执行者。</li>
+    </ul>
+    <p>进程之间全部走 <strong>ZMQ ipc socket</strong>，没有共享内存队列。这个设计直接写在 <code class="inline">launch_server</code> 的文档字符串里，是理解 SGLang 的起点。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>进程图</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t1 d1">
+        <title id="t1">SGLang SRT 进程模型</title>
+        <desc id="d1">主进程、Scheduler 子进程、Detokenizer 子进程与 ZMQ 通道</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 主进程 -->
+        <rect class="node acc" x="20" y="20" width="900" height="130" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#16648f">主进程 · FastAPI HTTP server + TokenizerManager</text>
+        <rect class="node" x="40" y="58" width="200" height="42" rx="6"></rect>
+        <text class="lbl" x="140" y="84" text-anchor="middle">http_server.py</text>
+        <rect class="node" x="270" y="58" width="220" height="42" rx="6"></rect>
+        <text class="lbl" x="380" y="84" text-anchor="middle">TokenizerManager</text>
+        <rect class="node" x="520" y="58" width="180" height="42" rx="6"></rect>
+        <text class="lbl" x="610" y="84" text-anchor="middle">Tokenizer</text>
+        <rect class="node" x="730" y="58" width="170" height="42" rx="6"></rect>
+        <text class="lbl" x="815" y="84" text-anchor="middle">SSE 流式输出</text>
+        <line class="edge" x1="240" y1="79" x2="268" y2="79"></line>
+        <line class="edge" x1="490" y1="79" x2="518" y2="79"></line>
+        <text class="lbl sm" x="40" y="128">职责：文本→token id（入）、token id→增量文本（出）、断连 abort、OpenAI 协议适配</text>
+
+        <!-- Scheduler 子进程 -->
+        <rect class="node core" x="20" y="180" width="900" height="180" rx="10"></rect>
+        <text class="lbl" x="40" y="206" font-weight="bold" fill="#b34a10">子进程 · Scheduler（tp_size=2 时就有 2 个，各持有一张 GPU）</text>
+        <rect class="node" x="40" y="218" width="180" height="42" rx="6"></rect>
+        <text class="lbl" x="130" y="244" text-anchor="middle">waiting_queue</text>
+        <rect class="node" x="250" y="218" width="180" height="42" rx="6"></rect>
+        <text class="lbl" x="340" y="244" text-anchor="middle">SchedulePolicy</text>
+        <rect class="node" x="460" y="218" width="170" height="42" rx="6"></rect>
+        <text class="lbl" x="545" y="244" text-anchor="middle">PrefillAdder</text>
+        <rect class="node" x="660" y="218" width="120" height="42" rx="6"></rect>
+        <text class="lbl" x="720" y="244" text-anchor="middle">running_batch</text>
+        <line class="edge" x1="220" y1="239" x2="248" y2="239"></line>
+        <line class="edge" x1="430" y1="239" x2="458" y2="239"></line>
+        <line class="edge" x1="630" y1="239" x2="658" y2="239"></line>
+
+        <rect class="node warn" x="40" y="280" width="200" height="42" rx="6"></rect>
+        <text class="lbl" x="140" y="306" text-anchor="middle">RadixCache</text>
+        <rect class="node warn" x="270" y="280" width="200" height="42" rx="6"></rect>
+        <text class="lbl" x="370" y="306" text-anchor="middle">KV 内存池 + 分页分配器</text>
+        <rect class="node" x="500" y="280" width="200" height="42" rx="6"></rect>
+        <text class="lbl" x="600" y="306" text-anchor="middle">TpModelWorker</text>
+        <rect class="node" x="730" y="280" width="170" height="42" rx="6"></rect>
+        <text class="lbl" x="815" y="306" text-anchor="middle">ModelRunner</text>
+        <line class="edge" x1="240" y1="301" x2="268" y2="301"></line>
+        <line class="edge" x1="470" y1="301" x2="498" y2="301"></line>
+        <line class="edge" x1="700" y1="301" x2="728" y2="301"></line>
+        <text class="lbl sm" x="40" y="348">职责：事件循环（ingest → 选 batch → 前向 → 处理结果），内存预算与抢占也在这里</text>
+
+        <!-- Detokenizer -->
+        <rect class="node" x="20" y="390" width="440" height="70" rx="10"></rect>
+        <text class="lbl" x="40" y="416" font-weight="bold" fill="#16648f">子进程 · DetokenizerManager</text>
+        <text class="lbl sm" x="40" y="438">增量反分词，多语言/字节级 token 安全拼接</text>
+
+        <!-- ZMQ 通道 -->
+        <line class="edge acc" x1="380" y1="100" x2="380" y2="178"></line>
+        <text class="lbl code" x="390" y="140">zmq PUSH · TokenizedGenerateReqInput</text>
+        <line class="edge acc" x1="545" y1="360" x2="545" y2="402"></line>
+        <line class="edge" x1="545" y1="402" x2="462" y2="402"></line>
+        <text class="lbl code" x="560" y="392">zmq PUSH · BatchTokenIDOutput</text>
+        <line class="edge back" x1="240" y1="430" x2="240" y2="152"></line>
+        <text class="lbl sm" x="250" y="170">回传 TokenizerManager（tcp ipc，经 detokenize 后的文本）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>Scheduler 子进程（调度核心）</span>
+        <span class="lg-item"><span class="sw acc"></span>主进程（HTTP + 分词）</span>
+        <span class="lg-item"><span class="sw warn"></span>KV 状态管理</span>
+        <span class="lg-item"><span class="sw"></span>一般组件</span>
+      </div>
+      <div class="fig-cap">图 1.2：SRT 进程模型。注意箭头方向：请求主链路经 Scheduler → GPU，输出从 Detokenizer 旁路回主进程——去程和回程走的是不同的 ZMQ 通道。</div>
+    </div>
+
+    <div class="annotation"><b>关键映射（按目录）：</b>
+      <code class="inline">python/sglang/srt/entrypoints/http_server.py</code> → HTTP 路由；
+      <code class="inline">python/sglang/srt/entrypoints/engine.py</code> → 进程编排（<code class="inline">Engine._launch_subprocesses</code>）；
+      <code class="inline">python/sglang/srt/managers/tokenizer_manager.py</code>、<code class="inline">scheduler.py</code>、<code class="inline">detokenizer_manager.py</code> → 三大管理器；
+      <code class="inline">python/sglang/srt/managers/tp_worker.py</code>、<code class="inline">python/sglang/srt/model_executor/</code> → GPU 执行层。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>用代码看｜进程是怎么被拉起来的</h2>
+    <p><code class="inline">launch_server</code> 的 docstring 就是官方架构图。它明确写出三个组件和通信方式：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server（摘录，docstring 译文）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">launch_server</span>(server_args, ...):
+    <span class="st">"""
+    Launch SRT (SGLang Runtime) Server.
+
+    The SRT server consists of an HTTP server and an SRT engine.
+
+    - HTTP server: A FastAPI server that routes requests to the engine.
+    - The engine consists of three components:
+        1. TokenizerManager: Tokenizes the requests and sends them to the scheduler.
+        2. Scheduler (subprocess): Receives requests from the Tokenizer Manager,
+           schedules batches, forwards them, and sends the output tokens to the
+           Detokenizer Manager.
+        3. DetokenizerManager (subprocess): Detokenizes the output tokens and
+           sends the result back to the Tokenizer Manager.
+
+    Note:
+    1. The HTTP server, Engine, and TokenizerManager all run in the main process.
+    2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
+    """</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 主进程持有 HTTP server 和 TokenizerManager；Scheduler 和 Detokenizer 都是子进程。进程个数不是写死的：<code class="inline">tp_size=8</code> 就是 8 个 Scheduler 子进程（每 rank 一张卡）。</div>
+
+    <p>子进程在 <code class="inline">Engine._launch_scheduler_processes</code> 里创建，注意循环的嵌套顺序——外层 PP rank、内层 TP rank，每个组合一个 <code class="inline">mp.Process</code>：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/engine.py — _launch_scheduler_processes（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>use_dp_controller = (
+    <span class="fn">get_parallel</span>().dp_size &gt; <span class="nu">1</span> <span class="kw">or</span> <span class="fn">get_exec</span>().moe.ep_join_mode == <span class="st">"scale"</span>
+)
+
+<span class="kw">if</span> <span class="kw">not</span> use_dp_controller:
+    <span class="cmt"># 直接按 (pp_rank, tp_rank) 起子进程</span>
+    <span class="kw">for</span> pp_rank <span class="kw">in</span> pp_rank_range:
+        <span class="kw">for</span> tp_rank <span class="kw">in</span> tp_rank_range:
+            reader, writer = mp.<span class="fn">Pipe</span>(duplex=<span class="kw">False</span>)
+            gpu_id = (
+                <span class="fn">get_device</span>().base_gpu_id
+                + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                + (tp_rank % tp_size_per_node) * <span class="fn">get_device</span>().gpu_id_step
+            )
+            proc = mp.<span class="fn">Process</span>(
+                target=run_scheduler_process_func,
+                args=(server_args, port_args, gpu_id, tp_rank, ...), ...)</pre>
+    <div class="annotation"><b>读懂这段：</b> 两种进程拓扑走两个分支——<code class="inline">dp_size == 1</code> 时直接为每个 TP/PP rank 起 Scheduler 进程；<code class="inline">dp_size &gt; 1</code> 时改由 <code class="inline">DataParallelController</code> 统一拉起并做请求分发（第 10 章）。<code class="inline">mp.Pipe(duplex=False)</code> 的 reader 用来等子进程初始化完成，真正的请求/响应流量走 ZMQ。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>用代码看｜Scheduler 里持有哪些状态</h2>
+    <p>Scheduler 的构造函数把所有引擎状态聚到一处。内存池和缓存不是 Scheduler 私有的，而是从 <code class="inline">TpModelWorker</code> 初始化结果里拿来的引用——也就是说，<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 做</strong>：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — Scheduler.__init__ 的组件接线（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Scheduler</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, ...):
+        <span class="cmt"># TP worker：持有模型 + GPU 内存池</span>
+        self.<span class="fn">init_model_worker</span>()
+
+        <span class="cmt"># 内存池与前缀缓存：从 kv_cache_builder 的结果里取引用</span>
+        result = kv_cache_builder.<span class="fn">build_kv_cache</span>(..., tp_worker=self.tp_worker, ...)
+        self.req_to_token_pool = result.req_to_token_pool
+        self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.tree_cache = result.tree_cache
+
+<span class="cmt"># init_model_worker 内部（同名文件）：</span>
+<span class="kw">def</span> <span class="fn">init_tp_model_worker</span>(self):
+    worker_kwargs = <span class="fn">dict</span>(server_args=..., gpu_id=self.ps.gpu_id, ps=self.ps, nccl_port=...)
+    <span class="kw">if</span> <span class="fn">use_mlx</span>():
+        self.tp_worker = <span class="cl">MlxTpModelWorker</span>(**worker_kwargs)
+    <span class="kw">else</span>:
+        self.tp_worker = <span class="cl">TpModelWorker</span>(**worker_kwargs)</pre>
+    <div class="annotation"><b>读懂这段：</b> 三个核心状态的分工：<code class="inline">req_to_token_pool</code> 是「请求 → 它的 token 都在哪些槽位」的目录；<code class="inline">token_to_kv_pool_allocator</code> 管 KV 物理槽位；<code class="inline">tree_cache</code>（RadixCache）管哪些前缀可以复用。第 3、5 章会分别展开。注意这中间的<span class="kw">两跳</span>：worker 的构造被收进了 <code class="inline">init_tp_model_worker()</code>（多一个 MLX 分支），而内存池结果来自 <code class="inline">kv_cache_builder.build_kv_cache()</code> 而非 worker 本身——<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 通过 builder 做出</strong>。这是「Scheduler 拿引用、不持有实现」的具体形态。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>为什么拆进程：演进与代价</h2>
+    <p>一个自然的问题是：<strong>为什么不像 vLLM 那样把调度器放进引擎主进程，而要单独开进程？</strong>从代码里能找到答案的一半——Scheduler 持有 GPU 上下文并做 Python 层的调度计算（排序、预算扣减、树操作），这些工作和 HTTP/分词的 asyncio 事件循环互相拖累。拆开后：</p>
+    <ul>
+      <li><strong>GIL 隔离</strong>：Scheduler 的事件循环是纯 while True（见 1.5 节），RadixCache 的树操作和 PrefillAdder 的预算计算是 CPU 密集的 Python 代码，与 uvloop 的网络 IO 各跑各的。</li>
+      <li><strong>每 TP rank 一个进程</strong>：模型权重按 TP 分片到多卡，每张卡要独立做内存 profiling 和 CUDA Graph 捕获，天然是一个进程一张卡的边界。</li>
+      <li><strong>崩溃隔离</strong>：一个 rank 的 CUDA OOM 不会带走 HTTP 服务；主进程有 watchdog 监控子进程存活。</li>
+    </ul>
+    <p>代价也很直接：每个 token 的输出都要多走一跳 ZMQ（Scheduler → Detokenizer → TokenizerManager → HTTP），延迟链变长。SGLang 用 batch 化的消息结构（<code class="inline">BatchTokenIDOutput</code>，一次携带整个 batch 的 token）摊薄这个成本。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      为什么 DetokenizerManager 单独一个进程，而不是放回 TokenizerManager？历史原因是把反分词的 CPU 开销也挪出主进程（流式请求每个输出步都要做一次 bytes→str 解码）；如今这个进程很轻，但通道结构没再合并——先有隔离、后有重叠调度器依赖这条稳定通道，是代码里能看到的演进痕迹。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>事件循环在哪：dispatch_event_loop</h2>
+    <p>Scheduler 的事件循环不止一种。启动时按配置分发到不同实现——普通/重叠（overlap）、流水线（PP）、prefill-decode 复用（pdmux）、PD 分离各自的前后端循环：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — dispatch_event_loop（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">dispatch_event_loop</span>(scheduler: <span class="cl">Scheduler</span>):
+    disaggregation_mode = scheduler.disaggregation_mode
+    <span class="kw">if</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.NULL:
+        <span class="kw">if</span> scheduler.enable_pdmux:
+            scheduler.<span class="fn">event_loop_pdmux</span>()
+        <span class="kw">elif</span> <span class="fn">get_parallel</span>().pp_size &gt; <span class="nu">1</span>:
+            scheduler.<span class="fn">event_loop_pp</span>()
+        <span class="kw">elif</span> scheduler.enable_overlap_mlx:
+            scheduler.<span class="fn">event_loop_overlap_mlx</span>()
+        <span class="kw">elif</span> scheduler.enable_overlap:
+            scheduler.<span class="fn">event_loop_overlap</span>()
+        <span class="kw">else</span>:
+            scheduler.<span class="fn">event_loop_normal</span>()
+    <span class="kw">elif</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.PREFILL:
+        ...  <span class="cmt"># event_loop_*_disagg_prefill（定义在 disaggregation/prefill.py 的 mixin 里）</span>
+    <span class="kw">elif</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.DECODE:
+        ...  <span class="cmt"># event_loop_*_disagg_decode（定义在 disaggregation/decode.py 的 mixin 里）</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 这是一张完整的「模式矩阵」：PD 分离 × PP × overlap 各选一个入口。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">disaggregation/prefill.py:527</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.6</span>一张表记牢每个部件</h2>
+    <table class="tbl">
+      <tr><th>部件</th><th>文件</th><th>职责</th><th>进程</th></tr>
+      <tr><td>launch_server</td><td>srt/entrypoints/http_server.py</td><td>启动整套进程，注册 ~40 条 HTTP 路由</td><td>主进程</td></tr>
+      <tr><td>TokenizerManager</td><td>srt/managers/tokenizer_manager.py</td><td>分词、发请求、收流式输出、abort</td><td>主进程</td></tr>
+      <tr><td>Scheduler</td><td>srt/managers/scheduler.py</td><td>事件循环、调度、KV 分配、前向发起</td><td>子进程 ×tp_size</td></tr>
+      <tr><td>TpModelWorker</td><td>srt/managers/tp_worker.py</td><td>把 ScheduleBatch 转成 ForwardBatch 并调 ModelRunner</td><td>Scheduler 进程内</td></tr>
+      <tr><td>ModelRunner</td><td>srt/model_executor/model_runner.py</td><td>持有模型、KV 池、CUDA Graph，执行前向</td><td>Scheduler 进程内</td></tr>
+      <tr><td>DetokenizerManager</td><td>srt/managers/detokenizer_manager.py</td><td>增量反分词、增量解码状态</td><td>子进程 ×1</td></tr>
+      <tr><td>DataParallelController</td><td>srt/managers/data_parallel_controller.py</td><td>dp_size&gt;1 时拉起多组 Scheduler 并分发请求</td><td>主进程（可选）</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.7</span>对「自研引擎」的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      多进程不是必需品。自研引擎的 MVP 用一个进程、一个 asyncio 事件循环 + 一个 GPU 前向线程就够。SGLang 拆进程换来的收益（GIL 隔离、rank 独立、崩溃隔离）只有在并发上去之后才值得。但有一个设计从第一天就该照抄：<strong>token id 通道和文本通道分开</strong>——调度层只传 id，反分词独立成段，这决定了你的流式协议好不好做。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-request-lifecycle.html">下一步：请求全生命周期 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 01 整体架构 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

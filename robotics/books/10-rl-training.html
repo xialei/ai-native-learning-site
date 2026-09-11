@@ -35,27 +35,28 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 10 RL 训练</div>
     <h1>RL 训练：奖励塑形、课程学习与域随机化</h1>
-    <div class="subtitle">环境心跳（第 9 章）只是舞台，真正让策略「练出本事」的是三件套：奖励塑形给方向、课程学习给台阶、域随机化给鲁棒性。本章拆 LiftCube 奖励表的接力棒设计，看 curriculum 怎么随进度收紧难度、EventCfg 四种 mode 的随机化入口——最后看 rsl_rl 的 PPO 如何包住 4096 个环境批量采样。</div>
+    <div class="subtitle">环境心跳（第 9 章）只是舞台，真正让策略「练出本事」的是三件套：奖励塑形给方向、课程学习给台阶、域随机化给鲁棒性。本章拆 Lift 任务新旧两代奖励表的接力棒设计——contrib 版的「密集引导 + 稀疏达标」与 core 版的「进度奖励 + ADR 课程」，看 curriculum 怎么随进度收紧难度、EventCfg 四种 mode 的随机化入口——最后看 rsl_rl 的 PPO 如何包住 4096 个环境批量采样。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">10.1</span>奖励塑形：接力棒设计</h2>
-    <p>LiftCube 的 RewardsCfg 六个术语，各自负责一段接力（lift_env_cfg.py:138-164）：</p>
+    <h2><span class="num">10.1</span>奖励塑形：接力棒设计（contrib 旧版）</h2>
+    <p>3.0 起官方任务库把 Lift 任务拆成两代：<code class="inline">contrib/lift/</code> 保留经典的 LiftCube 设计（gym id 前缀也改为 <code class="inline">IsaacContrib-</code>），新版设计在 <code class="inline">core/lift/</code>。旧版 RewardsCfg 六个术语，各自负责一段接力（contrib/lift/lift_env_cfg.py:135-161）：</p>
     <table class="tbl">
       <tr><th>术语</th><th>函数</th><th>参数</th><th>权重</th><th>塑形作用</th></tr>
       <tr><td>reaching_object</td><td>mdp.object_ee_distance</td><td>std=0.1</td><td>+1.0</td><td>引导手靠近物体（连续塑形）</td></tr>
       <tr><td>lifting_object</td><td>mdp.object_is_lifted</td><td>minimal_height=0.04</td><td>+15.0</td><td>「抬起」达标记号（二值）</td></tr>
-      <tr><td>object_goal_tracking</td><td>mdp.object_goal_distance</td><td>std=0.3, success_threshold=0.05</td><td>+16.0</td><td>粗跟踪目标位姿</td></tr>
-      <tr><td>..._fine_grained</td><td>mdp.object_goal_distance</td><td>std=0.05</td><td>+5.0</td><td>精跟踪（5cm 内才显著）</td></tr>
+      <tr><td>object_goal_tracking</td><td>mdp.object_goal_distance</td><td>std=0.3, minimal_height=0.04, success_threshold=0.05</td><td>+16.0</td><td>粗跟踪目标位姿（须已抬起）</td></tr>
+      <tr><td>..._fine_grained</td><td>mdp.object_goal_distance</td><td>std=0.05, minimal_height=0.04</td><td>+5.0</td><td>精跟踪（5cm 内才显著）</td></tr>
       <tr><td>action_rate</td><td>mdp.action_rate_l2 ‖aₜ−aₜ₋₁‖²</td><td>—</td><td>−1e-4</td><td>抑制抖动</td></tr>
       <tr><td>joint_vel</td><td>mdp.joint_vel_l2 ‖q̇‖²</td><td>—</td><td>−1e-4</td><td>节能 / 护硬件</td></tr>
     </table>
-    <div class="annotation"><b>三个塑形心法：</b>①<strong>密集引导 + 稀疏达标记号</strong>：reach 是连续指数塑形 exp(−d²/std²)——每一步都有梯度；lift 是二值标志 ×15——达成后持续给大额奖励。纯密集信号会被「贴着物体蹭」钻空子，补一个稀疏大额项防钻空。②<strong>std 即影响半径</strong>：exp(−d²/std²) 在 std=0.1 时 10cm 内梯度显著、30cm 外近乎为零；粗细两档跟踪的 std 差 6 倍，正是「远时粗、近时精」的接力棒。③<strong>惩罚项写负权重</strong>：action_rate 与 joint_vel 的 −1e-4 看似小，但课程后期会放大到 −1e-1（见 10.2）。</div>
+    <div class="annotation"><b>三个塑形心法：</b>①<strong>密集引导 + 稀疏达标记号</strong>：reach 是连续核函数塑形 <code class="inline">1 − tanh(d/std)</code>——每一步都有梯度；lift 是二值标志 ×15——达成后持续给大额奖励（源码注释自己写着 "tanh-kernel"）。纯密集信号会被「贴着物体蹭」钻空子，补一个稀疏大额项防钻空。②<strong>std 即影响半径</strong>：<code class="inline">1 − tanh(d/std)</code> 在 std=0.1 时 10cm 内梯度显著（d=0 给满 1.0，d=std 只剩 0.24，d=3·std 约 0.005）；粗细两档跟踪的 std 差 6 倍，正是「远时粗、近时精」的接力棒。注意跟踪项还乘了 <code class="inline">is_lifted</code> 门控——物体没抬起来时距离再近也不给分，避免「把方块推到位但没抓」骗奖励。③<strong>惩罚项写负权重</strong>：action_rate 与 joint_vel 的 −1e-4 看似小，但课程后期会放大到 −1e-1（见 10.2）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.2</span>课程学习：先宽后严</h2>
-    <div class="code-title">isaaclab_tasks/.../lift/lift_env_cfg.py:179 — CurriculumCfg</div>
+    <h2><span class="num">10.2</span>课程学习：两代设计</h2>
+    <p><strong>contrib 旧版「先宽后严」：</strong>两个课程项都用 mdp 库现成的 <code class="inline">modify_reward_weight</code>——前 10000 步用配置原值 −1e-4 让策略自由探索（别怕抖），10000 步后突变到 −1e-1（放大 1000 倍），逼出平滑动作（contrib/lift/lift_env_cfg.py:176）：</p>
+    <div class="code-title">isaaclab_tasks/.../contrib/lift/lift_env_cfg.py:176 — CurriculumCfg</div>
     <pre class="code"><span class="lang-tag">python</span><span class="meta">@configclass</span>
 <span class="kw">class</span> <span class="cl">CurriculumCfg</span>:
     <span class="cmt"># 前 10000 步权重 -1e-4（探索期宽容）；10000 步后突变到 -1e-1（重罚抖动）</span>
@@ -63,46 +64,65 @@
                            params={<span class="st">"term_name"</span>: <span class="st">"action_rate"</span>, <span class="st">"weight"</span>: -<span class="nu">1e-1</span>, <span class="st">"num_steps"</span>: <span class="nu">10000</span>})
     joint_vel   = <span class="fn">CurrTerm</span>(func=mdp.modify_reward_weight,
                            params={<span class="st">"term_name"</span>: <span class="st">"joint_vel"</span>,   <span class="st">"weight"</span>: -<span class="nu">1e-1</span>, <span class="st">"num_steps"</span>: <span class="nu">10000</span>})</pre>
-    <div class="annotation"><b>「先宽后严」范式：</b>两个课程项都用 mdp 库现成的 <code class="inline">modify_reward_weight</code>——前 10000 步用配置原值 −1e-4 让策略自由探索（别怕抖），10000 步后突变到 −1e-1（放大 1000 倍），逼出平滑动作。触发时机：CurriculumManager.compute 在 _reset_idx 最前跑（9.3 节），以 common_step_counter（全局步数）判断是否到达 num_steps。课程也可以反向用——locomotion 任务常见「terrain_levels」地形课程：跑得好的机器人被分配更难地形。</div>
+    <p><strong>core 新版 ADR（Automatic Domain Randomization）：</strong>课程对象从「改奖励权重」升级为「改整个任务配置」。入口是一个 <code class="inline">DifficultyScheduler</code>（core/lift/adr_curriculum.py:13）：</p>
+    <div class="code-title">isaaclab_tasks/.../core/lift/adr_curriculum.py:13 — CurriculumCfg（节选）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="meta">@configclass</span>
+<span class="kw">class</span> <span class="cl">CurriculumCfg</span>:
+    <span class="cmt"># adr = automatic/adaptive domain randomization：难度 0→10 由成功率驱动</span>
+    adr = <span class="fn">CurrTerm</span>(func=mdp.DifficultyScheduler,
+                   params={<span class="st">"init_difficulty"</span>: <span class="nu">0</span>, <span class="st">"min_difficulty"</span>: <span class="nu">0</span>, <span class="st">"max_difficulty"</span>: <span class="nu">10</span>})</pre>
+    <div class="annotation"><b>两代范式的差别：</b>旧版在「固定任务里调惩罚权重」，新版在「同一任务里渐进放大随机化」——难度每升一级，ADR 课程就用 <code class="inline">modify_term_cfg</code> + <code class="inline">initial_final_interpolate_fn</code> 把 12 项配置朝「更难」方向插值一步：观测噪声逐级放大（关节位置/速度、指尖状态、物体四元数、点云共 5 处，各 min/max 成对）、越界终止的 z 下边界从 0.3 放宽到 0.0（重力进场后物体落在桌上，别误判成出界）、重力从零逐步倾斜到真实 −9.81。注意 ADR <strong>不</strong>动质量与摩擦——那些是 startup 阶段一次性固定的。触发时机不变：CurriculumManager.compute 在 _reset_idx 最前跑（9.3 节）。课程也可以反向用——locomotion 任务常见「terrain_levels」地形课程：跑得好的机器人被分配更难地形。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.3</span>域随机化：EventCfg 与四种 mode</h2>
-    <p>域随机化（Domain Randomization）的入口是 EventCfg。LiftCube 自带两项（lift_env_cfg.py:121-134）：</p>
-    <div class="code-title">isaaclab_tasks/.../lift/lift_env_cfg.py — EventCfg（节选）</div>
+    <p>域随机化（Domain Randomization）的入口是 EventCfg。contrib 版 LiftCube 只有两项重置随机化（contrib/lift/lift_env_cfg.py:118-131）；core 新版在 startup 模式就铺了 6 项随机化（Franka 派生再加夹爪闭合速度 1 项）：</p>
+    <div class="code-title">isaaclab_tasks/.../contrib/lift/lift_env_cfg.py:118 — EventCfg；core/lift/lift_env_cfg.py:237（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="meta">@configclass</span>
 <span class="kw">class</span> <span class="cl">EventCfg</span>:
+    <span class="cmt"># --- contrib 旧版：两项，都在 reset 模式 ---</span>
     <span class="cmt"># 每次重置：先归零到配置初始状态，再叠加随机偏移</span>
-    reset_scene_to_default = <span class="fn">EventTerm</span>(func=mdp.reset_scene_to_default, mode=<span class="st">"reset"</span>)
+    reset_all = <span class="fn">EventTerm</span>(func=mdp.reset_scene_to_default, mode=<span class="st">"reset"</span>)
     <span class="cmt"># 物体初始位姿随机化：x ±0.1m、y ±0.25m</span>
     reset_object_position = <span class="fn">EventTerm</span>(
-        func=mdp.reset_root_state_uniform,
-        mode=<span class="st">"reset"</span>,
-        pose_range={<span class="st">"x"</span>: (-<span class="nu">0.1</span>, <span class="nu">0.1</span>), <span class="st">"y"</span>: (-<span class="nu">0.25</span>, <span class="nu">0.25</span>), <span class="st">"z"</span>: (<span class="nu">0.0</span>, <span class="nu">0.0</span>)},
-        asset_cfg=<span class="fn">SceneEntityCfg</span>(<span class="st">"object"</span>))
-    <span class="cmt"># 更激进的 DR 需自己加：摩擦 randomize_rigid_body_material、质量 randomize_rigid_body_mass、</span>
-    <span class="cmt"># 执行器参数（刚度/阻尼）、actuator 延迟……mdp 库都有现成函数</span></pre>
-    <div class="annotation"><b>四种 mode 对应四个随机化时机</b>（9.1 节）：<code class="inline">prestartup</code>——场景实体存在前改 USD 级参数（如 USD 属性）；<code class="inline">startup</code>——启动一次性（如每环境固定质心偏移）；<code class="inline">reset</code>——每集重置重抽（最常用）；<code class="inline">interval</code>——episode 中途按时间间隔扰动，locomotion 招牌是「每隔几秒推一下机器人（push_robot）」。②<strong>「先归零再随机」</strong>：reset_scene_to_default 先把场景拉回 cfg 初始状态再叠加 pose_range 噪声，保证一万集之后不累积漂移——两个 EventTerm 的声明顺序即执行顺序，归零项必须写在前。③ LiftCube 没配 interval 项——抓取不需要中途扰动，但你的任务需要时应加。</div>
+        func=mdp.reset_root_state_uniform, mode=<span class="st">"reset"</span>,
+        params={<span class="st">"pose_range"</span>: {<span class="st">"x"</span>: (-<span class="nu">0.1</span>, <span class="nu">0.1</span>), <span class="st">"y"</span>: (-<span class="nu">0.25</span>, <span class="nu">0.25</span>)}, ...})
+
+<span class="cmt"># --- core 新版：startup 模式批量随机化物理参数（节选） ---</span>
+    robot_physics_material = <span class="fn">EventTerm</span>(func=mdp.randomize_rigid_body_material, mode=<span class="st">"startup"</span>,
+                                       params={<span class="st">"static_friction_range"</span>: [<span class="nu">0.5</span>, <span class="nu">1.0</span>], ...})
+    joint_stiffness_and_damping = <span class="fn">EventTerm</span>(func=mdp.randomize_actuator_gains, mode=<span class="st">"startup"</span>, ...)
+    variable_gravity = <span class="fn">EventTerm</span>(func=mdp.randomize_physics_scene_gravity, mode=<span class="st">"reset"</span>, ...)</pre>
+    <div class="annotation"><b>四种 mode 对应四个随机化时机</b>（9.1 节）：event_manager.py 的文档写明 <code class="inline">prestartup</code>——仿真启动前改 USD 级属性（如网格 collider）；<code class="inline">startup</code>——启动一次性（如新版 Lift 的摩擦/刚度/阻尼/质量随机化，每环境固定一套值贯穿训练）；<code class="inline">reset</code>——每集重置重抽（最常用）；<code class="inline">interval</code>——episode 中途按时间间隔扰动，locomotion 招牌是「每隔几秒推一下机器人（push_by_setting_velocity）」。②<strong>「先归零再随机」</strong>：contrib 版 reset_all 先把场景拉回 cfg 初始状态再叠加 pose_range 噪声，保证一万集之后不累积漂移——两个 EventTerm 的声明顺序即执行顺序，归零项必须写在前。③ core 版还有一项设计值得注意：<code class="inline">conditional_reset</code>——重置不是每次都从均匀分布抽，而是先按有效性判据（物体与机器人的网格间隙、物体与桌面的间隙）拒绝采样出一个初始状态库、之后冻住，再按实测成功率加权重采（<code class="inline">SuccessMonitorCfg(target_success_rate=0.5)</code>），让已掌握的和还不会的状态都得到练习。④ 两版都没配 interval 项——抓取不需要中途扰动，但你的任务需要时应加。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.4</span>rsl_rl PPO：包住 4096 个环境</h2>
-    <p><strong>PPO（近端策略优化）</strong>一句话：反复「采样一批经验 → 按优势（比预期好多少）放大好动作、压制差动作的概率 → 但用 KL 散度限制每次更新的步长，防止一步走崩」。它是机器人 RL 的事实默认，rsl_rl 就是它的一个 GPU 高效实现。Isaac Lab 不自带 RL 算法——经 <code class="inline">RslRlVecEnvWrapper</code>（isaaclab_rl/rsl_rl/vecenv_wrapper.py:25）接入 rsl_rl：把五元组翻成 VecEnv 接口、把 extras["log"] 的逐项奖励/episode 长度喂给 TensorBoard。训练一行命令：</p>
-    <div class="code-title">一键训练 LiftCube（agents/rsl_rl_ppo_cfg.py 提供超参）</div>
-    <pre class="code"><span class="lang-tag">bash</span>./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
-    --task Isaac-Lift-Cube-Franka-v0 --num_envs <span class="nu">4096</span> --headless</pre>
-    <div class="code-title">isaaclab_tasks/.../franka/agents/rsl_rl_ppo_cfg.py:12 — LiftCubePPORunnerCfg（节选）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="meta">@configclass</span>
+    <p><strong>PPO（近端策略优化）</strong>一句话：反复「采样一批经验 → 按优势（比预期好多少）放大好动作、压制差动作的概率 → 但用 KL 散度限制每次更新的步长，防止一步走崩」。它是机器人 RL 的事实默认，rsl_rl 就是它的一个 GPU 高效实现。Isaac Lab 不自带 RL 算法——经 <code class="inline">RslRlVecEnvWrapper</code>（isaaclab_rl/rsl_rl/vecenv_wrapper.py:25）接入 rsl_rl：把五元组翻成 VecEnv 接口、把 extras["log"] 里的逐项奖励与终止计数喂给 TensorBoard（episode 长度由 rsl_rl 自己从 dones 统计，IsaacLab 侧的 log 里没有这个键）。两代任务的训练命令与超参都换了：</p>
+    <div class="code-title">一键训练（脚本已上移一层；两代 id 都没有 -v0 后缀）</div>
+    <pre class="code"><span class="lang-tag">bash</span><span class="cmt"># contrib 旧版：前缀改为 IsaacContrib-，id 本身无后缀</span>
+./isaaclab.sh -p scripts/reinforcement_learning/train.py \
+    --task IsaacContrib-Lift-Cube-Franka --rl_library rsl_rl --num_envs <span class="nu">4096</span> --headless
+<span class="cmt"># core 新版：同样无后缀，但 gym 注册时带了 default_agent="rsl_rl"，可省略 --rl_library</span>
+./isaaclab.sh -p scripts/reinforcement_learning/train.py \
+    --task Isaac-Lift-Franka --num_envs <span class="nu">4096</span> --headless</pre>
+    <div class="code-title">超参对比：contrib LiftCubePPORunnerCfg vs core FrankaPPORunnerCfg</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># contrib 旧版（config/franka/agents/rsl_rl_ppo_cfg.py:12）：经典小网络</span>
 <span class="kw">class</span> <span class="cl">LiftCubePPORunnerCfg</span>(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = <span class="nu">24</span>          <span class="cmt"># 每环境采 24 步 → rollout 24×4096 ≈ 98k 帧</span>
-    max_iterations = <span class="nu">1500</span>           <span class="cmt"># 外层迭代数</span>
-    actor = <span class="fn">RslRlMLPModelCfg</span>(hidden_dims=[<span class="nu">256</span>, <span class="nu">128</span>, <span class="nu">64</span>], activation=<span class="st">"elu"</span>,
-                             distribution_cfg=...GaussianDistributionCfg(init_std=<span class="nu">1.0</span>))
-    algorithm = <span class="fn">RslRlPpoAlgorithmCfg</span>(
-        clip_param=<span class="nu">0.2</span>, entropy_coef=<span class="nu">0.006</span>, num_learning_epochs=<span class="nu">5</span>, num_mini_batches=<span class="nu">4</span>,
-        learning_rate=<span class="nu">1.0e-4</span>, schedule=<span class="st">"adaptive"</span>, gamma=<span class="nu">0.98</span>, lam=<span class="nu">0.95</span>,
-        desired_kl=<span class="nu">0.01</span>, max_grad_norm=<span class="nu">1.0</span>)</pre>
-    <div class="annotation"><b>注意策略网络的「小」：</b>actor 是 [256,128,64] 的三层 MLP——对比第 5-7 章的 VLA（亿级参数）差五个数量级。RL 策略学的是<strong>一个任务的特定技能</strong>（状态→动作映射），观测是低维向量（9 个关节位置 + 9 速度 + 3 物体位置 + 指令 + 上一步动作）；VLA 学的是<strong>跨任务的通用常识</strong>。第 12 章路线图会对比两条技术路线的取舍。<b>adaptive 学习率：</b>schedule="adaptive" 按 desired_kl=0.01 自适应——若一次更新后 KL 散度超阈，步长减半；太小则加倍。这是 rsl_rl 对「PPO 超参敏感」的标准解法。</div>
+    num_steps_per_env = <span class="nu">24</span>          <span class="cmt"># rollout 24×4096 = 98k 条 transition（每环境 24 步）</span>
+    max_iterations = <span class="nu">1500</span>
+    actor = <span class="fn">RslRlMLPModelCfg</span>(hidden_dims=[<span class="nu">256</span>, <span class="nu">128</span>, <span class="nu">64</span>], ...)
+    algorithm = <span class="fn">RslRlPpoAlgorithmCfg</span>(learning_rate=<span class="nu">1.0e-4</span>, gamma=<span class="nu">0.98</span>, lam=<span class="nu">0.95</span>,
+                                     entropy_coef=<span class="nu">0.006</span>, num_mini_batches=<span class="nu">4</span>, ...)
+
+<span class="cmt"># core 新版（core/lift/config/franka/agents/rsl_rl_ppo_cfg.py）：大网络 + 观测归一化</span>
+    num_steps_per_env = <span class="nu">32</span>          <span class="cmt"># rollout 32×4096 = 13.1 万条 transition</span>
+    max_iterations = <span class="nu">15000</span>          <span class="cmt"># ADR 课程要爬 11 级难度，迭代数 ×10</span>
+    save_interval = <span class="nu">250</span>
+    actor = <span class="fn">RslRlMLPModelCfg</span>(hidden_dims=[<span class="nu">512</span>, <span class="nu">256</span>, <span class="nu">128</span>], obs_normalization=<span class="kw">True</span>, ...)
+    algorithm = <span class="fn">RslRlPpoAlgorithmCfg</span>(learning_rate=<span class="nu">1.0e-3</span>, gamma=<span class="nu">0.995</span>, lam=<span class="nu">0.90</span>,
+                                     entropy_coef=<span class="nu">0.005</span>, clip_param=<span class="nu">0.2</span>, ...)</pre>
+    <div class="annotation"><b>注意策略网络的「小」与「大」：</b>contrib 旧版 actor 是 [256,128,64] 的三层 MLP，观测是低维向量（9 关节位置 + 9 速度 + 3 物体位置 + 指令 + 上一步动作）——对比第 5-7 章的 VLA（亿级参数）差约三个数量级。core 新版网络变宽为 [512,256,128] 且打开 obs_normalization，因为观测从五项扩到了三组：policy（物体四元数 + 指令 + 上步动作）、proprio（关节 + 指尖状态 + 接触力）、perception（64 点物体点云），且全部带 5 帧历史堆叠。RL 策略学的仍是<strong>一个任务的特定技能</strong>；VLA 学的是<strong>跨任务的通用常识</strong>。第 12 章路线图会对比两条技术路线的取舍。<b>adaptive 学习率：</b>schedule="adaptive" 按 desired_kl=0.01 自适应——KL 超过 2×desired_kl 就把学习率 ÷1.5（下限 1e-5），低于 0.5×desired_kl 就 ×1.5（上限 1e-2）。触发阈值和倍数都写死在 rsl_rl 的 PPOCfg 实现里（本锚点固定 rsl-rl-lib==5.0.1，train_rsl_rl.py:48），不在 IsaacLab 仓库。</div>
   </section>
 
   <section class="block">
@@ -110,19 +130,19 @@
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t16 d16">
         <title id="t16">PPO 迭代回路</title>
-        <desc id="d16">采集 24 步 rollout、计算 GAE 优势、4 个 minibatch 上做 5 个 epoch 的 clipped 更新、自适应学习率、重复 1500 次迭代</desc>
+        <desc id="d16">采集 24 步 rollout、计算 GAE 优势、4 个 minibatch 上做 5 个 epoch 的 clipped 更新、自适应学习率、重复迭代直到收敛（contrib 1500 次，core 新版 15000 次带 ADR 课程）</desc>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
           </marker>
         </defs>
-        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">rsl_rl OnPolicyRunner 的一次迭代（num_steps_per_env=24, num_envs=4096）</text>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">rsl_rl OnPolicyRunner 的一次迭代（contrib：num_steps_per_env=24, num_envs=4096）</text>
 
         <g>
           <rect class="node" x="30" y="46" width="250" height="92" rx="8"></rect>
           <text class="lbl sm" x="155" y="70" text-anchor="middle">① 采集 rollout</text>
           <text class="lbl sm" x="155" y="90" text-anchor="middle">4096 env × 24 步</text>
-          <text class="lbl sm" x="155" y="108" text-anchor="middle">（≈9.8 万帧 / 8 秒仿真）</text>
+          <text class="lbl sm" x="155" y="108" text-anchor="middle">（≈9.8 万帧 / 0.48 秒仿真）</text>
           <text class="lbl sm" x="155" y="126" text-anchor="middle">存 obs/action/logp/reward</text>
         </g>
         <g>
@@ -146,12 +166,12 @@
         <line class="edge back" x1="745" y1="140" x2="745" y2="196"></line>
         <line class="edge back" x1="745" y1="196" x2="155" y2="196"></line>
         <line class="edge back" x1="155" y1="196" x2="155" y2="140"></line>
-        <text class="lbl sm" x="450" y="216" text-anchor="middle">④ KL 检查：超 desired_kl=0.01 → lr 减半；不足 → lr 加倍（schedule=adaptive）→ 回到 ①</text>
+        <text class="lbl sm" x="450" y="216" text-anchor="middle">④ KL 检查：超 2×0.01 → lr ÷1.5；低于 0.005 → lr ×1.5（schedule=adaptive）→ 回到 ①</text>
 
         <g>
           <rect class="node back" x="30" y="240" width="840" height="56" rx="8" stroke-dasharray="6 4"></rect>
-          <text class="lbl sm" x="46" y="262">迭代 ×1500（max_iterations）≈ 1500×24 控制步 × 0.02s = 12 分钟仿真时间，GPU 实际几分钟到几十分钟</text>
-          <text class="lbl sm" x="46" y="282">每 50 迭代存一次 checkpoint（save_interval=50）；TensorBoard 看 Episode_Reward/reaching_object 等逐项曲线</text>
+          <text class="lbl sm" x="46" y="262">contrib 旧版：迭代 ×1500（max_iterations），24 控制步 × 0.02s × 1500 迭代 = 12 分钟仿真时间；core 新版：×15000、每迭代 32 步，配 ADR 课程逐步加难</text>
+          <text class="lbl sm" x="46" y="282">每 save_interval 存一次 checkpoint（contrib 50 / core 250）；TensorBoard 看 Episode_Reward 逐项曲线</text>
         </g>
       </svg>
       <div class="svg-legend">
@@ -159,30 +179,30 @@
         <span class="lg-item"><span class="sw acc"></span>优势估计（GAE）</span>
         <span class="lg-item"><span class="sw back"></span>自适应学习率回环</span>
       </div>
-      <div class="fig-cap">图 10.1：PPO 迭代回路。④ 的 KL 自适应是 rsl_rl 的招牌：超参不敏感的代价是每步多算一次前向。</div>
+      <div class="fig-cap">图 10.1：PPO 迭代回路（contrib 版参数）。④ 的 KL 自适应是 rsl_rl 的招牌：超参不敏感的代价是每步多算一次前向。core 新版把 rollout 加长到 32 步、迭代加到 15000 次以容纳 ADR 课程，回路结构不变。</div>
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.6</span>域随机化 vs 系统辨识：两种哲学</h2>
-    <div class="annotation"><b>两种哲学：</b>域随机化赌「世界够乱、真机只是其中一种乱法」——用 4096 个世界的方差覆盖真机方差，策略被迫学不变性（对摩擦、质量、延迟不敏感）。系统辨识（System Identification）反向而行：用真机数据把仿真参数校准到接近真实值。实践中组合拳常见：先用系统辨识把「大结构」对齐（质量/摩擦落在合理区间），再用 DR 覆盖残余不确定性。actuator 家族（8.5 节）是这条缝的第一道防线——ActuatorNet 直接用真机数据学力矩模型，属于「学出来的系统辨识」。第 11 章 sim2real 会把这条缝补完。</div>
+    <div class="annotation"><b>两种哲学：</b>域随机化赌「世界够乱、真机只是其中一种乱法」——用 4096 个世界的方差覆盖真机方差，策略被迫学不变性（对摩擦、质量、延迟不敏感）。系统辨识（System Identification）反向而行：用真机数据把仿真参数校准到接近真实值。实践中组合拳常见：先用系统辨识把「大结构」对齐（质量/摩擦落在合理区间），再用 DR 覆盖残余不确定性。core 新版 Lift 的 ADR 把这套哲学推进一层：随机化幅度本身也是课程——难度 0 时重力偏移为零、噪声为零，随成功率爬到难度 10 时才逼近真实 −9.81 m/s² 与满幅噪声，相当于「边训练边系统辨识」。actuator 家族（8.5 节）是这条缝的第一道防线——ActuatorNet 直接用真机数据学力矩模型，属于「学出来的系统辨识」。第 11 章 sim2real 会把这条缝补完。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.7</span>小结</h2>
     <table class="tbl">
       <tr><th>三件套</th><th>配置入口</th><th>一句话</th></tr>
-      <tr><td>奖励塑形</td><td>RewardsCfg（weight ± 函数+参数）</td><td>密集引导 + 稀疏达标记号，std 决定影响半径</td></tr>
-      <tr><td>课程学习</td><td>CurriculumCfg（modify_reward_weight）</td><td>难度随进度收紧（−1e-4 → −1e-1 @10000 步）</td></tr>
+      <tr><td>奖励塑形</td><td>RewardsCfg（weight ± 函数+参数）</td><td>contrib：密集引导 + 稀疏达标记号；core：进度奖励「到过的高度不再计分」</td></tr>
+      <tr><td>课程学习</td><td>CurriculumCfg（modify_reward_weight / DifficultyScheduler）</td><td>contrib 调惩罚权重（−1e-4 → −1e-1）；core 用 ADR 渐进放大随机化</td></tr>
       <tr><td>域随机化</td><td>EventCfg（prestartup/startup/reset/interval）</td><td>用 4096 个世界的方差覆盖真机方差</td></tr>
     </table>
     <div class="callout info">
       <b class="tag">调试锦囊</b>
-      训练不收敛先看 extras["log"]["Episode_Reward/*"] 逐项曲线：哪个正项一直不涨（如 lifting_object 一直 0）就说明策略卡在那段接力棒上——回去查塑形参数（std/minimal_height），而不是上来就改网络。
+      训练不收敛先看 extras["log"]["Episode_Reward/*"] 逐项曲线：contrib 版哪个正项一直不涨（如 lifting_object 一直 0）就说明策略卡在那段接力棒上——回去查塑形参数（std/minimal_height）；core 版看 ADR 难度曲线——难度是按<strong>个体</strong>升降的（episode 结束时该环境的 success 标志为真则 +1，否则 −1），曲线不涨说明多数环境没成功过，先调奖励再谈课程，而不是上来就改网络。
     </div>
     <div class="callout warn">
       <b class="tag">下一步</b>
-      训练完成只是开始——策略要下真机：gRPC 异步推理、RTC ActionQueue、action chunk 消费，见 <a href="11-sim2real.html">第 11 章：Sim2Real</a>。
+      训练完成只是开始——策略要下真机：gRPC 异步推理、远程队列聚合、action chunk 消费，见 <a href="11-sim2real.html">第 11 章：Sim2Real</a>。
     </div>
   </section>
 
@@ -193,7 +213,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 10 RL 训练 · 基于 isaac-sim/IsaacLab（v3.0.0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 10 RL 训练 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ 4a961d71）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

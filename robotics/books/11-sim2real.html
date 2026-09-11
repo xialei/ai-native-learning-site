@@ -59,25 +59,27 @@
   rpc <span class="fn">StreamParameters</span>(Empty) <span class="kw">returns</span> (stream Parameters);   <span class="cmt">// 参数下发</span>
   rpc <span class="fn">SendTransitions</span>(stream Transition) <span class="kw">returns</span> (Empty);    <span class="cmt">// 经验回传</span>
   rpc <span class="fn">SendInteractions</span>(stream InteractionMessage) <span class="kw">returns</span> (Empty);
+  rpc <span class="fn">Ready</span>(Empty) <span class="kw">returns</span> (Empty);                            <span class="cmt">// 客户端握手</span>
 }
 
 <span class="cmt">// AsyncInference：机器人把观测流给远端 Policy 服务器，换回动作块</span>
 <span class="kw">service</span> <span class="cl">AsyncInference</span> {
   rpc <span class="fn">SendObservations</span>(stream Observation) <span class="kw">returns</span> (Empty);  <span class="cmt">// 机器人 → 策略</span>
   rpc <span class="fn">GetActions</span>(Empty) <span class="kw">returns</span> (Actions);                  <span class="cmt">// 策略 → 机器人</span>
-  rpc <span class="fn">SendPolicyInstructions</span>(PolicySetup) <span class="kw">returns</span> (Empty);  <span class="cmt">// 初始化握手</span>
+  rpc <span class="fn">SendPolicyInstructions</span>(PolicySetup) <span class="kw">returns</span> (Empty);  <span class="cmt">// 下发任务与策略参数</span>
+  rpc <span class="fn">Ready</span>(Empty) <span class="kw">returns</span> (Empty);                            <span class="cmt">// 客户端握手（服务器在此重置状态）</span>
 }</pre>
-    <div class="annotation"><b>读法：</b>观测用 <code class="inline">stream</code>（图像序列可能超 gRPC 4MB 单消息上限，按 TransferState BEGIN/MIDDLE/END 分块）；动作回传用一元 RPC——一次取回整个 action chunk（pickle 序列化的 TimedAction 列表）。策略支持白名单在 constants.py:26：<code class="inline">["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]</code>——正是第 5-7 章讲过的策略家族；机器人侧白名单 :29 是 so100/so101 等 follower。第 10 章的 RL checkpoint 不走这条路——rsl_rl 的 play.py 直接本地加载，或者你把 checkpoint 包装成一个 policy 插件再上服务。</div>
+    <div class="annotation"><b>读法：</b>观测用 <code class="inline">stream</code>（图像序列可能超 gRPC 4MB 单消息上限，按 TransferState BEGIN/MIDDLE/END 分块）；动作回传用一元 RPC——一次取回整个 action chunk（pickle 序列化的 TimedAction 列表）。策略支持白名单在 constants.py:26：<code class="inline">["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]</code>——正是第 5-7 章讲过的策略家族；机器人侧白名单 :29 是 so100/so101 等 follower（不过这条客户端校验目前被注释掉了，robot_client.py:501-503，实际不强制）。第 10 章的 RL checkpoint 不走这条路——rsl_rl 的 play.py 直接本地加载；要包装成 policy 插件上服务，除了注册配置类，还得把名字加进 <code class="inline">constants.py</code> 的 <code class="inline">SUPPORTED_POLICIES</code>，因为服务器校验的是这个硬编码列表（policy_server.py:130），不是 draccus 注册表。</div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t17 d17">
         <title id="t17">异步推理三线程时序</title>
-        <desc id="d17">机器人客户端三个线程：控制循环消费队列并采观测、接收线程收动作块合并进队列、策略服务器异步推理；队列让 100ms 推理延迟对 30Hz 控制不可见</desc>
+        <desc id="d17">机器人客户端两个线程（控制循环消费队列并采观测、接收线程收动作块合并进队列），策略服务器是另一个进程异步推理；队列让 100ms 推理延迟对 30Hz 控制不可见</desc>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
           </marker>
         </defs>
-        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">三条并行线程 —— 推理 100ms，控制 33ms（30Hz），互不阻塞</text>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#0f5c4c">客户端两线程 + 服务器进程 —— 推理 100ms，控制 33ms（30Hz），互不阻塞</text>
 
         <text class="lbl sm" x="40" y="56" font-weight="bold" fill="#0f5c4c">控制线程 robot_client.py:471 control_loop</text>
         <g>
@@ -142,7 +144,7 @@
 
   <section class="block">
     <h2><span class="num">11.3</span>三个精妙的工程细节</h2>
-    <p><strong>① must-go 观测直通（robot_client.py:440-450）。</strong>正常情况下队列还有存货时，新观测发上去也不急着推理（服务器会因「与上次太相似」跳过）。但若队列恰好空了——机器人面临「无动作可执行」的停摆风险——这条观测被标记 <code class="inline">must_go=True</code>，服务器无条件处理：</p>
+    <p><strong>① must-go 观测直通（robot_client.py:440-450）。</strong>正常情况下队列还有存货时，新观测发上去也不急着推理（服务器会因「与上次太相似」跳过）。但若队列恰好空了<strong>且保险丝处于复位态</strong>（<code class="inline">must_go.is_set()</code>）——机器人面临「无动作可执行」的停摆风险——这条观测才被标记 <code class="inline">must_go=True</code>（robot_client.py:442 是这两个条件的与），服务器无条件处理：</p>
     <div class="code-title">lerobot/src/lerobot/async_inference/robot_client.py:441 — 空队列触发直通</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">with</span> self.action_queue_lock:
     observation.must_go = self.must_go.is_set() <span class="kw">and</span> self.action_queue.empty()
@@ -158,9 +160,9 @@
 <span class="kw">else</span>:
     <span class="cmt"># 新旧块在同一 timestep 都有动作 → aggregate_fn 融合</span>
     future_action_queue.put(TimedAction(..., action=aggregate_fn(
-        current_action_queue[t], new_action.get_action())))</pre>
-    <div class="annotation"><b>读法：</b>默认 aggregate_fn 取新动作（最新观测的预测更可信）；可换 weighted_average——即第 5 章 ACT 时序集成的「网络版」。两条队列融合线路在此汇合：本地策略的队列消费 + 远程策略的队列聚合，本质都是「怎么优雅地用新预测覆盖旧预测」。</div>
-    <p><strong>③ 服务器侧省推理（policy_server.py:268-284）。</strong>观测入队前两道体检：timestep 已预测过 → 跳过；与上次预测的观测在关节空间距离 &lt; atol=1（observations_similar，helpers.py:281）→ 跳过。机器人静止或缓慢移动时，服务器不重复推理——省下的算力正是云端多机器人复用的底气。</p>
+        current_action_queue[new_action.get_timestep()], new_action.get_action())))</pre>
+    <div class="annotation"><b>读法：</b>融合函数从注册表里按名字取（<code class="inline">aggregate_fn_name</code>，async_inference/configs.py:29-34），<strong>默认是 weighted_average</strong>（<code class="inline">0.3·旧 + 0.7·新</code>），可换成 latest_only（直接取新）、average（各半）、conservative（0.7 旧 + 0.3 新）。注意 robot_client.py:243-246 里还有一个「未传 aggregate_fn 就取新动作」的兜底分支，但正常路径是 config 构造时把 <code class="inline">aggregate_fn_name</code> 解析成函数（configs.py:182）再传进来，所以走不到那个兜底——别把它当成默认行为。weighted_average 即第 5 章 ACT 时序集成的「网络版」。两条队列融合线路在此汇合：本地策略的队列消费 + 远程策略的队列聚合，本质都是「怎么优雅地用新预测覆盖旧预测」。</div>
+    <p><strong>③ 服务器侧省推理（policy_server.py:268-284）。</strong>观测入队前两道体检：timestep 已预测过 → 跳过；与上次预测的观测在关节空间距离 &lt; atol=1（observations_similar，helpers.py:281）→ 跳过。机器人静止或缓慢移动时，服务器不重复推理——这份省下来的算力让单个 GPU 服务一台机器人时余量充足（目前一个 policy_server 同时只服务一个客户端）。</p>
   </section>
 
   <section class="block">
@@ -171,7 +173,7 @@
       <tr><td>适用策略</td><td>ACT、Diffusion（小，CPU/边缘 GPU 可跑）</td><td>SmolVLA、π0（大，需要 GPU 服务器）</td></tr>
       <tr><td>延迟构成</td><td>纯推理时间</td><td>推理 + 网络 RTT + 序列化</td></tr>
       <tr><td>队列机制</td><td>policy.select_action 内部队列（第 5 章）</td><td>客户端 action_queue + 聚合（本章）</td></tr>
-      <tr><td>多机器人</td><td>一机一策略</td><td>一个服务器服务多机器人（观测体检去重）</td></tr>
+      <tr><td>多机器人</td><td>一机一策略</td><td>一次服务一个机器人客户端（观测体检去重；新客户端连入会先清空服务器队列，:100-111）</td></tr>
       <tr><td>代码入口</td><td>lerobot-record / python 推理脚本</td><td>async_inference/{policy_server,robot_client}.py</td></tr>
     </table>
     <div class="callout info">
@@ -183,8 +185,8 @@
   <section class="block">
     <h2><span class="num">11.5</span>仿真策略与真机栈的汇合</h2>
     <p>把全书的线收拢：第 10 章 rsl_rl 训出的 RL 策略（MLP，低维观测）可以直接 <code class="inline">play.py</code> 回放到真机吗？不行——中间还隔着第 2 章的硬件抽象：仿真里的 <code class="inline">JointPositionAction</code> 目标要翻译成 Feetech 电机的 goal_position（02 章 MotorsBus），观测要从相机帧 + 电机读数构造出与仿真一致的向量。工程上常见做法：</p>
-    <p>①<strong>直接移植</strong>：把 Isaac Lab 的 obs/action 归一化参数导出成 lerobot processor（第 4 章的 dataset stats、第 5 章的 preprocessor/postprocessor 管道），RL 策略注册为 PreTrainedPolicy 子类——白名单以外的策略通过 @PreTrainedConfig.register_subclass 插件机制接入（factory.py 的约定式解析天然支持）。</p>
-    <p>②<strong>蒸馏成 VLA 数据</strong>：仿真策略当「老师」在 Isaac Lab 里跑成功 rollout，用 RecorderManager（9.2 节）录成 LeRobotDataset——再把 VLA（第 6-7 章）当「学生」在这些数据上模仿学习。学生上位后自带视觉泛化，老师负责量产数据。</p>
+    <p>①<strong>直接移植</strong>：把 Isaac Lab 的 obs/action 归一化参数导出成 lerobot processor（第 4 章的 dataset stats、第 5 章的 preprocessor/postprocessor 管道），RL 策略注册为 PreTrainedPolicy 子类——白名单以外的策略通过 @PreTrainedConfig.register_subclass 插件机制接入——注意注册的是<strong>策略的配置类</strong>（如 ACTConfig，policies/act/configuration_act.py:22），策略本体再按 configuration_* → modeling_* 的命名约定被 factory.py 解析出来。</p>
+    <p>②<strong>蒸馏成 VLA 数据</strong>：仿真策略当「老师」在 Isaac Lab 里跑成功 rollout，用 RecorderManager（9.2 节）录成 HDF5 数据集，再用转换脚本（如 scripts/imitation_learning/locomanipulation_sdg/gr00t/convert_dataset.py）转成 LeRobotDataset——再把 VLA（第 6-7 章）当「学生」在这些数据上模仿学习。学生上位后自带视觉泛化，老师负责量产数据。</p>
     <div class="annotation"><b>第 11 章是全书的「汇合点」：</b>仿真线（8-10 章）的产出与真实线（2-7 章）的产出，最终都要通过本章的部署栈变成机器人的动作。12 章的路线图会把两条线串成六个里程碑。</div>
   </section>
 
@@ -195,7 +197,7 @@
       <tr><td>物理差距</td><td>DR + actuator 随机化 + DelayedPD</td><td>第 8.5/10.3 节</td></tr>
       <tr><td>推理延迟</td><td>action chunk + 队列（本地或远程）</td><td>5.2 / 11.3 节</td></tr>
       <tr><td>远程部署</td><td>gRPC AsyncInference：观测流上行、动作块下行</td><td>services.proto:38</td></tr>
-      <tr><td>新旧动作冲突</td><td>timestep 对齐聚合（默认取新 / weighted_average）</td><td>robot_client.py:237</td></tr>
+      <tr><td>新旧动作冲突</td><td>timestep 对齐聚合（默认 weighted_average 0.3 旧 + 0.7 新）</td><td>robot_client.py:237; configs.py:141</td></tr>
       <tr><td>饿死风险</td><td>must-go 直通保险丝</td><td>robot_client.py:441</td></tr>
       <tr><td>服务器过载</td><td>重复/相似观测跳过 + inference_latency 节流</td><td>policy_server.py:268/:254</td></tr>
     </table>
@@ -212,7 +214,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 11 Sim2Real · 基于 lerobot（async_inference/transport）与 isaac-sim/IsaacLab（v3.0.0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 11 Sim2Real · 基于 lerobot（async_inference/transport）与 isaac-sim/IsaacLab（v3.0.0，4a961d71）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

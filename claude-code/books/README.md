@@ -59,6 +59,7 @@ python3 -m http.server
 | 路径 | 对应章节 |
 |------|----------|
 | `plugins/`（十几个官方插件） | 第 7、10、13 章 |
+| `mods/`（sec-default / diff / telemetry 内置插件源码） | 第 8、10 章 |
 | `examples/hooks/bash_command_validator_example.py` | 第 8 章 |
 | `examples/settings/{lax,strict,bash-sandbox}.json` | 第 6、9 章 |
 | `examples/mdm/`（macOS/Windows 部署模板） | 第 6、9 章 |
@@ -67,6 +68,6 @@ python3 -m http.server
 
 ## 备注
 
-- CLI 内核源码未随仓库开放，涉及循环 / 上下文压缩等内部机制的章节以**官方公开文档 + 仓库实例的行为**为准。
-- 引用的代码片段大多来自上述仓库实例（Hooks、插件、配置），这些是**可运行、可对照**的部分，最适合边读边试。
+- CLI 内核源码未随仓库开放（2026-09 起仅 `mods/` 下 sec-default / diff / telemetry 三个内置插件以源码发布，采用 TypeScript hooks 模块写法，见第 8 章 §8.9），涉及循环 / 上下文压缩等内部机制的章节以**官方公开文档 + 仓库实例的行为**为准。
+- 引用的代码片段大多来自上述仓库实例（Hooks、插件、配置、mods），这些是**可运行、可对照**的部分，最适合边读边试。
 - 配色采用 Claude 的橘棕系（`assets/cc-learn.css`），结构上借鉴了 Pi Agent Harness / vLLM 学习站的卡片式模板。

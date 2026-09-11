@@ -34,7 +34,7 @@
 <div class="page">
 
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-1351-ga9519cbcdd</span>
+    <span class="version-badge">rusty-v8-v150.4.0-1950-gda20788df9</span>
     <h1>09 · 配置系统：分层、合并与约束</h1>
     <p class="lead">
       Codex 既要满足单个开发者在笔记本上的轻量配置，又要支撑企业 MDM 托管、项目级策略、CI 无人值守等截然不同的场景。
@@ -135,10 +135,12 @@
 }</pre>
 
     <p>所以你在全局 <code class="inline">config.toml</code> 里设了 <code class="inline">model = "gpt-5"</code>，而项目配置只写了 <code class="inline">sandbox_mode = "workspace-write"</code>，合并结果是两者都生效——项目层没有提到的字段从用户层继承。这避免了「要么全配要么不配」的痛苦。</p>
+
+    <p>合并也不会掩盖拼写错误。加载完成后，Codex 会对<b>合并后的生效配置</b>以及各 requirements 层再做一次「被忽略字段」检查（基于 serde 的 ignored-field 追踪，见 <code class="inline">strict_config.rs</code>）：发现未识别的键，就在启动时给出警告——<code class="inline">Codex is ignoring N unrecognized configuration setting(s). Check for typos or deprecated settings.</code> 警告只列出来源和字段名（不回显配置值），最多展示三条，并对几个已迁移的旧键（<code class="inline">network_proxy</code>、<code class="inline">allowed_permissions</code>、<code class="inline">include_view_image_tool</code>）附上迁移提示。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>ConfigToml：用户配置骨架</h2>
+    <h2><span class="num">9.3</span>ConfigToml：用户配置的结构</h2>
     <p><code class="inline">ConfigToml</code> 是 <code class="inline">~/.codex/config.toml</code> 的反序列化目标。它几乎全用 <code class="inline">Option</code>——因为每个字段都可能「未设置」，从而让下层值透传上来。</p>
 
     <pre class="code"><span class="lang-tag">codex-rs/config/src/config_toml.rs:155</span>
@@ -199,14 +201,16 @@
     <h2><span class="num">9.5</span>约束系统：requirements.toml</h2>
     <p>分层合并有个天然问题：如果企业想<b>强制</b>某个安全策略（比如「绝不允许 danger-full-access」），光靠覆盖是不够的——用户或项目层仍可能写回来。Codex 用一套独立的 <b>requirements</b> 机制解决：托管层不提供「配置值」，而是提供「约束」，约束会校验合并后的生效配置是否越界。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/config/src/config_requirements.rs</span>
+    <pre class="code"><span class="lang-tag">codex-rs/config/src/config_requirements.rs:44</span>
 <span class="kw">pub enum</span> <span class="cl">RequirementSource</span> {
     SystemRequirementsToml { file: <span class="cl">AbsolutePathBuf</span> },
-    <span class="cmt">// ... 其它托管来源</span>
+    <span class="cmt">// ... 其它托管来源（MDM、EnterpriseManaged、Composite 等）</span>
 }
 
 <span class="cmt">/// 合并归一化后的 requirements。</span>
 <span class="kw">pub struct</span> <span class="cl">ConfigRequirements</span> {
+    <span class="kw">pub</span> model_provider: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="kw">String</span>&gt;&gt;,
+    <span class="kw">pub</span> model_providers: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">HashMap</span>&lt;<span class="kw">String</span>, <span class="cl">ModelProviderInfo</span>&gt;&gt;&gt;,
     <span class="kw">pub</span> computer_use: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">ComputerUseRequirementsToml</span>&gt;&gt;,
     <span class="kw">pub</span> feature_requirements: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">FeatureRequirementsToml</span>&gt;&gt;,
     <span class="kw">pub</span> managed_hooks: <span class="kw">Option</span>&lt;<span class="cl">ConstrainedWithSource</span>&lt;<span class="cl">ManagedHooksRequirementsToml</span>&gt;&gt;,
@@ -215,7 +219,9 @@
     <span class="kw">pub</span> exec_policy: <span class="kw">Option</span>&lt;<span class="cl">Sourced</span>&lt;<span class="cl">RequirementsExecPolicy</span>&gt;&gt;,
 }</pre>
 
-    <p>注意 <code class="inline">ConstrainedWithSource</code> 这个类型名——它表示「带来源的约束」。约束的语义是「<b>能否设置</b>」而非「设成什么」。例如 <code class="inline">ApprovalsReviewer::User</code> 的约束可以是「禁止设成 AutoReview」，这样无论用户层怎么配，自动审核都开不了。这是企业安全治理的基石。</p>
+    <p>requirements 不只画安全红线。例如 <code class="inline">model_provider</code>/<code class="inline">model_providers</code> 出现在 requirements 里时，托管方可以<b>锁定模型 provider 的选择并下发完整的 provider 定义</b>（含认证与 headers）——必选 provider 直接覆盖本地与会话配置，每个必选定义替换同名的本地条目。也就是说，同一个文件既能「禁止某些值」（约束），也能「强推某些值」（必选定义）。</p>
+
+    <p>注意 <code class="inline">ConstrainedWithSource</code> 这个类型名——它表示「带来源的约束」。约束的语义是「<b>能否设置</b>」而非「设成什么」。例如 <code class="inline">approvals_reviewer</code> 的约束可以是「只允许 <code class="inline">user</code>」，这样无论用户层怎么配，配置加载时校验不通过都会回落到约束允许的值并给出启动警告，自动审核开不了。这是企业安全治理的基石。</p>
 
     <div class="callout tip">
       <b class="tag">配置 vs 约束</b>
@@ -227,27 +233,27 @@
     <h2><span class="num">9.6</span>Profile：命名的配置预设</h2>
     <p>当一个人在多个场景用 Codex（工作 / 个人 / 演示），反复改 config 很烦。<code class="inline">--profile</code> 机制允许命名预设：<code class="inline">$CODEX_HOME/&lt;name&gt;.config.toml</code>。选中某个 profile 时，User 层的优先级从 20 升到 21（见 9.1），相当于在用户基础配置之上再叠一层。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/config_types.rs</span>
+    <pre class="code"><span class="lang-tag">codex-rs/protocol/src/config_types.rs:118</span>
 <span class="cmt">/// 校验过的 profile-v2 名，用于选择 $CODEX_HOME/&lt;name&gt;.config.toml。</span>
 <span class="kw">pub struct</span> <span class="cl">ProfileV2Name</span>(<span class="kw">String</span>);
 
 <span class="cmt">// 解析失败的提示：</span>
 <span class="st">"invalid --profile value `{}`; pass a plain name such as `work`"</span></pre>
 
-    <p>profile 是<b>纯加法</b>：它只在你已有的用户配置之上叠加，不替换。这让「切换工作场景」变成一条 flag，而非重写整个配置文件。</p>
+    <p>profile 是<b>纯加法</b>：它只在你已有的用户配置之上叠加，不替换。这让「切换工作场景」变成一条 flag，而非重写整个配置文件。但叠加不等于「处处生效」：显式选中的 profile 设置（model、reasoning effort 等启动选择）会压过托管系统给新会话下发的默认值——托管默认只填补 profile 没有表态的字段，且被项目配置盖住的 profile 设置不算「表态」。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>配置全景：从文件到生效</h2>
+    <h2><span class="num">9.7</span>配置生效链路：从文件到运行时</h2>
     <table class="tbl">
       <thead><tr><th>概念</th><th>文件 / 类型</th><th>作用</th></tr></thead>
       <tbody>
         <tr><td>用户配置</td><td><code>~/.codex/config.toml</code> → <code>ConfigToml</code></td><td>个人默认值</td></tr>
         <tr><td>项目配置</td><td><code>.codex/config.toml</code></td><td>项目级覆盖（优先级更高）</td></tr>
         <tr><td>Profile 预设</td><td><code>$CODEX_HOME/&lt;name&gt;.config.toml</code></td><td>命名场景叠加</td></tr>
-        <tr><td>系统约束</td><td><code>requirements.toml</code> → <code>ConfigRequirements</code></td><td>托管层画红线</td></tr>
+        <tr><td>系统约束</td><td><code>requirements.toml</code> → <code>ConfigRequirements</code></td><td>托管层画红线 / 锁定 provider</td></tr>
         <tr><td>会话 flag</td><td>CLI <code>--flag</code></td><td>本次运行临时覆盖</td></tr>
-        <tr><td>合并引擎</td><td><code>merge_toml_values</code></td><td>字段级叠加</td></tr>
+        <tr><td>合并引擎</td><td><code>merge_toml_values</code></td><td>字段级叠加（合并后校验未知键并警告）</td></tr>
         <tr><td>权限 profile</td><td><code>default_permissions</code> → <code>PermissionProfile</code></td><td>沙箱构造方式</td></tr>
       </tbody>
     </table>
@@ -257,11 +263,11 @@
     <h2><span class="num">9.8</span>小结与对自研的启示</h2>
     <div class="callout tip">
       <b class="tag">自研 checklist</b>
-      配置系统是 Agent 的「治理骨架」，别等做大了再补。<strong>① 一开始就分层</strong>——默认值 / 用户 / 项目 / 会话 flag，每层带优先级。<strong>② 字段级合并</strong>而非整文件替换，用 <code class="inline">Option</code> 表示「未设置」。<strong>③ 配置与约束分离</strong>——企业场景必须有「不可被覆盖的红线」，否则安全默认形同虚设。<strong>④ 项目配置优先级高于用户配置</strong>是合理的（仓库自带策略），但必须配套「未信任项目默认收紧」机制。<strong>⑤ 提供 profile 预设</strong>——用户会感谢你能一键切场景。
+      配置系统别等做大了再补。<strong>① 一开始就分层</strong>——默认值 / 用户 / 项目 / 会话 flag，每层带优先级。<strong>② 字段级合并</strong>而非整文件替换，用 <code class="inline">Option</code> 表示「未设置」。<strong>③ 配置与约束分离</strong>——企业场景必须有「不可被覆盖的红线」，否则安全默认形同虚设。<strong>④ 项目配置优先级高于用户配置</strong>是合理的（仓库自带策略），但必须配套「未信任项目默认收紧」机制。<strong>⑤ 提供 profile 预设</strong>——不同场景一键切换。
     </div>
     <div class="callout info">
-      <b class="tag">一句话</b>
-      Codex 的配置哲学：<b>「自由叠加 + 不可逾越的约束」</b>。配置层让每个角色（开发者/项目/企业）都能表达偏好，约束层保证安全边界不被覆盖。二者合一，才让同一套二进制能在个人笔记本和企业集群里都安全运行。
+      <b class="tag">设计取舍</b>
+      Codex 的配置设计：<b>「自由叠加 + 不可逾越的约束」</b>。配置层让每个角色（开发者/项目/企业）都能表达偏好，约束层保证安全边界不被覆盖。二者合一，才让同一套二进制能在个人笔记本和企业集群里都安全运行。
     </div>
   </section>
 
@@ -272,7 +278,7 @@
 </div>
 
 <footer>
-  Codex CLI · 09 配置系统 · 版本 rusty-v8-v150.4.0-1351-ga9519cbcdd · 所有引用代码路径以仓库最新为准
+  Codex CLI · 09 配置系统 · 版本 rusty-v8-v150.4.0-1950-gda20788df9 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

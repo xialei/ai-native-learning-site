@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · 投机解码 — 深入浅出SGLang</title>
+<link rel="stylesheet" href="assets/sglang-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a href="03-radix-cache.html">前缀缓存</a>
+      <a href="04-scheduler.html">调度器</a>
+      <a href="05-memory.html">内存池</a>
+      <a href="06-model-runner.html">Model Runner</a>
+      <a href="07-attention-backends.html">注意力后端</a>
+      <a href="08-sampling.html">采样</a>
+      <a href="09-serving-entry.html">服务入口</a>
+      <a href="10-distributed.html">分布式</a>
+      <a href="11-hicache.html">HiCache</a>
+      <a href="12-pd-disaggregation.html">PD 分离</a>
+      <a class="active" href="13-speculative.html">投机解码</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 13 投机解码</div>
+    <h1>投机解码：一次前向换多个 token</h1>
+    <div class="subtitle">decode 阶段每生成一个 token 都要完整读一遍模型权重，瓶颈在显存带宽而不在算力。投机解码的思路是：用一个便宜的草稿器一次提出 k 个候选，再用目标模型的一次前向整批验证。这一章拆 SGLang 的实现：算法族、EAGLE worker 的结构、以及它怎么挂在第 2 章讲过的 overlap 调度上。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">13.1</span>一分钟版本</h2>
+    <p>decode 慢的根源：batch 里每个序列每步只算一个 token，权重却要整份读一遍。算术强度（每次权重读取换来的浮点运算量）很低，GPU 的算力单元大部分在等数据。投机解码把「读一遍权重」的收益放大：</p>
+    <ul>
+      <li><strong>草稿阶段</strong>：一个便宜的草稿器（小模型 / MTP 头 / n-gram 表）快速提出若干候选 token，按树或链组织。</li>
+      <li><strong>验证阶段</strong>：目标模型以 <code class="inline">ForwardMode.TARGET_VERIFY</code> 跑<em>一次</em>前向，把这 k 个候选当作 k 个输入位置一起算——这些位置共享同一次权重读取。</li>
+      <li><strong>接受阶段</strong>：逐位比较目标分布与草稿分布，做拒绝采样。数学上保证最终输出分布与直接用目标模型采样完全一致；接受多少发多少，从第一个不一致处截断。</li>
+    </ul>
+    <p>收益由<strong>接受长度</strong>决定：平均每次验证接受 α 个 token，decode 就近似提速 α 倍（草稿开销摊进去之后）。SGLang 内置的算法装在一个枚举里（见 13.3），入口统一是 <code class="inline">--speculative-algorithm</code>，值用字符串传入、由 <code class="inline">from_string</code> 转成枚举或插件对象。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.2</span>普通解码 vs 投机解码</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 500" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t13 d13">
+        <title id="t13">普通解码与投机解码的一步对比</title>
+        <desc id="d13">普通解码每步一个 token；投机解码先建草稿树，再一次目标前向验证整棵树</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6b5d54"></path>
+          </marker>
+        </defs>
+
+        <!-- 上：普通解码 -->
+        <rect class="node acc" x="20" y="20" width="900" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="44" font-weight="bold" fill="#16648f">普通 decode 一步（ForwardMode.DECODE）</text>
+        <rect class="node" x="40" y="58" width="170" height="44" rx="6"></rect>
+        <text class="lbl" x="125" y="84" text-anchor="middle">已有序列</text>
+        <rect class="node core" x="260" y="58" width="230" height="44" rx="6"></rect>
+        <text class="lbl" x="355" y="84" text-anchor="middle">目标模型前向 ×1</text>
+        <rect class="node" x="520" y="58" width="150" height="44" rx="6"></rect>
+        <text class="lbl" x="595" y="84" text-anchor="middle">Sampler</text>
+        <rect class="node" x="720" y="58" width="170" height="44" rx="6"></rect>
+        <text class="lbl" x="805" y="84" text-anchor="middle">+1 token / 序列</text>
+        <line class="edge" x1="210" y1="80" x2="218" y2="80"></line>
+        <line class="edge" x1="490" y1="80" x2="518" y2="80"></line>
+        <line class="edge" x1="670" y1="80" x2="718" y2="80"></line>
+        <text class="lbl sm" x="40" y="122">读一遍全部权重，换 1 个 token —— 显存带宽是瓶颈</text>
+
+        <!-- 下：投机解码 -->
+        <rect class="node core" x="20" y="160" width="900" height="320" rx="10"></rect>
+        <text class="lbl" x="40" y="186" font-weight="bold" fill="#b34a10">投机 decode 一步（EAGLE 为例）</text>
+
+        <rect class="node acc" x="40" y="210" width="180" height="52" rx="6"></rect>
+        <text class="lbl" x="130" y="232" text-anchor="middle">草稿模型</text>
+        <text class="lbl sm" x="130" y="250" text-anchor="middle">EagleDraftWorker.draft()</text>
+
+        <!-- 草稿树 -->
+        <rect class="node" x="270" y="206" width="24" height="20" rx="3"></rect>
+        <rect class="node" x="260" y="240" width="24" height="20" rx="3"></rect>
+        <rect class="node" x="304" y="240" width="24" height="20" rx="3"></rect>
+        <rect class="node" x="250" y="274" width="24" height="20" rx="3"></rect>
+        <rect class="node" x="284" y="274" width="24" height="20" rx="3"></rect>
+        <rect class="node" x="318" y="274" width="24" height="20" rx="3"></rect>
+        <line class="edge" x1="282" y1="226" x2="278" y2="238"></line>
+        <line class="edge" x1="286" y1="226" x2="312" y2="238"></line>
+        <line class="edge" x1="276" y1="260" x2="266" y2="272"></line>
+        <line class="edge" x1="288" y1="260" x2="290" y2="272"></line>
+        <line class="edge" x1="316" y1="260" x2="328" y2="272"></line>
+        <text class="lbl sm" x="270" y="312" text-anchor="middle">草稿树 num_draft_tokens 个节点</text>
+        <text class="lbl sm" x="270" y="328" text-anchor="middle">（topk 展开后再按分数截取）</text>
+        <line class="edge" x1="220" y1="236" x2="268" y2="220"></line>
+
+        <rect class="node core" x="440" y="210" width="230" height="52" rx="6"></rect>
+        <text class="lbl" x="555" y="232" text-anchor="middle">目标模型验证</text>
+        <text class="lbl sm" x="555" y="250" text-anchor="middle">ForwardMode.TARGET_VERIFY</text>
+        <text class="lbl sm" x="555" y="266" text-anchor="middle">一次前向算完整棵树</text>
+        <line class="edge" x1="360" y1="236" x2="438" y2="236"></line>
+
+        <rect class="node" x="720" y="210" width="180" height="52" rx="6"></rect>
+        <text class="lbl" x="810" y="232" text-anchor="middle">eagle_sample</text>
+        <text class="lbl sm" x="810" y="250" text-anchor="middle">拒绝采样 + accept_lens</text>
+        <line class="edge" x1="670" y1="236" x2="718" y2="236"></line>
+
+        <!-- 接受/拒绝 -->
+        <rect class="node warn" x="440" y="310" width="230" height="46" rx="6"></rect>
+        <text class="lbl" x="555" y="330" text-anchor="middle">接受前缀：emit accept_lens 个</text>
+        <text class="lbl sm" x="555" y="347" text-anchor="middle">+bonus token；截断处之后作废</text>
+        <line class="edge" x1="810" y1="262" x2="700" y2="308"></line>
+        <text class="lbl sm" x="700" y="292">接受结果</text>
+
+        <!-- 拒绝回退：虚线 -->
+        <line class="edge back" x1="438" y1="333" x2="300" y2="300"></line>
+        <text class="lbl sm" x="330" y="352">被拒分支的 KV 位置回收</text>
+
+        <rect class="node" x="40" y="310" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="140" y="330" text-anchor="middle">draft_extend</text>
+        <text class="lbl sm" x="140" y="347" text-anchor="middle">用验证结果更新草稿 KV</text>
+        <line class="edge" x1="438" y1="333" x2="242" y2="333"></line>
+
+        <text class="lbl sm" x="40" y="400">一次目标前向（读一遍权重）换来 0 ~ (num_draft_tokens-topk+1) 个 token；</text>
+        <text class="lbl sm" x="40" y="418">平均接受长度 α 越高越接近 α 倍收益。草稿模型本身也要做前向，</text>
+        <text class="lbl sm" x="40" y="436">但它的权重小得多，且通过 CUDA Graph 摊薄启动开销（13.5 节）。</text>
+        <line class="edge back" x1="130" y1="310" x2="130" y2="266"></line>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>目标模型（验证）</span>
+        <span class="lg-item"><span class="sw acc"></span>草稿侧</span>
+        <span class="lg-item"><span class="sw warn"></span>接受/截断结果</span>
+        <span class="lg-item"><span class="sw"></span>一般步骤</span>
+      </div>
+      <div class="fig-cap">图 13.2：虚线是「拒绝」路径——验证分布与草稿不一致处之后的所有候选都作废，对应 KV 位置回收。接受是前缀式的：从第一个不匹配处截断，不存在跳过中间接受后面。</div>
+    </div>
+    <div class="annotation"><b>为什么分布不变：</b> 拒绝采样按 min(1, p_target(x)/p_draft(x)) 的概率接受每个草稿 token；被拒时从修正后的残差分布里重新采一个。目标模型的 logits 是唯一事实来源，草稿只影响「提议什么」，不影响「输出什么分布」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.3</span>算法族一览</h2>
+    <p>所有算法共享同一套调度与验证框架（<code class="inline">ForwardMode.TARGET_VERIFY</code> + spec worker），差别只在「草稿从哪来」：</p>
+    <table class="tbl">
+      <tr><th>算法</th><th>草稿从哪来</th><th>额外权重</th><th>何时选它</th></tr>
+      <tr><td>EAGLE-2</td><td>EAGLE 草稿模型：拿目标模型倒数第二层特征做草稿，树状展开</td><td>单独草稿权重</td><td>兼容面最宽的默认选择；调 <code class="inline">--speculative-num-steps / -eagle-topk / -num-draft-tokens</code></td></tr>
+      <tr><td>EAGLE-3</td><td>EAGLE3 草稿模型：混用目标模型多层特征，训练态也看了多层输入</td><td>单独草稿权重</td><td>官方基准里吞吐最好，有对应草稿权重就优先选它</td></tr>
+      <tr><td>MTP（NEXTN）</td><td>模型自带的 multi-token prediction 头（DeepSeek/Qwen 等随权重发布）</td><td>通常无需单独下载</td><td>模型本身带 MTP 头时最省事；参数配小一些（steps/topk/draft_tokens）</td></tr>
+      <tr><td>NGRAM</td><td>从提示与已生成内容里查 n-gram 匹配，直接抄片段</td><td>无</td><td>agentic / 高重复负载（固定模板、代码补全）；CUDA-only</td></tr>
+      <tr><td>STANDALONE</td><td>一个更小的草稿 LLM，普通 token 级自回归</td><td>单独草稿模型</td><td>手里正好有个同词表小模型；不支持 dp-attention</td></tr>
+      <tr><td>UNO</td><td>目标模型 + 训练好的 UNO LoRA（线性链或树）</td><td>一个 LoRA</td><td>不想挂第二个模型；要求 TP=PP=1</td></tr>
+      <tr><td>DFLASH</td><td>DFlash 草稿模型（线性块验证）</td><td>单独草稿权重</td><td>有 DFlash checkpoint；禁 dp-attention、pp=1、禁 overlap 与 mixed chunked prefill</td></tr>
+    </table>
+    <div class="code-title">python/sglang/srt/speculative/spec_info.py — SpeculativeAlgorithm 枚举（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">SpeculativeAlgorithm</span>(<span class="cl">Enum</span>):
+    <span class="st">"""Builtin speculative decoding algorithms. Plugin-registered ones are
+    ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and
+    both expose the same ``is_*()`` / ``create_worker`` interface so callers
+    dispatch uniformly without isinstance checks.
+    """</span>
+
+    DFLASH = <span class="fn">auto</span>()
+    UNO = <span class="fn">auto</span>()
+    DSPARK = <span class="fn">auto</span>()
+    EAGLE = <span class="fn">auto</span>()
+    EAGLE3 = <span class="fn">auto</span>()
+    FROZEN_KV_MTP = <span class="fn">auto</span>()
+    STANDALONE = <span class="fn">auto</span>()
+    NGRAM = <span class="fn">auto</span>()
+    NONE = <span class="fn">auto</span>()</pre>
+    <p>枚举里<strong>没有</strong> <code class="inline">NONE</code> 之外可选项的那些策略要按「族」而不是「值」去对：上表有 7 行，枚举去掉 <code class="inline">NONE</code> 剩 8 个值，多出来的那个是 <code class="inline">DSPARK</code>——它和 <code class="inline">DFLASH</code> 同属一个族，源码里有专门的谓词 <code class="inline">is_dflash_family()</code>（<code class="inline">return self.is_dflash() or self.is_dspark()</code>）把两者并起来判，所以上表把它们合成一行讲。另外 <code class="inline">EAGLE</code> 与 <code class="inline">EAGLE3</code> 是两个独立值（不是版本号别名），<code class="inline">FROZEN_KV_MTP</code> 是 MTP 的另一条实现，都各占一行。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      文档里说 MTP「通常无需单独草稿模型」，但枚举里找不到 <code class="inline">MTP</code> 这个值。两条线索：<code class="inline">from_string</code> 把 <code class="inline">NEXTN</code> 别名映射到 <code class="inline">EAGLE</code>（<code class="inline">spec_registry.py</code> 的 <code class="inline">_RESERVED_ALIASES = frozenset({"NEXTN"})</code>）——DeepSeek 式 MTP 头就是按 EAGLE worker 挂载的，草稿权重指向模型自带的 MTP 模块；而 <code class="inline">FROZEN_KV_MTP</code> 是另一条独立实现（<code class="inline">frozen_kv_mtp_worker_v2.py</code>，验证时冻结目标 KV）。按「MTP」字面去 grep 枚举会扑空，这是演进叠层的痕迹。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.4</span>EAGLE 在 SGLang 里的结构</h2>
+    <p>调度器不认识 EAGLE。它只看到一个实现了 <code class="inline">forward_batch_generation(batch, on_publish)</code> 接口的 worker——普通模式这是 <code class="inline">TpModelWorker</code>，开投机后换成 <code class="inline">EAGLEWorkerV2</code>，内部包着「目标 worker + 草稿 worker」两个 <code class="inline">TpModelWorker</code>：</p>
+    <div class="code-title">python/sglang/srt/speculative/eagle_worker_v2.py — EAGLEWorkerV2 构造（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EAGLEWorkerV2</span>(<span class="cl">BaseSpecWorker</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, server_args, gpu_id, ps, nccl_port, target_worker: <span class="cl">TpModelWorker</span>):
+        ...
+        self.topk = <span class="fn">get_spec</span>().speculative_eagle_topk
+        self.speculative_num_steps = <span class="fn">get_spec</span>().speculative_num_steps
+        self.speculative_num_draft_tokens = <span class="fn">get_spec</span>().speculative_num_draft_tokens
+        self._target_worker = target_worker
+
+        <span class="cmt"># 只有 PP 最后一级真的跑草稿；其余 rank 拿代理，保持各 rank 分发一致</span>
+        self._hosts_draft = <span class="fn">get_pp_group</span>().is_last_rank
+        self._draft_worker = (
+            <span class="cl">EagleDraftWorker</span>(server_args, gpu_id, ps, nccl_port, target_worker)
+            <span class="kw">if</span> self._hosts_draft
+            <span class="kw">else</span> <span class="kw">None</span>
+        )</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">EagleDraftWorker</code>（同文件 ~157 行）内部再起一个 <code class="inline">TpModelWorker</code>，只是 <code class="inline">is_draft_worker=True</code>——草稿模型复用整套 ModelRunner/注意力后端/CUDA Graph 机制，只是权重小、层数少。所以「草稿模型」在 SGLang 里不是一个特殊物种，是同一个执行框架的第二次实例化。</div>
+
+    <p>一次 decode 迭代在这个 worker 里的顺序是 draft → verify → draft_extend，publish 卡在 verify 结束的时点：</p>
+    <div class="code-title">python/sglang/srt/speculative/eagle_worker_v2.py — forward_batch_generation 的 decode 分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward_batch_generation</span>(self, batch, on_publish=<span class="kw">None</span>, ...):
+    <span class="kw">if</span> batch.forward_mode.is_extend() <span class="kw">or</span> batch.is_extend_in_batch:
+        <span class="cmt"># prefill：目标模型算完就 publish，再让草稿模型做 draft_extend</span>
+        batch_output = self.target_worker.<span class="fn">forward_batch_generation</span>(...)
+        <span class="kw">if</span> on_publish <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            <span class="fn">on_publish</span>(batch_output.new_seq_lens)
+        batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(...)
+        <span class="kw">return</span> batch_output
+    <span class="kw">else</span>:
+        <span class="cmt"># decode：先草稿，再验证</span>
+        verify_input: <span class="cl">EagleVerifyInput</span> = self.draft_worker.<span class="fn">draft</span>(batch)
+        batch.spec_info = verify_input
+        batch_output = self.<span class="fn">verify</span>(batch, grammar_barrier=grammar_barrier)
+        <span class="cmt"># Publish before draft_extend so the fence is at verify-end.</span>
+        <span class="kw">if</span> on_publish <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            <span class="fn">on_publish</span>(batch_output.new_seq_lens)
+        ...  <span class="cmt"># draft_extend：草稿模型消化验证结果，为下一轮准备</span></pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">draft()</code>（~596 行）按 topk 逐层展开草稿树，输出 <code class="inline">EagleVerifyInput</code>；<code class="inline">verify()</code>（~1666 行）委托给 <code class="inline">eagle_worker_common.py</code> 的 <code class="inline">run_eagle_verify</code>。注意 publish 的位置——它在 verify 之后、draft_extend 之前，这个时点选择是 13.5 节 overlap 设计的关键。</div>
+
+    <p>验证的核心在 <code class="inline">run_eagle_verify</code>：准备 TARGET_VERIFY 批 → 目标模型一次前向 → 采样并统计接受长度：</p>
+    <div class="code-title">python/sglang/srt/speculative/eagle_worker_common.py — run_eagle_verify（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">run_eagle_verify</span>(batch, *, target_worker, ...) -&gt; <span class="cl">GenerationBatchResult</span>:
+    <span class="cmt"># 验证批的准备放在独立的 plan stream 上，与草稿前沿重叠</span>
+    <span class="kw">with</span> plan_stream_ctx:
+        verify_forward_batch, can_run_cuda_graph = <span class="fn">eagle_prepare_for_verify</span>(
+            verify_input, req_to_token_pool, batch, target_worker,
+        )
+
+    <span class="cmt"># Run target verify batch in the main compute stream (GPU compute).</span>
+    forward_batch_output = target_worker.<span class="fn">forward_batch_generation</span>(
+        batch=<span class="kw">None</span>,
+        forward_batch=verify_forward_batch,
+        is_verify=<span class="kw">True</span>,
+    )
+
+    <span class="cmt"># grammar 约束在树结构上生成词表掩码，再一起采样</span>
+    grammar_mask = <span class="kw">None</span>
+    <span class="kw">if</span> batch.has_grammar:
+        grammar_mask = <span class="fn">build_grammar_vocab_mask</span>(reqs=batch.reqs, tree=grammar_tree, ...)
+
+    (predict, accept_lens, accept_index) = <span class="fn">eagle_sample</span>(
+        verify_input, batch, logits_output, grammar_mask, ...)</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">accept_lens</code> 是每个请求实际接受的 token 数，后续 <code class="inline">new_seq_lens = batch.seq_lens + accept_lens</code> 直接以它为准；未接受位置的 KV 会被回收（调用 <code class="inline">clear_unaccepted_c128_draft_states</code>，定义在 <code class="inline">deepseek_v4_memory_pool.py</code>，由 <code class="inline">eagle_worker_common.py</code> 用 <code class="inline">getattr</code> 探测式调用——所以是 DSV4 专用的一条路径，别的模型不会碰它）。验证批的 ForwardMode 在 <code class="inline">eagle_prepare_for_verify</code> 里被置为 <code class="inline">ForwardMode.TARGET_VERIFY</code>（<code class="inline">eagle_utils.py:585</code>），idle batch 则保持 IDLE。</div>
+
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      <code class="inline">run_eagle_verify</code> 的 docstring 写明：单层 EAGLE 的验证体是「事实来源（超集）」，多层 EAGLE 的历史行为差异靠两个开关（<code class="inline">metadata_ready_pre_pad</code> / <code class="inline">finalize_tree_path</code>）逐字保留。这是典型的收敛过程——先各自实现，后合并函数、用开关保住旧路径的数值行为。读这类代码时，开关本身就是在讲「哪些行为曾被观测到不同」。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.5</span>与 overlap 调度的配合（spec v2）</h2>
+    <p>第 2 章讲过 overlap 调度：CPU 在 GPU 算上一批时准备下一批，中间靠 <code class="inline">future_map</code> 把「尚未算完的 token」占位。投机解码把一步拆成 draft/verify/draft_extend 三段，fence 的位置就得重新设计——这就是 spec v2。调度器把 <code class="inline">on_publish</code> 回调交给 worker，由 worker 决定在哪个时点宣布「这批的长度已定」：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — run_batch 的 spec 分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Spec_v2 fires on_publish mid-worker (between verify and draft_extend) so
+# schedule prep can overlap with draft_extend. Non-spec has no later work.</span>
+fwd_kwargs = {}
+<span class="kw">if</span> <span class="kw">not</span> batch.spec_algorithm.is_none():
+    fwd_kwargs[<span class="st">"on_publish"</span>] = partial(self.future_map.publish, future_indices)
+    <span class="kw">if</span> batch.spec_algorithm.supports_grammar_overlap():
+        fwd_kwargs[<span class="st">"grammar_barrier"</span>] = self._advance_pending_grammar
+
+batch_result = self.model_worker.<span class="fn">forward_batch_generation</span>(batch, **fwd_kwargs)
+<span class="kw">if</span> batch.spec_algorithm.is_none():
+    <span class="cmt"># 非投机：worker 返回后再 publish</span>
+    self.future_map.<span class="fn">publish</span>(future_indices, batch.seq_lens + <span class="nu">1</span>)</pre>
+    <div class="annotation"><b>读懂这段：</b> 对比两种时序：非投机在 worker 返回后由调度器 publish（此时 GPU 侧已全部结束）；投机则在 verify 与 draft_extend 之间由 worker 主动 publish——schedule stream 上的下一批准备得以与 draft_extend 重叠。<code class="inline">grammar_barrier</code> 同理：让 grammar FSM 的推进也塞进这段空隙。</div>
+
+    <p>两个专用 ForwardMode 在 <code class="inline">forward_batch_info.py</code> 里紧挨着普通模式定义：</p>
+    <div class="code-title">python/sglang/srt/model_executor/forward_batch_info.py — ForwardMode 中的投机项（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ForwardMode</span>(<span class="cl">IntEnum</span>):
+    ...
+    <span class="cmt"># Used in speculative decoding: verify a batch in the target model.</span>
+    TARGET_VERIFY = <span class="fn">auto</span>()
+    <span class="cmt"># Used in speculative decoding: extend a batch in the draft model.</span>
+    DRAFT_EXTEND_V2 = <span class="fn">auto</span>()
+
+    <span class="kw">def</span> <span class="fn">is_draft_extend_v2</span>(self):
+        <span class="cmt"># For fixed shape logits output in eagle v2 worker</span>
+        <span class="kw">return</span> self == <span class="cl">ForwardMode</span>.DRAFT_EXTEND_V2</pre>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">TARGET_VERIFY</code> 被归入 <code class="inline">is_extend()</code>（验证批的注意力形态与 prefill 同类：一次算多个位置），但它不进 prefill 调度，而是由 spec worker 在 decode 迭代内部构造。DRAFT_EXTEND_V2 的注释点出它的存在理由：给 EAGLE v2 worker 一个固定形状的 logits 输出，方便图捕获。</div>
+
+    <p>CUDA Graph 的约束也随之而来：草稿侧有自己的图 runner（<code class="inline">eagle_draft_cuda_graph_runner.py</code> / <code class="inline">eagle_draft_extend_cuda_graph_runner.py</code>），目标侧的验证批要按「bs × num_draft_tokens」的加宽形状捕获——这就是配置项 <code class="inline">--speculative-num-draft-tokens</code> 必须在启动时定死的原因之一。验证路径里也能看到对图边界的处理：<code class="inline">update_verify_buffers_to_fill_after_draft</code> 在草稿结束后回填 custom_mask/position 这类依赖草稿输出的元数据（<code class="inline">eagle_worker_common.py:531</code>）。</p>
+    <div class="callout warn">
+      <b class="tag">困惑点</b>
+      草稿 KV 存在哪？答案是<strong>和目标模型共用同一套 req_to_token_pool 与 token_to_kv_pool_allocator</strong>——<code class="inline">EagleDraftWorker.alloc_memory_pool</code>（~211 行）接收的就是调度器传进来的同一对池子，只是草稿模型层数少、每层张量小。所以第 4 章讲的 PrefillAdder 预算公式里 <code class="inline">max_new + page_size</code> 的预留，在开投机后实际上还要覆盖草稿树的槽位（<code class="inline">speculative_num_draft_tokens</code> 是显式参与预算的）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.6</span>MTP 与 NGRAM 简述</h2>
+    <p><strong>MTP</strong>：模型厂商随权重发布一个额外的预测头（DeepSeek-V3 的 MTP 层、Qwen 的 multi-token head）。它不是独立的第二个模型，而是目标模型的一个附加模块——草稿权重路径直接指向这些头。命令行上 DeepSeek 的惯用写法是 <code class="inline">--speculative-algorithm NEXTN</code>（代码里是 EAGLE 的保留别名），新一点的路径是 <code class="inline">FROZEN_KV_MTP</code>（验证时冻结目标 KV 的专用 worker，<code class="inline">frozen_kv_mtp_worker_v2.py</code>）。MTP 头与目标模型同源训练，接受率通常高于外挂小模型，代价是每层多一次头的前向。</p>
+    <p><strong>NGRAM</strong>：连草稿模型都不要。从当前提示与已生成序列里建 n-gram 索引，decode 时查「上一个 token 之后历史上跟过什么」，把命中的片段展开成草稿树。零额外显存权重、零额外前向，适合输出高度可预期的负载——agentic 场景里反复出现的工具调用格式、代码编辑里的重复结构。代价明显：CUDA-only、不支持 dp-attention、禁 overlap 调度器与 mixed chunked prefill（与 DFLASH 同样的限制，见 13.3 节表格）。</p>
+    <p>两个极端放在一起看很清楚：<strong>草稿器的质量（接受长度）与它的开销（额外前向/显存/实现限制）是同一根轴的两端</strong>。EAGLE 系列在这根轴的中间，所以成了默认推荐。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.7</span>对「自研引擎」的启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      投机解码不是采样器上的补丁，它会穿过你的引擎三层：调度器（验证批要按 num_draft_tokens 预留 KV 与图形状）、ForwardMode（TARGET_VERIFY / DRAFT_EXTEND）、采样（拒绝采样替换普通 argmax 路径）。SGLang 的切入方式值得照抄：<strong>① 新增 TARGET_VERIFY 模式，让验证批 ride 在既有 extend 机制上；② spec worker 实现与 TpModelWorker 相同的 forward_batch_generation(batch, on_publish) 接口，调度器零改动；③ 先测接受长度，再谈参数调优——平均接受长度不到 1.5 的负载上，投机解码大概率是负收益</strong>。另外留意 zero-step 分支（<code class="inline">speculative_num_steps == 0</code>，eagle_worker_v2.py:1333）：高并发时引擎会主动停掉草稿、只做验证，让草稿 KV 保持温热——这是「投机可动态开关」的实现雏形。本系列到这一章就走完了，<a href="index.html">返回索引</a>可按路径重读。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a class="dim" href="index.html">返回索引（全系列完）</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出SGLang · 13 投机解码 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

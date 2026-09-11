@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · 双引擎对照·自研 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 13 双引擎对照·自研</div>
+    <h1>两条路线，一张表，六个里程碑</h1>
+    <div class="subtitle">前 12 章的对照散落在各章末尾。这一章把它们收拢成一张总表，然后回答一个实操问题：如果从零写一个 on-device 引擎，里程碑怎么排？答案从两个引擎的「第一性差异」里来——它们对「模型是什么形状」的回答不同，之后每个子系统都分道扬镳。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">13.1</span>第一性差异：一张表看完全书</h2>
+    <p>按子系统对照。每一行都指向前面章节的展开处：</p>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>子系统</th><th>llama.cpp</th><th>FreeToken</th><th>详见</th></tr></thead>
+        <tbody>
+          <tr><td>权重格式</td><td>GGUF：单文件 + mmap 直读，量化在文件里定死</td><td>FTW / HF safetensors：4096 对齐分片，O_DIRECT 读入 pinned bank</td><td><a href="02-gguf-loading.html">2</a> / <a href="11-moe-offload.html">11.6</a></td></tr>
+          <tr><td>放置策略</td><td>n_gpu_layers 静态切层；--cpu-moe 把专家层固定在 CPU</td><td>槽池动态缓存；专家逐 (层,专家) 换入换出</td><td><a href="02-gguf-loading.html">2</a> / <a href="06-multi-device.html">6</a> / <a href="11-moe-offload.html">11</a></td></tr>
+          <tr><td>decode 主循环</td><td>llama_context 状态机 + ubatch 循环</td><td>overlap_loop 双流重叠 + chunked prefill</td><td><a href="03-decode-loop.html">3</a> / <a href="10-freetoken.html">10</a></td></tr>
+          <tr><td>批处理</td><td>n_batch 逻辑 / n_ubatch 物理，一请求一 slot</td><td>DecodeManager 组批，max_running_req=4，CUDA Graph bs 档位</td><td><a href="03-decode-loop.html">3</a> / <a href="05-graph-sched.html">5</a></td></tr>
+          <tr><td>KV cache</td><td>cells 槽位制 + bitset 多序列共享；iswa 双缓存</td><td>radix 树页池 + GDN 状态槽 + SWA 窗口池（三类资源）</td><td><a href="04-kv-cache.html">4</a></td></tr>
+          <tr><td>执行图</td><td>每步重建或复用 C 图（can_reuse），sched 切分多设备</td><td>预录 CUDA Graph 按 bs 档位重放（消除 launch）</td><td><a href="05-graph-sched.html">5</a></td></tr>
+          <tr><td>采样</td><td>责任链逐 sampler 组合，grammar 可插</td><td>批量 sample（flashinfer/triton），greedy 短路</td><td><a href="07-sampling.html">7</a></td></tr>
+          <tr><td>投机解码</td><td>11 种草稿-验证实现，词表兼容检查</td><td>无（MTP 字段有、消费无；与静态图形状冲突）</td><td><a href="08-speculative.html">8</a></td></tr>
+          <tr><td>服务层</td><td>单进程 llama-server，slot 状态机 + LCP 选槽</td><td>ZMQ 多进程（默认三进程）：父进程 FastAPI + scheduler/tokenizer 子进程；三协议路由</td><td><a href="09-server.html">9</a> / <a href="10-freetoken.html">10</a></td></tr>
+          <tr><td>前缀复用</td><td>slot 内 KV 复用 + prompt cache（会话边界内）</td><td>radix 树跨请求复用 + GDN 快照 + toolcall anchor</td><td><a href="09-server.html">9</a> / <a href="10-freetoken.html">10</a></td></tr>
+          <tr><td>MoE 策略</td><td>--cpu-moe 静态放 CPU，计算过去</td><td>offload（PCIe 搬）/ hybrid（搬+算）动态分流</td><td><a href="11-moe-offload.html">11</a> / <a href="12-hybrid-exec.html">12</a></td></tr>
+          <tr><td>GPU-CPU 协同</td><td>sched 切图接力，无协议</td><td>memop 门铃 + 物理核 pin + watchdog</td><td><a href="12-hybrid-exec.html">12</a></td></tr>
+          <tr><td>多设备</td><td>切层（layer/tensor split）+ pipeline</td><td>单卡押注；多卡 TP + 内存不平衡硬错</td><td><a href="06-multi-device.html">6</a></td></tr>
+          <tr><td>配置哲学</td><td>几百个 flag，全可调，默认保守</td><td>auto 自动决策：测硬件、算预算、选后端</td><td><a href="09-server.html">9</a> / <a href="11-moe-offload.html">11.6</a> / <a href="12-hybrid-exec.html">12.2</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="annotation"><b>读懂这张表：</b> 纵向看，llama.cpp 的每一行都是「通用机制 + 静态配置」，FreeToken 的每一行都是「专用机制 + 动态测量」。这不是能力差距，是目标函数不同：llama.cpp 的目标函数是<strong>覆盖面</strong>（任何硬件、任何模型都能跑），FreeToken 的目标函数是<strong>单点延迟</strong>（一台消费卡上 DeepSeek-V4 级 MoE 的 tok/s）。写自己的引擎前，先把目标函数写下来——它决定后面每一行的选择。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.2</span>绕不开的取舍：从源码里看到的三条工程定律</h2>
+    <p>两个引擎的源码反复验证了三件事。它们不是教条，是踩过坑之后的形状：</p>
+    <ul>
+      <li><strong>复用别人的组件，就要接受它的约束。</strong>FreeToken 借 vLLM 的 marlin 内核，就必须接受 moe_align_block_size 的 992 槽上限写进自己的配置校验（<a href="11-moe-offload.html">11.3</a>）；llama.cpp 的 GGUF 量化格式一旦发布就被几百个客户端依赖，废弃都要留兼容路径。<strong>依赖的约束会一路传到你的配置校验里，引入前先想清楚。</strong></li>
+      <li><strong>优化必须可观测，降级必须喊出来。</strong>hit-D2D 不可用时在日志喊一次并退回整层拷贝（<a href="11-moe-offload.html">11.5</a>）；memop 探测失败退回 host-func 时也明说（<a href="12-hybrid-exec.html">12.4</a>）。反例是 cudaMemcpyBatchAsync 混小块静默退化——那正是 FreeToken 造 256KB 门槛的原因。静默降级 = 用户以为开了优化、实际没有、数字对不上还查不出。</li>
+      <li><strong>测不准的就不要算，测。</strong>hybrid 的 q* 比例、offload/hybrid 的选择、显存预算——全部来自 benchbw 对这台机器的实测（<a href="12-hybrid-exec.html">12.2</a>），而不是理论推导。FreeToken 注释里的原话是：standalone 带宽「cannot predict this split」。</li>
+    </ul>
+    <p>还有一条反面教材值得单独记：自旋等待内核让 GPU 利用率假性 99%，笔记本功耗调度据此压 CPU 频率，decode 反而变慢（<a href="12-hybrid-exec.html">12.4</a>）。<strong>指标会变成目标</strong>——你让哪个数字好看，系统就会往那个方向扭曲。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.3</span>自研路线：六个里程碑</h2>
+    <p>把两个引擎从零到可用的建设顺序抽象成里程碑。每个里程碑结束时都有一个能跑的东西——不能跑的里程碑是骗局：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t13 d13">
+        <title id="t13">自研引擎六里程碑</title>
+        <desc id="d13">M1 单请求前向 → M2 KV+多轮 → M3 批处理服务 → M4 放不下模型 → M5 带宽协同 → M6 生产化</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="30" y="20" width="880" height="72" rx="8"></rect>
+        <text class="lbl" x="50" y="46" font-weight="bold">M1 · 一条请求跑通：加载 → prefill → 采样 → 文本出来</text>
+        <text class="lbl sm" x="50" y="66">安全网优先：llama.cpp 的 GGUF/mmap、FreeToken 的 O_DIRECT+pin。验收：固定 seed 下与 PyTorch 参考对齐</text>
+        <line class="edge" x1="470" y1="92" x2="470" y2="104"></line>
+
+        <rect class="node" x="30" y="106" width="880" height="72" rx="8"></rect>
+        <text class="lbl" x="50" y="132" font-weight="bold">M2 · KV cache 与多轮对话：find_slot、前缀复用、位置管理</text>
+        <text class="lbl sm" x="50" y="152">cells/mask 的记账与数据分离（llama.cpp）或页池+树（FreeToken）。shift/截断要在这里想清楚</text>
+        <line class="edge" x1="470" y1="178" x2="470" y2="190"></line>
+
+        <rect class="node" x="30" y="192" width="880" height="72" rx="8"></rect>
+        <text class="lbl" x="50" y="218" font-weight="bold">M3 · 批与服务化：slot/组批、HTTP、流式、并发请求</text>
+        <text class="lbl sm" x="50" y="238">llama.cpp 的 slot 状态机或 FreeToken 的 ZMQ 多进程。Python 选后者（GIL），C/C++ 选前者。验收：并发流式不串台、abort 即刻生效</text>
+        <line class="edge" x1="470" y1="264" x2="470" y2="276"></line>
+
+        <rect class="node warn" x="30" y="278" width="880" height="92" rx="8"></rect>
+        <text class="lbl" x="50" y="304" font-weight="bold">M4 · 放不下的模型：这里两条路线分岔</text>
+        <text class="lbl sm" x="50" y="324">稠密 → 量化 + 静态切层 + CPU 兜底（llama.cpp 路线）；MoE → host bank + 槽池 + LRU + prefill 流式（FreeToken 路线）</text>
+        <text class="lbl sm" x="50" y="344">预算算术（cache_budget 式）要在分配前拒绝非法几何——拒绝发生在算术层，而非 CUDA 分配层</text>
+        <line class="edge" x1="470" y1="370" x2="470" y2="382"></line>
+
+        <rect class="node core" x="30" y="384" width="880" height="72" rx="8"></rect>
+        <text class="lbl" x="50" y="410" font-weight="bold">M5 · 压榨带宽：bench → 分流 → 重叠</text>
+        <text class="lbl sm" x="50" y="430">先测（benchbw 式 profile），再分流（q*），再重叠（双流/双缓冲/门铃）。每个优化配 A/B 开关，降级路径有日志</text>
+        <line class="edge" x1="470" y1="456" x2="470" y2="468"></line>
+
+        <rect class="node acc" x="30" y="470" width="880" height="72" rx="8"></rect>
+        <text class="lbl" x="50" y="496" font-weight="bold">M6 · 生产化：图捕获、运行时重调、watchdog、加载进度</text>
+        <text class="lbl sm" x="50" y="516">CUDA Graph 档位与投机解码的互斥、两段式 rebuild 拒绝、watchdog 把卡死变成响错。验收：72 小时无人值守不掉链子</text>
+      </svg>
+      <div class="fig-cap">图 13.1：六个里程碑。M4 是分水岭——目标函数在这里定型，之后两个引擎再无交集。M5 的顺序（测→分→叠）不能反：没测过分流就是瞎猜，没分流的重叠是白叠。</div>
+    </div>
+    <p>每个里程碑与两个引擎源码的对应关系：</p>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>里程碑</th><th>去 llama.cpp 看什么</th><th>去 FreeToken 看什么</th></tr></thead>
+        <tbody>
+          <tr><td>M1 加载与前向</td><td>GGUF 头解析、mmap、量化 dequant（ggml/src/ggml-quants.c）</td><td>FTW 索引、O_DIRECT 读、pin-after-fill（checkpoint/ftw.py、moe/host_banks.py）</td></tr>
+          <tr><td>M2 KV</td><td>llama_kv_cells、find_slot、K-shift 图（src/llama-kv-cache*.cpp）</td><td>radix/hybrid 缓存、三类资源准入（kvcache/、scheduler/prefill.py）</td></tr>
+          <tr><td>M3 服务</td><td>slot 状态机、LCP 选槽、prompt cache（tools/server/）</td><td>overlap_loop、ZMQ 进程模型、supervisor（scheduler/、server/）</td></tr>
+          <tr><td>M4 放不下</td><td>n_gpu_layers 切层、--cpu-moe override（common/arg.cpp）</td><td>OffloadMoeCache 全部（moe/offload_cache.py，1077 行）</td></tr>
+          <tr><td>M5 带宽</td><td>（无对应物——通用路线到此为止）</td><td>benchbw、q* 分流、memop 门铃、GPU prequant</td></tr>
+          <tr><td>M6 生产化</td><td>图复用、iswa、投机检查点（src/、tools/server/）</td><td>GraphRunner、rebuild_runtime_cache、watchdog（engine/）</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.4</span>最后的话：读源码时带着的问题</h2>
+    <p>本书全部结论来自对两个仓库的逐行阅读。回看这 13 章，真正值得带走的不是任何具体机制，是每次拆机制时的那几个问题：</p>
+    <ul>
+      <li><strong>「这个设计在防什么事故？」</strong>——wait_stream 排序防的是 table_idx 复用覆盖；begin_prefill fence 防的是 decode 与 prefill 撞字节；watchdog 三重确认防的是误杀。读懂防的事故，才算读懂设计。</li>
+      <li><strong>「它为什么不做得更简单？」</strong>——llama.cpp 不做投机与 MoE 缓存组合、FreeToken 不做通用后端，都是主动放弃。看懂「不做什么」比看懂「做什么」更难，也更接近设计的本质。</li>
+      <li><strong>「这个数字凭什么是这个值？」</strong>——256KB 是驱动 bug 实测、992 是借用内核的约束、2× 是 bench 的判定阈值、12.85→15.65 是一条注释里的 A/B。<strong>每个数字都有出处，找不到出处的数字就是债。</strong></li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">版本锚点</b>
+      本书所有引用对应 llama.cpp <strong>b10901-1</strong>（HEAD df03399b8，2026-09-10）与 FreeToken <strong>nightly-5-g46d2743</strong>（HEAD 46d27439a）。两个仓库都在活跃演进——行号会漂移、函数会改名，但设计动机藏在注释里，比代码活得久。读不动的时候，读注释。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="12-hybrid-exec.html">← CPU/GPU 带宽协同</a>
+    <a href="index.html">返回索引</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 13 双引擎对照·自研 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · FreeToken 引擎总览 — 深入浅出On-Device推理</title>
+<link rel="stylesheet" href="assets/on-device-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-gguf-loading.html">GGUF与加载</a>
+      <a href="03-decode-loop.html">decode循环</a>
+      <a href="04-kv-cache.html">KV cache</a>
+      <a href="05-graph-sched.html">图与调度</a>
+      <a href="06-multi-device.html">多设备</a>
+      <a href="07-sampling.html">采样</a>
+      <a href="08-speculative.html">投机解码</a>
+      <a href="09-server.html">服务入口</a>
+      <a href="10-freetoken.html">FreeToken</a>
+      <a href="11-moe-offload.html">MoE缓存</a>
+      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a href="13-build-own-engine.html">双引擎对照·自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 FreeToken 引擎总览</div>
+    <h1>FreeToken：为消费级 GPU 重写的引擎</h1>
+    <div class="subtitle">llama.cpp 追求「什么硬件都能跑」；FreeToken 押注一个假设——消费级单卡 + CPU 内存大 + 模型是 MoE。三件事叠起来，才有了第 11/12 章的 offload 与协同设计。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>定位与约束</h2>
+    <p>FreeToken 目标场景：DeepSeek-V4-Flash 级别的 MoE（256 专家、43 层、约 290B 参数，仓库 README 自称 "290B+ frontier"）在 8-24GB 消费卡上跑。它不做的事很说明问题：GGUF 支持极窄（只有一条 <code class="inline">gemma4 → Gemma4GGUFForCausalLM</code> 的注册路径，读原生 Q4_0/Q6_K；主流路径是自研 FTW + HF safetensors）、没有 CPU fallback 前向（除 routed experts 外全部算子要求 GPU）、没有通用模型架构支持（模型注册表按架构枚举）。换来的是：针对 MoE decode 的极致优化。引擎并发上限默认 4：</p>
+    <div class="code-title">python/freetoken/engine/config.py:24 — 并发上限（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EngineConfig</span>:
+    max_running_req: <span class="cl">int</span> = <span class="nu">4</span></pre>
+    <div class="annotation"><b>读懂这段：</b> max_running_req=4 不是偷懒，是与 CUDA Graph 档位（[1,2,4]+range(8,160,8)，第 5 章）对齐——batch ≤4 是端侧常态，4 之上走 padding。所有设计都围绕「小 batch、低延迟」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>进程模型：ZMQ 多进程</h2>
+    <p>第 9 章看过 api_server.py 的五组路由，这里补全进程拓扑。FreeToken 不是单进程：父进程跑 FastAPI/uvicorn 且不碰模型，请求经 ZMQ 队列转发给后端 worker。默认配置（<code class="inline">num_tokenizer=0</code>、TP=1）下后端恰好是 3 个进程——1 个 scheduler（内含 <code class="inline">Engine</code> 实例）、1 个 tokenizer、1 个 detokenizer（后两者共用同一进程）；<code class="inline">--num-tokenizer N</code> 或 TP&gt;1 时按 world_size 线性增多：</p>
+    <div class="code-title">python/freetoken/utils/mp.py — ZMQ 队列（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ZmqAsyncPushQueue</span>(<span class="cl">Generic</span>[T]):   <span class="cmt"># HTTP → scheduler 方向</span>
+    ...
+
+<span class="kw">class</span> <span class="cl">ZmqAsyncPullQueue</span>(<span class="cl">Generic</span>[T]):   <span class="cmt"># scheduler → HTTP 方向</span>
+    ...</pre>
+    <p>supervisor.py 管启动握手：</p>
+    <div class="code-title">python/freetoken/server/supervisor.py — 启动握手（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt">"""Backend startup/liveness supervision, decoupled from run_api_server so it is unit
+testable without spawning real processes.
+
+The scheduler/tokenizer worker processes are spawned by launch.start_subprocess, which
+hands back a BackendHandle. ``drain_ready`` blocks until every worker has acked ready
+(applying interleaved ("progress", desc, done, total) messages to a LoadProgress),
+after which the caller flips the maintenance gate to "serving". Task 3 adds liveness
+watching on top of this."""</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 为什么拆进程？GIL。Python 里 HTTP 解析、JSON 序列化、流式 token 后处理都是 CPU 工作，与引擎主循环抢同一个 GIL。拆进程后 HTTP 进程的解析开销与引擎进程的调度开销并行；ZMQ 队列天然削峰。supervisor 的 drain_ready 等每个 worker ack（附带加载进度），把「加载到 99% 卡住」的观感问题也解决了——专家库加载阶段单独上报（phase_slug 里 expert bars 优先于 weight 匹配，加载进度 UI 不再停在最后一格）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>调度主循环：overlap_loop</h2>
+    <p>FreeToken 调度的核心是双流重叠（python/freetoken/scheduler/scheduler.py:197-250）：</p>
+    <div class="code-title">python/freetoken/scheduler/scheduler.py — overlap_loop（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">overlap_loop</span>(self, last_data):
+    <span class="cmt">"""The main loop of overlapping scheduling and execution.
+
+    It will overlap the execution of current batch and processing of last batch's
+    results, which can effectively hide CPU latency and improve GPU utilization."""</span>
+    <span class="cmt"># 把未处理的 batch 暴露给 abort 检查</span>
+    self._last_data = last_data
+    blocking = <span class="kw">not</span> (last_data <span class="kw">is not</span> <span class="kw">None</span>  <span class="cmt"># 有 batch 待处理就不阻塞收消息</span>
+        <span class="kw">or</span> self.prefill_manager.runnable
+        <span class="kw">or</span> self.decode_manager.runnable
+        <span class="kw">or</span> self._pending_rebuild <span class="kw">is not</span> <span class="kw">None</span>)
+    <span class="kw">for</span> msg <span class="kw">in</span> self.<span class="fn">receive_msg</span>(blocking=blocking):
+        self.<span class="fn">_process_one_msg</span>(msg)
+
+    <span class="cmt"># 调度器完全空闲时才执行排队的 cache rebuild（安全点）</span>
+    <span class="kw">if</span> self._pending_rebuild <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> last_data <span class="kw">is</span> <span class="kw">None</span> <span class="kw">and</span> <span class="kw">not</span> (...):
+        self.<span class="fn">_execute_pending_rebuild</span>()
+
+    <span class="cmt"># 关键：本迭代的 H2D token 拷贝要排在上一批采样写入之后 ——</span>
+    <span class="cmt"># 否则复用刚释放的 table_idx 的新请求，其 prompt 会被上一任</span>
+    <span class="cmt"># 占用者的未决输出写覆盖（丢图像占位符等）</span>
+    self.stream.<span class="fn">wait_stream</span>(self.engine.stream)
+    forward_input = self.<span class="fn">_schedule_next_batch</span>()
+    ongoing_data = <span class="kw">None</span>
+    <span class="kw">if</span> forward_input <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        <span class="kw">with</span> self.engine_stream_ctx:   <span class="cmt"># 批次跑在 engine 流上</span>
+            self.engine.stream.<span class="fn">wait_stream</span>(self.stream)
+            <span class="cmt"># 前缀命中时在 engine 流上做 GDN 快照 COW 恢复</span>
+            self.<span class="fn">_restore_linear_states</span>(forward_input.batch)
+            ongoing_data = (forward_input, self.<span class="fn">_forward</span>(forward_input))
+
+    <span class="cmt"># drain：上一批的结果处理（页表重指向、哨兵 scatter）</span>
+    <span class="cmt"># 会写本批还在读的状态，必须显式排序</span>
+    self.stream.<span class="fn">wait_stream</span>(self.engine.stream)
+    self.<span class="fn">_process_last_data</span>(last_data)
+    self.<span class="fn">_flush_abort_acks</span>()
+    <span class="kw">return</span> ongoing_data</pre>
+    <div class="annotation"><b>读懂这段：</b> 每个迭代做三件事：① 收消息（新请求/abort），有 batch 在飞就不阻塞；② 排下一批（H2D 拷贝、建 batch）；③ 交引擎前向 + 处理上一批结果。三处 <code class="inline">wait_stream</code> 是精髓：调度流与引擎流各自异步推进，在「读对方刚写的数据」处显式插栅栏——先是调度流等引擎流（本批 H2D 必须排在上一批采样写入之后），再是引擎流等调度流（前向必须等 batch 建好），最后调度流再等引擎流一次（drain 会写本批还在读的状态）。注释里那句「corrupting tokens (e.g. dropping an image placeholder)」是真实事故——table_idx 复用 + 流间无序 → 上一批的输出写覆盖新批的 prompt 拷贝。<strong>双流重叠的复杂度不在「并行」而在「排序」</strong>：谁等谁、等哪一段，每处都要写明白。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>chunked prefill 与请求生命周期</h2>
+    <p>长 prompt 不阻塞 decode：PrefillManager 把超过预算的 prompt 切块，逐轮消化（python/freetoken/scheduler/prefill.py:134-175）：</p>
+    <div class="code-title">python/freetoken/scheduler/prefill.py — chunk 切分（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>chunk_size = min(self.token_budget, remain_len)
+<span class="kw">if</span> self.cache_manager.swa_paged:
+    <span class="cmt"># SWA 页池能撑多少就切多少：swa 按 token 计费分配，</span>
+    <span class="cmt"># token_budget（max_extend_tokens，默认 8192）不会切短 prompt，</span>
+    <span class="cmt"># 所以由这个上限强制切块</span>
+    cm = self.cache_manager
+    window, ps = cm.sliding_window_size, cm.page_size
+    floor = cache_handle.cached_len
+    ...
+<span class="kw">if</span> <span class="nu">0</span> &lt; chunk_size &lt; remain_len:
+    <span class="cmt"># 续块要在页边界对齐（压缩器 carry 在块边界恢复）</span>
+    aligned = align_down(cached_len + chunk_size, ps) - cached_len
+    ...
+    chunk_size = aligned</pre>
+    <p>准入控制集中在 PrefillAdder._try_allocate_one（prefill.py:58-99），依次检查三类资源：</p>
+    <div class="code-title">python/freetoken/scheduler/prefill.py — 三重准入（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 第一类：KV 页池。预留量按页粒度算（CacheManager 分配以整页为单位）：</span>
+<span class="cmt"># 新增整页数 × page_size，而不是裸 token 数</span>
+estimated_size = self.<span class="fn">_kv_reservation_size</span>(req.input_len + req.output_len, cached_len)
+<span class="kw">if</span> estimated_size + self.reserved_size &gt; self.cache_manager.available_size:
+    <span class="kw">return</span> <span class="kw">None</span>
+...
+<span class="cmt"># 第二类（hybrid GDN）：1 个 live + 2 个 ping-pong 状态槽；不够就逐出树快照</span>
+<span class="kw">if</span> self.cache_manager.is_hybrid:
+    pool = self.cache_manager.linear_state_pool
+    <span class="kw">if</span> pool.num_free_slots &lt; <span class="nu">3</span>:
+        self.cache_manager.<span class="fn">ensure_mamba_slots</span>(<span class="nu">3</span>)
+    <span class="kw">if</span> pool.num_free_slots &lt; <span class="nu">3</span>:
+        <span class="kw">return</span> self.cache_manager.unlock(handle)
+
+<span class="cmt"># 第三类（SWA）：拒绝准入除非 swa 页池能容下本请求的首块</span>
+<span class="kw">if</span> self.cache_manager.swa_paged:
+    need_swa = div_ceil(...) * ps
+    <span class="kw">if</span> self.cache_manager.swa_available_size - self.reserved_swa &lt; need_swa:
+        <span class="kw">return</span> self.cache_manager.unlock(handle)</pre>
+    <div class="annotation"><b>读懂这段：</b> hybrid 模型的 KV 管理有三类资源：普通 KV 页、GDN 线性状态槽（1 live + 2 ping-pong）、SWA 窗口页。每种都有独立池、独立淘汰逻辑（radix 树各自记账），准入时都要单独检查。reserved_size = decode_manager.inflight_tokens——decode 中请求的增长余量（每请求预留 1 页，第 3 章见过）也被计入，防止「prefill 抢光、decode 涨不动」。</div>
+    <div class="callout info">
+      <b class="tag">一段代码的进化痕迹</b>
+      早期版本这里算的是 <code class="inline">estimated_len = extend_len + output_len</code>（裸 token 数）。但 CacheManager 给每个请求分配 KV 时是<strong>按整页</strong>来的——两个各占 0.6 页的短请求按 token 记账能挤进同一页的余量，真分配时却各自要一整页，准入就超卖了。后来补了 <code class="inline">_kv_reservation_size</code>：预留量改成「新增整页数 × page_size」，与分配口径对齐（#367）。<strong>准入按什么记账，分配就必须按什么记账</strong>——这个故事值得每个写调度器的人记住。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>toolcall anchor：调度层的状态检查点</h2>
+    <p>FreeToken 有一个 llama.cpp 没有的机制：<strong>toolcall anchor</strong>。它默认关闭，需 <code class="inline">--enable-special-token-ckpt</code> 启用（且只在 hybrid / SWA 缓存下生效）。动机：agent 场景下模型输出 tool call，客户端执行后把结果 + 重写的 tool call 回传续跑。重写后的文本与原输出在 opener 之后必然分叉——若能记住「opener 出现时」的状态，续跑就能从那里恢复而不是全部重算。先看 anchor id 的确定（utils/hf.py:82-96）：</p>
+    <div class="code-title">python/freetoken/utils/hf.py — anchor id 提取（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">load_toolcall_anchor_id</span>(tokenizer, opener) -&gt; int | <span class="kw">None</span>:
+    <span class="cmt">"""The single token id of ``opener`` -- the wire format's unique tool-call opening
+    marker, declared by the model's detector (``BaseFormatDetector.toolcall_opener``).
+    None when there is no opener or the tokenizer spells it with more than one token:
+    the scheduler's special-token checkpoint matches sampled ids one at a time, so only
+    a one-token opener can anchor."""</span>
+    ...
+    ids = tokenizer.<span class="fn">encode</span>(opener, add_special_tokens=<span class="kw">False</span>)
+    <span class="kw">return</span> int(ids[<span class="nu">0</span>]) <span class="kw">if</span> len(ids) == <span class="nu">1</span> <span class="kw">else</span> <span class="kw">None</span></pre>
+    <p>调度层逐 token 检测（scheduler.py:357-362）：</p>
+    <div class="code-title">python/freetoken/scheduler/scheduler.py — anchor 检测（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> (next_token == self.toolcall_anchor_id
+        <span class="kw">and</span> req.toolcall_anchor_len <span class="kw">is</span> <span class="kw">None</span>
+        <span class="kw">and</span> <span class="kw">not</span> finished):
+    req.toolcall_anchor_len = req.input_ids.numel()</pre>
+    <p>检测到后，在合适时机把 GDN 状态冻结进 ping-pong 槽（scheduler/cache.py:151-176）：</p>
+    <div class="code-title">python/freetoken/scheduler/cache.py — snapshot_toolcall_anchor（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">snapshot_toolcall_anchor</span>(self, reqs) -&gt; <span class="kw">None</span>:
+    <span class="cmt">"""Freeze each decoding request's GDN state at its tool-call anchor, into the
+    ping-pong slot that is idle during decode ... Must run on the engine stream
+    before the current step's kernels: cached_len equals the anchor exactly when
+    every enqueued step up to the anchor-consuming one has been issued ..."""</span>
+    <span class="kw">if not</span> self.is_hybrid:
+        <span class="kw">return</span>
+    <span class="kw">for</span> r <span class="kw">in</span> reqs:
+        a = r.toolcall_anchor_len
+        <span class="kw">if</span> (a <span class="kw">is</span> <span class="kw">None</span>
+            <span class="kw">or</span> r.mamba_ping_pong <span class="kw">is</span> <span class="kw">None</span>
+            <span class="kw">or</span> r.mamba_last_track_seqlen <span class="kw">is not</span> <span class="kw">None</span>
+            <span class="kw">or</span> r.cached_len != a              <span class="cmt"># 恰好走到锚点</span>
+            <span class="kw">or</span> align_down(a, self.page_size) != a):  <span class="cmt"># 锚点必须页对齐</span>
+            <span class="kw">continue</span>
+        dst = r.mamba_ping_pong[r.mamba_next_track_idx]
+        pool.<span class="fn">copy_from</span>(r.linear_slot_idx, dst)   <span class="cmt"># 冻结 live 状态到空闲槽</span>
+        r.mamba_last_track_seqlen = a
+        r.mamba_next_track_idx = <span class="nu">1</span> - r.mamba_next_track_idx  <span class="cmt"># ping-pong 翻转</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 三个精确性来源值得注意：① <strong>单 token opener</strong>——检测是逐采样 id 匹配，opener 编码成多 token 就锚不上（tokenize 时机决定的硬约束）；② <strong>流序精确性</strong>——「cached_len 恰好等于 anchor」意味着到锚点为止的所有 step 已发出、下一个还没发，快照拷贝落在两者之间的流序里；③ <strong>页对齐</strong>——快照要进 radix 树供后续复用，复用边界是页对齐的。SWA 模型还有配套的「锚点窗口保留」（maybe_free_swa_out_of_window 里 cap = anchor - window - gap，保证 [anchor-window, anchor) 可续跑）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.6</span>对照：一个请求的完整生命周期</h2>
+    <p>把各章零件串起来。两个引擎处理同一条请求的路径：</p>
+    <div class="tbl">
+      <table>
+        <thead><tr><th>阶段</th><th>llama.cpp / llama-server</th><th>FreeToken</th></tr></thead>
+        <tbody>
+          <tr><td>HTTP 入口</td><td>单进程 HTTP server + task 队列</td><td>父进程 FastAPI → ZMQ → scheduler 子进程</td></tr>
+          <tr><td>prompt 处理</td><td>slot 选择（LCP→LRU）→ 前缀复用</td><td>radix 树匹配 → chunked prefill</td></tr>
+          <tr><td>decode 调度</td><td>slot 独占 context，逐 slot 采样</td><td>DecodeManager 按 uid 排序组批，共享引擎</td></tr>
+          <tr><td>状态检查点</td><td>投机检查点（spec_ckpt）</td><td>toolcall anchor 快照（GDN ping-pong）</td></tr>
+          <tr><td>输出</td><td>流式 JSON，slot 逐 token 推送</td><td>DetokenizeMsg → HTTP 进程流式回传</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="annotation"><b>读懂这张表：</b> 最大的结构性差异在第二行：llama.cpp 的复用单位是「slot 里现存的 KV」，FreeToken 是「radix 树里的页 + GDN 快照」。llama.cpp 靠 LCP 选槽命中 slot 内的前缀，slot 被抢走就失效——但第 9 章讲过它还有一层 RAM prompt cache 兜底，能把已不在任何 slot 的 prompt 恢复回来，所以并非只能会话内复用；FreeToken 的 radix 树则在引擎生命周期内共享，粒度更细（页级）、命中率更高。agent 场景多轮高频续跑时差距明显。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.7</span>小结</h2>
+    <ul>
+      <li>定位极端：消费级单卡 + MoE + 4 并发，放弃通用性换取每处优化的自由度。</li>
+      <li>多进程 + ZMQ 绕开 GIL；supervisor 握手顺带解决加载进度上报。</li>
+      <li>overlap_loop 双流重叠：调度流与引擎流各走各的，读对方数据处插 wait_stream（三处）。</li>
+      <li>chunked prefill 三类资源准入（KV 页 / GDN 槽 / SWA 页）。</li>
+      <li>toolcall anchor（默认关闭，需 --enable-special-token-ckpt）：单 token opener + 流序精确快照 + 页对齐，agent 续跑免重算。</li>
+    </ul>
+    <p>下一章拆 FreeToken 最重要的部件：MoE 专家缓存。<a href="11-moe-offload.html">第 11 章：MoE 专家缓存</a>。</p>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="09-server.html">← 服务入口</a>
+    <a href="11-moe-offload.html">下一步：MoE 专家缓存 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出On-Device推理 · 10 FreeToken 引擎总览 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>
