@@ -40,7 +40,7 @@
 
   <section class="block">
     <h2><span class="num">6.1</span>总览：VLM 主干 + 动作专家 + 流匹配</h2>
-    <p>SmolVLAPolicy（modeling_smolvla.py:142）是包在 <code class="inline">VLAFlowMatching</code>（modeling_smolvla.py:466）外面的一层皮，后者才是网络本体。源码里自带的架构图说明了全部结构（modeling_smolvla.py:473）：</p>
+    <p><code class="inline">SmolVLAPolicy</code> 是包在 <code class="inline">VLAFlowMatching</code> 外面的一层皮，后者才是网络本体。源码里自带的架构注释说明了全部结构：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:466 — VLAFlowMatching 结构注释（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">VLAFlowMatching</span>(nn.Module):
     <span class="cmt">"""
@@ -132,13 +132,13 @@
       </div>
       <div class="fig-cap">图 6.1：双塔分工——「看懂」交给 VLM 塔（一次前向缓存 KV），「动手」交给小专家塔（每个去噪步只跑它）。这就是 VLA 推理能压到消费级显卡的关键：贵的部分不重复算。</div>
     </div>
-    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>动作专家与 VLM 共享同一 transformer 结构但宽度更窄（smolvlm_with_expert.py:110 <code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>，配置默认 0.75——configuration_smolvla.py:98），层数对齐 VLM 的前 16 层（<code class="inline">num_vlm_layers=16</code>）。专家通过 <strong>cross-attention 读 VLM 的 KV cache</strong>（attention_mode="cross_attn"，k/v proj 重塑成与 VLM 同维度，smolvlm_with_expert.py:122-135）——它继承了 VLM 对图像和语言的理解，自己只学「怎么动」。参数量约 450M，但微调时只训专家一半，显存需求进一步减半。</div>
+    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>动作专家与 VLM 共享同一 transformer 结构但宽度更窄（<code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>，配置默认 0.75），层数对齐 VLM 的前 16 层（<code class="inline">num_vlm_layers=16</code>）。专家通过 <strong>cross-attention 读 VLM 的 KV cache</strong>（<code class="inline">attention_mode="cross_attn"</code>，k/v proj 重塑成与 VLM 同维度）——它继承了 VLM 对图像和语言的理解，自己只学「怎么动」。参数量约 450M，但微调时只训专家一半，显存需求进一步减半。锚点：宽度乘法器 <code class="inline">smolvlm_with_expert.py:110</code> + <code class="inline">configuration_smolvla.py:98</code>；cross-attn 重塑 <code class="inline">smolvlm_with_expert.py:122-135</code>。</div>
     <div class="callout info"><b>KV cache 是什么：</b>transformer 注意力用到的 Key/Value 向量。若每步重算整个前缀序列的 K/V，代价随序列长度平方增长；把它们缓存起来（use_cache=True），后续只需算新 token 的注意力——这里即「VLM 看一遍图像和指令，缓存理解结果；十步去噪每步只跑小专家塔」。不熟悉的话记住结论即可：贵的部分只算一次，便宜的部分反复用。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.2</span>prefix 与 suffix：一次前向，十步去噪</h2>
-    <p><code class="inline">embed_prefix</code>（modeling_smolvla.py:552）把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code>（modeling_smolvla.py:646）把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
+    <p><code class="inline">embed_prefix</code> 把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code> 把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:744 — sample_actions：KV cache 复用（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Prefix 只前向一次，缓存 KV</span>
 prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
@@ -176,7 +176,7 @@ _, past_key_values = self.vlm_with_expert.forward(
 
   <section class="block">
     <h2><span class="num">6.3</span>流匹配：训练一行公式，推理一个欧拉循环</h2>
-    <p>流匹配（Flow Matching）比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向（modeling_smolvla.py:689-724）只有两行核心公式：</p>
+    <p>流匹配（Flow Matching）比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向只有两行核心公式：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:693 — forward：流匹配目标（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> noise <span class="kw">is</span> <span class="kw">None</span>:
     noise = self.sample_noise(actions.shape, actions.device)      <span class="cmt"># x₁：标准正态噪声</span>
@@ -251,7 +251,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
 
   <section class="block">
     <h2><span class="num">6.4</span>训练侧：冻结、缺相机补位、processor 链</h2>
-    <p>SmolVLA 的微调经济学藏在三个配置项（configuration_smolvla.py:69-71）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数）。此外 <code class="inline">prepare_images</code>（modeling_smolvla.py:334）处理「训练时有多相机、部署时缺相机」的不对称：</p>
+    <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:371 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Create image features not present in the batch as fully 0 padded images.</span>
 <span class="kw">for</span> num_empty_cameras <span class="kw">in</span> range(len(missing_img_keys)):

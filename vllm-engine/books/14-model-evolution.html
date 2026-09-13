@@ -41,7 +41,7 @@
 
   <div class="callout info">
     <b class="tag">本章材料从哪来</b>
-    模型侧事实（参数量、训练配方、benchmark）来自各团队的发布材料；引擎侧事实（类名、文件、行号）全部核对自本仓库 vLLM 源码（版本 <code class="inline">v0.28.1rc0-680-gb5d4186300</code>，与前 13 章同一锚点）。本章不复述模型发布稿——那不是 vLLM 这本书该干的事——只回答一个问题：<strong>这些新架构到达引擎时，长成了什么样的代码？</strong>
+    模型侧事实（参数量、训练配方、benchmark）来自各团队的发布材料；引擎侧事实（类名、文件、行号）全部核对自本仓库 vLLM 源码（版本 <code class="inline">v0.29.1rc0-18-gfa1b3b1922</code>，与前 13 章同一锚点）。本章不复述模型发布稿——那不是 vLLM 这本书该干的事——只回答一个问题：<strong>这些新架构到达引擎时，长成了什么样的代码？</strong>
   </div>
 
   <section class="block">
@@ -151,13 +151,13 @@
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_select_dsv4_attn_cls</span>(...):
     <span class="cmt"># 两套稀疏 MLA 后端并存：FlashMLA 与 FlashInfer</span>
     <span class="cmt"># SM120/130 等新卡默认走 FlashInfer 变体</span></pre>
-    <p><code class="inline">DeepseekV4FlashMLAAttention</code>（<code class="inline">nvidia/flashmla.py:51</code>）与 <code class="inline">DeepseekV4FlashInferMLAAttention</code>（<code class="inline">nvidia/flashinfer_sparse.py:195</code>）实现同一个 <code class="inline">DeepseekV4Attention</code> 抽象基类（<code class="inline">attention.py:131</code>）。「同一架构、两个 kernel 供应商」是 V4 时代的新常态，第 7 章讲 kernel 分层时提过这个趋势，V4 把它带进了稀疏注意力。</p>
+    <p><code class="inline">DeepseekV4FlashMLAAttention</code> 与 <code class="inline">DeepseekV4FlashInferMLAAttention</code> 实现同一个 <code class="inline">DeepseekV4Attention</code> 抽象基类。「同一架构、两个 kernel 供应商」是 V4 时代的新常态，第 7 章讲 kernel 分层时提过这个趋势，V4 把它带进了稀疏注意力。锚点：<code class="inline">nvidia/flashmla.py:51</code>、<code class="inline">nvidia/flashinfer_sparse.py:195</code>、基类 <code class="inline">attention.py:131</code>。</p>
     <p>残差流是更大的变化。经典 Transformer 只有一条残差流，V4 用 mHC（multi-head connection）把它拆成多条并行的通道，层间交互用一个小的路由矩阵混合。引擎侧对应的实现：</p>
-    <div class="code-title">vllm/model_executor/kernels/mhc/tilelang.py — mHC 的 TileLang kernel（摘录，行号 274–282）</div>
+    <div class="code-title">vllm/model_executor/kernels/mhc/tilelang.py — mHC 的 TileLang kernel（摘录，行号 266–274）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">mhc_pre_tilelang</span>(...,
                       hc_sinkhorn_eps: <span class="kw">float</span>,
                       sinkhorn_repeat: <span class="kw">int</span>, ...):</pre>
-    <p>mHC 的路由矩阵在训练时用 Sinkhorn 迭代约束成近双随机，推理时这个迭代成本还在——<code class="inline">hc_sinkhorn_iters</code> 配置项直接暴露给用户，模型的正向传播里（<code class="inline">nvidia/model.py:1228–1286</code>）串起 <code class="inline">mhc_pre_broadcast_tilelang</code> 和 <code class="inline">mhc_fused_post_pre_tilelang</code> 两个 kernel。这是「残差流拓扑」第一次成为引擎要专门写 kernel、专门暴露配置的东西。</p>
+    <p>mHC 的路由矩阵在训练时用 Sinkhorn 迭代约束成近双随机，推理时这个迭代成本还在——<code class="inline">hc_sinkhorn_iters</code> 配置项直接暴露给用户，模型的正向传播里（<code class="inline">nvidia/model.py:1275–1333</code>）串起 <code class="inline">mhc_pre_broadcast_tilelang</code> 和 <code class="inline">mhc_fused_post_pre_tilelang</code> 两个 kernel。这是「残差流拓扑」第一次成为引擎要专门写 kernel、专门暴露配置的东西。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 272" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -214,8 +214,8 @@
       </svg>
       <div class="fig-cap">图 14.3：两种残差流变体的形态对比。mHC 是「多条通道 + 跨层路由矩阵（Sinkhorn 约束，推理时仍要迭代）」；GatedResidual 是「多条分支 + 逐支路标量门」，没有跨层混合，kernel 成本低一档。</div>
     </div>
-    <p>MoE 侧的变化是 MegaMoE：<code class="inline">DeepseekV4MegaMoEExperts</code>（<code class="inline">nvidia/model.py:180</code>）走 <code class="inline">deep_gemm_mega_moe</code> 后端，且只在 SM100 上可用（<code class="inline">:338</code> 处的检查）；<code class="inline">vllm/config/kernel.py:160</code> 里 <code class="inline">MEGA_MOE_BACKENDS</code> 与 FlashInfer 的 moe_ep 后端并列为合法取值。另一个值得注意的点是 KV cache 规格的专用化：<code class="inline">SlidingWindowMLASpec</code>（<code class="inline">vllm/v1/kv_cache_interface.py:797</code>）在代码里明确标注 <code class="inline">model_version</code> 只接受 <code class="inline">"deepseek_v4"</code>——一个 KVCacheSpec 子类只服务一个模型，这在以前的通用缓存设计里不可想象。</p>
-    <p>V4.1 的增量（视觉多模态、DSML、数值化的 reasoning_effort）在引擎侧体现为 <code class="inline">DeepseekV4ForConditionalGeneration</code>（<code class="inline">vl_model.py:87</code>）——多模态版走 conditional generation 的注册形态，与第 12 章讲过的 Kimi-K2.5 同一模式。</p>
+    <p>MoE 侧的变化是 MegaMoE：<code class="inline">DeepseekV4MegaMoEExperts</code> 走 <code class="inline">deep_gemm_mega_moe</code> 后端，且只在 SM100 上可用；<code class="inline">vllm/config/kernel.py</code> 里 <code class="inline">MEGA_MOE_BACKENDS</code> 与 FlashInfer 的 moe_ep 后端并列为合法取值。另一个值得注意的点是 KV cache 规格的专用化：<code class="inline">SlidingWindowMLASpec</code> 在代码里明确标注 <code class="inline">model_version</code> 只接受 <code class="inline">"deepseek_v4"</code>——一个 KVCacheSpec 子类只服务一个模型，这在以前的通用缓存设计里不可想象。锚点：<code class="inline">nvidia/model.py:180</code>（SM100 检查在 <code class="inline">:338</code>）、<code class="inline">vllm/config/kernel.py:160</code>、<code class="inline">vllm/v1/kv_cache_interface.py:905</code>。</p>
+    <p>V4.1 的增量（视觉多模态、DSML、数值化的 reasoning_effort）在引擎侧体现为 <code class="inline">DeepseekV4ForConditionalGeneration</code>（<code class="inline">common/vl_model.py:83</code>，nvidia/vl_model.py 只剩转发）——多模态版走 conditional generation 的注册形态，与第 12 章讲过的 Kimi-K2.5 同一模式。</p>
     <p><strong>提炼一句</strong>：DeepSeek 线的变迁重心已经从「注意力怎么稀疏」移到「残差流怎么组织、MoE kernel 谁来供」。对引擎的含义是：模型定义的不再只是前向计算图，还包括残差流的拓扑和 MoE 的执行策略。</p>
   </section>
 
@@ -268,7 +268,7 @@
       <div class="fig-cap">图 14.4：DSA 的索引税与两种省法。5.2 在「层数」维度省钱（跨层共享同一份 top-k 索引）；5.3-Flash 在「每次算多少」维度省钱（先把索引器的 key 池化压缩）。</div>
     </div>
     <p><strong>GLM-5.2 的省法：跨层共享</strong>。相邻几层共用同一份 top-k 索引，算一次用多次。引擎里这个机制其实先在 DeepSeek-V3.2/GLM-5.2 共用的 <code class="inline">deepseek_v2.py</code> 里落地：</p>
-    <div class="code-title">vllm/model_executor/models/deepseek_v2.py — IndexCache 与跳层算索引（摘录，行号 1130–1135、1617–1635）</div>
+    <div class="code-title">vllm/model_executor/models/deepseek_v2.py — IndexCache 与跳层算索引（摘录，行号 1136–1141、1640–1658）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># IndexCache config / Refer: https://arxiv.org/abs/2603.12201</span>
 <span class="cmt"># skip_topk 的层模式：max(layer_id - offset + 1, 0) % index_topk_freq != 0 的层不建索引器</span>
 
@@ -276,7 +276,7 @@
 <span class="cmt"># checkpoint 给每一层都存了 indexer 权重，但 freq&gt;1 时只有部分层真的建了索引器——</span>
 <span class="cmt"># 加载时要主动丢弃用不上的那份</span></pre>
     <p>这套机制后来被 MiniMax（ATOM）独立验证过：<code class="inline">vllm/models/minimax_m3/amd/model.py:156</code> 的 <code class="inline">_should_skip_index_topk</code> 注释写明「相邻稀疏层选出的块几乎相同，ATOM 用 freq=4 验证过 GSM8K 不掉点」，启用方式是 <code class="inline">--hf-overrides '{"use_index_cache": true, "index_topk_freq": 4}'</code>。两家不同团队得到同一个结论，这条线算是站住了。</p>
-    <p><strong>GLM-5.3-Flash 的省法：压缩索引器自己的 key</strong>。它不共享，而是把索引器的 key 先池化——连续 <code class="inline">index_kpool</code> 个 token 压成一个 fp8 的 K 再算索引分。模型落在独立目录 <code class="inline">vllm/models/glm5next/</code>（架构名 <code class="inline">Glm5NextForCausalLM</code>，注册表 <code class="inline">registry.py:123</code>），核心类是 <code class="inline">SparseAttnIndexerKpool</code>（<code class="inline">vllm/model_executor/layers/sparse_attn_indexer_kpool.py:880</code>）。配置在 <code class="inline">vllm/transformers_utils/configs/glm5_next.py:73</code>：<code class="inline">index_kpool: int | None = 4</code>，即默认 4:1 压缩。</p>
+    <p><strong>GLM-5.3-Flash 的省法：压缩索引器自己的 key</strong>。它不共享，而是把索引器的 key 先池化——连续 <code class="inline">index_kpool</code> 个 token 压成一个 fp8 的 K 再算索引分。模型落在独立目录 <code class="inline">vllm/models/glm5next/</code>（架构名 <code class="inline">Glm5NextForCausalLM</code>），核心类是 <code class="inline">SparseAttnIndexerKpool</code>。配置项 <code class="inline">index_kpool: int | None = 4</code>，即默认 4:1 压缩。锚点：注册表 <code class="inline">registry.py:123</code>、核心类 <code class="inline">vllm/model_executor/layers/sparse_attn_indexer_kpool.py:880</code>、配置 <code class="inline">vllm/transformers_utils/configs/glm5_next.py:73</code>。</p>
     <p>这个省法在引擎侧的代价明显更大。池化改变了索引器元数据的粒度，KV cache 管理器必须跟着改：</p>
     <div class="code-title">vllm/models/glm5next/nvidia/attention.py — Kpool 索引器缓存对 block_size 的约束（摘录，行号 78 起的 docstring 与 116–120）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># tokens_per_state = index_kpool 时，indexer metadata builder 会改发</span>
@@ -284,7 +284,7 @@
 <span class="cmt"># 因此 block_size 必须是 index_kpool * 32 的倍数（index_kpool=16 时即 512）</span>
 
 <span class="kw">assert</span> block_size % index_kpool == <span class="kw">0</span></pre>
-    <p>除了 <code class="inline">assert</code>，还有一个新的 KVCacheSpec 子类专门接住池化后的尾部：<code class="inline">KpoolTailSpec</code>（<code class="inline">vllm/v1/kv_cache_interface.py:863</code>），注释称它是「给 kpool 索引器裸尾部用的一块环形草稿缓存」，且 <code class="inline">prefix_cacheable=False</code>——这部分缓存不参与前缀复用。GLM-5.3-Flash 同时是 sparse+linear 混合架构，线性层用 <code class="inline">Glm5NextLinearAttention</code>（<code class="inline">nvidia/kda.py:126</code>，继承自 GatedDeltaNet），这部分留到 14.5 一起讲。</p>
+    <p>除了 <code class="inline">assert</code>，还有一个新的 KVCacheSpec 子类专门接住池化后的尾部：<code class="inline">KpoolTailSpec</code>（<code class="inline">vllm/v1/kv_cache_interface.py:971</code>），注释称它是「给 kpool 索引器裸尾部用的一块环形草稿缓存」，且 <code class="inline">prefix_cacheable=False</code>——这部分缓存不参与前缀复用。GLM-5.3-Flash 同时是 sparse+linear 混合架构，线性层用 <code class="inline">Glm5NextLinearAttention</code>（<code class="inline">nvidia/kda.py:126</code>，继承自 GatedDeltaNet），这部分留到 14.5 一起讲。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 208" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -370,7 +370,7 @@
       <div class="fig-cap">图 14.6：Kimi-K3 的层混排与两种缓存的显存行为。KDA 层把「缓存」从随长度增长的 KV 换成固定形状的循环状态，这就是 MambaSpec 要表达的东西。</div>
     </div>
     <p>层分派按 <code class="inline">is_kda_layer()</code> 走（<code class="inline">vllm/transformers_utils/configs/kimi_linear.py:157–161</code>，判断式是 <code class="inline">(layer_idx + 1) in kda_layers</code>）。模型文件里的分支：</p>
-    <div class="code-title">vllm/models/kimi_k3/nvidia/model.py — KDA/MLA 分派与 NoPE 约束（摘录，行号 886–917）</div>
+    <div class="code-title">vllm/models/kimi_k3/nvidia/model.py — KDA/MLA 分派与 NoPE 约束（摘录，行号 907–938）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> config.is_kda_layer(layer_idx):
     <span class="cmt"># use_full_rank_gate 时走私有的 KimiK3DeltaAttention，否则用通用 GDN 实现</span>
     ...
@@ -381,7 +381,7 @@
     <div class="code-title">vllm/model_executor/layers/mamba/mamba_utils.py — KDA 状态形状（摘录，行号 298–320）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># kda_state_shape：固定形状，不随序列长度增长</span>
 recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
-    <p>这就是 <code class="inline">MambaSpec</code>（<code class="inline">vllm/v1/kv_cache_interface.py:885</code>）要表达的东西——KV cache 这个概念在 K3 里被推广成「注意力状态」，长序列下的显存曲线从线性变成常数。代价是调度器和内存管理要为这种固定形状状态单独建池，第 8 章讲过的 KV cache 管理器由此多了一个平行体系。</p>
+    <p>这就是 <code class="inline">MambaSpec</code>（<code class="inline">vllm/v1/kv_cache_interface.py:993</code>）要表达的东西——KV cache 这个概念在 K3 里被推广成「注意力状态」，长序列下的显存曲线从线性变成常数。代价是调度器和内存管理要为这种固定形状状态单独建池，第 8 章讲过的 KV cache 管理器由此多了一个平行体系。</p>
     <p>AttnRes 是另一处引擎可感知的变化：<code class="inline">attn_res_block_size</code>（config，<code class="inline">kimi_linear.py:51</code>）把层分组，组内每层配一个 <code class="inline">self_attention_res_proj</code> / <code class="inline">mlp_res_proj</code>（<code class="inline">ReplicatedLinear(hidden,1)</code>，<code class="inline">nvidia/model.py:999–1015</code>），前向时逐标量门控回读上一块输出（调用点 <code class="inline">:1053–1091</code>）。它不动 KV cache，但改写了 DecoderLayer 的前向结构——任何 fork vLLM 自己实现 K3 的人，漏掉这组投影权重就会加载报错。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 190" xmlns="http://www.w3.org/2000/svg">
@@ -421,8 +421,8 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
     <div class="code-title">vllm/models/qwen4_exp/nvidia/model.py — 残差变体挂到注意力与 MLP 两条通路（摘录，行号 266–272）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 同一个 GatedResidual 类，同时用作 attn_hyper_connection 与 mlp_hyper_connection</span>
 <span class="cmt"># （实现见 nvidia/hyperconnection.py:50，hc_lowrank=320 控制门控投影的秩）</span></pre>
-    <p><strong>再看 QSA</strong>（Queried Sparse Attention）。GLM 的两条路线都在 token 粒度上做文章，QSA 把稀疏化的粒度抬到 micro-block：索引器（<code class="inline">QSAIndexer</code>，<code class="inline">nvidia/indexer_qsa.py:90</code>）用 MQA 形态算块分数，预算是 <code class="inline">token_topk=config.indexer_budget</code>（<code class="inline">:115–118</code>，512 块 / 2048 token）。它对精度形态挑剔——要求 BF16 和 paged KV（<code class="inline">:110–111</code>），注意力后端是专门的 <code class="inline">Qwen4ExpQSAFlashAttentionBackend</code>（<code class="inline">nvidia/qsa.py:63</code>，继承 FlashAttentionBackend）。</p>
-    <p><strong>最后是 n-gram PLE 嵌入</strong>，这是本章四家里引擎侧牵动最大的一处。PLE 在第 2 层插一张 2000 万行的 n-gram 嵌入表（按 head 拆成素数大小的子词表，<code class="inline">nvidia/ngram_embedding.py:613</code> 的 <code class="inline">_make_vocab_layout</code>；真正的嵌入表是 <code class="inline">Qwen4ExpPLEEmbedding</code>，<code class="inline">:52</code>，继承自 <code class="inline">common/ple.py:82</code> 的 <code class="inline">PLEVocabParallelEmbedding</code>，由 <code class="inline">:535</code> 的容器类 <code class="inline">Qwen4ExpNGramEmbedding</code>（<code class="inline">nn.Module</code>，按 <code class="inline">cpu_offload</code> 选 <code class="inline">_PinnedHost</code>/<code class="inline">_Device</code> 实现）持有为 <code class="inline">self.ngram_embedding</code>，在 <code class="inline">ple_layer.py:96</code> 挂到 PLE 层上），让小激活模型在 few-shot 场景能直接从上下文抄 n-gram 级别的表面信息。问题在于它的查表结果随上下文变化，而 CUDA graph 要求每次重放的输入形状不变——模型层自己管不了这件事，于是 vLLM 开了一个通用扩展点：</p>
+    <p><strong>再看 QSA</strong>（Queried Sparse Attention）。GLM 的两条路线都在 token 粒度上做文章，QSA 把稀疏化的粒度抬到 micro-block：索引器（<code class="inline">QSAIndexer</code>）用 MQA 形态算块分数，预算是 <code class="inline">token_topk=config.indexer_budget</code>（512 块 / 2048 token）。它对精度形态挑剔——要求 BF16 和 paged KV，注意力后端是专门的 <code class="inline">Qwen4ExpQSAFlashAttentionBackend</code>（继承 FlashAttentionBackend）。锚点：索引器 <code class="inline">nvidia/indexer_qsa.py:90</code>（预算 <code class="inline">:115-118</code>、精度约束 <code class="inline">:110-111</code>）、后端 <code class="inline">nvidia/qsa.py:63</code>。</p>
+    <p><strong>最后是 n-gram PLE 嵌入</strong>，这是本章四家里引擎侧牵动最大的一处。PLE 在第 2 层插一张 2000 万行的 n-gram 嵌入表，让小激活模型在 few-shot 场景能直接从上下文抄 n-gram 级别的表面信息。结构分三层：真正的嵌入表 <code class="inline">Qwen4ExpPLEEmbedding</code> 继承 <code class="inline">PLEVocabParallelEmbedding</code>；外层是容器类 <code class="inline">Qwen4ExpNGramEmbedding</code>（一个 <code class="inline">nn.Module</code>，按 <code class="inline">cpu_offload</code> 选 pinned-host 或 device 实现），持有为 <code class="inline">self.ngram_embedding</code>；按 head 拆成素数大小的子词表由 <code class="inline">_make_vocab_layout</code> 完成。问题在于它的查表结果随上下文变化，而 CUDA graph 要求每次重放的输入形状不变——模型层自己管不了这件事，于是 vLLM 开了一个通用扩展点。锚点：容器类 <code class="inline">nvidia/ngram_embedding.py:535</code>、PLE 嵌入子类 <code class="inline">:52</code>、基类 <code class="inline">common/ple.py:82</code>、子词表布局 <code class="inline">nvidia/ngram_embedding.py:613</code>、挂载点 <code class="inline">ple_layer.py:96</code>。</p>
     <div class="code-title">vllm/v1/worker/gpu/model_states/__init__.py — 模型自带 ModelState 的钩子（摘录，行号 28 附近）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># "Let the model provide its own ModelState if it defines one"</span>
 <span class="cmt"># 模型类定义 get_model_state_cls() 即可接管 runner 层的状态管理</span></pre>
@@ -518,7 +518,7 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
       <div class="fig-cap">图 14.9：跨家族收敛。索引器省法三条路线（共享 / 压缩 / 换粒度）指向同一结论；MTP 成为旗舰标配；残差流在四家全部从单条变多条。</div>
     </div>
     <ul>
-      <li><strong>MTP 无一缺席</strong>。四家的新模型全部注册了 MTP 模型（<code class="inline">registry.py:667–696</code> 一整段 MTP 注册），且 <code class="inline">method="mtp"</code> 已是规范名，家族专名（DeepSeek MTP、Glm5Next MTP…）在 <code class="inline">vllm/config/speculative.py:1114–1119</code> 标记为废弃。推测解码从「可选加速」变成了旗舰模型的标配出厂件。</li>
+      <li><strong>MTP 无一缺席</strong>。四家的新模型全部注册了 MTP 模型（<code class="inline">registry.py:675–704</code> 一整段 MTP 注册），且 <code class="inline">method="mtp"</code> 已是规范名，家族专名（DeepSeek MTP、Glm5Next MTP…）在 <code class="inline">vllm/config/speculative.py:1121–1125</code> 标记为废弃。推测解码从「可选加速」变成了旗舰模型的标配出厂件。</li>
       <li><strong>索引器开销被当成独立问题</strong>。共享（DeepSeek/GLM/MiniMax）、压缩（GLM KPool）、换粒度（Qwen QSA）三种方案并存，说明业界共识是「稀疏注意力本身不是瓶颈，索引才是」。</li>
       <li><strong>残差流成了可调结构</strong>。mHC、iHC（Hunyuan-V4，<code class="inline">hc_mult</code> 并行通道）、GatedResidual、AttnRes 四种变体出现在四个团队，细节各异，方向一致：单一流不够用了。</li>
     </ul>
@@ -529,10 +529,10 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
     <h2><span class="num">14.7</span>引擎付出了什么：一张「被迫新增」清单</h2>
     <p>本章开头说这些机制是架构变迁的化石层，最后把它们集中列一遍——如果你要在自己的推理栈里支持这一代模型，这张清单就是工作量清单：</p>
     <ul>
-      <li><strong>KVCacheSpec 家族扩容</strong>：<code class="inline">SlidingWindowMLASpec</code>（<code class="inline">kv_cache_interface.py:797</code>，绑死 deepseek_v4）、<code class="inline">KpoolTailSpec</code>（<code class="inline">:863</code>，不可前缀复用的草稿块）、<code class="inline">MambaSpec</code>（<code class="inline">:885</code>，含 <code class="inline">tp_replicated</code> 标志与 KDA 形状）。缓存规格从「页大小 + dtype」的二维描述，膨胀成按模型家族定制的对象体系。</li>
+      <li><strong>KVCacheSpec 家族扩容</strong>：<code class="inline">SlidingWindowMLASpec</code>（<code class="inline">kv_cache_interface.py:905</code>，绑死 deepseek_v4）、<code class="inline">KpoolTailSpec</code>（<code class="inline">:971</code>，不可前缀复用的草稿块）、<code class="inline">MambaSpec</code>（<code class="inline">:993</code>，含 <code class="inline">tp_replicated</code> 标志与 KDA 形状）。缓存规格从「页大小 + dtype」的二维描述，膨胀成按模型家族定制的对象体系。</li>
       <li><strong>CacheDType 扩容</strong>（<code class="inline">vllm/config/cache.py:39–58</code>）：<code class="inline">fp8_ds_mla</code>、<code class="inline">nvfp4_ds_mla</code>（DSA 专用）、<code class="inline">turboquant_k8v4 / _4bit_nc / _k3v4_nc / _3bit_nc</code>（Kimi 系）、<code class="inline">int4/int8/fp8_per_token_head</code>、<code class="inline">nvfp4</code>、<code class="inline">nvfp4_4over6</code>。每一项背后是一种 KV 量化的精度/布局折中。</li>
       <li><strong>ModelState 扩展点</strong>（<code class="inline">v1/worker/gpu/model_states/__init__.py:28</code>）：模型第一次有了「接管 runner 层状态」的合法通道，Qwen4Exp 是第一个用户，但机制是通用的。</li>
-      <li><strong>推测解码体系重组</strong>：MTP 规范名统一、DSpark 草稿模型入册（<code class="inline">DSparkDeepseekV4ForCausalLM</code>、<code class="inline">K3DSparkForCausalLM</code>，经 <code class="inline">DSparkMarkovHead</code>/<code class="inline">DSparkConfidenceHead</code> 复用 qwen3_dspark 的实现）、K3 的 RecoverSSM（<code class="inline">vllm/config/vllm.py:2967–3035</code>：KDA 推测解码时自动启用，白名单只放 Kimi 两个架构，<code class="inline">mamba_cache_mode</code> 限 none/align）。</li>
+      <li><strong>推测解码体系重组</strong>：MTP 规范名统一、DSpark 草稿模型入册（<code class="inline">DSparkDeepseekV4ForCausalLM</code>、<code class="inline">K3DSparkForCausalLM</code>，经 <code class="inline">DSparkMarkovHead</code>/<code class="inline">DSparkConfidenceHead</code> 复用 qwen3_dspark 的实现）、K3 的 RecoverSSM（<code class="inline">vllm/config/vllm.py:3175–3244</code>：KDA 推测解码时自动启用，白名单只放 Kimi 两个架构，<code class="inline">mamba_cache_mode</code> 限 none/align）。</li>
       <li><strong>MTP 与稀疏索引的协同</strong>：<code class="inline">index_share_for_mtp_iteration</code>（<code class="inline">vllm/config/speculative.py:430</code>）——多步草稿时 top-k 只在第 0 步算，后续步复用，<code class="inline">glm5next/nvidia/mtp.py:145</code> 的 <code class="inline">set_skip_topk</code> 是执行点。推测解码和稀疏注意力不再各自为政。</li>
     </ul>
     <p>这张清单有一个共同的形状：引擎不再把模型当成「一个实现了 forward 的 nn.Module」，而是当成一个会声明自己缓存形状、状态管理方式、草稿策略的<strong>完整合约</strong>。前 13 章里引擎是主动方，模型是被动接入方；这一章里的新模型，每一个都反过来对引擎提了要求。</p>
@@ -599,7 +599,7 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 14 实战·国产开源模型架构变迁 · vLLM 侧版本 v0.28.1rc0-680-gb5d4186300 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 14 实战·国产开源模型架构变迁 · vLLM 侧版本 v0.29.1rc0-18-gfa1b3b1922 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 </body>
 </html>
