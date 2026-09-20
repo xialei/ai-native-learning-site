@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>On-Device推理</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -18,7 +18,7 @@
       <a href="02-gguf-loading.html">GGUF与加载</a>
       <a href="03-decode-loop.html">decode循环</a>
       <a href="04-kv-cache.html">KV cache</a>
-      <a href="05-graph-sched.html">图与调度</a>
+      <a class="active" href="05-graph-sched.html">图与调度</a>
       <a href="06-multi-device.html">多设备</a>
       <a href="07-sampling.html">采样</a>
       <a href="08-speculative.html">投机解码</a>
@@ -41,14 +41,14 @@
   <section class="block">
     <h2><span class="num">5.1</span>图复用：为什么 decode 第二步起不用重建图</h2>
     <p>每个 ubatch 的图拓扑只由「形状参数」决定——token 数、序列数、输入种类。参数不变，图就不变，于是 llama.cpp 缓存上一张图，先问一句「还能用吗」：</p>
-    <div class="code-title">src/llama-context.cpp:1341-1382 — process_ubatch 的图复用（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * res = gf_res_prev.get();
+    <div class="code-title">src/llama-context.cpp:1350-1394 — process_ubatch 的图复用（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * res = <span class="fn">get_gf_res_prev</span>();   <span class="cmt">// 双 arena 之一：按「本批有无输出」二选一</span>
 <span class="kw">auto</span> * gf  = res-&gt;<span class="fn">get_gf</span>();
 
 <span class="cmt">// 图的完整拓扑由这些参数唯一决定 —— 参数相同 ⇒ 拓扑相同</span>
 <span class="kw">const</span> <span class="kw">auto</span> gparams = <span class="fn">graph_params</span>(res, ubatch, mctx, gtype);
 
-<span class="kw">if</span> (!graph_reuse_disable &amp;&amp; res-&gt;<span class="fn">can_reuse</span>(gparams)) {
+<span class="kw">if</span> (!graph_reuse_disable &amp;&amp; gf_res_prev_active == res &amp;&amp; res-&gt;<span class="fn">can_reuse</span>(gparams)) {
     <span class="cmt">// pipeline parallel 时上一张图可能还在 GPU 上跑，必须先同步</span>
     <span class="cmt">// 才能覆写它正在读的输入张量</span>
     <span class="kw">if</span> (cparams.pipeline_parallel) {
@@ -56,6 +56,7 @@
     }
     n_reused++;
 } <span class="kw">else</span> {
+    gf_res_prev_active = <span class="kw">nullptr</span>;       <span class="cmt">// 旧图即刻作废</span>
     res-&gt;<span class="fn">reset</span>();
     <span class="fn">ggml_backend_sched_reset</span>(sched.get());
     <span class="fn">ggml_backend_sched_set_eval_callback</span>(sched.get(), cparams.cb_eval, ...);
@@ -67,6 +68,8 @@
         ret = GGML_STATUS_ALLOC_FAILED;
         <span class="kw">return</span> <span class="kw">nullptr</span>;
     }
+
+    gf_res_prev_active = res;          <span class="cmt">// 新图才算「在役」</span>
 }
 
 <span class="cmt">// 无论新建还是复用，输入都要重新填写</span>
@@ -104,13 +107,13 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     res &amp;= (kq_mask-&gt;ne[<span class="nu">3</span>] == n_stream);
     <span class="kw">return</span> res;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 复用不是「跳过计算」，是「跳过 CPU 上的建图 + 分配」这两个 CPU 密集步骤，GPU 计算照跑。注意 decode 单 token 场景下形状几乎恒定（n_tokens=1、n_kv 渐增——n_kv 变了 mask 形状就变，所以窗口涨的时候还是要重建；这正是 KV padding 到 256 对齐的动机之一：让 n_kv 阶梯状跳变，多数步复用成立）。计数器 <code class="inline">n_reused</code> 会在 llama_perf 里报告为「graphs reused」。</div>
+    <div class="annotation"><b>读懂这段：</b> 复用不是「跳过计算」，是「跳过 CPU 上的建图 + 分配」这两个 CPU 密集步骤，GPU 计算照跑。注意 decode 单 token 场景下形状几乎恒定（n_tokens=1、n_kv 渐增——n_kv 变了 mask 形状就变，所以窗口涨的时候还是要重建；这正是 KV padding 到 256 对齐的动机之一：让 n_kv 阶梯状跳变，多数步复用成立）。计数器 <code class="inline">n_reused</code> 会在 llama_perf 里报告为「graphs reused」。两个后续演进值得留意：① <code class="inline">gf_res_prev</code> 已从单个缓冲扩成 <code class="inline">array&lt;..., 2&gt;</code>——「有输出」和「无输出」的批各占一个 arena，头文件注释明说是为了让 CUDA Graph 的缓存键区分开（MTP draft 场景下两种批交替出现，#28549）；② 复用条件里多了 <code class="inline">gf_res_prev_active == res</code>——只有「本次刚建/刚用过」的 arena 才可复用，防止切换 arena 后误重用另一边的过期图。图复用的守卫随特性加一层套一层，这正是「跳过 CPU 工作」这类优化必然的复杂化路径。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.2</span>sched_reserve：三次 reserve 的启动仪式</h2>
     <p>启动时 llama.cpp 会用「最坏情况」图把计算缓冲一次性预留到位，推理期间 galloc 只在其中做原地分配。reserve 序列是 pp → tg → pp 三次：</p>
-    <div class="code-title">src/llama-context.cpp:623-681 — 三次 reserve（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:626-686 — 三次 reserve（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 先用 pp（prompt processing）图预留 —— 缓冲只分配一次</span>
 {
     <span class="kw">auto</span> * gf = <span class="fn">graph_reserve</span>(n_tokens, n_seqs, n_outputs_pp, mctx.get(), ...);
@@ -138,6 +141,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 {
     ggml_cgraph * gf = <span class="kw">nullptr</span>;
     <span class="kw">switch</span> (model.arch) {
+        <span class="kw">case</span> LLM_ARCH_KIMI_LINEAR:
         <span class="kw">case</span> LLM_ARCH_MINIMAX_01:
             <span class="cmt">// 特例：inp_diag_decay 随 n_seq_tokens^2 增长，n_seqs==1 反而更耗</span>
             gf = <span class="fn">graph_reserve</span>(n_tokens, <span class="nu">1</span>, n_outputs_pp, mctx.get(), ...);
@@ -147,7 +151,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     };
     ...
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 启动日志里的两行输出「compute buffer size = xxx MiB」「graph nodes = N (with bs=512), M (with bs=1)」就是这里打出来的。三次 reserve 的逻辑：① pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；② 跑一遍 tg 图测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；③ 再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长。</div>
+    <div class="annotation"><b>读懂这段：</b> 启动日志里的两行输出「compute buffer size = xxx MiB」「graph nodes = N (with bs=512), M (with bs=1)」就是这里打出来的。三次 reserve 的逻辑：① pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；② 跑一遍 tg 图测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；③ 再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 与 KIMI_LINEAR 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长，这个特例清单还在随新架构缓慢加长。</div>
   </section>
 
   <section class="block">
@@ -211,7 +215,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 
   <section class="block">
     <h2><span class="num">5.4</span>对照：FreeToken 的 CUDA Graph</h2>
-    <p>llama.cpp 的图是「每次推理现建的张量 DAG」（哪怕复用也要填输入）；FreeToken 把 decode 前向<strong>整段录制成 CUDA Graph</strong>，运行时一次 replay 消掉上千次 kernel launch 的 CPU 开销。先看 batch 尺寸候选怎么定（<code class="inline">python/freetoken/engine/graph.py:68-87</code>，函数体到 :87）：</p>
+    <p>llama.cpp 的图是「每次推理现建的张量 DAG」（哪怕复用也要填输入）；FreeToken 把 decode 前向<strong>整段录制成 CUDA Graph</strong>，运行时一次 replay 消掉上千次 kernel launch 的 CPU 开销。先看 batch 尺寸候选怎么定（<code class="inline">python/freetoken/engine/graph.py:79-98</code>，函数体到 :98）：</p>
     <div class="code-title">python/freetoken/engine/graph.py — bs 候选（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_determine_cuda_graph_bs</span>(cuda_graph_bs, cuda_graph_max_bs, free_memory):
     <span class="kw">if</span> cuda_graph_bs <span class="kw">is not</span> <span class="kw">None</span>:
@@ -227,7 +231,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     candidates = [<span class="nu">1</span>, <span class="nu">2</span>, <span class="nu">4</span>] + list(range(<span class="nu">8</span>, cuda_graph_max_bs + <span class="nu">1</span>, <span class="nu">8</span>))
     <span class="kw">return</span> [bs <span class="kw">for</span> bs <span class="kw">in</span> candidates <span class="kw">if</span> bs &lt;= cuda_graph_max_bs]</pre>
     <p>捕捉阶段每个 bs 录一张图，共享同一个内存池：</p>
-    <div class="code-title">python/freetoken/engine/graph.py:158-198 — capture 与 replay（摘录，注释为译注）</div>
+    <div class="code-title">python/freetoken/engine/graph.py:173-213 — capture 与 replay（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> bs <span class="kw">in</span> pbar:
     graph = torch.cuda.<span class="cl">CUDAGraph</span>()
     batch = <span class="cl">Batch</span>(reqs=[self.dummy_req] * bs, phase=<span class="st">"decode"</span>)
@@ -271,7 +275,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

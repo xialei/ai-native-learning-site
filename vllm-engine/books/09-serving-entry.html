@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -22,7 +22,7 @@
       <a href="06-sampling.html">采样</a>
       <a href="07-kernels.html">Kernel</a>
       <a href="08-memory.html">内存</a>
-      <a href="09-serving-entry.html">服务入口</a>
+      <a class="active" href="09-serving-entry.html">服务入口</a>
       <a href="10-distributed.html">分布式</a>
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
@@ -36,18 +36,18 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 服务入口</div>
     <h1>服务入口：从离线 generate 到在线流式 API</h1>
-    <div class="subtitle">前几章都在讲「引擎内部」。这一章走到能被人调用的<strong>外壳</strong>：OpenAI 兼容的 HTTP API、异步引擎的 background loop，以及「API server 与引擎核心分离」的部署架构。</div>
+    <div class="subtitle">前几章都在讲「引擎内部」。这一章走到能被人调用的那一层：OpenAI 兼容的 HTTP API、异步引擎的 background loop，以及「API server 与引擎核心分离」的部署架构。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">9.1</span>从离线到在线：LLM.generate vs 服务端</h2>
-    <p>会话外第一件事：vLLM 有<strong>两套完全不同</strong>的用法。离线 API <code class="inline">vllm/entrypoints/llm.py</code> 里的 <code class="inline">LLM.generate()</code> 是<strong>阻塞、一次性</strong>的——你给它一批 prompt，它算完再一次性把结果全部返回给你：</p>
+    <p>先分清 vLLM 的<strong>两套完全不同</strong>的用法。离线 API <code class="inline">vllm/entrypoints/llm.py</code> 里的 <code class="inline">LLM.generate()</code> 是<strong>阻塞、一次性</strong>的——你给它一批 prompt，它算完再一次性把结果全部返回给你：</p>
     <ul>
       <li><strong>阻塞</strong>：调用期间主线程被占住，算完才返回。</li>
       <li><strong>一次性</strong>：一批输入进来，整批跑完才交付，没有「边算边给」。</li>
       <li><strong>自包含</strong>：它内部自己 spawn 一个后台 EngineCore，用完即走。</li>
     </ul>
-    <p>而在线服务要做的是<strong>并发、流式、持续运行</strong>：无数客户端同时连上来，每个请求希望「第一个 token 越早越好」，服务进程要一直活着响应。离线 API 完全应付不了这种场景。</p>
+    <p>而在线服务要做的是<strong>并发、流式、持续运行</strong>：无数客户端同时连上来，每个请求希望「第一个 token 越早越好」，服务进程要一直活着响应。离线 API 不适合作为这种高并发、低 TTFT 场景的服务入口。</p>
     <div class="annotation"><b>关键转折：</b>vLLM 为在线场景抽象出 <code class="inline">AsyncLLMEngine</code>（新版其实是指向 <code class="inline">vllm.v1.engine.async_llm.AsyncLLM</code> 的别名，见下）。它和同步 <code class="inline">LLM</code> 的区别，就在于<strong>用 asyncio 事件循环驱动一个常驻的引擎后台循环</strong>，请求可以并发地进、逐个地出。下面 <code class="inline">vllm/engine/async_llm_engine.py</code> 全文件就三行，直接把别名指了过去：</div>
     <div class="code-title">vllm/engine/async_llm_engine.py（全文）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.v1.engine.async_llm <span class="kw">import</span> <span class="cl">AsyncLLM</span>
@@ -107,7 +107,7 @@ register_completion_api_router(app)</pre>
       <li><code class="inline">_run_output_handler()</code> 起一个随事件循环跑的 <code class="inline">asyncio</code> 后台任务（<code class="inline">output_handler</code>），不断 <code class="inline">await engine_core.get_output_async()</code> 从引擎拉输出，交给 <code class="inline">output_processor</code> 处理后推给每个请求自己的队列。</li>
       <li>调用方（这里是 serving handler）迭代 <code class="inline">AsyncLLM.generate()</code> 返回的生成器，边产边取边 yield 给客户端。</li>
     </ul>
-    <p>看 <code class="inline">generate()</code> 里等待输出那一段——它从按请求的队列里拿 <code class="inline">RequestOutput</code>，<strong>不是攒到最后</strong>，而是拿到一个吐一个：</p>
+    <p>看 <code class="inline">generate()</code> 里等待输出那一段——它从按请求的队列里拿 <code class="inline">RequestOutput</code>，<strong>拿到一个就立刻 yield 一个</strong>，不等整批跑完：</p>
     <div class="code-title">vllm/v1/engine/async_llm.py — AsyncLLM.generate 的取流循环（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">generate</span>(self, prompt, sampling_params, request_id, ...)
         <span class="kw">-&gt;</span> <span class="cl">AsyncGenerator</span>[<span class="cl">RequestOutput</span>, <span class="kw">None</span>]:
@@ -117,13 +117,13 @@ register_completion_api_router(app)</pre>
         out = q.get_nowait() <span class="kw">or</span> await q.get()   <span class="cmt"># 没有就先等，不空转</span>
         finished = out.finished
         <span class="kw">if</span> out is <span class="kw">not</span> <span class="cl">STREAM_FINISHED</span>:
-            <span class="kw">yield</span> out                     <span class="cmt"># 边生成边吐，绝不攒批</span></pre>
-    <div class="annotation"><b>贯通整条链：</b><code class="inline">/v1/completions?stream=true</code> → <code class="inline">create_completion</code> → <code class="inline">OpenAIServingCompletion</code> 调 <code class="inline">engine_client.generate(...)</code>（拿到上面的异步生成器）→ 逐 token 包成 <code class="inline">data: {...}\n\n</code> 事件片 → 经 <code class="inline">StreamingResponse</code> 立即写回 TCP。于是客户端<strong>第一个 token 秒到</strong>，这就是「流式」的落地点。</div>
+            <span class="kw">yield</span> out                     <span class="cmt"># 边生成边交，不攒批</span></pre>
+    <div class="annotation"><b>贯通整条链：</b><code class="inline">/v1/completions?stream=true</code> → <code class="inline">create_completion</code> → <code class="inline">OpenAIServingCompletion</code> 调 <code class="inline">engine_client.generate(...)</code>（拿到上面的异步生成器）→ 逐 token 包成 <code class="inline">data: {...}\n\n</code> 事件片 → 经 <code class="inline">StreamingResponse</code> 立即写回 TCP。于是客户端<strong>第一个 token 一生成就能收到</strong>，这就是「流式」的落地点。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.4</span>引擎/核心分离部署：无状态 API + 有状态 EngineCore</h2>
-    <p>vLLM 的现代架构把「HTTP 外壳」和「真正干活的引擎」<strong>拆成两个进程</strong>：</p>
+    <p>vLLM 的现代架构把「HTTP 接入」和「真正干活的引擎」<strong>拆成两个进程</strong>：</p>
     <ul>
       <li><strong>API server / AsyncLLM（无状态、可水平扩）</strong>：只做 HTTP 解析、请求翻译、流式回包。它不持有模型权重、不占 GPU，可以起很多个副本。</li>
       <li><strong>EngineCoreProc（有状态、常驻）</strong>：持有模型、KV cache、调度器，常驻后台进程，监听 ZMQ 端口。见 <code class="inline">vllm/v1/engine/core.py</code> 的 <code class="inline">EngineCoreProc</code>——类 docstring 直接写着「ZMQ-wrapper for running EngineCore in background process」。</li>
@@ -184,7 +184,7 @@ register_completion_api_router(app)</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.5</span>用代码看：输出的最后一公里</h2>
+    <h2><span class="num">9.5</span>用代码看：输出怎么走到客户端</h2>
     <p>承接 9.3，我们把 <code class="inline">AsyncLLM</code> 里那个「后台输出循环」看完整。它在一个 <code class="inline">asyncio</code> 任务里无限循环，从引擎拉 <code class="inline">EngineCoreOutputs</code>，处理成各请求的 <code class="inline">RequestOutput</code> 塞进队列：</p>
     <div class="code-title">vllm/v1/engine/async_llm.py — _run_output_handler 里的 output_handler 协程（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">output_handler</span>():
@@ -296,7 +296,7 @@ name=<span class="st">"vllm:request_num_preemptions"</span>          <span class
     <div class="annotation"><b>把指标映射回机制：</b><code class="inline">kv_cache_usage_perc</code> 高位 + <code class="inline">num_requests_waiting</code> 高位 → 该扩 KV 预算（第 8 章）或上抢占/优先级（第 4 章）；<code class="inline">prefix_cache_hits</code> 低 → 前缀缓存没吃上（第 8.5 章，或多副本没做会话亲和）；<code class="inline">request_num_preemptions</code> 非零 → KV 频繁不够，系统在反复重算（第 4.5 章）。<strong>每个指标都能追溯到某一章的机制——这就是「可观测性」和「读懂引擎」的关系。</strong></div>
     <div class="callout info">
       <b class="tag">延伸：MFU</b>
-      vLLM 还内置了一个更底层的度量：用解析法估算每步的 FLOPs 与读写字节数（<code class="inline">vllm/v1/metrics/perf.py</code> 模块，"Analytic flops/memory estimation ... to help derive MFU (Model Flops Utilization) stats"），打开 <code class="inline">VLLM_DEBUG_MFU_METRICS=1</code> 后日志会输出「MFU: N TF/s/GPU M GB/s/GPU」。MFU 回答的问题是「这张卡的算力我用满了几成」——它是判断「瓶颈在算力还是在访存」的最终依据，也正是第 7.1 章 arithmetic intensity 概念的实测形态。
+      vLLM 还内置了一个更底层的度量：用解析法估算每步的 FLOPs 与读写字节数（<code class="inline">vllm/v1/metrics/perf.py</code> 模块，"Analytic flops/memory estimation ... to help derive MFU (Model Flops Utilization) stats"），打开 <code class="inline">VLLM_DEBUG_MFU_METRICS=1</code> 后日志会输出「MFU: N TF/s/device M GB/s/device」。MFU 回答的问题是「这张卡的算力我用满了几成」——它是判断「瓶颈在算力还是在访存」的最终依据，也正是第 7.1 章 arithmetic intensity 概念的实测形态。
     </div>
   </section>
 
@@ -327,7 +327,7 @@ name=<span class="st">"vllm:request_num_preemptions"</span>          <span class
 </div>
 
 <footer>
-  深入浅出vLLM · 09 服务入口 · 版本 v0.29.1rc0-18-gfa1b3b1922 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 09 服务入口 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

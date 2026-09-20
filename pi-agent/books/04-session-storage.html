@@ -17,7 +17,7 @@
       <a href="01-architecture.html">架构</a>
       <a href="02-messages-types.html">消息类型</a>
       <a href="03-agent-loop.html">Agent 循环</a>
-      <a href="04-session-storage.html">会话存储</a>
+      <a class="active" href="04-session-storage.html">会话存储</a>
       <a href="05-context.html">上下文</a>
       <a href="06-compaction.html">压缩</a>
       <a href="07-harness.html">Harness</a>
@@ -446,7 +446,10 @@
 
   run&lt;T&gt;(operation: () =&gt; T | Promise&lt;T&gt;): Promise&lt;T&gt; {
     <span class="kw">if</span> (<span class="kw">this</span>.sealedError !== <span class="kw">undefined</span>) <span class="kw">return</span> Promise.reject(<span class="kw">this</span>.sealedError);
-    <span class="kw">const</span> result = <span class="kw">this</span>.tail.then(() =&gt; operation());
+    <span class="kw">const</span> result = <span class="kw">this</span>.tail.then(() =&gt; {
+      <span class="kw">if</span> (<span class="kw">this</span>.sealedError !== <span class="kw">undefined</span>) <span class="kw">throw</span> <span class="kw">this</span>.sealedError;
+      <span class="kw">return</span> operation();
+    });
     <span class="kw">this</span>.tail = result.then(() =&gt; <span class="kw">undefined</span>, () =&gt; <span class="kw">undefined</span>);
     <span class="kw">return</span> result;
   }
@@ -456,7 +459,7 @@
     <span class="kw">return this</span>.tail;
   }
 }</pre>
-    <p><code class="inline">SessionMutation</code> 的语义由此而来：<code class="inline">beginMutation()</code> 在 MutationLine 上排队拿到一个<strong>独占能力</strong>，它<strong>只允许一次 commit</strong>（第二次直接拒绝），<code class="inline">end()</code> 等待提交落地并释放互斥线。JSONL 后端再加最后一道防线——每个事务<strong>原子发布</strong>：先写 <code class="inline">{path}.tmp</code>，再 <code class="inline">rename</code> 覆盖正式文件；启动时逐行重放，<strong>不完整的最后一行（撕裂写）直接截断丢弃</strong>——半条事务永远不会被算数：</p>
+    <p><code class="inline">SessionMutation</code> 的语义由此而来：<code class="inline">beginMutation()</code> 在 MutationLine 上排队拿到一个<strong>独占能力</strong>，它<strong>只允许一次 commit</strong>（第二次直接拒绝），<code class="inline">end()</code> 等待提交落地并释放互斥线。注意 <code class="inline">run()</code> 里<strong>两处</strong>而不是一处检查 <code class="inline">sealedError</code>：入口处一次，排到队头、真正执行前再一次。作业排队期间 session 可能被 <code class="inline">seal()</code>（<code class="inline">close()</code> 就走这条路），只查入口会漏掉「排队时被关闭」的窗口。JSONL 后端再加最后一道防线——每个事务<strong>原子发布</strong>：先写 <code class="inline">{path}.tmp</code>，再 <code class="inline">rename</code> 覆盖正式文件；启动时逐行重放，<strong>不完整的最后一行（撕裂写）直接截断丢弃</strong>——半条事务永远不会被算数：</p>
     <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — openV4() 里的撕裂处理（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> { lines, torn } = splitCompleteLines(content);
 <span class="cmt">// ……校验 header（format 4：v/kind/id/storageVersion/createdAt/cwd）、逐行重放事务</span>
@@ -466,31 +469,38 @@
   );  <span class="cmt">// 只回写完整行，撕裂尾巴被截断丢弃</span>
 }</pre>
     <div class="callout">
-      <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
+      <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
     </div>
-    <div class="code-title">harness/session/session.ts · assertJsonSerializable（节选）</div>
-    <pre class="code"><code><span class="kw">export function</span> <span class="fn">assertJsonSerializable</span>(value: unknown): <span class="kw">void</span> {
-  <span class="kw">const</span> active = <span class="kw">new</span> WeakSet&lt;object&gt;();          <span class="cmt">// 记已访问，用于环检测</span>
-  <span class="kw">const</span> stack: JsonValidationFrame[] = [{ value }];
-  <span class="kw">while</span> (stack.length &gt; <span class="nu">0</span>) {
-    <span class="kw">const</span> frame = stack.pop()!;
-    <span class="kw">if</span> (<span class="st">"exit"</span> in frame) { active.<span class="fn">delete</span>(frame.exit); <span class="kw">continue</span>; }
-    <span class="kw">const</span> candidate = frame.value;
-    <span class="kw">if</span> (candidate === <span class="kw">null</span> || <span class="kw">typeof</span> candidate === <span class="st">"string"</span> || <span class="kw">typeof</span> candidate === <span class="st">"boolean"</span>) <span class="kw">continue</span>;
-    <span class="kw">if</span> (<span class="kw">typeof</span> candidate === <span class="st">"number"</span>) {
-      <span class="kw">if</span> (!Number.isFinite(candidate)) invalidPayload(<span class="st">"contains a non-finite number"</span>);
-      <span class="kw">continue</span>;
-    }
-    <span class="kw">if</span> (active.has(candidate)) invalidPayload(<span class="st">"contains a cycle"</span>);  <span class="cmt">// 环检测</span>
-    active.<span class="fn">add</span>(candidate);
-    stack.push({ exit: candidate });
-    <span class="cmt">// 对数组：拒绝稀疏数组、访问器、额外属性、符号键</span>
-    <span class="cmt">// 对对象：拒绝非平面对象、symbol 键、非可枚举/访问器属性、非有限数</span>
+    <p>还有一个容易想到、但 pi <strong>没有做</strong>的防线：写入前的 JSON 深度校验。早期版本在 session.ts 里确实有一段 <code class="inline">assertJsonSerializable</code>，用显式栈遍历整个待写对象，拒绝循环引用、稀疏数组、访问器属性、symbol 键、<code class="inline">NaN</code>/<code class="inline">Infinity</code>——深对象也不会爆栈。后来整段被删掉了。校验挪到了<strong>读取侧</strong>：每一行 JSONL 在启动重放时都过这道闸，</p>
+    <div class="code-title">harness/session/jsonl/io.ts — 读取侧逐字段校验（节选，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">requireSafeInteger</span>(value: <span class="kw">unknown</span>, field: <span class="kw">string</span>, minimum: <span class="kw">number</span>): <span class="kw">void</span> {
+  <span class="kw">if</span> (!Number.<span class="fn">isSafeInteger</span>(value) || (value <span class="kw">as</span> <span class="kw">number</span>) &lt; minimum) <span class="kw">throw new</span> <span class="cl">Error</span>(`Invalid JSONL ${field}`);
+}
+
+<span class="kw">function</span> <span class="fn">parseCommittedWrite</span>(value: <span class="kw">unknown</span>): <span class="cl">CommittedWrite</span> {
+  <span class="kw">if</span> (!isRecord(value)) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">"Invalid JSONL transaction write"</span>);
+  <span class="fn">requireSafeInteger</span>(value.seq, <span class="st">"write seq"</span>, <span class="nu">1</span>);   <span class="cmt">// seq 必须是 ≥1 的安全整数</span>
+  <span class="kw">switch</span> (value.kind) {                            <span class="cmt">// kind 只认四种写操作，op 只认合法取值</span>
+    <span class="kw">case</span> <span class="st">"entry"</span>:
+      <span class="fn">requireSafeInteger</span>(value.timestamp, <span class="st">"entry timestamp"</span>, <span class="nu">0</span>);
+      <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedEntryWrite</span>;
+    <span class="kw">case</span> <span class="st">"usage"</span>:
+      <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedUsageWrite</span>;
+    <span class="kw">case</span> <span class="st">"value"</span>:
+      <span class="kw">if</span> (value.op === <span class="st">"set"</span>) <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedValueSetWrite</span>;
+      <span class="kw">if</span> (value.op === <span class="st">"delete"</span>) <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedValueDeleteWrite</span>;
+      <span class="kw">throw new</span> <span class="cl">Error</span>(`Invalid JSONL value operation: ${<span class="cl">String</span>(value.op)}`);
+    <span class="kw">case</span> <span class="st">"list"</span>:
+      <span class="kw">if</span> (value.op === <span class="st">"append"</span>) <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedListAppendWrite</span>;
+      <span class="kw">if</span> (value.op === <span class="st">"delete"</span>) <span class="kw">return</span> value <span class="kw">as unknown as</span> <span class="cl">CommittedListDeleteWrite</span>;
+      <span class="kw">throw new</span> <span class="cl">Error</span>(`Invalid JSONL list operation: ${<span class="cl">String</span>(value.op)}`);
+    <span class="kw">default</span>:
+      <span class="kw">throw new</span> <span class="cl">Error</span>(`Invalid JSONL write kind: ${<span class="cl">String</span>(value.kind)}`);
   }
-}</code></pre>
-    <p>它防的坑都很「阴」——只靠 <code class="inline">JSON.stringify</code> 是无法发现的：稀疏数组、访问器（getter）、携带符号键或额外属性的数组、非平面原型对象、<code class="inline">NaN</code>/<code class="inline">Infinity</code>、循环引用。这些一旦混进 JSONL，轻则污染读出结果，重则让整个会话文件读不回来。它用的是<strong>显式栈</strong>而非递归——深对象不会爆栈。</p>
+}</pre>
+    <p><code class="inline">seq</code> 不是安全整数、<code class="inline">kind</code> 不认识、<code class="inline">value.op</code> 是个奇怪的字符串，统统当场抛错，会话拒绝加载。写入侧反而只剩 <code class="inline">JSON.stringify</code>——没有对称的「写前深度校验」。这条演化痕迹值得记：写入的数据是 TypeScript 类型约束过的自产数据，形状在编译期就有保证；真正防不住的是<strong>磁盘上的历史行</strong>——旧版本程序写的、跨过格式变更的、被手动编辑过的文件。校验放在读侧，一次投入护住所有历史数据，而且只在启动时跑一遍，不给热路径添成本。写侧的不变式由别处兜底：4.4 见过的 <code class="inline">validateCommittedWrites</code>（seq 单调、id 唯一、parent 必须先存在）在事务提交时把关。</p>
     <div class="callout">
-      <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘（本章 JSONL），「写前校验」就是第一道防线。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，每种都在无声地制造 bug。一道显式校验器 + 引入即失败，成本极低、收益极高。
+      <strong>为什么应当照着做？</strong>校验放在读侧而不是写侧，是持久化设计中容易想反的一步。别指望 <code class="inline">JSON.stringify</code> 兜底——<code class="inline">undefined</code> 会被静默丢弃、<code class="inline">NaN</code> 会变 <code class="inline">null</code>、<code class="inline">BigInt</code> 直接抛错，所以格式校验要靠显式的逐字段检查；而把它放在读取端，天然覆盖「所有历史版本 + 手动编辑过的文件」，成本只在启动时付一次。写侧则靠类型系统加提交期不变式（而非逐节点深度遍历）守住形状。
     </div>
   </section>
 
@@ -509,7 +519,7 @@
 </div>
 
 <footer>
-  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

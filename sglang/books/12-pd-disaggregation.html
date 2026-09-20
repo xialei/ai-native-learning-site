@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>SGLang</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -152,7 +152,7 @@
         <span class="cmt"># 调度入口换成了 disagg 版本（内部仍走 get_new_batch_prefill）</span>
         plan = self.<span class="fn">get_next_disagg_prefill_batch_to_run</span>(...)
         batch = plan.batch_to_run
-        batch = self.ngram_embedding_manager.<span class="fn">prepare_for_forward</span>(batch)
+        batch = self.ngram_embedding_manager.<span class="fn">prepare_for_forward</span>(batch, chunked_req=self.chunked_req)
 
         <span class="kw">if</span> batch:
             <span class="kw">if</span> self.enable_staging:
@@ -166,7 +166,7 @@
         self.<span class="fn">process_disagg_prefill_inflight_queue</span>()
 
         self.last_batch = batch</pre>
-    <div class="annotation"><b>读懂这段：</b> 和 <code class="inline">event_loop_normal</code>（第 2 章）逐行对照，只有两处新增：入口处从 bootstrap 队列取「握手完成」的请求；尾部驱动 KV 传输队列。decode 侧的 <code class="inline">event_loop_normal_disagg_decode</code>（<code class="inline">disaggregation/decode.py:2500</code>）结构相同，差异是把 <code class="inline">process_decode_queue()</code> 插在调度之前。这就是「复用引擎主体」的含义：调度、内存、前向代码一行没动，动的只有请求进出的边界。</div>
+    <div class="annotation"><b>读懂这段：</b> 和 <code class="inline">event_loop_normal</code>（第 2 章）逐行对照，只有两处新增：入口处从 bootstrap 队列取「握手完成」的请求；尾部驱动 KV 传输队列。decode 侧的 <code class="inline">event_loop_normal_disagg_decode</code>（<code class="inline">disaggregation/decode.py:2627</code>）结构相同，差异是把 <code class="inline">process_decode_queue()</code> 插在调度之前。这就是「复用引擎主体」的含义：调度、内存、前向代码一行没动，动的只有请求进出的边界。</div>
     <p><code class="inline">DisaggregationMode</code> 本身是三值枚举（<code class="inline">NULL / PREFILL / DECODE</code>），挂在 Scheduler 上，所有 if 分支都围绕它展开。</p>
   </section>
 
@@ -185,7 +185,7 @@
         """</span>
         <span class="cmt"># 轮询每个请求的 KVPoll 状态；到 Success 的移入 bootstrapped_reqs，</span>
         <span class="cmt"># Failed 的进入失败处理（PP 下还有跨 rank 共识：good_rids / bad_rids）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 「bootstrap」这个词在代码里指 decode 侧的接收准备（缓冲注册 + 元数据交换），完成状态由 <code class="inline">KVPoll</code> 枚举驱动（见 12.6）。每个请求自带的 <code class="inline">bootstrap_room / bootstrap_host / bootstrap_port</code> 三个字段（<code class="inline">schedule_batch.py:1277-1279</code>）就是握手凭据。</div>
+    <div class="annotation"><b>读懂这段：</b> 「bootstrap」这个词在代码里指 decode 侧的接收准备（缓冲注册 + 元数据交换），完成状态由 <code class="inline">KVPoll</code> 枚举驱动（见 12.6）。每个请求自带的 <code class="inline">bootstrap_room / bootstrap_host / bootstrap_port</code> 三个字段（<code class="inline">schedule_batch.py:1329-1331</code>）就是握手凭据。</div>
 
     <p>prefill 完成后，KV 的写出有两种时机。一是 <code class="inline">process_batch_result_disagg_prefill</code>（prefill 前向结束后整体发送）；二是可选的提前发送——radix cache 命中的前缀 KV 不用等本轮前向，先发出去，让传输和计算重叠。这个开关带一整套防竞态处理，值得看一眼：</p>
     <div class="code-title">python/sglang/srt/disaggregation/prefill.py — maybe_send_cached_prefix_chunk（摘录，注释为译注）</div>
@@ -288,7 +288,7 @@
     <ul>
       <li><strong>缓冲区注册</strong>：启动时把 KV 池的显存段注册给传输引擎（GPU 直接 RDMA 读写，不经过 CPU 拷贝）。</li>
       <li><strong>KVArgs / TransferInfo</strong>：描述「哪些层、哪些槽位、什么形状」的传输清单，经 ZMQ 在两实例间交换。</li>
-      <li><strong>KVPoll 状态机</strong>：<code class="inline">Failed → Bootstrapping → WaitingForInput → Transferring → Success</code>（<code class="inline">base/conn.py:100</code>），两侧队列都靠轮询它推进。</li>
+      <li><strong>KVPoll 状态机</strong>：<code class="inline">Failed → Bootstrapping → WaitingForInput → Transferring → Success</code>（<code class="inline">base/conn.py:103</code>），两侧队列都靠轮询它推进。</li>
     </ul>
     <div class="code-title">python/sglang/srt/disaggregation/mooncake/conn.py — send_kvcache 签名（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">send_kvcache</span>(
@@ -307,6 +307,14 @@
     <span class="cmt"># RDMA 写到 decode 侧 dst_kv_ptrs 指向的缓冲；线程池并发提交</span></pre>
     <p>分层传输是让传输「不成气泡」的关键：每算完一层就能传一层，传输时间藏进后续层的计算时间里。对 hybrid 模型（如带 SWA/Mamba 层）还有一处细节——full-attention 层与总层数的序号换算（<code class="inline">_transfer_start_layer</code>），因为对端池里只有 full-attention 层的缓冲。</p>
     <p>路由侧由 <code class="inline">sgl-model-gateway</code>（Rust）承担：以 <code class="inline">--pd-disaggregation</code> 启动时，router 把请求路由到 prefill 实例，并维护 prefill/decode 实例的负载与存活；decode 实例的挑选依据 bootstrap 信息回传。也就是说 <strong>请求级路由在 Rust router，KV 级路由在 bootstrap 房间握手</strong>，两层各管各的。</p>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      KV 传输本身多了一道质量闸：<code class="inline">--disaggregation-enable-kv-checksum</code>（arg_groups/fields/disagg.py:73，默认关，两侧要同时开）。开了之后，prefill 侧在发<strong>最后一个 chunk</strong> 时对这次请求的全部 KV 页算一个 Adler-32 校验和——内核是 <code class="inline">kernels/ops/memory/adler32.py</code> 的 <code class="inline">adler32_strided_checksum</code>（按页跨步算，整块 GPU 张量不过 CPU），计算入口是 <code class="inline">disaggregation/checksum.py</code> 的 <code class="inline">KvChecksumComputer</code>，把校验值塞进 metadata buffer 随 KV 一起走（prefill.py:1283 的 <code class="inline">send_kv_chunk</code>）。decode 侧在请求从等待队列进批之前重算一遍并对照（decode.py:2771 的 <code class="inline">get_new_prebuilt_batch</code>）：对不上说明收到的 KV 不是 prefill 发的那份——源码注释把锅明确甩给硬件或传输层，而不是请求本身。处置是分场景的：线上只 abort 这一个请求（500，服务继续）；CI 里直接 raise，因为单个坏请求很容易被一次绿灯淹没。校验和的期望值还跟着 <code class="inline">_defer_release</code> 一起保留（decode.py:2215 的 _commit_transfer_to_req），延迟释放的 KV 被重新收编时不用重传。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      PD 分离最重的运维成本——「角色写死在启动参数里，改角色就得重启进程」——最近被撬动了一角。新增 <code class="inline">--enable-pd-role-switch</code>（disagg.py:117）后可以经 <code class="inline">POST /pd_role_switch</code>（http_server.py:1568）在运行时让一个实例在 prefill 和 decode 之间换角色，commit 1f60ddef5d（#28403）。实现是个「监督者重启事件循环」的形状：Scheduler 的入口 <code class="inline">dispatch_event_loop</code>（scheduler.py:5897）包了一层 <code class="inline">role_switch.run_event_loop_supervisor</code>，换角色的请求抛 <code class="inline">PdRoleSwitchRestart</code> 异常冲出当前循环，监督者接住后重新派发。前置条件写得毫不含糊：<code class="inline">is_fully_idle()</code> 不过关直接拒绝——所有在跑请求要排干才能换（注释原话 "drain all requests before switching"）；换到 decode 侧时若还有 CUDA Graph 没捕获，<code class="inline">decode_cuda_graph_memory_gb</code> 必须显式给出且余量够，因为新角色要现捕获。切换动作是 <code class="inline">get_context().override("role_switch.flip", disaggregation_mode=new_role)</code> 改上下文再整体重建 <code class="inline">init_disaggregation()</code>；<code class="inline">teardown_disaggregation</code> 负责拆 KV manager、清三个队列、释放前缀缓存。失败路径没有原地回滚—— unhealthy 标志置位后实例只能重启。另一个并行的演进是传输布局：开了 <code class="inline">--enable-unified-memory</code> 的 hybrid 模型把「全注意力 KV + SWA/Mamba 状态」两块静态分区换成一个动态切分的字节大池（memory.py:86 的字段说明），mooncake 传输随之出现整页信封（whole-envelope）模式——对端注册的是<strong>一个完整的页 envelope 区域</strong>，寻址按 <code class="inline">dst_ptr + page_id * item_len</code> 用本端的 item_len 算，所以 <code class="inline">_validate_envelope_kv_layout</code>（conn.py:971）会拒绝两侧 KV 注册形状不一致、或 prefill/decode 注意力 TP 大小不同的对端（整页状态无法跨 TP 重切）。配套地，decode 侧的准入从两个内联数值比较改成 <code class="inline">_prealloc_reservation_fits</code> + <code class="inline">_reclaim_swa_tail_capacity</code>（decode.py:458 起）——因为共享字节大池下「FULL 侧放得下」不再隐含「SWA 侧也放得下」，预分配要两侧一起询价（<code class="inline">prealloc_fits</code> 逐边预算、hybrid SWA 变体按共享信封计价）、不够时连 SWA 尾部一起回收。
+    </div>
   </section>
 
   <section class="block">
@@ -324,7 +332,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-9767-g0b0d2c257a · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

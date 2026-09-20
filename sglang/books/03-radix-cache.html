@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>SGLang</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -127,7 +127,7 @@
     </div>
 
     <div class="annotation"><b>关键映射：</b>
-      节点 = <code class="inline">TreeNode</code>（<code class="inline">radix_cache.py:259</code>）；键 = <code class="inline">RadixKey</code>（token id 数组 + <code class="inline">extra_key</code> + <code class="inline">cache_salt</code>）；值 = <code class="inline">value</code>（<code class="inline">torch.Tensor</code>，KV 槽位下标）；淘汰集合 = <code class="inline">evictable_leaves</code>。
+      节点 = <code class="inline">TreeNode</code>（<code class="inline">radix_cache.py:256</code>）；键 = <code class="inline">RadixKey</code>（token id 数组 + <code class="inline">extra_key</code> + <code class="inline">cache_salt</code>）；值 = <code class="inline">value</code>（<code class="inline">torch.Tensor</code>，KV 槽位下标）；淘汰集合 = <code class="inline">evictable_leaves</code>。
     </div>
   </section>
 
@@ -211,7 +211,7 @@
 
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      命名空间隔离经历了从无到有的过程。最早的树只按 token id 分叉，所有请求共享一棵树；后来 <code class="inline">RadixKey</code> 增加了 <code class="inline">extra_key</code>（LoRA 适配器、采样盐等调用方自定义隔离），最近又把 <code class="inline">cache_salt</code> 从 <code class="inline">extra_key</code> 里独立出来——代码注释明确写着「kept distinct so it cannot collide with extra_key」，因为 L3/远端存储的键仍然只用 token，进程内外的命名空间契约必须分开表述。
+      命名空间隔离经历了从无到有的过程。最早的树只按 token id 分叉，所有请求共享一棵树；后来 <code class="inline">RadixKey</code> 增加了 <code class="inline">extra_key</code>（LoRA 适配器、采样盐等调用方自定义隔离），最近又把 <code class="inline">cache_salt</code> 从 <code class="inline">extra_key</code> 里独立出来。两者的注释写出了分工：<code class="inline">extra_key</code>「Namespaces the tree and storage; omitted from KV events」——隔树和存储，但不进 KV 事件；<code class="inline">cache_salt</code>「Namespaces the tree, storage and KV events」——连事件也一起隔。注意 salt 现在也作用于存储端（HiCache 按 extra key 隔离存储页），不再是「进程内才有意义」的字段。
     </div>
   </section>
 
@@ -249,7 +249,11 @@
     <div class="annotation"><b>读懂这段：</b> 三个要点。① 优先级由 <code class="inline">eviction_strategy.get_priority</code> 决定，默认 LRU（<code class="inline">last_access_time</code>）。② <code class="inline">free_segment</code> 归还的是物理槽位；树节点被删，数据等下次分配被覆盖。③ 淘汰只从叶子开始，父节点要等所有孩子都没了才暴露为叶子——这保证被淘汰的永远是一段完整后缀，不会在中间挖洞。</div>
     <div class="callout info">
       <b class="tag">容易搞混的一对</b>
-      <code class="inline">TreeNode.__lt__</code> 比的是 <code class="inline">last_access_time</code>，而堆里排序用的 <strong>不是</strong> <code class="inline">__lt__</code>，是 <code class="inline">eviction_strategy.get_priority(node)</code>。两者在默认 LRU 下刚好一致（<code class="inline">LRUStrategy.get_priority</code> 就 <code class="inline">return node.last_access_time</code>），所以读代码时容易以为是同一个东西。实际有七种策略可选（<code class="inline">lru / lfu / fifo / mru / filo / priority / slru</code>，<code class="inline">--radix-eviction-policy</code>，默认 <code class="inline">lru</code>），它们的返回值形态不同：<code class="inline">LFUStrategy</code> 返回 <code class="inline">(hit_count, last_access_time)</code>、<code class="inline">SLRUStrategy</code> 返回 <code class="inline">(分段号, last_access_time)</code>——都是元组，靠 Python 的元组比较做「先按主键、再按 LRU 打破平局」。<code class="inline">PriorityStrategy</code> 的元组是 <code class="inline">(priority, last_access_time)</code>，值<strong>小的先被淘汰</strong>；而 <code class="inline">priority</code> 字段本身在 insert 时沿途取 max 向上传播（<code class="inline">node.priority = max(node.priority, priority)</code>），根节点则初始化为 <code class="inline">-sys.maxsize</code>，保证它永远排在最后。
+      <code class="inline">TreeNode.__lt__</code> 比的是 <code class="inline">last_access_time</code>，而堆里排序用的 <strong>不是</strong> <code class="inline">__lt__</code>，是 <code class="inline">eviction_strategy.get_priority(node)</code>。两者在默认 LRU 下刚好一致（<code class="inline">LRUStrategy.get_priority</code> 就 <code class="inline">return node.last_access_time</code>），所以读代码时容易以为是同一个东西。实际有八种策略可选（<code class="inline">lru / lfu / fifo / mru / filo / priority / slru / tlru</code>，<code class="inline">--radix-eviction-policy</code>，默认 <code class="inline">lru</code>），它们的返回值形态不同：<code class="inline">LFUStrategy</code> 返回 <code class="inline">(hit_count, last_access_time)</code>、<code class="inline">SLRUStrategy</code> 返回 <code class="inline">(分段号, last_access_time)</code>——都是元组，靠 Python 的元组比较做「先按主键、再按 LRU 打破平局」。<code class="inline">PriorityStrategy</code> 的元组是 <code class="inline">(priority, last_access_time)</code>，值<strong>小的先被淘汰</strong>；而 <code class="inline">priority</code> 字段本身在 insert 时沿途取 max 向上传播（<code class="inline">node.priority = max(node.priority, priority)</code>），根节点则初始化为 <code class="inline">-sys.maxsize</code>，保证它永远排在最后。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      第八种策略 <code class="inline">tlru</code>（<code class="inline">TLRUStrategy</code>，<code class="inline">evict_policy.py:49</code>）是 2026 年 10 月随论文 <em>Tail-Optimized LRU</em>（arXiv:2510.15152）加进来的，解决一个具体的错配：chunked prefill 时代，一个长前缀被逐块登记进树，传统的 LRU 只看 <code class="inline">last_access_time</code>，于是「刚被最后一个块碰过」的长前缀反而最不容易被淘汰——但它恰恰可能还没算完，缓存它中间那段对 TTFT 没有任何贡献。T-LRU 的做法是给每个节点估算一个「再往它身上追加 prompt、TTFT 还能不能改善」的预算（<code class="inline">threshold</code> 与 <code class="inline">next_prompt_estimate</code>，单位 token，经 <code class="inline">--radix-eviction-policy-config</code> 配置），算不动的节点标成 <em>TEL-safe</em>，<code class="inline">get_priority</code> 返回 <code class="inline">(-1, last_access_time)</code> 让它优先出堆——注意主键 -1 比所有 LRU 类元组都小，堆里值小的先出，所以 TEL-safe 节点反而最先被淘汰。目前要求 <code class="inline">UnifiedRadixCache</code>（普通 <code class="inline">RadixCache</code> 传入会直接 ValueError），且配置校验有一条很直白的防线：<code class="inline">threshold &gt; next_prompt_estimate</code> 时报错，因为那样任何 token 都不可能 TEL-safe，T-LRU 退化成普通 LRU。论文的两阶段方案（先把不 TEL-safe 的存量节点排干净，再进入正常的按新旧节奏）在实现里不需要淘汰循环做任何改造——TEL-safe 节点被上报成「无限旧」，现有的淘汰驱动自然先清掉它们，清完自动回到普通的最近最少使用顺序。
     </div>
 
     <p>锁是树的第二个保护层。一个正在运行的请求会把从匹配终点到根的整条路径锁住：</p>
@@ -284,7 +288,7 @@
 
   <section class="block">
     <h2><span class="num">3.5</span>与调度的配合：从 match 到 prefill 只剩后缀</h2>
-    <p>把视角拉回调度链路。每个请求入队时（<code class="inline">Req.init_next_round_input</code>，<code class="inline">schedule_batch.py:1439</code>）先做一次前缀匹配，把结果写回 <code class="inline">Req</code> 自己身上：</p>
+    <p>把视角拉回调度链路。每个请求入队时（<code class="inline">Req.init_next_round_input</code>，<code class="inline">schedule_batch.py:1556</code>）先做一次前缀匹配，把结果写回 <code class="inline">Req</code> 自己身上：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_batch.py — init_next_round_input 中的匹配（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>match_result = tree_cache.<span class="fn">match_prefix</span>(
     <span class="cl">MatchPrefixParams</span>(
@@ -322,7 +326,7 @@
 )</pre>
     <div class="annotation"><b>读懂这段：</b> <code class="inline">prefix_indices</code> 从这一刻起就是请求的「已就绪 KV 清单」。后面所有环节都在它上面做减法，而不再碰树。<br><br><b>这个元组为什么这么长：</b>它已经从一个「匹配结果」长成了一个「按层类型分类的匹配结果」。最初只有前两项（槽位 + 终点节点），后来 HiCache 加进来长了 <code class="inline">host_hit_length</code>，再后来<strong>滑动窗口层</strong>（<code class="inline">swa_*</code>）和 <strong>Mamba/线性注意力层</strong>（<code class="inline">mamba_*</code>）各自有了独立的命中长度——因为这三类层能复用的历史长度不一样：全注意力层能复用整段前缀，滑动窗口层只能复用最后 <code class="inline">window_size</code> 个 token，Mamba 类层的状态则有个「分支点」概念（<code class="inline">branching_seqlen</code>，超过它状态就不能直接续用，必须重算）。如果你在别的分支上看到过只有 5 项的版本，那是这个元组扩张过程中的中间形态。</div>
 
-    <p>第一个减法在准入阶段。<code class="inline">PrefillAdder.add_one_req</code>（<code class="inline">schedule_policy.py:1266</code>）按「还剩多少 token 真的要算」扣预算：</p>
+    <p>第一个减法在准入阶段。<code class="inline">PrefillAdder.add_one_req</code>（<code class="inline">schedule_policy.py:1232</code>）按「还剩多少 token 真的要算」扣预算：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_policy.py — add_one_req 的预算段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 预留一页的页对齐开销：分页分配器可能为每个请求多占一页</span>
 max_new = <span class="fn">min</span>(
@@ -336,7 +340,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
     <span class="kw">return</span> <span class="cl">AddReqResult</span>.NO_TOKEN</pre>
     <div class="annotation"><b>读懂这段：</b> 前缀命中直接降低准入成本：命中越多，<code class="inline">cand_extend_input_len</code> 越小，同一个预算能塞进更多请求。这也是第 4 章 cache-aware 排序策略（优先挑命中长的请求）的动机——同样的显存，先做命中多的，吞吐更高。</div>
 
-    <p>第二个减法在组 batch 阶段。<code class="inline">prepare_for_extend</code>（<code class="inline">schedule_batch.py:2569</code>）只把后缀喂给模型：</p>
+    <p>第二个减法在组 batch 阶段。<code class="inline">prepare_for_extend</code>（<code class="inline">schedule_batch.py:2683</code>）只把后缀喂给模型：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_batch.py — prepare_for_extend（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">prepare_for_extend</span>(self):
     self.forward_mode = <span class="cl">ForwardMode</span>.EXTEND
@@ -356,7 +360,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
     <div class="code-title">python/sglang/srt/managers/scheduler.py — stash_chunked_request（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">stash_chunked_request</span>(self, req: <span class="cl">Req</span>):
     <span class="fn">maybe_cache_unfinished_req</span>(req, self.tree_cache, chunked=<span class="kw">True</span>)</pre>
-    <p>对应到树这边的 <code class="inline">cache_unfinished_req</code>（<code class="inline">radix_cache.py:539</code>）：把已算好的段 insert 进树、立刻重新 match 一次、用新 <code class="inline">prefix_indices</code> 覆盖请求的旧值，然后换锁（<code class="inline">dec_lock_ref(req.last_node)</code> → <code class="inline">inc_lock_ref(new_last_node)</code>）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
+    <p>对应到树这边的 <code class="inline">cache_unfinished_req</code>（<code class="inline">radix_cache.py:566</code>）：把已算好的段 insert 进树、立刻重新 match 一次、用新 <code class="inline">prefix_indices</code> 覆盖请求的旧值，然后换锁（<code class="inline">dec_lock_ref(req.last_node)</code> → <code class="inline">inc_lock_ref(new_last_node)</code>）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
       <code class="inline">cache_unfinished_req</code> 里有个专门的 <code class="inline">cache_protected_len</code> 字段，注释解释了为什么需要它：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在 <code class="inline">prefix_indices</code> 里但不在树上；这半页的槽位<strong>不能</strong>在中间块结束时归还（下一个块还要接着用），也不能永远占着——所以单独记一个「受保护长度」，推迟到下一个块或最终收尾时统一释放。这是页对齐与树记账之间的一次典型补丁：先有按 token 的树，后有按页的池，接缝处需要这个字段对齐两套粒度。
@@ -409,7 +413,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
 </div>
 
 <footer>
-  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-9767-g0b0d2c257a · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

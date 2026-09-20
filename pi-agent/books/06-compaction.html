@@ -19,7 +19,7 @@
       <a href="03-agent-loop.html">Agent 循环</a>
       <a href="04-session-storage.html">会话存储</a>
       <a href="05-context.html">上下文</a>
-      <a href="06-compaction.html">压缩</a>
+      <a class="active" href="06-compaction.html">压缩</a>
       <a href="07-harness.html">Harness</a>
       <a href="08-agent-session.html">生产 Harness</a>
       <a href="09-tools.html">工具</a>
@@ -170,6 +170,7 @@
   <span class="kw">return</span> contextTokens &gt; contextWindow - settings.reserveTokens;
 }</pre>
     <div class="annotation"><b>读懂这段：</b> 思路是「别等到窗口满才动，留出 <code class="inline">reserveTokens</code> 给这次摘要本身」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。</div>
+    <p>生产侧（coding-agent 的 <code class="inline">settings-manager.ts</code>）在这两个旋钮之上又加了一层解析：<code class="inline">compaction.modelOverrides</code> 允许按 <code class="inline">"provider/modelId"</code> 精确覆盖 <code class="inline">reserveTokens</code>/<code class="inline">keepRecentTokens</code>。动机很实际——一个 1M 窗口的模型与一个 32K 窗口的模型，合身的预留预算差了一个量级，全局一份默认值必然顾此失彼。解析顺序是<strong>模型覆盖 → 普通设置 → 内置默认</strong>，两个字段各自独立回退；<code class="inline">AgentSession</code> 在每次触发检查、手动 <code class="inline">/compact</code>、溢出恢复时都按<strong>当前模型</strong>调 <code class="inline">getCompactionSettings(model)</code> 拿生效值，换模型后下次检查就用新预算（进行中的那次压缩仍用开工时捕获的设置）。</p>
   </section>
 
   <section class="block">
@@ -240,6 +241,32 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 <span class="kw">return</span> ok({ summary, tokensBefore, usage: summaryUsage, retainedTail,
              details: { readFiles, modifiedFiles } });</pre>
     <div class="annotation"><b>读懂这段：</b> <code class="inline">retainedTail</code> 直接存在 compaction 条目上——所以第 5 章的 <code class="inline">sessionEntryToContextMessages</code> 能「<code class="inline">[摘要假消息, ...retainedTail]</code>」地展开它。而 <code class="inline">details</code> 记录了「这段历史读过/改过哪些文件」，让后续上下文（或你自研时）能推断文件依赖而无需重扫。</div>
+    <p>coding-agent 的 <code class="inline">appendCompaction</code> 还往 compaction 条目上多存了一样东西——<strong>压缩那一刻的完整系统提示</strong>：</p>
+    <div class="code-title">coding-agent/src/core/session-manager.ts — 压缩检查点（节选，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// CompactionEntry 上新增的字段：边界处的完整 prompt 与工具声明状态</span>
+<span class="cmt">/** Complete prompt and tool state at this compaction boundary. */</span>
+systemMessage?: <span class="cl">SystemMessage</span>;
+
+<span class="cmt">// appendCompaction 写入时快照当前生效的系统消息</span>
+<span class="kw">const</span> systemMessage = <span class="fn">getCurrentSystemMessage</span>(<span class="kw">this</span>.<span class="fn">buildSessionContext</span>().messages);
+<span class="kw">const</span> entry: <span class="cl">CompactionEntry</span>&lt;T&gt; = {
+  type: <span class="st">"compaction"</span>, summary, firstKeptEntryId, tokensBefore, details, usage, fromHook,
+  ...(systemMessage ? { systemMessage: { ...systemMessage } } : {}),
+};</pre>
+    <div class="annotation"><b>读懂这段：</b> 系统提示不再是「永远在头顶的一条固定消息」，而是随对话演化、可被中途替换的状态（<a href="10-ai-layer.html">第 10 章</a>）。这带来一个压缩特有的问题：压缩会把旧消息丢掉，如果那条记录「系统提示是什么」的 system 消息恰好落在被丢掉的部分，压缩后模型就失去了 prompt。所以压缩条目把边界处的 system 消息<strong>整体存档</strong>，重放时展开成「<code class="inline">[系统消息, 摘要消息]</code>」两条：</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// sessionEntryToContextMessages 的 compaction 分支</span>
+<span class="kw">if</span> (entry.type === <span class="st">"compaction"</span>) {
+  <span class="kw">const</span> summary = <span class="fn">createCompactionSummaryMessage</span>(entry.summary, entry.tokensBefore, entry.timestamp);
+  <span class="kw">return</span> entry.systemMessage ? [entry.systemMessage, summary] : [summary];
+}
+<span class="cmt">// buildContextEntries 反向处理：保留段里的 system 消息一律剔除，</span>
+<span class="cmt">// 否则同一条 prompt 会出现两次（存档里一份、保留段里一份）</span>
+<span class="kw">if</span> (foundFirstKept &amp;&amp; !(entry.type === <span class="st">"message"</span> &amp;&amp; entry.message.role === <span class="st">"system"</span>)) {
+  contextEntries.push(entry);
+}</pre>
+    <div class="callout">
+      <strong>配套的取舍：</strong>压缩收集待摘要消息时也跳过 system 角色（<code class="inline">getMessageFromEntryForCompaction</code> 里有一句注释「System messages are prompt state, not conversation」）——系统提示不参与摘要。另外切分 turn 时，拆成「历史摘要 + turn 前缀摘要」两段再合并，历史那段的种子文本现在取 <code class="inline">previousSummary ?? "No prior history."</code>——即上一轮的旧摘要直接作为增量更新的底稿，而不是每次都从「无历史」开始。压缩在 coding-agent 里因此是<strong>递归的</strong>：新摘要 = 旧摘要 + 新增消息的合并。
+    </div>
   </section>
 
   <section class="block">
@@ -273,7 +300,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 <span class="cmt">// ② 在 token 预算内挑消息 + 提取文件操作（prepareBranchEntries）</span>
 <span class="kw">export function</span> <span class="fn">prepareBranchEntries</span>(entries, tokenBudget): BranchPreparation {
   <span class="cmt">// 从新到旧累加，超预算就停；toolResult 不进消息但会抽文件操作</span>
-  <span class="cmt">// 已有的 branch_summary/compaction 条目会先把其 readFiles/modifiedFiles 并进来</span>
+  <span class="cmt">// 已有的 branch_summary 条目会先把其 readFiles/modifiedFiles 并进来（compaction 条目的文件清单另有 extractFileOperations 处理）</span>
   <span class="kw">return</span> { messages, fileOps, totalTokens };
 }
 
@@ -305,7 +332,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 </div>
 
 <footer>
-  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

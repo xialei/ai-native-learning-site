@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>On-Device推理</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -23,7 +23,7 @@
       <a href="07-sampling.html">采样</a>
       <a href="08-speculative.html">投机解码</a>
       <a href="09-server.html">服务入口</a>
-      <a href="10-freetoken.html">FreeToken</a>
+      <a class="active" href="10-freetoken.html">FreeToken</a>
       <a href="11-moe-offload.html">MoE缓存</a>
       <a href="12-hybrid-exec.html">CPU/GPU协同</a>
       <a href="13-build-own-engine.html">双引擎对照·自研</a>
@@ -41,7 +41,7 @@
   <section class="block">
     <h2><span class="num">10.1</span>定位与约束</h2>
     <p>FreeToken 目标场景：DeepSeek-V4-Flash 级别的 MoE（256 专家、43 层、约 290B 参数，仓库 README 自称 "290B+ frontier"）在 8-24GB 消费卡上跑。它不做的事很说明问题：GGUF 支持极窄（只有一条 <code class="inline">gemma4 → Gemma4GGUFForCausalLM</code> 的注册路径，读原生 Q4_0/Q6_K；主流路径是自研 FTW + HF safetensors）、没有 CPU fallback 前向（除 routed experts 外全部算子要求 GPU）、没有通用模型架构支持（模型注册表按架构枚举）。换来的是：针对 MoE decode 的极致优化。引擎并发上限默认 4：</p>
-    <div class="code-title">python/freetoken/engine/config.py:24 — 并发上限（摘录）</div>
+    <div class="code-title">python/freetoken/engine/config.py:26 — 并发上限（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EngineConfig</span>:
     max_running_req: <span class="cl">int</span> = <span class="nu">4</span></pre>
     <div class="annotation"><b>读懂这段：</b> max_running_req=4 不是偷懒，是与 CUDA Graph 档位（[1,2,4]+range(8,160,8)，第 5 章）对齐——batch ≤4 是端侧常态，4 之上走 padding。所有设计都围绕「小 batch、低延迟」。</div>
@@ -71,7 +71,7 @@ watching on top of this."""</span></pre>
 
   <section class="block">
     <h2><span class="num">10.3</span>调度主循环：overlap_loop</h2>
-    <p>FreeToken 调度的核心是双流重叠（python/freetoken/scheduler/scheduler.py:197-250）：</p>
+    <p>FreeToken 调度的核心是双流重叠（python/freetoken/scheduler/scheduler.py:207-261）：</p>
     <div class="code-title">python/freetoken/scheduler/scheduler.py — overlap_loop（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">overlap_loop</span>(self, last_data):
     <span class="cmt">"""The main loop of overlapping scheduling and execution.
@@ -115,7 +115,7 @@ watching on top of this."""</span></pre>
 
   <section class="block">
     <h2><span class="num">10.4</span>chunked prefill 与请求生命周期</h2>
-    <p>长 prompt 不阻塞 decode：PrefillManager 把超过预算的 prompt 切块，逐轮消化（python/freetoken/scheduler/prefill.py:134-175）：</p>
+    <p>长 prompt 不阻塞 decode：PrefillManager 把超过预算的 prompt 切块，逐轮消化（python/freetoken/scheduler/prefill.py:134-198）：</p>
     <div class="code-title">python/freetoken/scheduler/prefill.py — chunk 切分（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>chunk_size = min(self.token_budget, remain_len)
 <span class="kw">if</span> self.cache_manager.swa_paged:
@@ -131,7 +131,7 @@ watching on top of this."""</span></pre>
     aligned = align_down(cached_len + chunk_size, ps) - cached_len
     ...
     chunk_size = aligned</pre>
-    <p>准入控制集中在 PrefillAdder._try_allocate_one（prefill.py:58-99），依次检查三类资源：</p>
+    <p>准入控制集中在 PrefillAdder._try_allocate_one（prefill.py:70-111），依次检查三类资源：</p>
     <div class="code-title">python/freetoken/scheduler/prefill.py — 三重准入（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 第一类：KV 页池。预留量按页粒度算（CacheManager 分配以整页为单位）：</span>
 <span class="cmt"># 新增整页数 × page_size，而不是裸 token 数</span>
@@ -172,13 +172,13 @@ estimated_size = self.<span class="fn">_kv_reservation_size</span>(req.input_len
     ...
     ids = tokenizer.<span class="fn">encode</span>(opener, add_special_tokens=<span class="kw">False</span>)
     <span class="kw">return</span> int(ids[<span class="nu">0</span>]) <span class="kw">if</span> len(ids) == <span class="nu">1</span> <span class="kw">else</span> <span class="kw">None</span></pre>
-    <p>调度层逐 token 检测（scheduler.py:357-362）：</p>
+    <p>调度层逐 token 检测（scheduler.py:367-372）：</p>
     <div class="code-title">python/freetoken/scheduler/scheduler.py — anchor 检测（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> (next_token == self.toolcall_anchor_id
         <span class="kw">and</span> req.toolcall_anchor_len <span class="kw">is</span> <span class="kw">None</span>
         <span class="kw">and</span> <span class="kw">not</span> finished):
     req.toolcall_anchor_len = req.input_ids.numel()</pre>
-    <p>检测到后，在合适时机把 GDN 状态冻结进 ping-pong 槽（scheduler/cache.py:151-176）：</p>
+    <p>检测到后，在合适时机把 GDN 状态冻结进 ping-pong 槽（scheduler/cache.py:148-173）：</p>
     <div class="code-title">python/freetoken/scheduler/cache.py — snapshot_toolcall_anchor（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">snapshot_toolcall_anchor</span>(self, reqs) -&gt; <span class="kw">None</span>:
     <span class="cmt">"""Freeze each decoding request's GDN state at its tool-call anchor, into the
@@ -239,7 +239,7 @@ estimated_size = self.<span class="fn">_kv_reservation_size</span>(req.input_len
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 10 FreeToken 引擎总览 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 10 FreeToken 引擎总览 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

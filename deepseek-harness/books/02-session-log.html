@@ -10,12 +10,12 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>dsh</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
       <a href="01-architecture.html">架构</a>
-      <a href="02-session-log.html">会话日志</a>
+      <a class="active" href="02-session-log.html">会话日志</a>
       <a href="03-agent-lifecycle.html">生命周期</a>
       <a href="04-agent-loop.html">Agent 循环</a>
       <a href="05-persistence.html">持久化</a>
@@ -171,6 +171,7 @@
       <tr><td><code class="inline">compaction/start</code></td><td><code class="inline">compaction/compaction/src/types.ts</code></td><td>{compactionId, sourceCommandId?, turn | null} — log-only，持有锁直到 end</td></tr>
       <tr><td><code class="inline">todo/write</code></td><td><code class="inline">todo/tool-todo/src/types.ts</code></td><td>{todos: TodoItem[]} — 整表快照</td></tr>
       <tr><td><code class="inline">goal/change</code></td><td><code class="inline">goal/goal/src/domain.ts</code></td><td>{kind:'goal/change', version:1, operation, goal: GoalSnapshot, roundsStarted, …}</td></tr>
+      <tr><td><code class="inline">image/offload</code></td><td><code class="inline">compaction/compaction-image-offload/src/projection.ts</code></td><td>{targets: {seq, imageIndexes}[]} — 永久省略所选输入图（见 §2.4 与第 11 章）</td></tr>
     </table>
   </section>
 
@@ -226,29 +227,33 @@
   <section class="block">
     <h2><span class="num">2.4</span>投影：deriveMessages() 如何从日志得到模型历史</h2>
     <p>模型历史从不单独存储，它是对表面节点的<strong>折叠</strong>。核心实现带一个精细的增量缓存（<code class="inline">packages/core/session/src/index.ts</code>）：</p>
-    <div class="code-title">packages/core/session/src/index.ts — deriveMessages()</div>
+    <div class="code-title">packages/core/session/src/index.ts — deriveMessages()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/** The derived-message cache: frozen projections, extended per unseen node. */</span>
   <span class="kw">private</span> derived: <span class="cl">Message</span>[] = []
   <span class="cmt">/** Surface position (nodes projected) the cache has reached. */</span>
   <span class="kw">private</span> derivedNodes = <span class="nu">0</span>
-  <span class="cmt">/** SurfaceManager.replaceGeneration the cache was built under. */</span>
+  <span class="cmt">/** {@link SurfaceManager.contentGeneration} the cache was built under. */</span>
   <span class="kw">private</span> derivedGeneration = <span class="nu">0</span>
 
   <span class="cmt">/**
    * Derive the LLM message history by walking the ordered sequences of
-   * message-producing events maintained by `surfaceOp` markers.
+   * message-producing events maintained by `surfaceOp` markers. The
+   * surface is the single source of derived history: every message-producing
+   * append records its `surfaceOp`, so a raw event with no marker (a chunk, a
+   * turn boundary) is correctly absent, and a compaction `replace` deletes the
+   * shadowed nodes from the derivation.
    *
-   * CACHED: each surface node is projected exactly once, when first seen —
-   * a call costs O(new nodes), and a surface rewrite (a `replace`)
-   * rebuilds. The returned array is a fresh snapshot per call; the `Message`
-   * objects in it are SHARED and **deep-frozen**. Their content reuses the
-   * already frozen durable event data, so the cache needs no second deep
-   * clone and consumers still cannot mutate the log.
+   * CACHED: pure tail growth costs O(new nodes); a replacement or message
+   * projection ({@link SessionSurface.contentGeneration}) rebuilds. The
+   * returned array is a fresh snapshot per call; the `Message` objects in
+   * it are SHARED and **deep-frozen**. Unchanged content reuses frozen
+   * event data; projected blocks are frozen derived copies. Consumers
+   * cannot mutate the log through either form.
    */</span>
   <span class="fn">deriveMessages</span>(): <span class="cl">Message</span>[] {
     <span class="kw">const</span> surface = <span class="kw">this</span>.surface
     <span class="kw">const</span> nodes = surface.nodes
-    <span class="kw">const</span> generation = surface.replaceGeneration
+    <span class="kw">const</span> generation = surface.contentGeneration
     <span class="kw">if</span> (generation !== <span class="kw">this</span>.derivedGeneration) {
       <span class="kw">this</span>.derived = []
       <span class="kw">this</span>.derivedNodes = <span class="nu">0</span>
@@ -263,7 +268,14 @@
     <span class="kw">this</span>.derivedNodes = nodes.length
     <span class="kw">return</span> [...<span class="kw">this</span>.derived]
   }</pre>
-    <div class="annotation"><b>三个不变量</b>：① 没带 <code class="inline">surfaceOp</code> 的裸事件（chunk、回合边界）天然缺席历史；② compaction 的 <code class="inline">replace</code> 会把被遮蔽节点从派生中删除（通过 replaceGeneration 使缓存失效重建）；③ 返回数组每次是<strong>新快照</strong>，里面的 Message 对象是<strong>共享且深冻结</strong>的——消费者拿到的历史不可变，日志也不可能被改。</div>
+    <div class="annotation"><b>三个不变量</b>：① 没带 <code class="inline">surfaceOp</code> 的裸事件（chunk、回合边界）天然缺席历史；② compaction 的 <code class="inline">replace</code> 会把被遮蔽节点从派生中删除（通过 contentGeneration 使缓存失效重建——替换和插件侧的消息投影共用这一个计数）；③ 返回数组每次是<strong>新快照</strong>，里面的 Message 对象是<strong>共享且深冻结</strong>的——消费者拿到的历史不可变，日志也不可能被改。</div>
+
+    <p>②里那句「插件侧的消息投影」是 v0.1.6 wave 落地的新机制，值得单独说清楚。<code class="inline">image/offload</code> 这类事件的<strong>模型可见效果</strong>不能靠默认派生规则得到——它需要把某个 <code class="inline">user/message</code> / <code class="inline">tool/result</code> 节点里的部分 image block 换成占位文本。会话子系统为此提供了 <code class="inline">SessionMessageProjection { type, project(event, context) → ReadonlyMap&lt;SessionSeq, Message&gt; }</code>：插件用 <code class="inline">sessions.registerMessageProjection()</code> 注册<strong>自己事件类型的纯解释器</strong>（重复 type 直接抛错；dispose 后再用该事件的会话会拒绝继续派生——fail-closed）。注册表在 <code class="inline">known-event-types.ts</code> 的 <code class="inline">MESSAGE_PROJECTION_EVENT_TYPES</code> 里列硬要求：声明进 <code class="inline">SessionEventMap</code> 的事件若标了 <code class="inline">@messageProjection</code>，没有对应解释器时 append/restore/fold 直接报错。折叠入口 <code class="inline">foldSurface</code> 返回值多了 <code class="inline">projectedMessages</code>，<code class="inline">deriveEventMessage(event, projectedMessages?)</code> 优先查这张表——离线读者（fork、detached replay）必须显式传入同前缀的投影，否则读到的是原始内容。这使得「被 offload 的图」在所有读路径上一致地变回占位符，而不需要任何人重写日志。</p>
+
+    <div class="callout info">
+      <b class="tag">顺带的 API 卫生</b>
+      同一个 wave 把同步读日志的三个入口 <code class="inline">eventAt()</code> / <code class="inline">snapshotEvents()</code> / <code class="inline">ownEvents()</code> 标了 <code class="inline">@deprecated</code>——「Existing logic may remain unmigrated for now, but new calls are prohibited」（存量逻辑可暂不迁移，新调用禁止），指向设计笔记 2026-09-09-deprecate-synchronous-session-event-reads。语义取代者分别是：增量表面节点（surface.nodes）、投影与分页。讽刺的是 image-offload 自己还在用 <code class="inline">eventAt()</code>——带着 waiver 注释「Existing Session history read; migration deferred」。自家园丁也逃不过存量。
+    </div>
   </section>
 
   <section class="block">
@@ -271,7 +283,7 @@
     <p>这是整个会话子系统的第一不变量（<code class="inline">docs/architecture.md</code>）：</p>
     <div class="callout warn">
       <b class="tag">铁律</b>
-      <strong>任何到达模型请求的内容，都必须能从日志重建</strong>——运行时有不变量断言强制这一点。所以「新增一种模型可见输入」的第一步永远是：扩展 <code class="inline">SessionEventMap</code>，然后从日志渲染。反过来，文件变更通知、子目录 AGENTS.md、skill 内容、cron 通知这些 <code class="inline">agent.inject()</code> 注入物，最终都以 <code class="inline">user/message</code>（带区分用的 <code class="inline">source</code>）落日志。
+      <strong>任何到达模型请求的内容，都必须能从日志重建</strong>——运行时有不变量断言强制这一点。所以「新增一种模型可见输入」的第一步永远是：扩展 <code class="inline">SessionEventMap</code>，然后从日志渲染。若默认派生规则表达不了效果（比如把图换成占位符），再加一个插件自有的 <code class="inline">SessionMessageProjection</code> 纯解释器（§2.4）。反过来，文件变更通知、子目录 AGENTS.md、skill 内容、cron 通知这些 <code class="inline">agent.inject()</code> 注入物，最终都以 <code class="inline">user/message</code>（带区分用的 <code class="inline">source</code>）落日志。
     </div>
     <p>这条铁律带来的直接收益：fork、resume、转录、遥测、持久化<strong>全部</strong>从同一份持久结算（assistant/message 与 assistant/attempt）派生，彼此不可能不一致。唯一的例外是 UI 的增量渲染——它消费进程内的 <code class="inline">agent/assistant-stream</code> live 事件，而进程崩溃时未结算的流不会留下任何持久痕迹（这是有意为之：宁缺勿假）。</p>
 
@@ -307,7 +319,7 @@
         <text class="lbl sm" x="770" y="70" text-anchor="middle">发给 LLM 的 messages</text>
         <rect class="node acc" x="660" y="100" width="220" height="52" rx="9"/>
         <text class="lbl sm" x="770" y="122" text-anchor="middle">UI 转录 / Web 投影</text>
-        <text class="lbl sm" x="770" y="140" text-anchor="middle">fork / resume / 遥测</text>
+        <text class="lbl sm" x="770" y="140" text-anchor="middle">fork/resume 直读 · 遥测走 firehose</text>
         <rect class="node acc" x="660" y="170" width="220" height="52" rx="9"/>
         <text class="lbl sm" x="770" y="192" text-anchor="middle">崩溃恢复缝合</text>
         <text class="lbl sm" x="770" y="210" text-anchor="middle">interruptedTurnClosers()</text>
@@ -376,7 +388,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 02 会话日志 · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 02 会话日志 · 版本 dsh-v0.1.5-rc.2-805 (HEAD 0d1f50007f) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -2,7 +2,7 @@
 
 一套**纯静态、自包含**的 HTML 学习站点，用于系统学习 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的 agent 运行时实现，并为**自制 Harness** 提供路线图。无需任何构建工具，双击 `index.html` 即可浏览。
 
-> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.5-rc.2-139**（HEAD `c291e7961a`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
+> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.5-rc.2-805**（HEAD `0d1f50007f`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
 
 ## 如何浏览
 
@@ -25,9 +25,9 @@ open ai-native-learning-site/deepseek-harness/books/index.html
 | `07-llm.html` | LLM 层 | StreamChunk 协议、LlmFailure 稳定错误码、重试策略、DeepSeek 适配器 |
 | `08-scope-prompt.html` | Prompt/Scope | system prompt 四类输入、SECTION_ORDERS 版面、persona 遮蔽、Scope 双向语义、tools.restrict |
 | `09-security.html` | 安全 | 沙箱模式与后端链（bwrap/Landlock/Seatbelt/ACL）、审批决策流、权限升级 |
-| `10-seams.html` | 能力缝 | shell/fs/web/skill/jobs 五条缝的注册表语义与失败契约 |
-| `11-compaction.html` | Compaction | 压缩事件编舞、影子定价、溢出恢复、检查点来源 |
-| `12-orchestration.html` | 编排 | 委派缝多 provider、continuable 子 agent、工作流 worker thread、ralph |
+| `10-seams.html` | 能力缝 | shell/fs/web/skill/jobs 五条缝的注册表语义与失败契约、新增的 MCP/SSH/browser-use 缝 |
+| `11-compaction.html` | Compaction | 压缩事件编舞、影子定价、溢出恢复（含 image-offload 恢复链）、检查点来源 |
+| `12-orchestration.html` | 编排 | 委派缝多 provider、continuable 子 agent、工作流 PTC 引擎、ralph |
 | `13-roadmap.html` | 自制 Harness | profile bundle / SDK（JSON-RPC stdio）/ Web host 三张面孔、能力缝配方、八里程碑路线图 |
 
 共享样式：`assets/dsh-learn.css`。所有架构图/流程图均为**内联 SVG**。

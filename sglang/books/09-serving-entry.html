@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>SGLang</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -149,7 +149,7 @@
       <tr><td>运维控制</td><td>/flush_cache · /get_server_info · /abort_request · /pause_generation</td><td>TokenizerManager 专用方法</td></tr>
       <tr><td>权重更新</td><td>/update_weights_from_disk · /update_weights_from_tensor · /update_weights_from_distributed</td><td>TokenizerManager → Scheduler</td></tr>
       <tr><td>可观测</td><td>/start_profile · /stop_profile · /set_trace_level · /freeze_gc</td><td>profiler / tracing</td></tr>
-      <tr><td>健康检查</td><td>/health · /health_generate · /ping</td><td>状态检查或单 token 生成</td></tr>
+      <tr><td>健康检查</td><td>/health · /health_generate · /ping · /ready</td><td>状态检查或单 token 生成；/ready 额外反映暂停/排空状态（见下方注）</td></tr>
       <tr><td>HiCache 管理</td><td>/hicache/storage-backend（GET/PUT/DELETE）</td><td>分层缓存后端热切换（第 11 章）</td></tr>
     </table>
 
@@ -207,6 +207,11 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
       为什么有 /health 和 /health_generate 两条？代码给出了答案：/health 默认只查进程状态，直接 200，负载均衡器高频轮询时零开销；/health_generate 会真的发一条 input_ids=[0]、max_new_tokens=1 的生成请求，验证「前向通路是好的」而不仅是「进程活着」。另外 /health 支持 SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION 开关把它也升级成真生成——是运维口径分裂后的收敛痕迹。
     </div>
 
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      新近多出的第三条：<code class="inline">/ready</code>（http_server.py:663）。它与 /health 的分野在<strong>语义</strong>：/health 回答「进程活着」，/ready 回答「这个实例现在该不该接新请求」——实现读 <code class="inline">TokenizerManager.is_ready()</code>（tokenizer_manager.py:672）：未暂停、未在优雅排空、<code class="inline">ServerStatus.Up</code> 三个条件同时成立才 200，否则 503。滚动发布时先把实例置为排空、等它退出负载均衡、再停进程，探针就得盯 /ready 而不是 /health——活着但不想接活的实例，用 /health 看不出来。
+    </div>
+
     <p>还有一个值得注意的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
     <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server 的双分支（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> envs.SGLANG_RUST_SERVER.<span class="fn">get</span>():
@@ -234,37 +239,57 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
     )</pre>
     <div class="annotation"><b>读懂这段：</b> 每个 /v1 端点对应一个 <code class="inline">OpenAIServing*</code> 对象，启动时统一挂到 <code class="inline">fast_api_app.state</code> 上，构造参数都是同一个 TokenizerManager 加 TemplateManager。适配层要干的活比「转格式」多得多。</div>
 
-    <p>第一件重活是 chat 模板。messages 数组要按模型自带的 Jinja 模板渲染成 prompt token 序列，tools 定义也要拼进模板：</p>
-    <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — chat 模板渲染（摘录）</div>
-    <pre class="code"><span class="lang-tag">python</span>prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">apply_chat_template</span>(
+    <p>第一件重活是 chat 模板。messages 数组要按模型自带的 Jinja 模板渲染成 prompt token 序列，tools 定义也要拼进模板。通用路径在 <code class="inline">_render_and_encode_chat_template</code>：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — chat 模板渲染（摘录，节选自 _render_and_encode_chat_template）</div>
+    <pre class="code"><span class="lang-tag">python</span>rendered_prompt = self.tokenizer_manager.tokenizer.<span class="fn">apply_chat_template</span>(
     messages,
-    tokenize=<span class="kw">True</span>,
+    tokenize=<span class="kw">False</span>,
     add_generation_prompt=<span class="kw">True</span>,
-    tools=request_tools,
+    tools=tools,
     return_dict=<span class="kw">False</span>,
     **template_kwargs,
-)</pre>
-    <div class="annotation"><b>读懂这段：</b> 这里直接用 HF tokenizer 的 apply_chat_template 并 tokenize=True，产出的是 token id 而非文本——少一次 tokenize 往返。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
+)
+prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(rendered_prompt, **encode_kwargs)</pre>
+    <div class="annotation"><b>读懂这段：</b> 通用路径是「先渲染成文本、再 encode」两步，中间结果（<code class="inline">rendered_prompt</code> / <code class="inline">prompt_ids</code> / 反解码的 <code class="inline">decoded_prompt</code>）按 (chat_template, messages, tools, kwargs) 整体做 LRU 缓存（上限 128，仅多模态请求启用）——同一批图片重复请求时渲染和编码都省掉。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      模板渲染出的东西怎么交给引擎，这里有过一次收敛。渲染结果可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是一个逐模型 <code class="inline">elif</code> 链：先特判 <code class="inline">kimi_k3</code>，再特判 <code class="inline">inkling</code>，剩下的走默认。现在抽成了一个独立方法 <code class="inline">_engine_prompt()</code>，判断依据从<strong>模型名字符串</strong>换成了能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>。<strong>每接一个特殊编码器就加一个 <code class="inline">elif</code>，是这类地方的典型退化路径</strong>；换成能力位之后，新模型只要在编码 spec 里声明自己的行为，这里不用再动。
+      这条路径上有过两次收敛。其一，渲染结果怎么交给引擎：可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是逐模型 <code class="inline">elif</code> 链（先 <code class="inline">kimi_k3</code> 再 <code class="inline">inkling</code>），后来抽成 <code class="inline">_engine_prompt()</code>，判断依据从模型名字符串换成能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>——<strong>每接一个特殊编码器就加一个 elif 是这类地方的典型退化路径</strong>，换成能力位之后新模型声明行为即可，这里不用动。其二，tokenize 本身：kimi_k3 一族仍走「<code class="inline">apply_chat_template(tokenize=True)</code> 一步出 id」的快路径（<code class="inline">_encode_messages</code> 内），通用模型走上面渲染+编码两步——一步出 id 少一次 tokenize 往返，但两步版能拿到中间文本做多模态缓存键，各取所需。如今两条路之间还插了一个自动仲裁：构造时跑一次 <code class="inline">_probe_prompt_text_round_trip</code>（serving_chat.py:374）——拿一条 <code class="inline">[{"role": "user", "content": "x"}]</code> 分别走「渲染成文本再 encode」和「直接 tokenize=True」，结果不同就标记 lossy，此后该 tokenizer 的请求直接走一步出 id。这是被 mistral_common 类 tokenizer 逼出来的：它们的控制 token（<code class="inline">[INST]</code>、<code class="inline">[AVAILABLE_TOOLS]</code>）没有文本形式，渲染成字符串会变成字面字母、再 encode 还会多出一个 BOS——模型看到的不再是框住工具块的控制 token，而是字面字符。探测失败（比如模板需要探测没给的 kwargs）时保守回到老的文本路径。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      logprobs 的 <code class="inline">bytes</code> 字段最近也修了一处静默损坏：<code class="inline">_build_token_logprobs_from_raw</code>（serving_chat.py:2436）的 docstring 讲得很清楚——引擎返回的三元组里 token id 永远是真的，但 token text 是<strong>展示用的反解码字符串</strong>，会丢碎片字节 token：比如 U+20BB7 的四个单字节 BPE 片段各自 decode 都是坏字节，拼出来是 U+FFFD。此前 OpenAI 响应里的 <code class="inline">bytes</code> 字段从展示文本反推，多字节字符就被这几个 U+FFFD 毁掉；现在改成从 token_id 走 GPT-2 字节解码器恢复真实字节。SentencePiece 系 tokenizer 没有这种字节回退表，仍退回展示文本。凡是做「把内部 (logprob, token_id, text) 三元组映射成 OpenAI 格式」的适配层，这条「id 才是真身、text 是投影」的教训都直接适用。
     </div>
 
     <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
     <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — tool call 约束构建（摘录，注释为译注）</div>
-    <pre class="code"><span class="kw">if</span> self.tool_call_parser:
-    parser = <span class="cl">FunctionCallParser</span>(
-        effective_tools,
-        self.tool_call_parser,
-        tokenizer=self.tokenizer_manager.tokenizer,
-    )
+    <pre class="code"><span class="cmt"># glm47 先走：整助手回复一条 EBNF 约束，不走逐工具解析</span>
+glm_constraint = self.tool_call_parser == <span class="st">"glm47"</span> <span class="kw">and not</span> <span class="fn">any</span>(
+    tool.function.strict <span class="kw">for</span> tool <span class="kw">in</span> effective_tools
+)
+<span class="kw">if</span> glm_constraint:
+    enable_thinking = (request.chat_template_kwargs <span class="kw">or</span> {}).<span class="fn">get</span>(<span class="st">"enable_thinking"</span>)
+    parser = <span class="cl">FunctionCallParser</span>(request.tools <span class="kw">or</span> [], self.tool_call_parser)
     tool_call_constraint = parser.<span class="fn">get_structure_constraint</span>(
         request.tool_choice,
         parallel_tool_calls=request.parallel_tool_calls,
-        thinking_mode=xgrammar_reasoning,
+        thinking_mode=<span class="kw">True</span> <span class="kw">if</span> enable_thinking <span class="kw">is</span> <span class="kw">None</span> <span class="kw">else</span> <span class="fn">bool</span>(enable_thinking),
     )
-    required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
-    <div class="annotation"><b>读懂这段：</b> tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
+required_parsed_natively = glm_constraint
+<span class="kw">if</span> effective_tools <span class="kw">and</span> request.tool_choice != <span class="st">"none"</span>:
+    ...
+    <span class="kw">if</span> self.tool_call_parser <span class="kw">and not</span> glm_constraint:
+        parser = <span class="cl">FunctionCallParser</span>(
+            effective_tools,
+            self.tool_call_parser,
+            tokenizer=self.tokenizer_manager.tokenizer,
+        )
+        tool_call_constraint = parser.<span class="fn">get_structure_constraint</span>(
+            request.tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=xgrammar_reasoning,
+        )
+        required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
+    <div class="annotation"><b>读懂这段：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生吐出，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
   </section>
 
   <section class="block">
@@ -365,7 +390,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9767-g0b0d2c257a · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

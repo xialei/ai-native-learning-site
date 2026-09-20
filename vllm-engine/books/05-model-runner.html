@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -18,7 +18,7 @@
       <a href="02-request-lifecycle.html">请求生命周期</a>
       <a href="03-paged-attention.html">PagedAttention</a>
       <a href="04-scheduler.html">调度器</a>
-      <a href="05-model-runner.html">Model Runner</a>
+      <a class="active" href="05-model-runner.html">Model Runner</a>
       <a href="06-sampling.html">采样</a>
       <a href="07-kernels.html">Kernel</a>
       <a href="08-memory.html">内存</a>
@@ -36,19 +36,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 Model Runner</div>
     <h1>Model Runner：把「调度器决定跑什么」翻译成「GPU 真正算什么」</h1>
-    <div class="subtitle">调度器只说了「这批请求、每个请求几个 token」。Model Runner 负责把这份「计划」变成 GPU 能吃的张量：token ids、positions、每层的 KV 指针和 block table，然后把整个 batch 喂进 transformer，产出一批 logits 给采样器。CPU 侧的决策到这里结束，之后都是 GPU 侧的执行。</div>
+    <div class="subtitle">调度器交出计划，CPU 侧的决策就结束了。本章站在 GPU 侧回答三个具体问题：几十个请求的 token 怎么拼成一个张量、一次算完；每个 attention 层怎么在显存里找到自己要读写的 KV；一次前向几百次 kernel 启动的固定开销怎么省。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">5.1</span>Model Runner 是做什么的</h2>
-    <p>上一章调度器给出了 <code class="inline">SchedulerOutput</code>——一张「这个 step 要跑哪些请求、每个请求调度几个新 token」的计划表。Model Runner 的职责是：<strong>把这份计划变成 GPU 上的一堆张量，跑一遍 transformer，再吐回 logits</strong>。上承「EngineCPU 决定跑什么」，下接「GPU 真正算」。</p>
+    <h2><span class="num">5.1</span>从调度器的计划到 GPU 的执行</h2>
+    <p>上一章结束时，调度器产出了 <code class="inline">SchedulerOutput</code>——一张「这个 step 要跑哪些请求、每个请求调度几个新 token」的计划表。这张表是 CPU 上的 Python 对象；GPU 上的 transformer 只认张量。从对象到张量、从计划到执行，中间的转换都在 Model Runner 里完成。本章只讲三件事：token 怎么拼、KV 怎么找、启动开销怎么省。</p>
+    <p>先看全貌。一次执行的路径是：</p>
     <ul>
-      <li><strong>翻译批次</strong>：把 N 个请求的 token 拼成一个连续的 <code class="inline">input_ids</code> 大张量（还有对应的 <code class="inline">positions</code>、每个请求的 <code class="inline">seq_lens</code>）。</li>
-      <li><strong>翻译 KV 布局</strong>：从 KV 缓存里，按层取出每个请求的物理块指针，组装成 attention metadata（含 block table），让分页注意力 kernel 能按表取 K/V。</li>
-      <li><strong>跑模型</strong>：调用 <code class="inline">self.model(**model_inputs)</code> 完成一次前向。</li>
-      <li><strong>产出 logits</strong>：把 hidden states 里真正的「最后一个位置」取出来算 logits，交给采样器。</li>
+      <li><strong>拼 token 张量</strong>：把 N 个请求这步要算的 token 拼成一个一维的 <code class="inline">input_ids</code>，外加每个 token 的位置编号（<code class="inline">positions</code>）和每个请求的序列长度（<code class="inline">seq_lens</code>）。对应 <code class="inline">prepare_inputs</code>。</li>
+      <li><strong>给 attention 层准备 KV 的地址信息</strong>：第 3 章说过，每个请求的 KV 物理块不连续，attention 层手里必须有一张「逻辑块 → 物理块」的对照表（block table）才能读写 KV。这一步把这些表从 CPU 搬到 GPU 并整理成 kernel 要的形状。对应 <code class="inline">prepare_attn</code>，细节在 5.3 展开。</li>
+      <li><strong>跑一次前向</strong>：调用 <code class="inline">self.model(**model_inputs)</code>。</li>
+      <li><strong>取出需要算 logits 的位置</strong>：前向输出所有位置的 hidden states，但下一步采样只需要其中几个位置。这一步把它们挑出来。对应 <code class="inline">sample</code>。</li>
     </ul>
-    <p>在真实代码里，这段逻辑分布在 <code class="inline">GPUModelRunner.execute_model</code> 这条大流水线里：<code class="inline">prepare_inputs</code>（拼 token 张量）→ <code class="inline">prepare_attn</code>（取 block tables &amp; slot mappings）→ attention metadata 构建 → 模型前向 → <code class="inline">sample</code>（算 logits）。</p>
+    <p>这些步骤都写在 <code class="inline">GPUModelRunner.execute_model</code> 里（<code class="inline">vllm/v1/worker/gpu/model_runner.py</code>）。下面三节按「拼 token → 找 KV → 省启动开销」的顺序拆开。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -94,42 +95,49 @@
         <rect class="node" x="20" y="282" width="180" height="36" rx="6"></rect>
         <text class="lbl sm" x="110" y="303" text-anchor="middle">新 token 回填 → 进下一轮调度</text>
       </svg>
-      <div class="fig-cap">图 5.1：Model Runner 把调度批次翻译成 GPU 张量，跑完整 transformer，产出 logits。</div>
+      <div class="fig-cap">图 5.1：Model Runner 把调度批次变成 GPU 张量，跑完整 transformer。输出的 hidden states 交采样层（第 6 章）。</div>
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.2</span>组装输入：把整 batch 拼成一个大张量</h2>
-    <p>关键数据结构是 <code class="inline">InputBatch</code>（v1 里叫 <code class="inline">InputBatch</code>，继承自一段 dataclass）。它几乎全是「按 token 或按请求维度排列的连续张量」——<strong>整个 batch 拼成一个大张量</strong>，而不是每个请求一个张量。这样一次 kernel launch 就能处理所有请求，极大减少 CPU→GPU 的启动开销。</p>
+    <h2><span class="num">5.2</span>token 怎么拼：整 batch 一个一维张量</h2>
+    <p>第一个问题：这个 step 要给 50 个请求算共 800 个 token，怎么把它们交给 transformer？</p>
+    <p>vLLM 的答案是把它们<strong>拼成一个一维张量</strong>——50 个请求的 800 个 token 首尾相连，变成一个 <code class="inline">[800]</code> 的 <code class="inline">input_ids</code>，而不是 50 个独立张量。请求之间的分界记在另一个张量 <code class="inline">query_start_loc</code> 里：它是一个前缀和，形如 <code class="inline">[0, 5, 37, …, 800]</code>，第 i 个请求的 token 就占区间 <code class="inline">query_start_loc[i] : query_start_loc[i+1]</code>。任何 kernel 想单独处理某个请求，按这个区间取就行。</p>
+    <p>承载这些数据的数据结构叫 <code class="inline">InputBatch</code>，几乎所有字段都是按 token 或按请求排布的连续张量：</p>
     <div class="code-title">vllm/v1/worker/gpu/input_batch.py — class InputBatch（关键字段摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">@dataclass</span>
 <span class="kw">class</span> <span class="fn">InputBatch</span>:
-    <span class="cmt"># batch_idx -&gt; req_id：本 batch 里每个槽位对应哪个请求</span>
+    <span class="cmt"># 本 batch 里每个槽位对应哪个请求</span>
     req_ids: <span class="cl">list</span>[<span class="cl">str</span>]
     num_reqs: <span class="cl">int</span>
     num_reqs_after_padding: <span class="cl">int</span>
 
-    <span class="cmt"># [num_reqs + 1] 每个请求的 token 区间起点（前缀和，方便切分）</span>
+    <span class="cmt"># [num_reqs + 1] 每个请求的 token 区间起点（前缀和）</span>
     query_start_loc: <span class="cl">torch</span>.Tensor
     <span class="cmt"># [num_reqs] 每个请求当前的序列长度</span>
     seq_lens: <span class="cl">torch</span>.Tensor
 
-    <span class="cmt"># [num_tokens_after_padding] 整个 batch 拼在一起的 token ids / 位置</span>
+    <span class="cmt"># [num_tokens_after_padding] 拼 token / 拼位置</span>
     input_ids: <span class="cl">torch</span>.Tensor
     positions: <span class="cl">torch</span>.Tensor
     is_padding: <span class="cl">torch</span>.Tensor
 
-    <span class="cmt"># [total_num_logits] 哪些 token 位置要产出 logits（通常是每请求最后一个）</span>
+    <span class="cmt"># 要算 logits 的 token 位置（通常是每请求最后一个）</span>
     logits_indices: <span class="cl">torch</span>.Tensor
-    cu_num_logits: <span class="cl">torch</span>.Tensor
     ...</pre>
-    <div class="annotation"><b>为什么拼成大张量：</b>GPU kernel 的开销大头是每次 launch 的固定成本（指令下发、上下文切换）。vLLM 把所有请求的所有 token 摊平成 <code class="inline">input_ids</code> 一个 <code class="inline">[num_tokens]</code> 的张量，一次 kernel launch 就能覆盖整个 batch。分界信息（谁到谁）靠 <code class="inline">query_start_loc</code> 前缀和保存，每个 kernel 按需取自己的区间。</div>
-    <p>填充（padding）也在这里出现：CUDA graph 模式要求固定 shape，所以会往尾部补 <code class="inline">is_padding=True</code> 的假 token，kernel 里再跳过它们。</p>
+    <div class="annotation"><b>为什么这样拼：</b>GPU 每启动一个 kernel 都有固定开销，张量个数越多、次数越多，开销越大。50 个请求一个张量，一轮 kernel 启动就全覆盖；拆成 50 个张量就要启动 50 轮。这是本章的底色，5.4 的 CUDA Graph 会把它推到极致。</div>
+    <p><code class="inline">input_ids</code> 的长度是 <code class="inline">num_tokens_after_padding</code> 而不是真实 token 数——多出来的部分是往尾部补的假 token，用 <code class="inline">is_padding=True</code> 标记，kernel 会跳过它们。为什么要补、补到多长，到 5.4 讲 CUDA Graph 时就清楚了。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.3</span>KV cache 怎么进 kernel：按层聚合指针</h2>
-    <p>光有 token ids 还不够——attention 层要知道「这个请求的 KV 缓存在显存哪里」。这块由 <code class="inline">prepare_attn</code> 负责：它对每个请求取出 <strong>block table</strong>（逻辑块→物理块映射）和 <strong>slot mapping</strong>（每个 token 落在哪个物理槽位），再按 kv_cache_group 聚合。</p>
+    <h2><span class="num">5.3</span>KV 怎么找：每个请求一张表，每个 token 一个槽位</h2>
+    <p>第二个问题：token 张量拼好了，attention 层去哪读 KV？</p>
+    <p>每个请求的 KV 散落在物理内存的不同块里。具体到「请求 A 的第 7 个 token，它的 K/V 存在哪个块、块内第几格」，答案是两张表：</p>
+    <ul>
+      <li><strong>block table</strong>——每个请求一张，把「这个请求的第 0、1、2… 个逻辑块」翻译成「物理块 #7、#13、#2…」。读序列里任何一个 token 的历史 KV，都要先查它。第 3 章讲 PagedAttention 时见过这张表，这里是它在执行侧真正被使用的地方。</li>
+      <li><strong>slot mapping</strong>——这个 step 要新写入的每个 token 一个槽位号：物理块号 × 块内偏移。attention 算完这个 token 的 K/V，就按槽位号把结果写进显存的那个格子。读历史 KV 靠 block table，写新 token 靠它。</li>
+    </ul>
+    <p>两者都在 <code class="inline">prepare_attn</code> 里生成：</p>
     <div class="code-title">vllm/v1/worker/gpu/model_runner.py — prepare_attn（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">prepare_attn</span>(self, input_batch: <span class="cl">InputBatch</span>):
     <span class="cmt"># Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks]</span>
@@ -145,24 +153,26 @@
         num_tokens_padded=input_batch.num_tokens_after_padding,
     )
     <span class="kw">return</span> block_tables, slot_mappings</pre>
-    <p>拿到 block tables / slot mappings 后，<code class="inline">model_state.prepare_attn</code> 调 <code class="inline">build_attn_metadata</code>：<strong>按 kv_cache_group 生成一份 attention metadata，再把同一份 metadata 绑定到该组的所有 layer</strong>。物理 KV 张量则通过 <code class="inline">bind_kv_cache_to_layers</code> 按层名绑到每个 attention 层。</p>
+    <p>到这里，每个请求的两张表都有了。还剩一步打包：把这些张量连同 <code class="inline">seq_lens</code>、区间切分等组装成 attention metadata，交给每个 attention 层。</p>
+    <p>交给谁？模型里 attention 层有几十个，但它们的 KV 布局规格并不都相同——普通全注意力的层和滑窗层块数不同，MLA 层的缓存形状也不同。vLLM 把「布局规格相同」的层归成一组（<code class="inline">kv_cache_group</code>，第 8 章会看到它是怎么分的），同一个组里的层用同一份 metadata、同一批物理块。于是 metadata 不用按层构建几十份，每个组构建一份、组内共享：</p>
     <div class="code-title">vllm/v1/worker/gpu/attn_utils.py — build_attn_metadata（每层绑定同一份 metadata 的部分）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> attn_group <span class="kw">in</span> attn_groups[i]:
     metadata = attn_metadata_builder.build(common_prefix_len=<span class="nu">0</span>,
                                            common_attn_metadata=common_attn_metadata)
     <span class="kw">for</span> layer_name <span class="kw">in</span> attn_group.layer_names:
         attn_metadata[layer_name] = metadata   <span class="cmt"># 这层就用这份 metadata</span></pre>
-    <div class="annotation"><b>读懂这段：</b>「按层」体现在这块——每个 attention 组里的所有 layer 共享同一批 block table 和 slot mapping（因为它们的 KV 布局规格相同），于是 vLLM 只构建一份 metadata 再复制到多处，省内存也省构建时间。而真正的物理 KV 指针，早在 <code class="inline">bind_kv_cache_to_layers</code> 时按 layer_name 绑好了，kernel 里按 block table + slot 索引即可读写对应的物理块。</div>
+    <div class="annotation"><b>读懂这段：</b>metadata 的构建按组进行（外层按 kv_cache_group 分组循环），构建好一份就复制给组内每个 layer（内层按 layer_names 循环）。省内存也省构建时间。至于每个层真正要读写的物理 KV 大张量，则在引擎启动时由 <code class="inline">bind_kv_cache_to_layers</code> 按层名绑定到层上——那是一次性的，不在每步的路径里。每步真正随 batch 变化的只有这两张表。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.4</span>CUDA Graph：省掉 kernel launch 开销</h2>
-    <p>对 decode 这种「每步只算 1 个新 token、但 batch 里有几十上百个请求」的负载，瓶颈常常不是计算量，而是<strong>每个 kernel 的启动开销</strong>——一次前向几十上百个 kernel，每个 launch 都有固定成本。CUDA Graph 把整条计算流「录」下来，之后只需一次回放（replay），省掉反复的 kernel 下发。</p>
+    <h2><span class="num">5.4</span>启动开销怎么省：CUDA Graph</h2>
+    <p>第三个问题在 5.2 已经埋下：GPU 每启动一个 kernel 都有固定开销，而一次前向要跑几十上百个 kernel。decode 时每个请求通常只算 1 个 token，计算本身很短，启动开销就占了相当比例。省掉它的手段是 CUDA Graph：把一次前向的全部 kernel 启动录成一张「图」，之后每步只需一次命令就整图回放（replay），几百次启动变成一次。</p>
+    <p>录制在引擎启动时做。以 5.2 的 50 请求 800 token 为例：vLLM 预先枚举一组 batch 形状（比如 token 数 1、2、4、8、…），对每个形状把整个前向录成一张图：</p>
     <div class="code-title">vllm/v1/worker/gpu/cudagraph_utils.py — CudaGraphManager.capture（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">with</span> <span class="fn">torch</span>.cuda.graph(graph, self.pool):
     forward_fn(CUDAGraphMode.NONE)      <span class="cmt"># 把整条前向录成一张图</span>
-self.graphs[desc] = graph              <span class="cmt"># {batch描述: 图} 存起来复用</span></pre>
-    <p>回放侧在 <code class="inline">execute_model</code> 里：当 batch 形状命中某张已捕获的图时，<code class="inline">self.cudagraph_manager.run_fullgraph(batch_desc)</code> 直接回放，不再逐 kernel 调用。</p>
+self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} 存起来复用</span></pre>
+    <p>推理时每个 step 查一次表：这个 batch 的形状命中哪张图，就回放哪张。命中不了才走普通路径，逐 kernel 调 <code class="inline">model()</code>：</p>
     <div class="code-title">vllm/v1/worker/gpu/model_runner.py — execute_model（FULL 模式回放）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> batch_desc.cg_mode == <span class="cl">CUDAGraphMode</span>.FULL:
     <span class="cmt"># 输入已拷到 CUDA graph 的输入缓冲区，回放即可</span>
@@ -170,16 +180,17 @@ self.graphs[desc] = graph              <span class="cmt"># {batch描述: 图} �
 <span class="kw">else</span>:
     <span class="cmt"># Eager / PIECEWISE：直接调 model()</span>
     model_output = self.model(**model_inputs)</pre>
-    <h3>限制：固定 batch shape 才能复用</h3>
-    <p>CUDA graph 一旦捕获，kernel 的 grid 尺寸就<strong>固定住了</strong>。因此只能按一组「捕获尺寸」（<code class="inline">cudagraph_capture_sizes</code>，decode 通常是 1、2、4、8、…、max_batch）各录一张图，实际 batch 命中某个尺寸就用那张，<strong>不命中就向上取整到更大的图</strong>，多余的槽位填 padding token。这就是 5.2 里 <code class="inline">is_padding</code> 的由来。</p>
-    <div class="annotation"><b>张力：</b>固定的图尺寸和「按需动态批处理」是天然的矛盾——你越想让每个 step 的 batch 正好填满，越难命中预录的尺寸。vLLM 用「pad 到最近捕获尺寸」来折中：宁可多算几个 padding token，也省下 kernel launch。这也解释了为什么把 decode（每步固定 +1 token、batch 可变）用单独一套捕获尺寸，和 prefill（num_tokens 每步不同）分开。</div>
+    <h3>限制：图的形状是死的，batch 是活的</h3>
+    <p>CUDA graph 一旦录好，里面每个 kernel 的尺寸就固定了。而第 4 章的连续批处理意味着每个 step 的 batch 大小都在变——请求随时加入、退出。两件事要兼容，只有一个办法：把活 batch 补齐到某张图的尺寸再回放。</p>
+    <p>具体做法：预先枚举一组「捕获尺寸」（<code class="inline">cudagraph_capture_sizes</code>，如 1、2、4、8、…直到最大批），batch 落在哪个区间，就补齐到该区间的上限。比如 50 个请求补到 56，多出来的 6 个槽位填上假 token——正是 5.2 里 <code class="inline">is_padding=True</code> 的来源。补的那几个 token 白算一点点计算，换回来的是整次前向只付一次启动开销，划算。</p>
+    <div class="annotation"><b>为什么 decode 单独一套尺寸：</b>decode 每步固定每个请求 +1 token，batch 之间只差请求数，形状种类少，枚举尺寸容易命中；prefill 的 token 数每个请求各不相同，命中预录形状的概率低得多。所以 vLLM 对 decode 用「枚举尺寸 + 补齐」，prefill 走别的路径（如 PIECEWISE 编译图），两者分开处理。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.5</span>用代码看：一次完整前向</h2>
-    <p>把 5.1–5.4 串起来。下面的片段取自 <code class="inline">execute_model</code>：先组装 <code class="inline">model_inputs</code>，再按是否命中 CUDA graph 决定回放还是 eager 调 <code class="inline">model()</code>，最后算 logits。</p>
-    <div class="code-title">vllm/v1/worker/gpu/model_runner.py — execute_model（组装输入 + 前向 + 采样，语义逐行注释）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 1) 拼一个大张量 batch：整个 batch 的 input_ids + positions</span>
+    <p>把 5.1–5.4 串起来。下面的片段取自 <code class="inline">execute_model</code>：组装输入字典，命中 CUDA graph 就回放、否则直接调模型，最后从 hidden states 里挑出要算 logits 的位置。</p>
+    <div class="code-title">vllm/v1/worker/gpu/model_runner.py — execute_model（组装输入 + 前向 + 取 logits，语义逐行注释）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 1) 组装模型输入：整个 batch 的 input_ids + positions</span>
 model_inputs = {
     <span class="st">"input_ids"</span>: input_ids,
     <span class="st">"positions"</span>: input_batch.positions,
@@ -195,20 +206,20 @@ model_inputs = {
 <span class="kw">else</span>:
     model_output = self.model(**model_inputs)
 
-<span class="cmt"># 3) 采样：只取每请求最后位置的 hidden state 算 logits</span>
+<span class="cmt"># 3) 只取每请求最后位置的 hidden state 算 logits</span>
 sample_hidden_states = hidden_states[input_batch.logits_indices]
 logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)</pre>
-    <div class="annotation"><b>逐行读懂：</b>(1) 里 k/v 都对齐到 <code class="inline">[num_tokens]</code> 的一维张量，一次前向覆盖整个 batch；(2) 是 5.4 说的「命中图就回放，否则 eager」；(3) 里 <code class="inline">logits_indices</code> 标记了每个请求真正要出 logits 的位置——decode 是最后 1 个，prefill 是最后一个 token——所以模型只在这几个位置算 logits，不白算整条序列。</div>
+    <div class="annotation"><b>逐行读懂：</b>(1) 把输入装进一个字典传给模型，其中的张量就是 5.2 拼好的一维大张量；(2) 是 5.4 说的「命中图就回放，否则 eager」；(3) 里前向输出的是每个 token 位置的 hidden states，<code class="inline">logits_indices</code> 从中挑出每个请求真正要出 logits 的位置（decode 是最后一个 token，prefill 挑到需要的位置），只对这些位置算 logits，不白算整条序列。至于 logits 怎么变成 token，是第 6 章的事。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.6</span>小结与自研启示</h2>
     <table class="tbl">
       <tr><th>阶段</th><th>vLLM 的做法</th><th>你的引擎该怎么做</th></tr>
-      <tr><td>批次翻译</td><td>整 batch 拼成一维大张量（InputBatch）</td><td>同上，query_start_loc 前缀和切分</td></tr>
-      <tr><td>KV 进 kernel</td><td>按 kv_cache_group 聚合 block table / slot</td><td>从每层 KV 取物理指针 + block table 传给 kernel</td></tr>
-      <tr><td>CUDA Graph</td><td>按捕获尺寸各录一张，不命中就近 padding</td><td>先不做；把 eager 前向跑通、正确性稳定后再优化</td></tr>
-      <tr><td>logits</td><td>logits_indices 只算每请求最后位置</td><td>同思路，别白算整条序列</td></tr>
+      <tr><td>拼 token</td><td>整 batch 拼成一维张量（InputBatch），query_start_loc 记分界</td><td>同上，一个前缀和张量切分请求</td></tr>
+      <tr><td>找 KV</td><td>每请求一份 block table + 每个 token 一个 slot 槽位</td><td>同样两张表传给 attention kernel</td></tr>
+      <tr><td>CUDA Graph</td><td>按捕获尺寸各录一张，不命中就补齐到更大尺寸</td><td>先不做；把 eager 前向跑通、正确性稳定后再优化</td></tr>
+      <tr><td>算 logits</td><td>logits_indices 只挑每请求最后位置</td><td>同思路，别白算整条序列</td></tr>
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>
@@ -223,7 +234,7 @@ logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)
 </div>
 
 <footer>
-  深入浅出vLLM · 05 Model Runner · 版本 v0.29.1rc0-18-gfa1b3b1922 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 05 Model Runner · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

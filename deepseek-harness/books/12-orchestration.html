@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出dsh</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>dsh</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -25,7 +25,7 @@
       <a href="09-security.html">安全</a>
       <a href="10-seams.html">能力缝</a>
       <a href="11-compaction.html">Compaction</a>
-      <a href="12-orchestration.html">编排</a>
+      <a class="active" href="12-orchestration.html">编排</a>
       <a href="13-roadmap.html">自制 Harness</a>
     </nav>
   </div>
@@ -35,7 +35,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 编排</div>
     <h1>编排与多 Agent：委派缝、工作流、Ralph</h1>
-    <div class="subtitle">一个 agent 够用，一群 agent 才叫 harness。dsh 的编排栈三层：委派缝（ctx.subagents，多 provider 注册表）、工作流（模型写的 JS 脚本在 worker thread 里 fan out 子 agent）、以及固定策略工具 ralph。每一层都建立在第 4 章的循环之上——子 agent 就是又一个 ReactLoopAgent。</div>
+    <div class="subtitle">一个 agent 够用，一群 agent 才叫 harness。dsh 的编排栈三层：委派缝（ctx.subagents，多 provider 注册表）、工作流（模型写的 JS 脚本在 PTC Node 进程里 fan out 子 agent）、以及固定策略工具 ralph。每一层都建立在第 4 章的循环之上——子 agent 就是又一个 ReactLoopAgent。</div>
   </div>
 
   <section class="block">
@@ -44,7 +44,7 @@
       <li><code class="inline">ctx.subagents</code> 是命名 provider 注册表：spawn（新子）/ fork（继承父已完成历史）/ acp / codex / claude-code / dsh-sdk 可共存，按名字选择。</li>
       <li>两种子 agent 形态：<strong>one-shot run</strong>（provider 全权建立→发布→所有权转移）与 <strong>continuable child</strong>（durable，续聊走消息与冷恢复）。</li>
       <li>continuable 子 agent 的全部运行时（身份、组合、turn、teardown、冷恢复）归 continuation manager——provider 只贡献「是否带父历史」这一个创建参数，<strong>永远看不见子 agent 本体</strong>。</li>
-      <li>工作流 = 模型写的纯 JS 编排脚本，跑在每 run 一个的 worker thread 里，<code class="inline">agent()/parallel()/pipeline()/phase()/log()</code> 经 typed 协议调回宿主；「containment, not a security boundary」。</li>
+      <li>工作流 = 模型写的纯 JS 编排脚本，跑在每 run 一个的 PTC Node 进程里（受会话文件沙箱政策约束），<code class="inline">agent()/parallel()/pipeline()/phase()/log()</code> 经绑定协议调回宿主；「The VM … is not a security boundary」——网络访问不受文件政策限制。</li>
       <li>ralph 是固定前台循环：每轮一个<strong>全新</strong>子 agent（无对话种子），跨轮只传一份有界结构化报告（maxRounds 默认 256），共享 workspace 是长期记忆。</li>
     </ul>
   </section>
@@ -119,7 +119,7 @@ persistence, and model boundaries.</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">12.4</span>工作流：worker thread 里的编排脚本</h2>
+    <h2><span class="num">12.4</span>工作流：PTC Node 进程里的编排脚本</h2>
     <p>dsh-workflow 运行模型写的纯 JS 编排脚本，返回一个 run，其结果 resolve 为脚本最终 JSON 值。脚本可用的原语：</p>
     <table class="tbl">
       <tr><th>原语</th><th>作用</th></tr>
@@ -128,18 +128,18 @@ persistence, and model boundaries.</pre>
       <tr><td><code class="inline">pipeline(items, ...stages)</code></td><td>逐项穿过多阶段，无 barrier</td></tr>
       <tr><td><code class="inline">phase(title) / log(msg)</code></td><td>进度分组与叙述行</td></tr>
     </table>
-    <div class="code-title">packages/workflow/workflow-worker-thread/README.md — 隔离立场（摘要）</div>
-    <pre class="code"><span class="lang-tag">text</span>每个 run 一个 Node worker thread：编排脚本在全新 worker 里执行，
-其 agent() 调用经 typed host/worker 协议到达宿主的 subagents。
-同步脚本循环不会卡住 harness 事件循环；忽略取消的脚本
-可以连 worker 一起终止。
+    <div class="code-title">packages/workflow/workflow-ptc/README.md — 执行与隔离立场（摘要）</div>
+    <pre class="code"><span class="lang-tag">text</span>编排脚本在 fresh Node 进程里执行，受调用 Session 的
+文件沙箱政策约束；agent() 调用经 PTC 绑定协议到达宿主的
+subagents。PTC 进程级限制（堆/输出/终止）由 ptc-runtime
+provider 决定，取消立即中止进程与活动子 agent。
 
-The isolation is containment, not a security boundary —
-模型写的脚本与模型既有的 bash 访问同一信任前提，
-逃出 node:vm 上下文即恢复 worker 的进程权限。
-不要把 worker thread 当真正不受信脚本的沙箱——
-敌意代码需要独立进程或容器引擎。</pre>
-    <div class="annotation"><b>两层隔离声明</b>：worker thread 解决的是<strong>可用性</strong>（死循环脚本不卡宿主、可强制终止）而非<strong>安全性</strong>——README 明确划界。安全性走的是第 9 章的沙箱与审批。dsh-workflow 自身不执行任何脚本（README 原话：「The caller must supply an execution engine, allowing the isolation strategy to change without altering visible behavior.」），dsh-workflow-worker-thread 是当前引擎——换一个隔离策略（独立进程、容器）不需要改 callers 或模型所见。这与 LLM 层（第 7 章）「协议与适配器分离」完全同构。agent() 的每次调用作为 published child run 归属到发起 agent，父 agent 因此能在会话日志里审计整棵 fan-out 树。这里有两组生命周期事件，名字不要混：引擎自身发 <code class="inline">workflow/start</code> → <code class="inline">workflow/agent-start</code> → <code class="inline">workflow/agent-end</code> → <code class="inline">workflow/end</code>（后两个按 <code class="inline">agent.seq</code> 配对，一次 started 调用在每条停止路径上都恰好有一个 end，引擎强杀时合成的 end 带 <code class="inline">'cancelled'</code>）；tool-workflow 再把它们落成会话事件 <code class="inline">tool-workflow/run-start|agent-start|agent-end|run-end</code>。「established」「settled」是这两组事件的 JSDoc 用词，不是事件名。</div>
+The VM retains the documented helper API, but it is
+not a security boundary: code that reaches Node remains
+subject to the selected OS file policy. The program-visible
+environment is empty. Network access is not restricted
+by the file policy.</pre>
+    <div class="annotation"><b>两层隔离声明</b>：PTC 引擎解决的是<strong>可用性</strong>（脚本跑在受管进程里、取消可连同进程终止）而非<strong>安全性</strong>——README 明确划界：node:vm 只是护栏，抵达 Node 的代码受所选 OS 文件政策约束。安全性走的是第 9 章的沙箱与审批。dsh-workflow 自身不执行任何脚本（README 原话：「The caller must supply an execution engine, allowing the isolation strategy to change without altering visible behavior.」），dsh-workflow-ptc 是当前引擎——它复用第 6 章 PTC 的那个 fresh-Node-进程运行时，引擎与 PTC 共享同一个执行 provider。这与 LLM 层（第 7 章）「协议与适配器分离」完全同构。agent() 的每次调用作为 published child run 归属到发起 agent，父 agent 因此能在会话日志里审计整棵 fan-out 树。这里有两组生命周期事件，名字不要混：引擎自身发 <code class="inline">workflow/start</code> → <code class="inline">workflow/agent-start</code> → <code class="inline">workflow/agent-end</code> → <code class="inline">workflow/end</code>（后两个按 <code class="inline">agent.seq</code> 配对，一次 started 调用在每条停止路径上都恰好有一个 end，引擎终止路径上合成的 end 带 <code class="inline">'cancelled'</code>（WorkflowStopReason 只有 completed | cancelled | error）；tool-workflow 再把它们落成会话事件 <code class="inline">tool-workflow/run-start|agent-start|agent-end|run-end</code>。「established」「settled」是这两组事件的 JSDoc 用词，不是事件名。</div>
   </section>
 
   <section class="block">
@@ -168,7 +168,7 @@ The isolation is containment, not a security boundary —
   previous = report
 }
 <span class="kw">return</span> { status: <span class="st">'budget-limited'</span>, roundsStarted: args.maxRounds, report: previous }</pre>
-    <div class="annotation"><b>四个防呆</b>：① 每轮子 agent 是<strong>全新</strong>的——「no parent conversation and no prior child session」，杜绝上下文腐化在轮间累积；② 跨轮只有一份 bounded 结构化报告（summary/evidence/nextSteps/blocker，超 maxHandoffChars 直接抛错）——记忆外置到共享 workspace，报告只是交接信；③ 报告校验极严：complete 必须有 evidence 且无 nextSteps 且 blocker 为空，blocked 必须有具体 blocker，continue 必须有 nextSteps——「completion and blockers are worker reports, not independent certification」（完成声明不是独立认证，人仍需复核）；④ maxRounds schema 默认 256（非传闻的 64），配 budget-limited 出口。README 明确划定适用场景：「Use it only when the direct human explicitly asks for a Ralph loop… ordinary long-running objectives belong to goal tools, and bounded delegation belongs to subagents or workflows」。</div>
+    <div class="annotation"><b>四个防呆</b>：① 每轮子 agent 是<strong>全新</strong>的——「no parent conversation and no prior child session」，杜绝上下文腐化在轮间累积；② 跨轮只有一份 bounded 结构化报告（summary/evidence/nextSteps/blocker，超 maxHandoffChars 直接抛错）——记忆外置到共享 workspace，报告只是交接信；③ 报告校验极严：complete 必须有 evidence 且无 nextSteps 且 blocker 为空，blocked 必须有具体 blocker，continue 必须有 nextSteps——「completion and blockers are worker reports, not independent certification」（完成声明不是独立认证，人仍需复核）；④ maxRounds schema 默认 256，但 base bundle 行和全部出厂预设都把它配成 64 且 <code class="inline">disabled: true</code>（「Off by default… An overlay row restores it」——工具描述把 ralph 限制在人类显式要求的运行里，overlay 行可恢复），配 budget-limited 出口。README 明确划定适用场景：「Use it only when the direct human explicitly asks for a Ralph loop… ordinary long-running objectives belong to goal tools, and bounded delegation belongs to subagents or workflows」。</div>
   </section>
 
   <section class="block">
@@ -190,7 +190,7 @@ The isolation is containment, not a security boundary —
           <rect x="40" y="170" width="240" height="60" rx="8" fill="#1c2040" stroke="#4a5aa0"/>
           <text x="160" y="193" text-anchor="middle" font-size="11" fill="#aebcff">tool-workflow · tool-ralph</text>
           <text x="160" y="215" text-anchor="middle" font-size="10" fill="#8890c0">编排脚本 · 新鲜 agent 循环</text>
-          <text x="160" y="262" text-anchor="middle" font-size="10" fill="#8890c0">会话日志记录 lifecycle 事件对</text>
+          <text x="160" y="262" text-anchor="middle" font-size="10" fill="#8890c0">tool-workflow 落 lifecycle 会话事件对</text>
           <text x="160" y="282" text-anchor="middle" font-size="10" fill="#8890c0">（run-start / agent-start / agent-end / run-end）</text>
 
           <rect x="360" y="20" width="270" height="130" rx="10" fill="#eceffe" stroke="#4156c8"/>
@@ -202,19 +202,20 @@ The isolation is containment, not a security boundary —
 
           <rect x="360" y="170" width="270" height="130" rx="10" fill="#fdf1e2" stroke="#e8850a"/>
           <text x="495" y="196" text-anchor="middle" font-size="12" font-weight="bold" fill="#9a5a06">ctx.workflowEngine</text>
-          <text x="380" y="222" text-anchor="middle" font-size="10.5" fill="#444">每 run 一个 worker thread</text>
+          <text x="380" y="222" text-anchor="middle" font-size="10.5" fill="#444">每 run 一个 PTC Node 进程</text>
           <text x="380" y="242" text-anchor="middle" font-size="10.5" fill="#444">agent()/parallel()/pipeline()</text>
-          <text x="380" y="262" text-anchor="middle" font-size="10.5" fill="#444">typed host/worker 协议回调宿主</text>
-          <text x="380" y="282" text-anchor="middle" font-size="10.5" fill="#444">containment，非安全边界</text>
+          <text x="380" y="262" text-anchor="middle" font-size="10.5" fill="#444">绑定协议回调宿主 subagents</text>
+          <text x="380" y="282" text-anchor="middle" font-size="10.5" fill="#444">VM 非安全边界 · 网络不受文件政策限</text>
 
           <rect x="680" y="60" width="260" height="220" rx="10" fill="#e8f6ee" stroke="#2d8a56"/>
           <text x="810" y="88" text-anchor="middle" font-size="12" font-weight="bold" fill="#1c5c38">子 Agent = 又一个 ReactLoopAgent</text>
           <rect x="700" y="105" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
           <text x="810" y="122" text-anchor="middle" font-size="10" fill="#333">自己的 Session log（parentSession</text>
           <text x="810" y="136" text-anchor="middle" font-size="10" fill="#333">记录父 id）· 自己的 Scope</text>
-          <rect x="700" y="153" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
-          <text x="810" y="170" text-anchor="middle" font-size="10" fill="#333">自己的 persona / restrict（第 8 章）</text>
-          <text x="810" y="184" text-anchor="middle" font-size="10" fill="#333">approval=never（委派种子）</text>
+          <rect x="700" y="153" width="220" height="42" rx="6" fill="#fff" stroke="#57b97e"/>
+          <text x="810" y="168" text-anchor="middle" font-size="10" fill="#333">自己的 persona / restrict（第 8 章）</text>
+          <text x="810" y="181" text-anchor="middle" font-size="10" fill="#333">approval=never（委派种子）</text>
+          <text x="810" y="193" text-anchor="middle" font-size="10" fill="#333">继承父 permissionPreset（auto/full-access）</text>
           <rect x="700" y="201" width="220" height="38" rx="6" fill="#fff" stroke="#57b97e"/>
           <text x="810" y="218" text-anchor="middle" font-size="10" fill="#333">idle 可被 sendMessage 唤醒</text>
           <text x="810" y="232" text-anchor="middle" font-size="10" fill="#333">不在场可冷恢复（第 5 章）</text>
@@ -247,7 +248,7 @@ The isolation is containment, not a security boundary —
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.5-rc.2-139 (HEAD c291e7961a) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.5-rc.2-805 (HEAD 0d1f50007f) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

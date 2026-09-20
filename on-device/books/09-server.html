@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>On-Device推理</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -22,7 +22,7 @@
       <a href="06-multi-device.html">多设备</a>
       <a href="07-sampling.html">采样</a>
       <a href="08-speculative.html">投机解码</a>
-      <a href="09-server.html">服务入口</a>
+      <a class="active" href="09-server.html">服务入口</a>
       <a href="10-freetoken.html">FreeToken</a>
       <a href="11-moe-offload.html">MoE缓存</a>
       <a href="12-hybrid-exec.html">CPU/GPU协同</a>
@@ -112,7 +112,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 
   <section class="block">
     <h2><span class="num">9.3</span>server_tokens：多模态占位符</h2>
-    <p>server 层的 prompt 不是简单 token 数组，而是 <code class="inline">server_tokens</code>——支持图文交错的「占位符」结构（tools/server/server-common.h:136-157）：</p>
+    <p>server 层的 prompt 不是简单 token 数组，而是 <code class="inline">server_tokens</code>——支持图文交错的「占位符」结构（tools/server/server-common.h:138-159）：</p>
     <div class="code-title">tools/server/server-common.h — server_tokens（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">struct</span> <span class="cl">server_tokens</span> {
     <span class="kw">bool</span> has_mtmd = <span class="kw">false</span>;
@@ -154,19 +154,20 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
     <span class="kw">bool</span> <span class="fn">load</span>(server_prompt &amp; prompt, <span class="kw">const</span> server_tokens &amp; tokens_new, ...);
 };</pre>
     <div class="annotation"><b>读懂这段：</b> 缓存条目 = token 序列 + KV checkpoint（common_prompt_checkpoint，投机解码那章见过同一类型）。命中时 load() 把 KV 状态直接恢复进 slot——新请求的前缀部分零计算。容量按字节数和 token 数双限。这补上了 slot 调度的短板：LCP 选择只在「slot 内存里有」的范围内有效，prompt cache 把有效范围扩展到「曾经出现过」的 prompt。</div>
+    <div class="callout info"><b class="tag">一段代码的进化痕迹</b>上面只讲了「存档」，没讲「在哪打点」——这半边也是一行一行磨出来的。checkpoint 的打点位置不是均匀分批，而是在<strong>用户消息的开头</strong>：server 填批循环里每加一个 token 都要问一次 <code class="inline">spans.is_user_start(...)</code>（server-context.cpp:3550），是就在这里 break 掉、让这一小批单独成一个 ubatch——这样 KV 快照正好落在多轮对话的消息边界上，多轮续聊能从最近一条用户消息整段复用。但 server 怎么知道「第 N 个 token 是用户消息的开头」？靠 chat 模板解析器登记的 <code class="inline">message_delimiters</code>（common/chat.h:282）在 prompt 里搜出消息跨度。坑在这：qwen3-coder、gpt-oss、kimi-k3 等解析器早就登记了各自的分隔符，DeepSeek V3.2/V4 的解析器却一直没登记——<code class="inline">&lt;｜User｜&gt;</code>/<code class="inline">&lt;｜Assistant｜&gt;</code> 就是普通文本，checkpoint 在整个 DSv3.2/DSv4 家族上静默失效。#29008（2026-09）只加了 6 行补上这个登记。启示：一条格式约定要<strong>解析器和 server 两侧同时接上</strong>才生效——Book 里反复出现的「特性接线不全」在这个小案例上重演了一遍。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.5</span>对照：FreeToken 的多进程 server</h2>
     <p>llama-server 是单进程多线程；FreeToken 把 HTTP 层与引擎拆成多个进程。api_server.py 是 FastAPI 应用，注册五组路由：</p>
-    <div class="code-title">python/freetoken/server/api_server.py:417-422 — 路由注册（摘录）</div>
+    <div class="code-title">python/freetoken/server/api_server.py:420-425 — 路由注册（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>app = <span class="cl">FastAPI</span>(title=<span class="st">"FreeToken API Server"</span>, version=__version__, lifespan=lifespan)
 <span class="fn">register_openai_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_anthropic_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_responses_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_control_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_accounting_routes</span>(app, get_global_state)</pre>
-    <div class="annotation"><b>读懂这段：</b> 与 llama-server 不同，FreeToken 同时暴露 OpenAI、Anthropic、Responses 三套协议——端侧应用（桌面客户端等）可能来自任何一家生态。HTTP 进程不直接碰模型：请求经 ZMQ 队列传给 tokenizer/scheduler 进程（utils/mp.py 的 ZmqAsyncPushQueue/ZmqAsyncPullQueue），引擎进程独占 GPU。supervisor（server/supervisor.py）负责启动握手：drain_ready 等所有 worker ack ready、收集进度条、故障时抛 WorkerDied。这个进程拓扑的动机在第 10 章展开：GIL 之下 Python 引擎要把「HTTP 解析、token 流式处理、模型前向」分给不同进程才能吃满 CPU/GPU 流水线。并发上限默认 4：<code class="inline">engine/config.py:24 max_running_req: int = 4</code>（可被 <code class="inline">--max-running-requests</code> 覆盖，shell 模式强制为 1）。</div>
+    <div class="annotation"><b>读懂这段：</b> 与 llama-server 不同，FreeToken 同时暴露 OpenAI、Anthropic、Responses 三套协议——端侧应用（桌面客户端等）可能来自任何一家生态。HTTP 进程不直接碰模型：请求经 ZMQ 队列传给 tokenizer/scheduler 进程（utils/mp.py 的 ZmqAsyncPushQueue/ZmqAsyncPullQueue），引擎进程独占 GPU。supervisor（server/supervisor.py）负责启动握手：drain_ready 等所有 worker ack ready、收集进度条、故障时抛 WorkerDied。这个进程拓扑的动机在第 10 章展开：GIL 之下 Python 引擎要把「HTTP 解析、token 流式处理、模型前向」分给不同进程才能吃满 CPU/GPU 流水线。并发上限默认 4：<code class="inline">engine/config.py:26 max_running_req: int = 4</code>（可被 <code class="inline">--max-running-requests</code> 覆盖，shell 模式强制为 1）。</div>
   </section>
 
   <section class="block">
@@ -188,7 +189,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

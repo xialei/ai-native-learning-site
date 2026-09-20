@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -26,7 +26,7 @@
       <a href="10-distributed.html">分布式</a>
       <a href="11-build-own-engine.html">自制引擎</a>
       <a href="12-model-weights.html">实战·权重</a>
-      <a href="13-agentic-gateway.html">实战·网关</a>
+      <a class="active" href="13-agentic-gateway.html">实战·网关</a>
       <a href="14-model-evolution.html">实战·变迁</a>
     </nav>
   </div>
@@ -36,17 +36,17 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 13 实战 · Agentic 网关</div>
     <h1>实战：给 vLLM 补一层「有状态」的 Agentic 网关</h1>
-    <div class="subtitle">第 9 章的结论是「vLLM 的 API server 是<strong>无状态</strong>的」——这正是它水平扩展的资本。但真实的 Agent 应用偏偏需要状态：<code class="inline">previous_response_id</code> 续聊、服务端工具循环、多轮编排、持久化。这一章拆解 <strong>vllm-project/agentic-api</strong>（Rust）——一个坐在 vLLM 前面、专门承接这些「状态活」的网关，看它如何把「一次客户端请求」变成「N 轮无状态推理 + 工具执行」，再拼成一条响应流还给你。</div>
+    <div class="subtitle">第 9 章的结论是「vLLM 的 API server 是<strong>无状态</strong>的」——这里指的是<strong>请求/会话语义层面</strong>：每个请求自包含、不依赖之前的请求，进程内部当然也有队列、缓存这类运行时状态，但不跨请求保留任何会话信息。这正是它水平扩展的资本。但真实的 Agent 应用偏偏需要状态：<code class="inline">previous_response_id</code> 续聊、服务端工具循环、多轮编排、持久化。这一章拆解 <strong>vllm-project/agentic-api</strong>（Rust）——一个坐在 vLLM 前面、专门承接这些「状态活」的网关，看它如何把「一次客户端请求」变成「N 轮无状态推理 + 工具执行」，再拼成一条响应流还给你。</div>
   </div>
 
   <div class="callout info">
     <b class="tag">代码来源</b>
-    本章所有 Rust 片段摘自 <strong>vllm-project/agentic-api</strong>（<code class="inline">v0.5.0-24-gc04ac19</code>，Apache-2.0），核心库在 <code class="inline">crates/agentic-server-core/</code>（对外叫 <code class="inline">agentic_core</code>）。它不是 vLLM 的 fork，而是一个<strong>独立进程</strong>：vLLM 用 <code class="inline">vllm serve</code> 原样启动，网关把请求翻译成 vLLM 自己的 OpenAI 兼容 Responses API 再转发。片段有删节，行内中文注释是本书补写的说明——源码里的注释是英文。
+    本章所有 Rust 片段摘自 <strong>vllm-project/agentic-api</strong>（<code class="inline">v0.7.0-21-ga38b0f0</code>，Apache-2.0），核心库在 <code class="inline">crates/agentic-server-core/</code>（对外叫 <code class="inline">agentic_core</code>）。它不是 vLLM 的 fork，而是一个<strong>独立进程</strong>：vLLM 用 <code class="inline">vllm serve</code> 原样启动，网关把请求翻译成 vLLM 自己的 OpenAI 兼容 Responses API 再转发。片段有删节，行内中文注释是本书补写的说明——源码里的注释是英文。
   </div>
 
   <section class="block">
-    <h2><span class="num">13.1</span>问题：vLLM 是无状态的，Agent 是有状态的</h2>
-    <p>先回到第 9 章的架构：vLLM 的 OpenAI API server（<code class="inline">vllm/entrypoints/openai/</code>）被刻意设计成<strong>无状态、可水平扩</strong>。它其实也实现了一个 Responses API，但状态管理非常有限——看 <code class="inline">vllm/entrypoints/openai/responses/serving.py</code> 里存储是怎么做的：</p>
+    <h2><span class="num">13.1</span>问题：vLLM 不管理会话状态，Agent 需要</h2>
+    <p>先说清「无状态」在这本书里的准确含义。vLLM 进程内部当然有运行时状态——请求队列、KV cache、后台循环——第 9 章讲的 EngineCore 本身就是「有状态、常驻」的。所谓<strong>无状态</strong>，特指 API server 在<strong>会话语义层面</strong>：它不跨请求保留「这轮对话聊了什么」，每个请求必须自包含。Agent 场景要的恰恰是这种跨请求的会话状态。先回到第 9 章的架构：vLLM 的 OpenAI API server（<code class="inline">vllm/entrypoints/openai/</code>）被刻意设计成<strong>会话无状态、可水平扩</strong>。它其实也实现了一个 Responses API，但状态管理非常有限——看 <code class="inline">vllm/entrypoints/openai/responses/serving.py</code> 里存储是怎么做的：</p>
     <div class="code-title">vllm/entrypoints/openai/responses/serving.py — vLLM 自带的「响应存储」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># HACK(woosuk): This is a hack. We should use a better store.</span>
 <span class="cmt"># FIXME: If enable_store=True, this may cause a memory leak since we</span>
@@ -80,7 +80,7 @@
         <line class="edge" x1="400" y1="76" x2="418" y2="76"></line>
 
         <rect class="node" x="270" y="120" width="290" height="56" rx="6" fill="#eaf6ea"></rect>
-        <text class="lbl sm" x="415" y="140" text-anchor="middle">多轮循环 run_gateway_tool_loop（≤10 轮）</text>
+        <text class="lbl sm" x="415" y="140" text-anchor="middle">多轮循环 EngineOrchestration::run（≤10 轮）</text>
         <text class="lbl sm" x="415" y="158" text-anchor="middle">推理 → 按所有权执行工具 → 结果喂回 → 再推理</text>
         <line class="edge core" x1="415" y1="96" x2="415" y2="118"></line>
 
@@ -96,23 +96,25 @@
         <line class="edge core" x1="580" y1="150" x2="660" y2="150"></line>
         <rect class="node acc" x="662" y="110" width="200" height="130" rx="8"></rect>
         <text class="lbl" x="752" y="140" text-anchor="middle" font-weight="bold">vLLM（原样部署）</text>
-        <text class="lbl sm" x="752" y="160" text-anchor="middle">无状态 Responses API</text>
+        <text class="lbl sm" x="752" y="160" text-anchor="middle">Responses API（会话无状态）</text>
         <text class="lbl sm" x="752" y="176" text-anchor="middle">POST /v1/responses（一轮一调）</text>
         <text class="lbl sm" x="752" y="210" text-anchor="middle">只有 function 工具、无状态、</text>
         <text class="lbl sm" x="752" y="226" text-anchor="middle">不用感知历史与多轮</text>
         <text class="lbl sm" x="415" y="296" text-anchor="middle">客户端始终只看到一次请求 / 一条流 / 一个 response id</text>
       </svg>
-      <div class="fig-cap">图 13.1：agentic-api 在 vLLM 前承接「有状态的活」。vLLM 只看到一份份自包含的无状态请求；历史、工具循环、持久化都由网关负责。</div>
+      <div class="fig-cap">图 13.1：agentic-api 在 vLLM 前承接「有状态的活」。vLLM 只看到一份份自包含的无状态请求；历史、工具循环、持久化都由网关承担。</div>
     </div>
-    <div class="callout warn"><b class="tag">对照第 9 章</b>第 9 章讲「API server ↔ EngineCore」是<strong>进程内</strong>的无状态/有状态分层；本章是它的<strong>镜像补充</strong>：把「对话级状态」从推理进程里彻底拿出去，放到一个独立的 Rust 网关进程。两层拆分之后，vLLM 侧保持纯粹的「token 工厂」，可以随便重启、扩缩容，而对话状态安稳地躺在网关的数据库里。</div>
+    <div class="callout warn"><b class="tag">对照第 9 章</b>第 9 章讲「API server ↔ EngineCore」是<strong>进程内</strong>的无状态/有状态分层——那里的「有状态」指 KV cache、调度队列这类请求内状态；本章是它的<strong>镜像补充</strong>：把「对话级状态」（跨请求、跨重启的历史）从推理进程里彻底拿出去，放到一个独立的 Rust 网关进程。两层拆分之后，vLLM 侧每个请求自包含、可以随便重启、扩缩容，而对话状态安稳地躺在网关的数据库里。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">13.2</span>一次请求的两条路：executor 还是纯代理</h2>
     <p>网关并不劫持所有流量。每个 <code class="inline">POST /v1/responses</code> 先做一个<strong>路由判定</strong>：请求里有没有「只有网关才能干」的活？没有就原样透传给 vLLM，一个字节都不改：</p>
     <div class="code-title">crates/agentic-server/src/handler/http/responses.rs — 路由判定（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let</span> should_execute = routing_payload.store
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let</span> has_tool_search_state = ToolSearchHandler::request_has_state(&routing_payload);
+<span class="kw">let</span> should_execute = routing_payload.store
     || routing_payload.previous_response_id.is_some()
+    || has_tool_search_state
     || routing_payload.in_process_feature().is_some();
 
 <span class="kw">if</span> should_execute {
@@ -120,17 +122,23 @@
 } <span class="kw">else</span> {
     proxy_responses(&state, parts, bytes).await   <span class="cmt">// 原样透传 vLLM</span>
 }</pre>
-    <p>其中 <code class="inline">in_process_feature()</code>（<code class="inline">crates/agentic-server-core/src/types/request_response.rs:182</code>）枚举了「网关专属」的四种特征：<code class="inline">conversation_id</code>、任何非 function 的工具声明（网关自有工具与 client 侧 custom 工具都在此列——后者虽由客户端执行，但「注册、改写为 function」这一步必须发生在网关进程里）、compaction 输入、<code class="inline">context_management</code>。命中任意一个就走执行器路径。</p>
+    <p>其中 <code class="inline">in_process_feature()</code>（<code class="inline">crates/agentic-server-core/src/types/request_response.rs:299</code>）枚举了「网关专属」的四种特征：<code class="inline">conversation_id</code>、任何非 function 的工具声明（网关自有工具与 client 侧 custom 工具都在此列——后者虽由客户端执行，但「注册、改写为 function」这一步必须发生在网关进程里）、compaction 输入、<code class="inline">context_management</code>。第四个条件 <code class="inline">has_tool_search_state</code> 是 <code class="inline">type: &quot;tool_search&quot;</code> 声明：客户端用一次搜索来动态挑选工具（13.5），这种请求虽然工具都归客户端执行，但网关必须接手生成「可选工具目录」。命中任意一个就走执行器路径。</p>
     <div class="annotation"><b>为什么值得学：</b>这是网关类的「<strong>透明降级</strong>」设计——用户发一个纯无状态请求时，网关只做转发（<code class="inline">agentic_core::proxy</code>，不解析不落库）；只有真的需要状态时才启动编排。代价小、语义清晰：vLLM 自己能干的事绝不代劳。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">13.3</span>状态恢复：previous_response_id → 完整历史</h2>
     <p>执行器路径的第一步是 <strong>rehydrate（恢复历史）</strong>：客户端只带一个 <code class="inline">previous_response_id</code>，网关把这条 ID 背后的全部历史从数据库里捞出来，拼到本轮输入前面。入口在 <code class="inline">crates/agentic-server-core/src/executor/rehydrate.rs</code>：</p>
-    <div class="code-title">crates/agentic-server-core/src/executor/rehydrate.rs — rehydrate_conversation（摘录，注释为译注）</div>
+    <div class="code-title">crates/agentic-server-core/src/executor/rehydrate.rs — rehydrate_with_continuation（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> <span class="fn">rehydrate_conversation</span>(
-    request: <span class="cl">RequestPayload</span>,
-    exec_ctx: &<span class="cl">ExecutionContext</span>,
+    request: <span class="cl">RequestPayload</span>, exec_ctx: &<span class="cl">ExecutionContext</span>,
+) -&gt; <span class="cl">ExecutorResult</span>&lt;<span class="cl">RequestContext</span>&gt; {
+    <span class="fn">rehydrate_with_continuation</span>(request, exec_ctx, <span class="cl">None</span>).<span class="kw">await</span>  <span class="cmt">// 薄包装</span>
+}
+
+<span class="kw">pub(crate) async fn</span> <span class="fn">rehydrate_with_continuation</span>(
+    request: <span class="cl">RequestPayload</span>, exec_ctx: &<span class="cl">ExecutionContext</span>,
+    continuation: <span class="cl">Option</span>&lt;<span class="cl">ResponseContinuation</span>&gt;,   <span class="cmt">// 有界会话（WebSocket）续租凭据</span>
 ) -&gt; <span class="cl">ExecutorResult</span>&lt;<span class="cl">RequestContext</span>&gt; {
     <span class="kw">let</span> response_id = <span class="fn">uuid7_str</span>(<span class="st">"resp_"</span>);   <span class="cmt">// 先领好本轮 response id</span>
     ...
@@ -146,7 +154,7 @@
     } <span class="kw">else if</span> ctx.original_request.previous_response_id.is_some() {
         <span class="fn">from_response</span>(&amp;<span class="kw">mut</span> ctx, exec_ctx).<span class="kw">await</span>?;      <span class="cmt">// 响应链</span>
     } <span class="kw">else</span> {
-        ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(ctx.new_input_items.clone());
+        ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(<span class="cl">Vec</span>::<span class="fn">from</span>(&ctx.original_request.input));
     }
     <span class="cl">Ok</span>(ctx)
 }</pre>
@@ -170,7 +178,7 @@
     ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(items);
     ...
 }</pre>
-    <div class="annotation"><b>三个细节：</b>(1) 拼完历史立刻做 <strong>pending calls 校验</strong>——每个 call_id 必须唯一、每个 call 必须有且仅有一个 output，有悬空就拒绝请求（4xx），绝不把烂账喂给模型；(2) <code class="inline">previous_response_id</code> 被清空——vLLM 收到的永远是<strong>自包含全量输入</strong>，它不需要知道「续聊」的存在；(3) 工具声明可以从上条 response 的元数据里<strong>继承</strong>（<code class="inline">resolve_tools</code>），续聊不必每次重发 tools。</div>
+    <div class="annotation"><b>三个细节：</b>(1) 拼完历史立刻做 <strong>pending calls 校验</strong>——每个 call_id 必须唯一、每个 call 必须有且仅有一个 output，有悬空就拒绝请求（4xx），绝不把残缺的调用记录喂给模型；(2) <code class="inline">previous_response_id</code> 被清空——vLLM 收到的永远是<strong>自包含全量输入</strong>，它不需要知道「续聊」的存在；(3) 工具声明可以从上条 response 的元数据里<strong>继承</strong>（<code class="inline">resolve_tools</code>），续聊不必每次重发 tools。</div>
     <p>那数据库里到底存了什么？看建表 SQL，整个存储只有三张表，核心是一张 items 流水表：</p>
     <div class="code-title">crates/agentic-server-core/migrations/0001_initial.sql（摘录）</div>
     <pre class="code"><span class="lang-tag">sql</span><span class="kw">CREATE TABLE IF NOT EXISTS</span> conversations (
@@ -194,49 +202,50 @@
     metadata             <span class="cl">TEXT</span>,   <span class="cmt">-- 有效 tools / tool_choice 快照，供续聊继承</span>
     created_at           <span class="cl">INTEGER NOT NULL</span>
 );</pre>
-    <div class="annotation"><b>设计取舍：</b>没有「响应表存整段对话」的宽表，而是 <strong>append-only 的 item 流水 + 链式索引</strong>。每一轮持久化时，把本轮的输出转成 <code class="inline">InputItem</code> 追加进 items，再把继承的 id 链写进 <code class="inline">responses.history_item_ids</code>。好处：续聊只需按 id 列表捞行、按序号重放；纯 JSON 列让 item 类型天然可扩展（SQLite 默认库，可切 PostgreSQL）。</div>
+    <div class="annotation"><b>设计取舍：</b>没有「响应表存整段对话」的宽表，而是 <strong>append-only 的 item 流水 + 链式索引</strong>。每一轮持久化时，把本轮的输出转成 <code class="inline">InputItem</code> 追加进 items，再把继承的 id 链写进 <code class="inline">responses.history_item_ids</code>。好处：续聊只需按 id 列表捞行、按序号重放；纯 JSON 列让 item 类型天然可扩展（SQLite 默认库，可切 PostgreSQL）。后续迁移（<code class="inline">0004</code>）又给 conversations 表加了 <code class="inline">latest_response_id</code> 快捷指针——会话树模式下取「最新一轮」不用再扫链。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.4</span>核心：多轮工具循环 run_gateway_tool_loop</h2>
+    <h2><span class="num">13.4</span>核心：多轮工具循环 EngineOrchestration::run</h2>
     <p>这是整章的核心。客户端发来一句话，模型可能要调 3 次工具才能答——<strong>「推理一轮 → 执行工具 → 把结果喂回去 → 再推理」</strong>的循环发生在网关里，客户端对此无感。看 <code class="inline">crates/agentic-server-core/src/executor/engine.rs</code>（下为摘录拼接，保留了原始顺序）：</p>
-    <div class="code-title">crates/agentic-server-core/src/executor/engine.rs — run_gateway_tool_loop（摘录，注释为译注）</div>
+    <div class="code-title">crates/agentic-server-core/src/executor/engine.rs — EngineOrchestration::run（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">const</span> <span class="cl">MAX_GATEWAY_TOOL_ROUNDS</span>: <span class="cl">usize</span> = <span class="nu">10</span>;
 
-<span class="kw">async fn</span> <span class="fn">run_gateway_tool_loop</span>(
-    <span class="kw">mut</span> ctx: <span class="cl">RequestContext</span>,
-    exec_ctx: &<span class="cl">ExecutionContext</span>,
-    ...
-) -&gt; <span class="cl">ExecutorResult</span>&lt;(<span class="cl">ResponsePayload</span>, <span class="cl">RequestContext</span>)&gt; {
-    <span class="kw">let mut</span> registry = <span class="fn">build_tool_registry</span>(&amp;<span class="kw">mut</span> ctx, exec_ctx).<span class="kw">await</span>?;
+<span class="kw">async fn</span> <span class="fn">run</span>(<span class="kw">mut self</span>, auth: <span class="cl">Option</span>&lt;&amp;<span class="cl">str</span>&gt;, stream_upstream: <span class="cl">bool</span>)
+    -&gt; <span class="cl">ExecutorResult</span>&lt;(<span class="cl">ResponsePayload</span>, <span class="cl">Option</span>&lt;<span class="cl">ToolSearchMetadata</span>&gt;)&gt;
+{
+    <span class="kw">let mut</span> combined_output: <span class="cl">Vec</span>&lt;<span class="cl">OutputItem</span>&gt; = <span class="kw">self</span>.registry.<span class="fn">mcp_list_tool_items</span>()...;
 
     <span class="kw">for</span> round <span class="kw">in</span> <span class="nu">0</span>..<span class="cl">MAX_GATEWAY_TOOL_ROUNDS</span> {
         <span class="cmt">// ① 每轮推理前：先看上下文要不要压缩（13.7）</span>
-        <span class="kw">let</span> compaction_usage = <span class="fn">maybe_compact_context</span>(&amp;<span class="kw">mut</span> ctx, exec_ctx, auth).<span class="kw">await</span>?;
+        <span class="kw">let</span> compaction_usage = <span class="fn">maybe_compact_context</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>.agent.request, <span class="kw">self</span>.exec_ctx, auth).<span class="kw">await</span>?;
 
-        <span class="cmt">// ② 一轮无状态推理：把全量历史发给 vLLM</span>
+        <span class="cmt">// ② 一轮自包含推理：把全量历史发给 vLLM</span>
         <span class="kw">let</span> (<span class="kw">mut</span> payload, deferred_stream_events) = <span class="kw">if</span> stream_upstream {
-            <span class="fn">fetch_stream_payload</span>(&amp;ctx, exec_ctx, auth, &amp;registry, ...).<span class="kw">await</span>?
+            <span class="kw">let</span> stream_payload = <span class="fn">fetch_stream_payload</span>(
+                &amp;<span class="kw">mut</span> <span class="kw">self</span>.agent, <span class="kw">self</span>.exec_ctx, auth, &amp;<span class="kw">self</span>.registry,
+                output_offset, &amp;<span class="kw">self</span>.response_budget,
+            ).<span class="kw">await</span>?;
+            (stream_payload.payload, stream_payload.deferred_events)
         } <span class="kw">else</span> {
-            (<span class="fn">fetch_blocking_payload</span>(&amp;ctx, exec_ctx, auth).<span class="kw">await</span>?, <span class="cl">Vec::new</span>())
+            (<span class="fn">fetch_blocking_payload</span>(&amp;<span class="kw">self</span>.agent, <span class="kw">self</span>.exec_ctx, auth, &amp;<span class="kw">self</span>.registry, ...).<span class="kw">await</span>?, <span class="cl">Vec::new</span>())
         };
 
         <span class="cmt">// ③ 本轮产出的 function_call，按所有权分派执行</span>
-        <span class="kw">let</span> has_client_owned = <span class="fn">has_client_owned_calls</span>(&amp;current_output, &amp;registry);
-        <span class="kw">let</span> gateway_results = <span class="fn">execute_and_emit_round_output_calls</span>(
-            &amp;current_output, &amp;registry, output_offset, ...
+        <span class="kw">let</span> has_client_owned = <span class="fn">has_client_owned_calls</span>(&amp;current_output, &amp;<span class="kw">self</span>.registry);
+        <span class="kw">let</span> gateway_results = <span class="kw">self</span>.<span class="fn">execute_round_output</span>(
+            &amp;current_output, output_offset, deferred_stream_events,
         ).<span class="kw">await</span>?;
 
         <span class="cmt">// ④ 决定：继续循环 / 交还客户端 / 完成 / 轮数耗尽</span>
         <span class="kw">match</span> <span class="fn">classify_round</span>(has_client_owned, &amp;gateway_results, round, <span class="cl">MAX_GATEWAY_TOOL_ROUNDS</span>) {
             <span class="cl">LoopDecision::Continue</span> =&gt; {
-                ctx.enriched_request.tool_choice = <span class="cl">Some</span>(<span class="cl">ToolChoice::Auto</span>);
-                <span class="fn">append_output_items_to_input</span>(&amp;<span class="kw">mut</span> ctx.enriched_request.input, &amp;current_output);
-                <span class="fn">append_gateway_calls_to_new_input</span>(&amp;<span class="kw">mut</span> ctx, &amp;current_output, &amp;registry);
-                <span class="fn">append_tool_outputs</span>(&amp;<span class="kw">mut</span> ctx, ...);   <span class="cmt">// 工具结果 → 下一轮输入</span>
+                <span class="kw">self</span>.agent.request.enriched_request.tool_choice = <span class="cl">Some</span>(<span class="cl">ToolChoice::Auto</span>);
+                <span class="fn">append_output_items_to_input</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>.agent.request.enriched_request.input, &amp;current_output);
+                <span class="kw">self</span>.<span class="fn">record_gateway_results</span>(gateway_results);   <span class="cmt">// 工具结果 → 下一轮输入</span>
             }
             <span class="cl">LoopDecision::Done</span> | <span class="cl">LoopDecision::RequiresClientAction</span>
-            | <span class="cl">LoopDecision::Incomplete</span>(_) =&gt; { <span class="fn">finalize_loop</span>(...); <span class="kw">return</span> <span class="cl">Ok</span>((payload, ctx)); }
+            | <span class="cl">LoopDecision::Incomplete</span>(_) =&gt; { <span class="fn">finalize_loop</span>(...); <span class="kw">return</span> <span class="cl">Ok</span>((payload, ...)); }
         }
     }
 }</pre>
@@ -299,7 +308,7 @@
     <span class="cmt">/// `None` 表示原则上归网关、但还没实现 handler（如 FileSearch/CodeInterpreter）。</span>
     <span class="cl">Gateway</span>(<span class="cl">Option</span>&lt;<span class="cl">GatewayBinding</span>&gt;),
 }</pre>
-    <p>三种命运对应三个归属：<strong>Client</strong>——调用原样交还客户端执行（function、custom、Codex 命名空间）；<strong>Gateway(Some)</strong>——网关绑定执行器自己跑（web_search、MCP 发现的工具）；<strong>Gateway(None)</strong>——原则上归网关、但 handler 尚未实现（如 FileSearch / CodeInterpreter），调度器派活时命中 <code class="inline">GatewayExecutionPlan::MissingHandler</code>（<code class="inline">gateway.rs:242</code>），生成一条「has no registered handler」的错误输出喂回模型，请求照常继续而不是 500。</p>
+    <p>三种命运对应三个归属：<strong>Client</strong>——调用原样交还客户端执行（function、custom、Codex 命名空间）；<strong>Gateway(Some)</strong>——网关绑定执行器自己跑（web_search、MCP 发现的工具）；<strong>Gateway(None)</strong>——原则上归网关、但 handler 尚未实现（如 FileSearch / CodeInterpreter），调度器派活时命中 <code class="inline">GatewayExecutionPlan::MissingHandler</code>（<code class="inline">gateway.rs:283</code>），生成一条「has no registered handler」的错误输出喂回模型，请求照常继续而不是 500。</p>
     <p>每个请求开始时，网关把客户端声明的所有工具「过一遍注册流程」，建出一张 <strong>模型可见名 → 条目</strong> 的请求级注册表：</p>
     <div class="code-title">crates/agentic-server-core/src/tool/registry.rs — build_with_handlers（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> <span class="fn">build_with_handlers</span>(
@@ -324,7 +333,7 @@
         }
     }
 }</pre>
-    <div class="callout warn"><b class="tag">为什么 vLLM 只见到 function 工具</b>推理前有个「规范化」步骤（<code class="inline">RequestPayload::to_upstream_request</code>，<code class="inline">types/request_response.rs:258</code>）：所有能执行的声明——<code class="inline">web_search</code>、<code class="inline">mcp</code>、<code class="inline">custom</code>、Codex 命名空间——统统<strong>统一成普通的 <code class="inline">{"type":"function"}</code> 工具</strong>再发给 vLLM。因为 vLLM 只认 function 工具。推理完拿到 <code class="inline">function_call</code> 后，网关再用注册表把名字<strong>还原</strong>成真实的公开形态（<code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> / <code class="inline">custom_tool_call</code>）。概括成一句：<strong>wire 层做加法，语义层做还原</strong>。</div>
+    <div class="callout warn"><b class="tag">为什么 vLLM 只见到 function 工具</b>推理前有个「规范化」步骤（<code class="inline">RequestPayload::to_upstream_request</code>，<code class="inline">types/request_response.rs:376</code>）：所有能执行的声明——<code class="inline">web_search</code>、<code class="inline">mcp</code>、<code class="inline">custom</code>、Codex 命名空间——统统<strong>统一成普通的 <code class="inline">{"type":"function"}</code> 工具</strong>再发给 vLLM。因为 vLLM 只认 function 工具。推理完拿到 <code class="inline">function_call</code> 后，网关再用注册表把名字<strong>还原</strong>成真实的公开形态（<code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> / <code class="inline">custom_tool_call</code>）。概括成一句：<strong>wire 层做加法，语义层做还原</strong>。</div>
     <p>「网关侧执行」由一个两段式 trait 决定，所有工具类型都实现它：</p>
     <div class="code-title">crates/agentic-server-core/src/tool/handler.rs — 两个核心 trait（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 所有工具（无论归谁执行）都实现：校验 + 转成 vLLM 的 function 工具</span>
@@ -349,19 +358,21 @@
     ...
 }</pre>
     <div class="annotation"><b>拆开看：</b><code class="inline">ToolHandler</code> 管「声明侧」（校验、转成 function 工具）；<code class="inline">GatewayExecutor</code> 额外管「执行侧」（真跑、超时、并发策略、对外事件）。客户端工具（function/custom/Codex namespace）只实现前者——它们的调用永远原样交还客户端。这样新增一种工具 = 实现两个 trait + 注册，<strong>循环代码一行不改</strong>（设计文档称 additive 原则：「The executor loop doesn't change.」）。</div>
-    <p>落到具体工具上，比如内置的 <code class="inline">web_search</code>（You.com 后端）：一次调用最多带 5 个 query，逐个拿信号量后并发查：</p>
-    <div class="code-title">crates/agentic-server-core/src/tool/web_search.rs — execute_search（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">const</span> <span class="cl">MAX_WEB_SEARCH_QUERIES</span>: <span class="cl">usize</span> = <span class="nu">5</span>;
-
-<span class="kw">async fn</span> <span class="fn">execute_search</span>(&amp;<span class="kw">self</span>, call_id: &amp;<span class="cl">str</span>, arguments: &amp;<span class="cl">str</span>, params: ...) {
-    <span class="kw">let</span> queries = <span class="cl">WebSearchArguments::from_json</span>(arguments)?.<span class="fn">all_queries</span>();
-    <span class="kw">let</span> responses = futures::stream::<span class="fn">iter</span>(queries.iter().cloned())
-        .map(|query| <span class="kw">async move</span> {
-            <span class="kw">let</span> _permit = query_permits.<span class="fn">acquire_owned</span>().<span class="kw">await</span>?;  <span class="cmt">// 信号量限流</span>
-            provider.<span class="fn">search</span>(&amp;query, args_ref, params).<span class="kw">await</span>
+    <p>落到具体工具上，比如内置的 <code class="inline">web_search</code>：后端通过配置选择（<code class="inline">WebSearchProviderKind</code>，<code class="inline">config.rs:167</code>，默认 You.com、可选 Brave）。一次调用最多带 5 个 query，逐个拿信号量后并发查：</p>
+    <div class="code-title">crates/agentic-server-core/src/tool/web_search/mod.rs — execute_search（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">async fn</span> <span class="fn">execute_search</span>(&amp;<span class="kw">self</span>, call_id: &amp;<span class="cl">str</span>, arguments: &amp;<span class="cl">str</span>, params: ...) {
+    <span class="kw">let</span> args = <span class="cl">WebSearchArguments::from_json</span>(arguments)?;
+    <span class="kw">let</span> queries = args.<span class="fn">queries</span>();                       <span class="cmt">// ≤5 个（args.rs:17）</span>
+    <span class="kw">let mut</span> responses = <span class="cl">Box</span>::<span class="fn">pin</span>(futures::stream::<span class="fn">iter</span>(queries.iter().cloned())
+        .map(|query| {
+            <span class="kw">let</span> provider = <span class="cl">Arc</span>::<span class="fn">clone</span>(provider);
+            <span class="kw">async move</span> {
+                <span class="kw">let</span> _permit = query_permits.<span class="fn">acquire_owned</span>().<span class="kw">await</span>?;  <span class="cmt">// 信号量限流</span>
+                provider.<span class="fn">search</span>(&amp;query, args_ref, params).<span class="kw">await</span>
+            }
         })
-        .<span class="fn">buffered</span>(<span class="kw">self</span>.max_concurrent_queries.get())   <span class="cmt">// 滑动窗口并发</span>
-        .<span class="fn">try_collect</span>::&lt;<span class="cl">Vec</span>&lt;_&gt;&gt;().<span class="kw">await</span>?;</pre>
+        .<span class="fn">buffered</span>(<span class="kw">self</span>.max_concurrent_queries.get()));  <span class="cmt">// 滑动窗口并发</span>
+    <span class="cmt">// …逐个结果累加字节计数，超出 MAX_GATEWAY_TOOL_OUTPUT_BYTES 立即报错</span></pre>
     <p>最后，循环里真正「派活」的是 <code class="inline">GatewayScheduler</code>——它把每轮产出的 function_call 过一遍注册表，找出网关拥有的那些，绑定执行器并并发执行（注意错误处理：单个工具失败<strong>不会</strong>炸掉整个响应，而是变成一条错误结果喂回模型）：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/gateway.rs — GatewayScheduler::execute 与 run_one（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(super) async fn</span> <span class="fn">execute</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>) -&gt; <span class="cl">ExecutorResult</span>&lt;<span class="cl">Vec</span>&lt;<span class="cl">GatewayCallResult</span>&gt;&gt; {
@@ -395,7 +406,7 @@
         ...
     };
 }</pre>
-    <div class="annotation"><b>三层并发控制叠在一起：</b>(1) 全局滑动窗口 <code class="inline">max_concurrent_gateway_calls</code>（默认 5，来自 <code class="inline">config.rs:23</code> 的 <code class="inline">DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS</code>）；(2) 每个工具自己的 <code class="inline">self_exclusion</code> 信号量——<code class="inline">supports_parallel_execution()</code> 返回 false 的工具，同名调用自动排队；(3) 单次调用 60s 超时（<code class="inline">GATEWAY_TOOL_TIMEOUT</code>，<code class="inline">gateway.rs:47</code>）。三层正交：改全局吞吐、改单工具串行策略、改超时互不干扰。</div>
+    <div class="annotation"><b>三层并发控制叠在一起：</b>(1) 全局滑动窗口 <code class="inline">max_concurrent_gateway_calls</code>（默认 5，来自 <code class="inline">config.rs:25</code> 的 <code class="inline">DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS</code>）；(2) 每个工具自己的 <code class="inline">self_exclusion</code> 信号量——<code class="inline">supports_parallel_execution()</code> 返回 false 的工具，同名调用自动排队；(3) 单次调用 60s 超时（<code class="inline">GATEWAY_TOOL_TIMEOUT</code>，<code class="inline">gateway.rs:75</code>）。三层正交：改全局吞吐、改单工具串行策略、改超时互不干扰。</div>
   </section>
 
   <section class="block">
@@ -406,6 +417,7 @@
     next_sequence_number: <span class="cl">u64</span>,     <span class="cmt">// 跨轮单调递增</span>
     emitted_created: <span class="cl">bool</span>,          <span class="cmt">// response.created 只发一次</span>
     emitted_in_progress: <span class="cl">bool</span>,
+    max_stream_event_bytes: <span class="cl">usize</span>,  <span class="cmt">// 单帧大小上限（防超大事件）</span>
 }
 
 <span class="kw">pub fn</span> <span class="fn">process_event</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>, frame: &amp;<span class="kw">mut</span> <span class="cl">EventFrame</span>, output_offset: <span class="cl">usize</span>) -&gt; <span class="cl">bool</span> {
@@ -414,19 +426,28 @@
     <span class="kw">true</span>
 }</pre>
     <div class="annotation"><b>它只做三件事：</b>① 全流 <code class="inline">sequence_number</code> 单调递增（跨轮连续）；② 后面轮次的 <code class="inline">output_index</code> 整体平移（<code class="inline">output_offset</code>），让第 2 轮的输出接在第 1 轮后面而不是顶掉它；③ <code class="inline">response.created/in_progress</code> 去重，每个 response 只发一次。其余帧原样透传。名字里虽然有 accumulator，但它<strong>不攒数据</strong>——攒数据的是另一头的 <code class="inline">ResponseAccumulator</code>（把流拼回完整 JSON 用）。</div>
-    <p>更麻烦的是<strong>工具事件</strong>：vLLM 不管工具归谁，一律吐 <code class="inline">function_call</code> 事件。但公开 API 里 web_search/MCP 调用应该是 <code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> 形状，而且要等真实执行完才能给结果。翻译器 <code class="inline">FunctionSseTranslator</code> 在流上做三方分流（<code class="inline">executor/function_sse.rs:15</code> 的 <code class="inline">FunctionCallShape</code>）：</p>
-    <div class="code-title">crates/agentic-server-core/src/executor/function_sse.rs — 流上的三种形状（摘录）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">enum</span> <span class="cl">FunctionCallShape</span> {
-    <span class="cl">PublicFunction</span>,   <span class="cmt">// 客户端 function 工具：原样透传</span>
-    <span class="cl">GatewayOwned</span>,     <span class="cmt">// web_search/MCP：先扣下（suppress），执行完再合成公开事件</span>
-    <span class="cl">Custom</span>(<span class="cl">CustomCallState</span>),  <span class="cmt">// 自由格式工具：把 arguments 流重拼成 input 流</span>
+    <p>更麻烦的是<strong>工具事件</strong>：vLLM 不管工具归谁，一律吐 <code class="inline">function_call</code> 事件。但公开 API 里 web_search/MCP 调用应该是 <code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> 形状，而且要等真实执行完才能给结果。这件事在 59 个文件的翻译层重构后被拆成「一个调度器 + 一族翻译器」（<code class="inline">executor/translate/</code>）：调度器只管路由和缓冲，每种工具各自持有翻译状态：</p>
+    <div class="code-title">crates/agentic-server-core/src/executor/translate/dispatcher.rs + mod.rs（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// 每个活跃调用二选一：客户端工具挂着翻译器（原样/改写透传），</span>
+<span class="cmt">// 网关工具直接标记 Gateway——它的公开生命周期事件由执行完事后合成</span>
+<span class="kw">enum</span> <span class="cl">ActiveCall</span> {
+    <span class="cl">Client</span>(<span class="cl">Box</span>&lt;<span class="kw">dyn</span> <span class="cl">ToolTranslator</span>&gt;),
+    <span class="cl">Gateway</span>,
 }
 
-<span class="kw">const</span> <span class="cl">MAX_PENDING_FUNCTION_BYTES</span>: <span class="cl">usize</span> = <span class="nu">256</span> * <span class="nu">1024</span>;  <span class="cmt">// 未知名调用缓冲上限</span></pre>
+<span class="cmt">// 每种工具一个翻译器实现 ToolTranslator trait（mod.rs:71）：</span>
+<span class="cmt">// function / custom / namespace / shell / tool_search 各一份</span>
+<span class="kw">trait</span> <span class="cl">ToolTranslator</span>: std::fmt::<span class="cl">Debug</span> + <span class="cl">Send</span> {
+    <span class="kw">fn</span> <span class="fn">translate</span>(&amp;<span class="kw">mut</span> <span class="kw">self</span>, event: <span class="cl">ToolEvent</span>&lt;'_&gt;,
+        call: <span class="cl">Option</span>&lt;<span class="cl">AccumulatedFunctionCall</span>&lt;'_&gt;&gt;) -&gt; <span class="cl">ExecutorResult</span>&lt;<span class="cl">Vec</span>&lt;<span class="cl">EventFrame</span>&gt;&gt;;
+}
+
+<span class="kw">const</span> <span class="cl">MAX_PENDING_FUNCTION_BYTES</span>: <span class="cl">usize</span> = <span class="nu">256</span> * <span class="nu">1024</span>;  <span class="cmt">// 未知名调用缓冲上限（mod.rs:23）</span></pre>
     <div class="annotation"><b>难点在时序：</b>模型可能先吐 arguments 后吐名字（甚至不吐），网关收到「没名字的 function_call delta」只能先缓冲——但必须封顶（256 KiB，防恶意流打爆内存）；等名字到了再决定「透传 / 改写 / 抑制」。而网关工具的公开生命周期事件（开始/完成/失败）是执行完<strong>事后合成</strong>的，并把 defer 边界记住，保证客户端看到的顺序仍然是模型输出的顺序。</div>
-    <p>整条流的入口在 <code class="inline">engine.rs::run_stream</code>——一个 <code class="inline">tokio::select!</code> 循环，一边消费后台循环发出的事件，一边保证「持久化先于 <code class="inline">response.completed</code> 出门」：</p>
-    <div class="code-title">crates/agentic-server-core/src/executor/engine.rs — run_stream（摘录）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {
+    <p>整条流的入口在 <code class="inline">executor/engine/streaming.rs::run_stream</code>——一个 <code class="inline">tokio::select!</code> 循环，一边消费后台循环发出的事件，一边保证「持久化先于 <code class="inline">response.completed</code> 出门」。注意事件通道是<strong>有界</strong>的（<code class="inline">STREAM_EVENT_BUFFER = 1</code>）：消费端卡住时，生产端也会跟着暂停，背压一路传导到上游读取：</p>
+    <div class="code-title">crates/agentic-server-core/src/executor/engine/streaming.rs — run_stream（摘录）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let</span> (event_tx, <span class="kw">mut</span> event_rx) = mpsc::<span class="fn">channel</span>(<span class="cl">STREAM_EVENT_BUFFER</span>);  <span class="cmt">// 有界通道，容量 1</span>
+<span class="kw">loop</span> {
     tokio::select! {
         Some(event) = event_rx.recv() =&gt; {
             <span class="kw">yield</span> <span class="fn">consume_stream_event</span>(event, &amp;<span class="kw">mut</span> next_sequence_number);
@@ -447,11 +468,11 @@
         }
     }
 }</pre>
-    <div class="callout warn"><b class="tag">工程细节</b>「持久化先于终态事件」是一个容易踩的坑：如果先把 <code class="inline">response.completed</code> 发出去，客户端（尤其 Codex 这种拿到终态就关连接的）会立刻断开，此时持久化若还没完成就被取消，下一轮 <code class="inline">previous_response_id</code> 就指向一条没写完的历史。顺序反过来，掉电都不怕。</div>
+    <div class="callout warn"><b class="tag">工程细节</b>「持久化先于终态事件」是一个容易踩的坑：如果先把 <code class="inline">response.completed</code> 发出去，客户端（尤其 Codex 这种拿到终态就关连接的）会立刻断开，此时持久化若还没完成就被取消，下一轮 <code class="inline">previous_response_id</code> 就指向一条没写完的历史。顺序反过来，可以避免「终态事件先发、持久化被取消」的风险；至于掉电等更极端的场景，仍要依赖数据库自身的持久化保证（事务、fsync、正确的配置）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.7</span>上下文压缩：compaction，长会话的活命机制</h2>
+    <h2><span class="num">13.7</span>上下文压缩：compaction，长会话怎么不被上下文撑爆</h2>
     <p>对话越长，每轮「全量重放」就越贵（这正是第 8 章讲过的 KV/显存预算问题的 API 层版本）。agentic-api 提供了 <strong>compaction</strong>：把旧上下文压成一条「检查点摘要」，之后的轮次只带摘要 + 摘要后的新内容。可以显式调 <code class="inline">POST /v1/responses/compact</code>，也可以挂自动阈值，每轮推理前检查：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/compaction.rs — maybe_compact_context（摘录）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) async fn</span> <span class="fn">maybe_compact_context</span>(
@@ -474,15 +495,14 @@
     <p>压缩的执行本身也是<strong>一次普通的推理调用</strong>——用一段固定的 CHECKPOINT 提示词让模型自己总结：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/compaction.rs — 压缩提示词（原文）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">const</span> <span class="cl">COMPACTION_PROMPT</span>: &amp;<span class="cl">str</span> = <span class="st">"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a concise handoff summary that preserves current progress, decisions, constraints, unresolved work, and critical references for the next model. Return only the summary."</span>;</pre>
-    <p>压完之后，「历史可见性」有两条边界，值得分开看（<code class="inline">types/io/input.rs:340</code>）：</p>
+    <p>压完之后，「历史可见性」有两条边界，值得分开看（<code class="inline">types/io/input.rs:585</code>）：</p>
     <div class="code-title">crates/agentic-server-core/src/types/io/input.rs — model_input：模型可见性边界（摘录）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub fn</span> <span class="fn">model_input</span>(&amp;<span class="kw">self</span>) -&gt; <span class="cl">Cow</span>&lt;<span class="cl">'_</span>, <span class="kw">Self</span>&gt; {
+    <span class="cmt">// 裁剪窗口在 model_items()（input.rs:549）里算好：</span>
     <span class="cmt">// ① 剥掉编排用的内部项（mcp_list_tools / compaction_trigger）——模型永远看不到</span>
     <span class="cmt">// ② 若有压缩检查点：检查点之前的旧上下文被摘要取代；</span>
     <span class="cmt">//    检查点本身转成一条 assistant 消息（内容即摘要文本）</span>
-    <span class="kw">let</span> model_items = window.retained_user_items(items)
-        .chain(items[window.latest_index()..].iter())
-        .filter(|item| item.<span class="fn">is_model_visible</span>())
+    <span class="kw">let</span> model_items = <span class="kw">self</span>.<span class="fn">model_items</span>()
         .map(|item| <span class="kw">match</span> item {
             <span class="cl">InputItem::Compaction</span>(compaction) =&gt; <span class="cl">InputItem::Message</span>(...),  <span class="cmt">// → assistant 摘要</span>
             other =&gt; other.clone(),
@@ -495,7 +515,7 @@
     <h2><span class="num">13.8</span>实战串联：把三层跑起来</h2>
     <p>把第 9 章（vLLM 服务）和本章（网关）拼成一条完整命令链——注意 vLLM 的启动参数只有解析器类配置（工具解析器 + 自动工具选择 + 推理解析器），<strong>状态与循环完全不归它管</strong>：</p>
     <div class="code-title">三层启动（终端）</div>
-    <pre class="code"><span class="lang-tag">bash</span><span class="cmt"># ① vLLM：无状态推理引擎（第 9 章的 AsyncLLM + EngineCore）</span>
+    <pre class="code"><span class="lang-tag">bash</span><span class="cmt"># ① vLLM：自包含单轮推理引擎（第 9 章的 AsyncLLM + EngineCore）</span>
 vllm serve Qwen/Qwen3-30B-A3B-FP8 \
   --tool-call-parser qwen3_coder --enable-auto-tool-choice \
   --reasoning-parser qwen3 --port 5050
@@ -534,7 +554,7 @@ curl http://localhost:9000/v1/responses -H <span class="st">"Content-Type: appli
 </div>
 
 <footer>
-  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.5.0-24-gc04ac19 · vLLM 侧版本 v0.29.1rc0-18-gfa1b3b1922 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.7.0-21-ga38b0f0 · vLLM 侧版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

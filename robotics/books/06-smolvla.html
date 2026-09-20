@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出具身智能</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>具身智能</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -19,7 +19,7 @@
       <a href="03-teleop.html">遥操作</a>
       <a href="04-dataset.html">数据集</a>
       <a href="05-policy.html">策略</a>
-      <a href="06-smolvla.html">SmolVLA</a>
+      <a class="active" href="06-smolvla.html">SmolVLA</a>
       <a href="07-vla-frontier.html">VLA 前沿</a>
       <a href="08-sim-isaaclab.html">仿真</a>
       <a href="09-manager-based-env.html">环境</a>
@@ -35,7 +35,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 SmolVLA</div>
     <h1>SmolVLA：当 VLM 学会动手</h1>
-    <div class="subtitle">第 5 章的策略「看」到的是像素，但不「理解」语言——你说「把杯子放到盘子上」，ACT 听不懂。VLA（Vision-Language-Action）把预训练 VLM 的语言与视觉理解嫁接到动作生成上，让机器人第一次真正「听指令」。SmolVLA 是其中最小而全的一个：SmolVLM2-500M 主干 + 一半宽度的动作专家 + 流匹配，单张消费级显卡可训。本章把它的双塔架构与流匹配细节读透。</div>
+    <div class="subtitle">第 5 章的策略「看」到的是像素，但不「理解」语言——你说「把杯子放到盘子上」，ACT 听不懂。VLA（Vision-Language-Action）把预训练 VLM 的语言与视觉理解嫁接到动作生成上，让机器人第一次真正「听指令」。SmolVLA 是其中最小而全的一个：SmolVLM2-500M 主干 + ×0.75 宽度的动作专家 + 流匹配，单张消费级显卡可训。本章把它的双塔架构与流匹配细节读透。</div>
   </div>
 
   <section class="block">
@@ -132,7 +132,8 @@
       </div>
       <div class="fig-cap">图 6.1：双塔分工——「看懂」交给 VLM 塔（一次前向缓存 KV），「动手」交给小专家塔（每个去噪步只跑它）。这就是 VLA 推理能压到消费级显卡的关键：贵的部分不重复算。</div>
     </div>
-    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>动作专家与 VLM 共享同一 transformer 结构但宽度更窄（<code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>，配置默认 0.75），层数对齐 VLM 的前 16 层（<code class="inline">num_vlm_layers=16</code>）。专家通过 <strong>cross-attention 读 VLM 的 KV cache</strong>（<code class="inline">attention_mode="cross_attn"</code>，k/v proj 重塑成与 VLM 同维度）——它继承了 VLM 对图像和语言的理解，自己只学「怎么动」。参数量约 450M，但微调时只训专家一半，显存需求进一步减半。锚点：宽度乘法器 <code class="inline">smolvlm_with_expert.py:110</code> + <code class="inline">configuration_smolvla.py:98</code>；cross-attn 重塑 <code class="inline">smolvlm_with_expert.py:122-135</code>。</div>
+    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>核心一句话——理解不发生在专家的权重里，它发生在 VLM 的 KV cache 里，专家只是个「读缓存的小查询器」，所以天然可以窄。三个源码事实撑起这句话：① 专家从 config 随机初始化、不加载 VLM 权重（<code class="inline">smolvlm_with_expert.py:118</code> 的 <code class="inline">AutoModel.from_config</code>，出生时对图像语言一无所知）；② 它连词表都没有（<code class="inline">:138</code> <code class="inline">embed_tokens = None</code>），输入是 <code class="inline">action_in_proj</code>/<code class="inline">state_proj</code> 投影进来的连续向量（<code class="inline">modeling_smolvla.py:511-512</code>）——它对世界的全部理解只能来自每层 cross-attention 读 VLM 的 KV cache（<code class="inline">:122-135</code> 把 VLM 维度的 K/V 投影进专家的小空间），它不是知识的容器，是知识的查询器，查询器不需要跟知识库一样大；③ 它要学的函数输出低维低熵（50 步 × 几十维连续速度场），而 VLM 学的「看懂+听懂」来自数十亿 token 预训练——容量分配跟着难度走。另外，专家是每个去噪步都跑的（6.2 的循环 ×10），循环体必须小，第二个 500M 大模型直接让「prefix 算一次、suffix 十次便宜循环」的消费级显卡经济学破产。<br><br>
+    「共享结构但宽度更窄」不矛盾——这是两个独立的旋钮：<strong>结构</strong>（同）= 块的拓扑（RMSNorm、RoPE、GQA、16 层堆叠，<code class="inline">num_vlm_layers=16</code>），复用结构是省去重新设计调参——这种 block 已被 VLM 预训练验证过会收敛；<strong>宽度</strong>（窄）= 每层 <code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>（配置默认 0.75，<code class="inline">configuration_smolvla.py:98</code>），纯容量旋钮。还有个佐证细节：<code class="inline">self_attn_every_n_layers=2</code>——专家塔每隔一层才保留一次对自己的 self-attention，其余层纯 cross-attention；suffix 就是一个噪声动作块（约 50 个 token），自己人之间没什么好交互的，主要信息得从 prefix 拿——真正独立的第二个语言模型绝不会这么设计。参数量约 450M，微调时只训专家一半，显存进一步减半。这套「大模型管理解、小专家管动手」不是 SmolVLA 的发明：7.1 的 π0 同款——3B PaliGemma 冻结出 KV，≈300M 的 flow-matching 动作专家每步去噪时跑；SmolVLA 把这个比例推得更极端。锚点：宽度乘法器 <code class="inline">smolvlm_with_expert.py:110</code>；cross-attn 重塑 <code class="inline">smolvlm_with_expert.py:122-135</code>。</div>
     <div class="callout info"><b>KV cache 是什么：</b>transformer 注意力用到的 Key/Value 向量。若每步重算整个前缀序列的 K/V，代价随序列长度平方增长；把它们缓存起来（use_cache=True），后续只需算新 token 的注意力——这里即「VLM 看一遍图像和指令，缓存理解结果；十步去噪每步只跑小专家塔」。不熟悉的话记住结论即可：贵的部分只算一次，便宜的部分反复用。</div>
   </section>
 
@@ -251,7 +252,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
 
   <section class="block">
     <h2><span class="num">6.4</span>训练侧：冻结、缺相机补位、processor 链</h2>
-    <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
+    <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数；专家宽度是 VLM 的 0.75 倍、参数量不与其宽度成正比）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:371 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Create image features not present in the batch as fully 0 padded images.</span>
 <span class="kw">for</span> num_empty_cameras <span class="kw">in</span> range(len(missing_img_keys)):
@@ -299,7 +300,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
 </div>
 
 <footer>
-  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（b6ec0060）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（89236ea0）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

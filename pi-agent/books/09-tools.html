@@ -22,7 +22,7 @@
       <a href="06-compaction.html">压缩</a>
       <a href="07-harness.html">Harness</a>
       <a href="08-agent-session.html">生产 Harness</a>
-      <a href="09-tools.html">工具</a>
+      <a class="active" href="09-tools.html">工具</a>
       <a href="10-ai-layer.html">AI 层</a>
       <a href="11-coding-agent.html">编码 Agent</a>
       <a href="12-build-own-runtime.html">自制 Runtime</a>
@@ -235,6 +235,7 @@ finalizedCalls.push(<span class="kw">async</span> () =&gt; {
     <div class="callout">
       <strong>安全模型概括：</strong>Pi 的工具分「<strong>只读</strong>（read/grep/find/ls）」与「<strong>会改动系统</strong>（bash/edit/write）」。前者几乎无条件放行，后者在 <em>beforeToolCall 钩子</em> 处接受权限确认（bash 尤其）。你自己做 Runtime 时，把<b>副作用强度</b>作为工具分类的第一维，能让权限系统简单一半。
     </div>
+    <p>还有一个藏在 <code class="inline">Tool</code> 接口里的字段值得知道：<code class="inline">constrainedSampling</code>。内置的 read/bash/edit/write 都带 <code class="inline">{ type: "json_schema", strict: "prefer" }</code>——意思是「模型倾向用 JSON Schema 严格模式来填参数」。strict 是个光谱：<code class="inline">prefer</code> 表示 provider 支持就收紧、不支持就静默退回普通 schema（把模型从不支持 strict 的供应商迁到 pi-ai 上，参数照填）；<code class="inline">require</code> 则相反——provider 不支持就直接报错，绝不悄悄降级。哪些 JSON Schema 关键字（<code class="inline">$ref</code>、<code class="inline">allOf</code> 等）会被 strict 模式拒收，在 pi-ai 的 <code class="inline">constrained-sampling.ts</code> 里白名单管理。给工具定参数 schema 时知道这件事有实际意义：schema 越保守，strict 模式下的参数质量越高。</p>
     <h3>9.4.1 <code class="inline">edit</code> 工具的「容错输入」与 BOM 处理</h3>
     <p><code class="inline">edit</code> 工具的契约是「一组 <code class="inline">{ oldText, newText }</code> 编辑」，但真实模型并不总按契约来。生产版的 <code class="inline">prepareEditArguments</code> 做了三道容错，本质上是「<strong>宁可猜对也别让一次合法编辑失败</strong>」：</p>
     <div class="code-title">core/tools/edit.ts · prepareEditArguments 容错分支</div>
@@ -255,11 +256,12 @@ finalizedCalls.push(<span class="kw">async</span> () =&gt; {
   <section class="block">
     <h2><span class="num">9.5</span>钩子 × 工具的叠加：两处拦截</h2>
     <p>你可能会疑惑：工具自己可以带 <code class="inline">beforeToolCall</code>（9.1），config 也有全局 <code class="inline">beforeToolCall</code>（9.2），生产 agent-session 里又装了钩子（第 8 章）。它们如何共存？看 agent-loop 的调度，实际上<strong>自定义钩子与内置钩子是同一套 config 字段</strong>，生产 harness 在构造 Agent 时把它们注入：</p>
-    <div class="code-title">agent-session.ts · 安装工具钩子（line ~472）</div>
+    <div class="code-title">agent-session.ts · 安装工具钩子（line 489）</div>
     <pre class="code"><code><span class="cmt">// 安装一次工具钩子，复用给每个 Agent run（避免重复安装）</span>
 <span class="fn">this</span>.agent.beforeToolCall = <span class="kw">async</span> ({ toolCall, args }) =&gt; {
   <span class="cmt">// ① 先给扩展一个 tool_call 拦截机会（可 block）</span>
-  <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.emitToolCall({ type: <span class="st">"tool_call"</span>, toolCall, args });
+  <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.emitToolCall({
+    type: <span class="st">"tool_call"</span>, toolName: toolCall.name, toolCallId: toolCall.id, input: args });
   <span class="cmt">// ② 再跑内置权限确认 / bash 确认等</span>
   ...
 };
@@ -267,8 +269,29 @@ finalizedCalls.push(<span class="kw">async</span> () =&gt; {
   <span class="cmt">// 给扩展 tool_result 钩子 + 累积 usage / 决定 terminate</span>
 };</code></pre>
     <p>这一处是实现「扩展能拦工具」与「bash 要确认」共存的钩子。它把「<strong>谁有权放行一个工具</strong>」收敛成一条链：扩展（可 block）→ 内置权限/确认 → 真正 execute。任何一层都能 interrupt。</p>
+    <h3>9.5.1 user_bash：用户亲手执行的命令也过钩子</h3>
+    <p>上面的拦截链针对的是「模型发起的工具调用」。但还有一个权限盲区：用户在 TUI 里用 <code class="inline">!</code>（或 <code class="inline">!!</code>）前缀亲手敲的命令——它不经过任何工具，直接在终端里跑。这条路径同样给扩展留了钩子（<code class="inline">user_bash</code> 事件），而且处理方式很有讲究：</p>
+    <div class="code-title">extensions/types.ts · user_bash 的返回类型（判别联合）</div>
+    <pre class="code"><code><span class="cmt">// 返回 undefined → 照常本地执行；返回时必须二选一：</span>
+<span class="kw">export type</span> UserBashEventResult =
+  | { operations: <span class="cl">BashOperations</span>; result?: <span class="kw">never</span> }   <span class="cmt">// 换掉执行器（如远程 shell），仍由 pi 跑</span>
+  | { operations?: <span class="kw">never</span>; result: <span class="cl">BashResult</span> };       <span class="cmt">// 扩展自己跑完了，交回完整结果</span></code></pre>
+    <div class="code-title">agent-session.ts / interactive-mode.ts · 两个方向的配合（节选）</div>
+    <pre class="code"><code><span class="cmt">// session 侧：executeBash 接受 operations 参数——执行器可被替换</span>
+<span class="kw">await</span> executeBashWithOperations(resolvedCommand, cwd,
+  options?.operations ?? createLocalBashOperations({ shellPath }), ...);
+
+<span class="cmt">// 交互层：扩展出错时，绝不回退到本地执行</span>
+<span class="kw">try</span> {
+  eventResult = <span class="kw">await</span> extensionRunner.emitUserBash({ type: <span class="st">"user_bash"</span>, command, ... });
+} <span class="kw">catch</span> {
+  <span class="cmt">// The extension runner already reported the error. Do not fall back to local execution.</span>
+  <span class="kw">return</span>;
+}</code></pre>
+    <p>三点值得记。<strong>一、判别联合表达「异或」</strong>：<code class="inline">operations</code>（我只换执行环境）与 <code class="inline">result</code>（我跑完了，直接用我的结果）不能同时给，TypeScript 用 <code class="inline">result?: never</code> 把这个约束写进类型；运行时还有一道 <code class="inline">isUserBashEventResult</code> 校验，不符合直接抛错。因为对 bash 来说，「扩展想拦但返回了残缺对象」绝不能被解释成「那就本地跑吧」——<code class="inline">!</code> 敲进来的命令是要真改系统的，语义含糊时唯一安全的动作是<strong>不执行</strong>。这就是 fail-closed：把「失败怎么办」的默认值设为「不做」，而不是「退回原路」。</p>
+    <p><strong>二、执行器是抽象的</strong>：<code class="inline">executeBashWithOperations</code> 把「跑命令」抽象成可替换的 <code class="inline">BashOperations</code>（本地 shell 只是默认实现），扩展可以换成远程执行、容器执行。而 <code class="inline">recordBashResult</code> 落盘的是一条 <code class="inline">bashExecution</code> 角色的消息（带 <code class="inline">command/output/exitCode/cancelled/truncated/excludeFromContext</code>），进 LLM 上下文时由 <code class="inline">bashExecutionToText</code> 渲染成 <code class="inline">Ran \`command\`</code> 开头的 user 消息——<code class="inline">!!</code> 前缀（<code class="inline">excludeFromContext: true</code>）的输出不进上下文。</p>
     <div class="callout">
-      <strong>架构洞察：</strong>工具本身<strong>不该</strong>关心权限与审校——那是 harness 的职责。工具只做「被允许做的 IO」。分层之后，你能在不动任何工具源码的情况下，给所有工具统一加日志、限流、审校、权限。这就是「<strong>关注点分离</strong>」在 Agent 工具层的最佳示范，也是你第 12 章值得借鉴的。
+      <strong>架构洞察：</strong>工具本身<strong>不该</strong>关心权限与审校——那是 harness 的职责。工具只做「被允许做的 IO」。分层之后，你能在不动任何工具源码的情况下，给所有工具统一加日志、限流、审校、权限。这就是「<strong>关注点分离</strong>」在 Agent 工具层的最佳示范，也是你第 12 章值得借鉴的。而 user_bash 补上了另一半：<strong>用户的直接操作也要过同一套权限哲学</strong>，并且失败时的方向是「拒绝执行」而非「换个方式执行」。
     </div>
   </section>
 
@@ -358,7 +381,7 @@ fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 09 工具层 · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 09 工具层 · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

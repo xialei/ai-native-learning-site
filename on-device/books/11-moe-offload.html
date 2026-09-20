@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>On-Device推理</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -24,7 +24,7 @@
       <a href="08-speculative.html">投机解码</a>
       <a href="09-server.html">服务入口</a>
       <a href="10-freetoken.html">FreeToken</a>
-      <a href="11-moe-offload.html">MoE缓存</a>
+      <a class="active" href="11-moe-offload.html">MoE缓存</a>
       <a href="12-hybrid-exec.html">CPU/GPU协同</a>
       <a href="13-build-own-engine.html">双引擎对照·自研</a>
     </nav>
@@ -176,7 +176,7 @@ MARLIN_MAX_CACHE_SIZE = <span class="nu">992</span></pre>
 
   <section class="block">
     <h2><span class="num">11.4</span>decode 路径：ensure_experts → copy_missing</h2>
-    <p>decode 时每层 MoE 的前向分三步（layers/moe.py:279-290）：改写路由 id、搬缺失、算 GEMM：</p>
+    <p>decode 时每层 MoE 的前向分三步（layers/moe.py:285-296）：改写路由 id、搬缺失、算 GEMM：</p>
     <div class="code-title">python/freetoken/layers/moe.py — _decode_routed（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>cache.ensure_experts(<span class="kw">self</span>.layer_id, topk_ids)   <span class="cmt"># topk_ids 就地变槽 id</span>
 cache.copy_missing()                                <span class="cmt"># 缺失行经 PCIe 入槽</span>
@@ -228,7 +228,7 @@ cache.copy_missing()                                <span class="cmt"># 缺失�
 
   <section class="block">
     <h2><span class="num">11.5</span>prefill 路径：整层流式与双缓冲</h2>
-    <p>prefill 与 decode 的处境完全不同：一个 chunk 可达数千 token，几乎必然激活<strong>每层的全部 256 个专家</strong>（6/256 是每 token 的分布，乘上几千 token 后命中每一个专家的概率接近 1）。逐专家 LRU 毫无意义——干脆整层整层地搬。<strong>prefill 默认不走 LRU：槽位 = 专家 id，路由 id 原样通过</strong>（_prefill_routed，moe.py:347-350 的注释 "position == expert id, so the routing ids pass through unmapped"）。例外是 DeepSeek-V4：它 override 了 _prefill_routed，对小于整层的小 chunk 会退回 LRU 路径（models/deepseek_v4/moe.py:96-110），免得为几百 token 搬满整层。</p>
+    <p>prefill 与 decode 的处境完全不同：一个 chunk 可达数千 token，几乎必然激活<strong>每层的全部 256 个专家</strong>（6/256 是每 token 的分布，乘上几千 token 后命中每一个专家的概率接近 1）。逐专家 LRU 毫无意义——干脆整层整层地搬。<strong>prefill 默认不走 LRU：槽位 = 专家 id，路由 id 原样通过</strong>（_prefill_routed，moe.py:353-356 的注释 "position == expert id, so the routing ids pass through unmapped"）。例外是 DeepSeek-V4：它 override 了 _prefill_routed，对小于整层的小 chunk 会退回 LRU 路径（models/deepseek_v4/moe.py:96-110），免得为几百 token 搬满整层。</p>
     <p>整层搬运若串行，PCIe 时间会直接叠在 GEMM 时间上。prefill_overlap 的方案：把槽池<strong>最前面的 2×num_experts 个槽临时征用为双缓冲</strong>——层 L 用 L%2 号缓冲，层 L 的 GEMM 与层 L+1 的 H2D 并行：</p>
     <div class="code-title">python/freetoken/moe/offload_cache.py:611-616 — 双缓冲借用槽池（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># The double buffers borrow the slot cache's first 2 * num_experts slots</span>
@@ -237,7 +237,7 @@ self.prefill_bank_buffers = [
     cache[: <span class="nu">2</span> * self.num_experts].view(<span class="nu">2</span>, self.num_experts, *cache.shape[<span class="nu">1</span>:])
     <span class="kw">for</span> _, cache <span class="kw">in</span> self.banks
 ]</pre>
-    <div class="code-title">python/freetoken/layers/moe.py:380-390 — 每层的双缓冲交替（摘录）</div>
+    <div class="code-title">python/freetoken/layers/moe.py:386-396 — 每层的双缓冲交替（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_wait_prefill_overlap</span>(self, cache) -&gt; tuple:
     <span class="kw">if</span> self.layer_id == <span class="nu">0</span>:
         cache.begin_prefill()
@@ -284,7 +284,7 @@ arbitrary offset; ...
 """</span>
 ALIGN = <span class="nu">4096</span>                <span class="cmt"># O_DIRECT block alignment</span>
 DEFAULT_SHARD_LIMIT = <span class="nu">8</span> &lt;&lt; <span class="nu">30</span>   <span class="cmt"># 8 GiB per shard</span></pre>
-    <p>读盘侧（FTWReader，:200-280）的选路有个不显眼的取舍：O_DIRECT 不可用时<strong>退到 mmap，而不是退到普通缓冲读</strong>——「整片 mmap + 内核预读」远快于「逐 chunk 走 page cache」。host bank 的分配也有讲究：先 mmap 出惰性匿名区、填满数据、再 cudaHostRegister（pin-after-fill，moe/host_banks.py:6-10）；顺序反过来（先注册后填）会先触发一轮全页 zero-fill，DSV4 的 137 GiB 会白白多花约 47 秒。</p>
+    <p>读盘侧（FTWReader，:208-288）的选路有个不显眼的取舍：O_DIRECT 不可用时<strong>退到 mmap，而不是退到普通缓冲读</strong>——「整片 mmap + 内核预读」远快于「逐 chunk 走 page cache」。host bank 的分配也有讲究：先 mmap 出惰性匿名区、填满数据、再 cudaHostRegister（pin-after-fill，moe/host_banks.py:6-10）；顺序反过来（先注册后填）会先触发一轮全页 zero-fill，DSV4 的 137 GiB 会白白多花约 47 秒。</p>
     <p>显存侧，专家槽池和 KV 页池是竞争者。<strong>谁让谁、让多少</strong>，集中在一段无副作用的小算术里（engine/cache_budget.py:48-95）：</p>
     <div class="code-title">python/freetoken/engine/cache_budget.py — plan_cache_budget（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>hi = min(total_experts, max_slots)
@@ -304,8 +304,8 @@ moe_cache_size = max(lo, min(raw, hi))
 <span class="cmt"># later CUDA allocation.</span>
 total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 <span class="kw">assert</span> total &lt;= budget_bytes, (...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:41 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
-    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:766 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
+    <div class="annotation"><b>读懂这段：</b> 策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:43 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
+    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:841 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
   </section>
 
   <section class="block">
@@ -366,7 +366,7 @@ total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

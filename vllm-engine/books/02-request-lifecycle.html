@@ -10,12 +10,12 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出vLLM</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>vLLM</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
       <a href="01-architecture.html">架构</a>
-      <a href="02-request-lifecycle.html">请求生命周期</a>
+      <a class="active" href="02-request-lifecycle.html">请求生命周期</a>
       <a href="03-paged-attention.html">PagedAttention</a>
       <a href="04-scheduler.html">调度器</a>
       <a href="05-model-runner.html">Model Runner</a>
@@ -35,7 +35,7 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 请求全生命周期</div>
-    <h1>一条请求的旅程：从 generate() 到输出 token</h1>
+    <h1>一条请求的完整路径：从 generate() 到输出 token</h1>
     <div class="subtitle">把第 1 章的静态分层「跑起来」：一次调用如何穿过全部层级，每一步谁在处理、传了什么。看懂这条链，你的引擎主循环就有雏形了。</div>
   </div>
 
@@ -130,7 +130,7 @@
 
   <section class="block">
     <h2><span class="num">2.2</span>第 1 步：入口把「文本」变「token」</h2>
-    <p>调用 <code class="inline">generate()</code> 后，<code class="inline">_run_completion()</code>（定义在 <code class="inline">vllm/entrypoints/offline_utils.py</code>）负责把用户给出的 prompt 处理成引擎能用的形式：<strong>文本 → prompt_token_ids</strong>。</p>
+    <p>调用 <code class="inline">generate()</code> 后，<code class="inline">_run_completion()</code>（定义在 <code class="inline">vllm/entrypoints/offline_utils.py</code>）先把用户给出的 prompt 处理成引擎能用的形式：<strong>文本 → prompt_token_ids</strong>。</p>
     <div class="code-title">vllm/entrypoints/offline_utils.py — 摘录，注释为译注</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_run_completion</span>(self, prompts, params, output_type, ...):
     <span class="cmt"># 1) 把每个 prompt 解析、tokenize，生成 Request（含 prompt_token_ids）</span>
@@ -169,13 +169,13 @@
     outputs = self.engine_core.<span class="fn">get_output</span>()   <span class="cmt"># 见 core_client.py：取回 EngineCore 的输出</span>
     processed = self.output_processor.<span class="fn">process_outputs</span>(outputs.outputs, ...)
     <span class="kw">return</span> processed</pre>
-    <div class="annotation"><b>读懂这段：</b>「有人负责批处理的前端（Engine），有人负责批处理的决策（Core/Scheduler），有人负责批处理的执行（Worker）」。这三段的职责分离，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
+    <div class="annotation"><b>读懂这段：</b>批处理的前端在 Engine，决策在 Core/Scheduler，执行在 Worker。这三段分工，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
     <div class="annotation"><b>一张图别当真：</b>上面的泳道图和本节代码为了易懂，把循环画成了<strong>纯串行</strong>——调度完、等 GPU 算完、回传、再调度。真实引擎不会傻等，见下一节。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">2.5</span>第 3 步½：重叠执行——CPU 调度 step N+1 时，GPU 在算 step N</h2>
-    <p>2.4 的串行图里有个隐藏浪费：<strong>CPU 做调度（选 batch、分配 KV 块）时，GPU 闲着；GPU 在前向时，CPU 闲着。</strong>而这两件事用的是不同资源——CPU 调度只碰 dict 和 list，GPU 前向才是重计算。vLLM v1 的解法是<strong>异步调度（async scheduling）</strong>：GPU 算第 N 步时，CPU 已经在为第 N+1 步做调度，两个「工厂流水线工序」重叠起来，把 GPU 的空档填掉。</p>
+    <p>2.4 的串行图里有个隐藏浪费：<strong>CPU 做调度（选 batch、分配 KV 块）时，GPU 闲着；GPU 在前向时，CPU 闲着。</strong>而这两件事用的是不同资源——CPU 调度只碰 dict 和 list，GPU 前向才是重计算。vLLM v1 的解法是<strong>异步调度（async scheduling）</strong>：GPU 算第 N 步时，CPU 已经在为第 N+1 步做调度，两件事重叠进行，GPU 的空档就被填掉了。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
         <text class="lbl" x="20" y="24" font-weight="bold" fill="#d33">串行（2.4 的直觉）：GPU 有空档</text>
@@ -203,8 +203,8 @@
       </svg>
       <div class="fig-cap">图 2.5：async scheduling 把「下一步的 CPU 调度」与「本步的 GPU 前向」重叠，消除 GPU 等待调度的空档。</div>
     </div>
-    <p>开关在 <code class="inline">vllm/config/scheduler.py:190</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
-    <div class="code-title">vllm/config/scheduler.py:190 — async_scheduling 配置（摘录）</div>
+    <p>开关在 <code class="inline">vllm/config/scheduler.py:200</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
+    <div class="code-title">vllm/config/scheduler.py:200 — async_scheduling 配置（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>async_scheduling: <span class="cl">bool</span> | <span class="kw">None</span> = <span class="kw">None</span>
 <span class="st">"""If set to False, disable async scheduling. Async scheduling helps to
 avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -234,7 +234,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
 
   <section class="block">
     <h2><span class="num">2.7</span>从生命周期反向看你的引擎</h2>
-    <p>把这条链「减到最小」就是自研引擎的骨架（这会是第 11 章的起点）：</p>
+    <p>把这条链减到最小，就是一个能跑的引擎（第 11 章从这个起点开始搭）：</p>
     <div class="code-title">一个最小引擎的主循环（伪代码）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 伪代码：单请求、无批处理的最小引擎</span>
 <span class="kw">def</span> <span class="fn">generate</span>(prompt: <span class="cl">str</span>, max_tokens=<span class="nu">16</span>) -&gt; <span class="cl">str</span>:
@@ -246,7 +246,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
         tok = sample(logits)                    <span class="cmt"># 4. 采样</span>
         out_ids.append(tok); tokens.append(tok)
     <span class="kw">return</span> tokenizer.decode(out_ids)          <span class="cmt"># 5. token→文本</span></pre>
-    <div class="annotation"><b>下一步：</b>上面的 <code class="inline">kv_cache</code> 是「整个序列一次性分配」，浪费且限制了并发。第 3 章的 PagedAttention 教你把它改成分页、按需分配——这正是 vLLM 每秒吞吐量高的关键，也让你理解为什么它能同时服务几千个请求。</div>
+    <div class="annotation"><b>下一步：</b>上面的 <code class="inline">kv_cache</code> 是「整个序列一次性分配」，浪费且限制了并发。第 3 章的 PagedAttention 教你把它改成分页、按需分配——这正是 vLLM 每秒吞吐量高的关键，也让你理解为什么它在合适的模型、显存与上下文长度配置下能支撑大量并发请求。</div>
   </section>
 
   <div class="arrow-nav">
@@ -256,7 +256,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
 </div>
 
 <footer>
-  深入浅出vLLM · 02 请求全生命周期 · 版本 v0.29.1rc0-18-gfa1b3b1922 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 02 请求全生命周期 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

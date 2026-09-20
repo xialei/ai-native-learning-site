@@ -21,7 +21,7 @@
       <a href="05-context.html">上下文</a>
       <a href="06-compaction.html">压缩</a>
       <a href="07-harness.html">Harness</a>
-      <a href="08-agent-session.html">生产 Harness</a>
+      <a class="active" href="08-agent-session.html">生产 Harness</a>
       <a href="09-tools.html">工具</a>
       <a href="10-ai-layer.html">AI 层</a>
       <a href="11-coding-agent.html">编码 Agent</a>
@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
     <h1>生产 Harness：agent-session 里的真实运行时</h1>
-    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章看到的是<code class="inline">AgentHarness</code>接口契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 3300 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。它是你未来做 Agent Runtime 时最该抄的样板。</div>
+    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章看到的是<code class="inline">AgentHarness</code>接口契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 3600 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。它是你未来做 Agent Runtime 时最该抄的样板。</div>
   </div>
 
   <section class="block">
@@ -346,8 +346,9 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
       event.message.display, event.message.details,
     );
   }
-  <span class="cmt">// 常规 LLM 消息 → SessionMessageEntry（第 4 章讲过）</span>
+  <span class="cmt">// 常规 LLM 消息（含 system）→ SessionMessageEntry（第 4 章讲过）</span>
   <span class="kw">else if</span> (
+    event.message.role === <span class="st">"system"</span> ||
     event.message.role === <span class="st">"user"</span> ||
     event.message.role === <span class="st">"assistant"</span> ||
     event.message.role === <span class="st">"toolResult"</span>
@@ -356,7 +357,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
   }
   <span class="cmt">// bashExecution / compactionSummary / branchSummary 在别处单独落盘</span>
 }</code></pre>
-    <p>注意事件在扩展层可以<strong>改写和拦截</strong>。工具调用先过 <code class="inline">emitToolCall</code>——扩展可以 <code class="inline">block</code> 它；助手消息结束过 <code class="inline">emitMessageEnd</code>——扩展可返回替换消息（这正是一致性/审校型扩展的挂点）。</p>
+    <p>注意 system 消息也在落盘之列——系统提示如今是消息流里的一条条 SystemMessage，跟着普通消息一起持久化（它怎么来的，见 8.4 末尾）。注意事件在扩展层可以<strong>改写和拦截</strong>。工具调用先过 <code class="inline">emitToolCall</code>——扩展可以 <code class="inline">block</code> 它；助手消息结束过 <code class="inline">emitMessageEnd</code>——扩展可返回替换消息（这正是一致性/审校型扩展的挂点）。</p>
     <div class="callout">
       <strong>顺序很重要：</strong>先是 <code class="inline">_emitExtensionEvent(event)</code>（给扩展，允许改写），再 <code class="inline">_emit(...)</code>（给 UI 监听器，只读展示），最后 <code class="inline">appendMessage</code>（落盘）。改写在先、展示在中、存盘在后——三层各吃一份，互不阻塞。
     </div>
@@ -375,7 +376,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
       <span class="kw">await</span> <span class="fn">this</span>.agent.continue();
     }
   } <span class="kw">finally</span> {
-    <span class="fn">this</span>._systemPromptOverride = <span class="kw">undefined</span>;
+    <span class="fn">this</span>._runSystemPromptOptions = <span class="kw">undefined</span>;
     <span class="fn">this</span>._flushPendingBashMessages();
     <span class="fn">this</span>._flushPendingCustomMessages();   <span class="cmt">// 流式期间排队的 custom 消息，此刻落盘</span>
     <span class="kw">await</span> <span class="fn">this</span>._emitAgentSettled();
@@ -417,8 +418,31 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
       <li><strong>守卫</strong>：换模型后跳过旧模型的溢出判断；「消息比最近一次压缩还旧」就不再次触发（避免刚压完又被旧 usage 拉回）；aborted 消息默认跳过。</li>
     </ul>
     <div class="callout">
-      <strong>这是「自适应收敛」的精髓：</strong>基础 harness 契约只定义了「有 compaction 操作」；生产层负责<strong>自己判断何时触发、何时不触发</strong>。除了这条「跑完后」的收敛线，生产层还装了一条「开跑前」的线：<code class="inline">_installAgentNextTurnRefresh</code> 把 <code class="inline">agent.prepareNextTurnWithContext</code> 接管过来，每个 turn 开始前调 <code class="inline">_compactBeforeNextAssistantResponse</code>——若按估算 token 已过阈值，就先 <code class="inline">_runAutoCompaction("threshold", false)</code> 压一轮再让模型看到上下文。注意压缩前还会给扩展一个 <code class="inline">session_before_compact</code> 钩子——扩展可以拿到准备对象并 <code class="inline">cancel</code> 掉压缩。所有这些「自动驾驶」叠加起来，就是用户感知里「Agent 自己越跑越聪明、从不崩」的来源。
+      <strong>这是「自适应收敛」的精髓：</strong>基础 harness 契约只定义了「有 compaction 操作」；生产层负责<strong>自己判断何时触发、何时不触发</strong>。除了这条「跑完后」的收敛线，生产层还装了一条「开跑前」的线：<code class="inline">_installAgentNextTurnRefresh</code> 把 <code class="inline">agent.prepareNextTurnWithContext</code> 接管过来，每个 turn 开始前调 <code class="inline">_compactBeforeNextAssistantResponse</code>——若按估算 token 已过阈值，就先 <code class="inline">_runAutoCompaction("threshold", false)</code> 压一轮再让模型看到上下文。而且它不只管压缩：接管的函数随后会重算「现在该有的系统提示 + 工具 loadout」（<code class="inline">_preparePromptAndToolLoadout</code>，见下面的小节），有变化就产出一条 patch system 消息随下轮注入。注意压缩前还会给扩展一个 <code class="inline">session_before_compact</code> 钩子——扩展可以拿到准备对象并 <code class="inline">cancel</code> 掉压缩。所有这些「自动驾驶」叠加起来，就是用户感知里「Agent 自己越跑越聪明、从不崩」的来源。
     </div>
+    <h3>系统提示的三个写入时机</h3>
+    <p>8.4 里那句「system 消息也在落盘之列」值得展开。系统提示是消息流里的状态，而生产 harness 在<strong>三个时机</strong>写它：</p>
+    <ul>
+      <li><strong>会话启动</strong>：<code class="inline">_baseSystemPromptOptions</code> 经 <code class="inline">_preparePromptAndToolLoadout()</code> 生成第一条 system 消息，随 agent_start 进入消息流。</li>
+      <li><strong>每次 <code class="inline">before_agent_start</code></strong>：扩展可以在 <code class="inline">event.systemPromptOptions</code> 上改 <code class="inline">selectedTools</code> 等字段（或干脆用 <code class="inline">forceSystemPrompt</code> 塞一段完全自定义的 prompt）。生产层把改完的选项交给 <code class="inline">_preparePromptAndToolLoadout()</code>，它对比「消息流里当前生效的 system 消息」和「现在该有的状态」，有差异就产出一条新的 system 消息 <code class="inline">unshift</code> 进本次输入。注意那个 <code class="inline">handlerEditedTools</code> 判断：扩展显式改了 selectedTools 就尊重它，没改则以运行时真实 loadout 为准——避免「扩展没动、但 loadout 已经被 <code class="inline">setActiveTools()</code> 改过」的情况被旧值覆盖。</li>
+      <li><strong>finally 收尾</strong>：<code class="inline">_runSystemPromptOptions = undefined</code>——本次运行挂的临时 prompt 设置（<code class="inline">_runSystemPromptOptions</code> 优先于 <code class="inline">_baseSystemPromptOptions</code>）只活一次运行，跑完即清。</li>
+    </ul>
+    <div class="code-title">agent-session.ts · _preparePromptAndToolLoadout（节选，注释为译注）</div>
+    <pre class="code"><code><span class="kw">private</span> <span class="fn">_preparePromptAndToolLoadout</span>(options, messages = <span class="kw">this</span>.agent.state.messages) {
+  options.selectedTools = [...<span class="kw">new</span> <span class="cl">Set</span>(options.selectedTools)].filter((name) =&gt; <span class="kw">this</span>._toolRegistry.has(name));
+  <span class="kw">this</span>.agent.state.tools = ...;                     <span class="cmt">// 让 agent 能执行的工具对齐</span>
+  <span class="kw">const</span> current = <span class="fn">getCurrentSystemMessage</span>(messages);  <span class="cmt">// 消息流里当前生效的 system</span>
+  <span class="kw">const</span> desired = <span class="fn">buildSystemPromptState</span>(options);    <span class="cmt">// 现在该有的 system</span>
+  <span class="kw">const</span> currentIsOpaque = current !== <span class="kw">undefined</span> &amp;&amp; current.sections === <span class="kw">undefined</span>;
+  <span class="kw">if</span> (desired.sections === <span class="kw">undefined</span> || currentIsOpaque) {
+    <span class="cmt">// 无法按 section 差量（对方是整段文本或我们只能整段给）→ 整段 replace</span>
+    <span class="kw">return</span> unchanged ? <span class="kw">undefined</span> : { role: <span class="st">"system"</span>, ...desired, <span class="kw">replace</span>: <span class="kw">true</span>, timestamp: <span class="cl">Date</span>.now() };
+  }
+  <span class="cmt">// 两侧都是 section 化的 → 只发有变化的 section</span>
+  <span class="kw">const</span> sections = <span class="fn">diffSystemPromptSections</span>(current?.sections ?? {}, desired.sections);
+  <span class="kw">return</span> sections ? { role: <span class="st">"system"</span>, content: <span class="st">""</span>, sections, timestamp: <span class="cl">Date</span>.now() } : <span class="kw">undefined</span>;
+}</code></pre>
+    <div class="annotation"><b>读懂这段：</b> 这里能看出 system 消息的两种形态：整段 <code class="inline">content</code>（opaque，配 <code class="inline">replace: true</code>——重放时丢弃之前所有 system 状态，从这条开始算）或 <code class="inline">sections</code>（按命名小节差量更新，只发变化的节）。选择逻辑是「能差量就差量，遇到不透明的就整段替换」。所以「改一次 prompt」在消息流里可能表现为<strong>多条小消息的累积</strong>，也可能是一条大消息的替换——重放函数负责把它们收敛成「此刻真正生效的一条」（重放规则见 <a href="10-ai-layer.html">第 10 章</a>）。</div>
   </section>
 
   <section class="block">
@@ -487,7 +511,7 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.85.1-30-g6160683a4 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

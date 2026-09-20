@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出SGLang</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>SGLang</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -256,11 +256,15 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
       <b class="tag">困惑点</b>
       MLA（DeepSeek 系列）的池子为什么只有一个 <code class="inline">kv_buffer</code>？因为 MLA 把 K/V 压进一个隐空间向量：每 token 每层只存 <code class="inline">kv_lora_rank + qk_rope_head_dim</code> 维（解耦 RoPE 部分单独保留），attention 内部再做吸收变换。所以 <code class="inline">MLATokenToKVPool</code> 的 buffer 形状是 <code class="inline">(size + page_size, 1, kv_lora_rank + qk_rope_head_dim)</code>，比 MHA 的两份 per-head 张量省一个数量级的显存。池子和注意力后端是配套设计的（见第 7 章）。
     </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      池子家族里还有一排刚建好、但还没有生产入口的成员：<code class="inline">mem_cache/page_interleave_pool.py</code> 与 <code class="inline">allocator/page_interleave.py</code> 实现了「KV 按 shard 组分片存储」——把 N 个连续物理页组成一个逻辑页、每组内各 rank 存自己那一份（GQA/MHA 沿注意力 CP 组、MLA 沿注意力 TP 组，因为这两处 KV 本来就是复制的，直接条带化就能省显存）。树、分配器、<code class="inline">req_to_token</code>、调度预算全都在逻辑槽位上看世界，只有池子底层做逻辑页→本 rank 物理页的双射换算；attention 侧经 <code class="inline">kv_shard_hooks.py</code> 的 <code class="inline">get_kv_shard_pool</code> 探测接线（目前只挂了 flashattention 与 trtllm_mla 两个后端）。不过全仓库还没有任何构造调用点——这是条预留的轨道，读代码时知道有这层设计即可，别当成已启用的路径。
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.5</span>分页分配器：以页为单位发号</h2>
-    <p>调度器拿到的不是零散槽位，而是 <code class="inline">out_cache_loc</code> 槽位数组；分页版分配器内部只维护一个 <code class="inline">free_pages</code> 张量（空闲页号）。<code class="inline">alloc_for_extend</code>（<code class="inline">mem_cache/allocation.py:342</code>）把两件事接起来：先从 <code class="inline">req_to_token_pool</code> 发请求行，再按 <code class="inline">page_size</code> 决定走 token 版还是分页版分配。</p>
+    <p>调度器拿到的不是零散槽位，而是 <code class="inline">out_cache_loc</code> 槽位数组；分页版分配器内部只维护一个 <code class="inline">free_pages</code> 张量（空闲页号）。<code class="inline">alloc_for_extend</code>（<code class="inline">mem_cache/allocation.py:344</code>）把两件事接起来：先从 <code class="inline">req_to_token_pool</code> 发请求行，再按 <code class="inline">page_size</code> 决定走 token 版还是分页版分配。</p>
     <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_extend / alloc_decode（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_extend</span>(
     self,
@@ -292,7 +296,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
         <span class="kw">return</span> <span class="kw">None</span>
     self.free_pages = self.free_pages[num_new_pages:]
     <span class="kw">return</span> out_indices</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang/kernels/ops/memory/allocator.py:16</code>）每个请求一个 program，把槽位计算拆成三段：<strong>① 填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>）；<strong>② 申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移）；<strong>③ 开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。文件里还留着一个纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现，两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
+    <div class="annotation"><b>读懂这段：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang/kernels/ops/memory/allocator.py:116</code>）每个请求一个 program，把槽位计算拆成三段：<strong>① 填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>）；<strong>② 申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移）；<strong>③ 开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现留在调用方文件里（<code class="inline">mem_cache/allocator/paged.py:40</code>），两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
 
     <p>decode 每步每请求至多消耗一页，kernel 更简单；释放则要把 token 槽位号折算回页号并去重：</p>
     <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_decode 与 free（摘录，注释为译注）</div>
@@ -379,7 +383,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
 </div>
 
 <footer>
-  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-9358-gf618022b73 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-9767-g0b0d2c257a · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

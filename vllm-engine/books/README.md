@@ -27,7 +27,7 @@ open vllm-engine/books/index.html
 | `09-serving-entry.html` | 服务入口 | OpenAI API、AsyncLLMEngine、流式、引擎分离、性能指标（TTFT/ITL/Prometheus/MFU） |
 | `10-distributed.html` | 分布式 | TP/PP/DP/EP、Executor（uniproc/ray/multiproc） |
 | `11-build-own-engine.html` | 自研路线图 | 六个里程碑：从单请求到多卡 |
-| `12-model-weights.html` | 实战·模型权重加载 | 注册表→loader→load_weights 重映射→量化/稀疏调优；以 DeepSeek-V4 / GLM-5.2 / Kimi-K2 为例；附三个真实 checkpoint 仓库目录结构对照 |
+| `12-model-weights.html` | 实战·模型权重加载 | 注册表→loader→load_weights 重映射→量化/稀疏调优；以 DeepSeek-V4 / GLM-5.2 / Kimi-K2.5/K3 为例；附三个真实 checkpoint 仓库目录结构对照 |
 | `13-agentic-gateway.html` | 实战·Agentic 网关 | 拆解 vllm-project/agentic-api（Rust）：previous_response_id 状态恢复、服务端工具循环、工具所有权路由、SSE 流重组、compaction；vLLM 前的有状态编排层 |
 | `14-model-evolution.html` | 实战·国产开源模型架构变迁 | 以引擎视角追踪 DeepSeek-V4/V4.1、GLM-5.2/5.3-Flash、Kimi-K2.6/K3、Qwen3.8/Flash-Next 的架构演进：稀疏索引省法、残差流变体、线性注意力混合，及引擎侧对应的新机制（KVCacheSpec、model_states、CacheDType） |
 

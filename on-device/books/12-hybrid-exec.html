@@ -10,7 +10,7 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <a class="brand" href="index.html"><span class="logo-dot"></span>深入浅出On-Device推理</a>
+    <a class="brand" href="index.html"><span class="logo-dot"></span>On-Device推理</a>
     <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
     <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
     <nav>
@@ -25,7 +25,7 @@
       <a href="09-server.html">服务入口</a>
       <a href="10-freetoken.html">FreeToken</a>
       <a href="11-moe-offload.html">MoE缓存</a>
-      <a href="12-hybrid-exec.html">CPU/GPU协同</a>
+      <a class="active" href="12-hybrid-exec.html">CPU/GPU协同</a>
       <a href="13-build-own-engine.html">双引擎对照·自研</a>
     </nav>
   </div>
@@ -41,7 +41,7 @@
   <section class="block">
     <h2><span class="num">12.1</span>两块带宽，一道分法</h2>
     <p>第 11 章的 offload 模式下，decode 每步每层的缺失专家都要过 PCIe（典型 16-32 GB/s）。而 CPU 这边——内存带宽 50-100 GB/s 的桌面机——整个 decode 期间基本闲着。hybrid 把两边同时用上：每步的缺失专家分成两份，<strong>一份经 PCIe 拉到 GPU 槽池由 GPU 算，剩下的直接在 CPU 上用 host bank 算 GEMV</strong>，两边的部分结果相加。</p>
-    <p>切分比例的推导写在 engine.py 的注释里（python/freetoken/engine/engine.py:639-641）：</p>
+    <p>切分比例的推导写在 engine.py 的注释里（python/freetoken/engine/engine.py:714-718）：</p>
     <div class="code-title">python/freetoken/engine/engine.py — fetch fraction 推导（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># _resolve_hybrid_fetch：--moe-hybrid-max-fetch -1 (auto) 的解析</span>
 <span class="cmt"># Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :</span>
@@ -65,7 +65,7 @@
 
   <section class="block">
     <h2><span class="num">12.2</span>benchbw：给这台机器测一遍带宽</h2>
-    <p>比例来自 <code class="inline">ft bench bw</code>（moe/benchbw.py），一台 GPU 跑一次，结果存 <code class="inline">~/.cache/freetoken/benchbw/&lt;gpu-uuid&gt;.json</code>（docs/cli.md:172，按 UUID 键控——同型号卡插不同槽位带宽可能不同）。它测三组数：</p>
+    <p>比例来自 <code class="inline">ft bench bw</code>（moe/benchbw.py），一台 GPU 跑一次，结果存 <code class="inline">~/.cache/freetoken/benchbw/&lt;gpu-uuid&gt;.json</code>（docs/cli.md:198，按 UUID 键控——同型号卡插不同槽位带宽可能不同）。它测三组数：</p>
     <div class="tbl">
       <table>
         <thead><tr><th>测量</th><th>方法</th><th>用途</th></tr></thead>
@@ -87,13 +87,17 @@ DRAM to begin with -- the DMA then mostly rides the leftover bandwidth; assuming
 contention ignores it entirely. Measuring the contended pair directly gives the hybrid
 backend its bandwidth-matched fetch split: fetched : cpu-computed = pcie_ov : cpu_ov.
 """</span></pre>
-    <p>判定与分流用这套 profile 的决策链（docs/cli.md:82、engine/engine.py:1446-1490）：moe_strategy=auto 时默认 offload；若 profile 判定 hybrid（CPU 带宽 &gt; 2× PCIe），再核对 CPU 执行器支持该激活函数、编译扩展没过期，都过了才升级 hybrid——<strong>每一步降级都有日志，绝不静默</strong>。分流比例 --moe-hybrid-max-fetch=-1（auto）读同一个 profile：没有 profile 就退回固定 cap=1（engine.py:651-658）。</p>
+    <p>判定与分流用这套 profile 的决策链（docs/cli.md:82、engine/engine.py:1560-1628）：moe_strategy=auto 时默认 offload；若 profile 判定 hybrid（CPU 带宽 &gt; 2× PCIe），再核对 CPU 执行器支持该激活函数、编译扩展没过期，都过了才升级 hybrid——<strong>每一步降级都有日志，绝不静默</strong>。分流比例 --moe-hybrid-max-fetch=-1（auto）读同一个 profile：没有 profile 就退回固定 cap=1（engine.py:728-733）。</p>
     <div class="annotation"><b>读懂这段：</b> 这个设计把「调参」变成了「测量」。q* 没有公式可推导——不同主板、内存条数、PCIe 通道数的组合，谁也推不准，测一次就一劳永逸（profile 按 format+GPU 键控，换格式或换卡才重测）。<strong>自适应的本质是承认自己算不准</strong>，把不确定的部分交给测量。</div>
+    <div class="callout info">
+      <b class="tag">一段代码的进化痕迹</b>
+      整条 hybrid 升级链有一个前提：host 和 GPU 之间<strong>存在一条 PCIe</strong>。统一内存 GPU（DGX Spark 的 GB10、Jetson）把这个前提抽掉了——没有 host/device 边界，offload 家族的一切搬运都是同一块 DRAM 的两个名字互倒，实测每个请求多出约 130 秒的停顿（#369）。#445 的修法不是给 hybrid 打补丁，而是在决策链最前面加一个分岔：探测到统一内存且模型装得下，auto 直接选 fused（常驻专家），跳过整个 benchbw hybrid 判定——「CPU 带宽升级」在共享内存的机器上没有意义。<strong>带宽策略要跟着内存拓扑走</strong>：PCIe 存在时才有「两边」可协同。
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.3</span>hybrid decode：一份路由的两半</h2>
-    <p>hybrid 的每步每层（layers/moe.py:292-340）是把第 11 章的 ensure_experts 换成带 cap 的变体，然后路由一分为二：</p>
+    <p>hybrid 的每步每层（layers/moe.py:298-345）是把第 11 章的 ensure_experts 换成带 cap 的变体，然后路由一分为二：</p>
     <div class="code-title">python/freetoken/layers/moe.py — _decode_hybrid（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>raw = topk_ids.clone()                            <span class="cmt"># 原始专家 id 留给 CPU 侧</span>
 cache.ensure_experts_hybrid(self.layer_id, topk_ids) <span class="cmt"># 原地改写：槽 id 或 -1（超 cap 的缺失）</span>
@@ -111,7 +115,7 @@ cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU �
 <span class="kw">return</span> gpu_routed + cpu_routed</pre>
     <p>「每条路由恰好算一次」靠的是<strong>双向置零</strong>：GPU 侧把 CPU 负责的路由权重置 0（id clamp 到槽 0，乘出来是 0）；CPU 侧把 GPU 负责的路由 id 置 -1（C++ 内核跳过 id&lt;0）。两边都跑、各自只算自己那份、结果相加——没有 if 分支，全部是形状固定的张量操作，CUDA Graph 可捕获。</p>
     <p>cap 的语义（offload_cache.py:855-874 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:196-201）。</p>
-    <div class="annotation"><b>读懂这段：</b> 为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:319-320 注释明说 "Measurement knob"）。</div>
+    <div class="annotation"><b>读懂这段：</b> 为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:325-326 注释明说 "Measurement knob"）。</div>
   </section>
 
   <section class="block">
@@ -247,7 +251,7 @@ self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">an
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b10901-1 / FreeToken nightly-5-g46d2743 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
