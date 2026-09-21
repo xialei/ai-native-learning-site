@@ -124,6 +124,34 @@
 }</pre>
     <p>其中 <code class="inline">in_process_feature()</code>（<code class="inline">crates/agentic-server-core/src/types/request_response.rs:299</code>）枚举了「网关专属」的四种特征：<code class="inline">conversation_id</code>、任何非 function 的工具声明（网关自有工具与 client 侧 custom 工具都在此列——后者虽由客户端执行，但「注册、改写为 function」这一步必须发生在网关进程里）、compaction 输入、<code class="inline">context_management</code>。第四个条件 <code class="inline">has_tool_search_state</code> 是 <code class="inline">type: &quot;tool_search&quot;</code> 声明：客户端用一次搜索来动态挑选工具（13.5），这种请求虽然工具都归客户端执行，但网关必须接手生成「可选工具目录」。命中任意一个就走执行器路径。</p>
     <div class="annotation"><b>为什么值得学：</b>这是网关类的「<strong>透明降级</strong>」设计——用户发一个纯无状态请求时，网关只做转发（<code class="inline">agentic_core::proxy</code>，不解析不落库）；只有真的需要状态时才启动编排。代价小、语义清晰：vLLM 自己能干的事绝不代劳。</div>
+    <p>把判定条件摊开看，两条路的分野一目了然：</p>
+    <table class="tbl">
+      <thead><tr><th>走执行器（网关编排）——命中任一条件</th><th>走代理（零状态透传）——一条都不命中</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>
+            ① <code class="inline">store: true</code>——要求把本轮持久化；<br>
+            ② 带 <code class="inline">previous_response_id</code>——响应链续聊，要读历史；<br>
+            ③ 带 <code class="inline">conversation_id</code>——会话树取历史；<br>
+            ④ 声明了任何非 function 工具（<code class="inline">web_search</code> / <code class="inline">mcp</code> / <code class="inline">custom</code> / Codex 命名空间）——注册、改写成 function 必须发生在网关进程；<br>
+            ⑤ 带 <code class="inline">type: "tool_search"</code>——网关要接手生成「可选工具目录」（13.5）；<br>
+            ⑥ compaction 输入或 <code class="inline">context_management</code>——上下文压缩归网关（13.7）。
+          </td>
+          <td>
+            只声明 function 工具、不引用任何历史、不要求存储。<br><br>
+            模型吐出的 function_call 原样回到客户端，由客户端自己执行、自己拼下一轮请求——网关在中间只是一次反向代理，请求结束了服务端什么都没留下。
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <table class="tbl">
+      <thead><tr><th style="width:16%"></th><th style="width:42%">代理路径</th><th>执行器路径</th></tr></thead>
+      <tbody>
+        <tr><td>延迟构成</td><td>一次转发 + vLLM 自身时延，网关几乎零附加</td><td>读库恢复历史 + N 轮「全量输入重新 prefill」（每轮都是完整前缀，13.7 的代价正来自这里）+ 工具执行耗时 + 收尾落库</td></tr>
+        <tr><td>持久化</td><td>不落库</td><td>items 逐条落库、responses 记链（13.3）——「续聊」只有在这条路上才存在</td></tr>
+        <tr><td>SSE 流</td><td>vLLM 的事件字节级原样透传</td><td>序号重打、生命周期去重、网关工具事件事后合成（13.6）</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section class="block">
@@ -203,6 +231,39 @@
     created_at           <span class="cl">INTEGER NOT NULL</span>
 );</pre>
     <div class="annotation"><b>设计取舍：</b>没有「响应表存整段对话」的宽表，而是 <strong>append-only 的 item 流水 + 链式索引</strong>。每一轮持久化时，把本轮的输出转成 <code class="inline">InputItem</code> 追加进 items，再把继承的 id 链写进 <code class="inline">responses.history_item_ids</code>。好处：续聊只需按 id 列表捞行、按序号重放；纯 JSON 列让 item 类型天然可扩展（SQLite 默认库，可切 PostgreSQL）。后续迁移（<code class="inline">0004</code>）又给 conversations 表加了 <code class="inline">latest_response_id</code> 快捷指针——会话树模式下取「最新一轮」不用再扫链。</div>
+    <p>光看 schema 还是抽象，跟踪一次真实的两请求对话，看三张表里各出现哪些行。第 1 个请求：用户问「vLLM 这个月有什么新东西？」，网关里跑了两轮工具循环（调 web_search → 结果喂回 → 再推理）；第 2 个请求：客户端带 <code class="inline">previous_response_id</code> 续聊。注意持久化的粒度是<strong>客户端请求</strong>而不是循环轮次——整个 10 轮上限内的循环跑完，收尾时才落一次库（<code class="inline">persist_prepared_turn</code>）：</p>
+    <div class="code-title">两次请求在三张表里的落库结果（示意，id 缩短）</div>
+    <pre class="code"><span class="lang-tag">text</span><span class="cmt">-- conversations（会话树模式下才建行；响应链模式为空）</span>
+id=conv_1
+
+<span class="cmt">-- items：append-only，每个原子项一行；响应链模式下顺序由 id 列表决定</span>
+<span class="cmt">--   （请求 1 的新增 items —— new_input_items 与输出项在一次事务里写入）</span>
+id=it_1 data={"type":"message","role":"user","content":"vLLM 这个月…"}
+id=it_2 data={"type":"function_call","name":"web_search","arguments":"{…}"}   <span class="cmt">-- 模型侧：发给 vLLM 的调用</span>
+id=it_3 data={"type":"function_call_output","call_id":…,"output":"…"}        <span class="cmt">-- 模型侧：喂回的结果</span>
+id=it_4 data={"type":"reasoning","summary":[…]}                             <span class="cmt">-- 公开侧：第 1 轮推理</span>
+id=it_5 data={"type":"web_search_call","status":"completed","action":{…}}    <span class="cmt">-- 公开侧：给客户端看的形状</span>
+id=it_6 data={"type":"message","role":"assistant","content":"根据搜索结果…"}
+
+<span class="cmt">-- responses：只记元数据，不重复存内容</span>
+id=resp_1 conversation_id=conv_1 previous_response_id=NULL
+    history_item_ids=[it_1,…,it_6]              <span class="cmt">-- 本请求新增的全部 item id</span>
+    metadata={"tools":[web_search 快照]}
+id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
+    history_item_ids=[it_1..it_6, it_7(新用户消息)] <span class="cmt">-- 从上一条的 id 链接续，写全（storage/response.rs:120）</span>
+    metadata={"tools":[web_search 快照]}</pre>
+    <p>两次落库，三种身份的 item 混在同一张流水表里：模型侧的 <code class="inline">function_call / function_call_output</code> 对、公开侧的 <code class="inline">web_search_call</code>、普通 message。它们在 rehydrate 时待遇不同——<code class="inline">OutputItem::to_input_item</code> 对 <code class="inline">WebSearchCall</code> 返回 <code class="inline">None</code>（源码注释原话：public output is omitted because the model-facing function call and output are persisted separately as input items）。于是第 2 个请求 rehydrate 出来的模型上下文是：<code class="inline">message(user) + function_call + function_call_output + reasoning + message(assistant)</code>——公开形态的 <code class="inline">web_search_call</code> 被自动剥掉，模型看到的永远是 function 视角；这正是「wire 层做加法，语义层做还原」（13.5）在存储层的对应物。</p>
+    <p>现在回答「为什么不能只存一列完整 JSON」——假设只有 <code class="inline">responses(id, conversation TEXT)</code> 一列，上述所有内容都塞在一个字符串里，立刻撞上四个问题：</p>
+    <table class="tbl">
+      <thead><tr><th style="width:26%">只存一列 JSON 的问题</th><th>item 流水 + 链式索引的解法</th></tr></thead>
+      <tbody>
+        <tr><td>重放顺序无从谈起——数组里第几项是第几项，但没有跨请求的稳定序</td><td>响应链按 <code class="inline">history_item_ids</code> 的数组顺序重放（rehydrate 就是按列表序捞行拼回）；会话树还有 <code class="inline">seq</code> 兜底。「搜索结果一定排在回答前面」由存储结构保证，不靠解析字符串</td></tr>
+        <tr><td>类型无法单独处理——想统计「调了几次工具」得解析每条历史</td><td><code class="inline">data-&gt;&gt;'type'</code> 直接可用（SQLite JSON1）；pending-call 校验（rehydrate 的 MissingOutput 检查）按 call_id 逐项核对，粒度是单条 item</td></tr>
+        <tr><td>长会话每次续聊都整段复制——改一个字也要重写全量、占双倍空间</td><td>append-only：续聊请求只新增自己的 items 行，旧内容物理不动；压缩（13.7）也只需新增一条检查点 item，不改历史</td></tr>
+        <tr><td>断点续传 / 部分失败无法表达——响应写一半崩了，整列都是残缺 JSON</td><td>items 与 response 在同一个事务里写（<code class="inline">create_in_tx</code> + 单次 commit）：要么整轮可见，要么整轮回滚，不存在「写一半的调用」</td></tr>
+      </tbody>
+    </table>
+    <div class="annotation"><b>和 responses 的分工：</b><code class="inline">history_item_ids</code> 存的是 id 列表而不是内容——内容只在 items 里有一份。responses 是「这轮对话的目录页」：翻到任何一轮，都能拿到「该读哪些行、继承自谁、当时挂了什么工具」。这种「流水 + 索引」的结构和 vLLM 自己的 block table（第 3 章）是同构的：数据块存内容，表存引用。</div>
   </section>
 
   <section class="block">
@@ -469,6 +530,40 @@
     }
 }</pre>
     <div class="callout warn"><b class="tag">工程细节</b>「持久化先于终态事件」是一个容易踩的坑：如果先把 <code class="inline">response.completed</code> 发出去，客户端（尤其 Codex 这种拿到终态就关连接的）会立刻断开，此时持久化若还没完成就被取消，下一轮 <code class="inline">previous_response_id</code> 就指向一条没写完的历史。顺序反过来，可以避免「终态事件先发、持久化被取消」的风险；至于掉电等更极端的场景，仍要依赖数据库自身的持久化保证（事务、fsync、正确的配置）。</div>
+    <p>13.4–13.6 的所有零件——所有权、注册表、规范化、翻译器、累积器、持久化——拼到一条具体的时间线上，看一个 <code class="inline">web_search</code> 工具调用走完它的完整一生：</p>
+    <div class="code-title">一次 web_search 调用的端到端时间线（客户端声明了 {"type": "web_search"}）</div>
+    <pre class="code"><span class="lang-tag">text</span>客户端 ──POST /v1/responses──▶ 网关
+  {"input": "vLLM 最新动态？", "tools": [{"type": "web_search"}], "store": true}
+        │ 命中路由条件（store + 非 function 工具）→ 执行器路径
+        │ 注册表：web_search → Gateway(Some)，绑 web_search_handler
+        │ 规范化：{"type":"web_search"} → {"type":"function","name":"web_search"} 发给 vLLM
+
+vLLM ──SSE──▶ 网关                          <span class="cmt">（第 1 轮推理的流）</span>
+  response.created            → 累积器放行，打 seq=0
+  response.output_item.added  → 翻译器：function_call item 挂上缓冲
+  response.function_call_arguments.delta → 缓冲累积，不下发
+  response.function_call_arguments.done
+  response.output_item.done   → 拼出完整调用 {"name":"web_search",
+        │                      "arguments":"{\"queries\":[\"vLLM release notes\"]}"}
+        │ classify_round：Gateway 调用 → Continue
+        │
+网关 ──执行──▶ You.com API                  <span class="cmt">（GatewayExecutor，60s 超时）</span>
+  拿到搜索结果（超过 MAX_GATEWAY_TOOL_OUTPUT_BYTES 会被截断报错）
+        │
+        │ 结果包装成 function_call_output 拼进下一轮输入
+        │ （此刻不落库——持久化在整个循环收尾时一次完成）
+        │ 公开事件事后合成：response.web_search_call.in_progress → .completed
+        │ （用 defer 边界保证这些事件排在模型已产出的事件之后）
+        │
+网关 ──SSE──▶ 客户端                        <span class="cmt">（组合后的对外流）</span>
+  data: {"type":"response.output_item.done","item":{"type":"web_search_call",…}}
+  <span class="cmt">—— 注意：客户端看到的是 web_search_call，不是 function_call ——</span>
+
+        │ 第 2 轮：搜索结果拼进 input，tool_choice=auto，再调 vLLM
+        │ ……模型直接给出最终回答，classify_round：gateway_results 为空 → Done
+        │ 先 persist（两轮的全部 items + resp_1 一次事务写入），后发 response.completed → [DONE]</pre>
+    <p>同一条时间线换成 <strong>function 工具</strong>会怎么变？注册表记为 Client；vLLM 吐出调用后 <code class="inline">classify_round</code> 直接走 <code class="inline">RequiresClientAction</code>——网关不执行任何东西，调用原样翻译成对外事件交还客户端，等客户端下一轮带着 <code class="inline">function_call_output</code> 回来。两条路径的分岔点只有一处：注册表里的所有权判定；循环、翻译、持久化代码完全共享。</p>
+    <div class="annotation"><b>值得数一数的事件守门员：</b>这段流里每帧都过了三道检查——累积器的生命周期去重与序号重打、翻译器的形状改写（function → web_search_call）、执行后合成的事件插队（带 defer 边界）。客户端拿到的流自始至终序号单调、形状合法、时序真实，完全看不出中间经历了两轮推理和一次外部 HTTP 调用。这就是「编排层」存在的意义：把复杂度收敛在服务端，把简单留给协议两端。</div>
   </section>
 
   <section class="block">

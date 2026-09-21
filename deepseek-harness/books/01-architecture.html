@@ -146,7 +146,25 @@
       <li>home 级 <code class="inline">cordis.patch.yml</code>；</li>
       <li>命令行 <code class="inline">--patch</code> 覆盖层。</li>
     </ol>
-    <div class="annotation"><b>两层 patchReload</b>：自定义 profile 默认 live 热重载；<code class="inline">web</code> 也是 live。而 <code class="inline">headless/sdk/sdk-minimal/acp</code> 只在启动时应用所有层——一次性或 stdio 应用在接活之后再换依赖，生命周期就作废了。</div>
+    <div class="annotation"><b>哪些层 live 热重载</b>：自定义 profile 默认 live 热重载；<code class="inline">web</code> 也是 live。而 <code class="inline">headless/sdk/sdk-minimal/acp</code> 只在启动时应用所有层——一次性或 stdio 应用在接活之后再换依赖，生命周期就作废了。这个行为在 v0.1.6 里换了一个拥有者：早期版本由 ProfileTemplate 上的 <code class="inline">patchReload</code> 字段按 profile 声明，现在该字段已删除，重载生命周期整体归 <code class="inline">packages/boot/hmr</code>（dsh-hmr）管——它在 base bundle 里注册（<code class="inline">disabled: !!js "!ctx.get('profileContext')"</code>），profile 在场才启用；监听 profile 的 manifest 与两个 patch 文件（profile 自己的 + home 级），变更后经 <code class="inline">reconcileProfilePatches</code>（hmr/src/index.ts:230）重新应用 patch 层；headless/sdk/acp 的 bundle 显式加一行 <code class="inline">hmr / disabled: true</code> 关掉它。语义没变，「声明在哪个 YAML 行」变了。</div>
+
+    <p>v0.1.6 还给 base 带来了两个新的管理面行（在 base patch 的 insert 列表最前面）：</p>
+    <div class="code-title">packages/bundle/base/cordis.patch.yml:16 — 插件管理与热重载行（节选）</div>
+    <pre class="code"><span class="lang-tag">yaml</span>    - <span class="kw">id</span>: tool-plugin-manager
+      <span class="kw">name</span>: <span class="st">'@deepseek-ai/dsh-plugin-manager/tools'</span>
+      <span class="kw">disabled</span>: <span class="kw">true</span>                     <span class="cmt"># 模型侧工具，出厂关闭，预设行可开</span>
+
+    - <span class="kw">id</span>: plugin-manager
+      <span class="kw">name</span>: <span class="st">'@deepseek-ai/dsh-plugin-manager'</span>
+      <span class="kw">disabled</span>: !!js <span class="st">"!ctx.get('profileContext')"</span>   <span class="cmt"># 有 profile 才启用</span>
+
+    <span class="cmt"># Profile configuration reloads by default; module roots are opt-in.</span>
+    - <span class="kw">id</span>: hmr
+      <span class="kw">name</span>: <span class="st">'@deepseek-ai/dsh-hmr'</span>
+      <span class="kw">disabled</span>: !!js <span class="st">"!ctx.get('profileContext')"</span>
+      <span class="kw">config</span>:
+        <span class="kw">root</span>: []                        <span class="cmt"># 默认只监听配置，不监听模块源码</span></pre>
+    <div class="annotation"><b>三行三种开关姿势</b>：tool 行用静态 <code class="inline">disabled: true</code>（工具默认不出场，cordis 预设或用户 patch 打开）；service 行用 <code class="inline">!!js</code> 表达式按运行时事实（<code class="inline">profileContext</code> 在不在）决定；hmr 行再叠一层 config——<code class="inline">root: []</code> 表示 profile 配置重载是默认行为，模块源码热替换是可选项（要在 profile patch 里写 <code class="inline">root: ["."]</code>）。同一个 YAML 文件里三种声明粒度，值得对照着读。</div>
 
     <p><code class="inline">dsh-base</code> 是 web/headless/sdk/acp 共享的第一层。它的 patch 文件头注释把这一层的自我定位讲得很清楚（<code class="inline">packages/bundle/base/cordis.patch.yml</code> 开头）：</p>
     <div class="code-title">packages/bundle/base/cordis.patch.yml（文件头注释）</div>
@@ -169,11 +187,13 @@
     <div class="code-title">shell</div>
     <pre class="code"><span class="fn">dsh</span> --profile web --dump-config</pre>
     <div class="annotation"><b>审计入口</b>：打印出的任何一行都可以被你自己的 patch 替换。排查「我的配置为什么没生效」时，第一件事就是 dump-config 看该行的最终 config 是谁写的。</div>
+
+    <p>v0.1.6 补上了装配面的最后一块拼图：插件不用手编 YAML 也能管。<code class="inline">packages/boot/plugin-manager</code> 提供 <code class="inline">plugin_manager</code> 工具（六个 action：<code class="inline">list_plugins / list_bundles / set_plugin / set_bundle / install_bundle / remove_bundle</code>）与 Web 侧栏的 Plugins 页；<code class="inline">dsh &lt;name&gt;</code> 命令行简写也落在同一条命令族里——CLI 把首个非选项、且不等于 <code class="inline">plugin</code> 的位置参数展开成 <code class="inline">--profile &lt;name&gt;</code>（apps/cli/src/args.ts:186-189），所以 <code class="inline">dsh myprofile</code> 等价于 <code class="inline">dsh --profile myprofile</code>，而 <code class="inline">dsh plugin …</code> 保留给插件管理子命令。工具侧每一步都要求 danger-full-access 或本次调用的审批（理由串自带 <code class="inline">Profile changes persist across sessions; installed Host code runs outside the workspace sandbox</code>）——安装的 Host 代码<strong>在进程内、工作区沙箱之外</strong>运行，这是它必须过审批的原因。变更写入 profile 自己的 <code class="inline">cordis.patch.yml</code>（行级 disabled 覆盖）与 <code class="inline">package.json</code> 的 <code class="inline">dsh.profile.bundles</code> 列表；一次只允许一个变更（profile 写锁串行化），失败或取消的安装会把 <code class="inline">package.json</code> 与 <code class="inline">pnpm-lock.yaml</code> 快照回滚（index.ts:57 的 <code class="inline">RESTORED_FILES</code>），一批 protected modules（plugin-manager 自己、loader、include、webserver、hmr 等 16 个模块，index.ts:44）禁止被停用——管理面不能拔掉自己的电源。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">1.5</span>packages/ 目录导览</h2>
-    <p><code class="inline">packages/</code> 下 52 个顶层目录、约 290 个叶子包，都遵循「按能力缝分组」的命名。挑重要的看（目录：<code class="inline">packages/</code>）：</p>
+    <p><code class="inline">packages/</code> 下 54 个顶层目录、约 300 个叶子包，都遵循「按能力缝分组」的命名。挑重要的看（目录：<code class="inline">packages/</code>）：</p>
     <table class="tbl">
       <tr><th>目录</th><th>拥有什么</th><th>ctx 键 / 角色</th></tr>
       <tr><td><code class="inline">core/session</code></td><td>append-only <code class="inline">SessionEvent</code> 日志与内存存储</td><td><code class="inline">ctx.sessions</code></td></tr>
@@ -187,6 +207,8 @@
       <tr><td><code class="inline">bundle/</code></td><td>base / web-app / headless / sdk-app / sdk-minimal / acp-app 六个 bundle</td><td>装配层</td></tr>
       <tr><td><code class="inline">preset/agent-presets</code></td><td>cordis/minimal/ptc/standard 四个内置代理预设</td><td>第 8 章</td></tr>
       <tr><td><code class="inline">boot/app-boot</code></td><td>profile 合成机制（bundles → patch 叠层）</td><td>启动器</td></tr>
+      <tr><td><code class="inline">boot/hmr</code></td><td>模块与 profile 配置重载的统一串行队列（v0.1.6）</td><td><code class="inline">ctx.hmr</code></td></tr>
+      <tr><td><code class="inline">boot/plugin-manager</code></td><td>profile 插件管理：启停行、选装/装卸 bundle（v0.1.6）</td><td><code class="inline">plugin_manager</code> 工具 + Web Plugins 页</td></tr>
     </table>
     <div class="callout info">
       <b class="tag">阅读建议</b>
@@ -268,7 +290,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 01 整体架构 · 版本 dsh-v0.1.5-rc.2-805 (HEAD 0d1f50007f) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 01 整体架构 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

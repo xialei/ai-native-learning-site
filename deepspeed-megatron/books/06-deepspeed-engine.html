@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · DeepSpeed 引擎 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a class="active" href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 DeepSpeed 引擎</div>
+    <h1>DeepSpeedEngine：三行训练循环背后的三百个分支</h1>
+    <div class="subtitle">从这一章进入 DeepSpeed 半场。用户写的循环只有三行：forward、backward、step。DeepSpeedEngine 把这三行展开成：GAS 边界判断、loss 缩放、梯度分区归约、优化器子组步进。这一章先看引擎骨架，第 7、8 章再深入 ZeRO 各 stage 在这三行里的挂点。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>initialize()：一行调用背后的装配线</h2>
+    <p>用户入口是一行 <code class="inline">deepspeed.initialize()</code>：</p>
+    <div class="code-title">deepspeed/__init__.py — initialize()（签名摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">initialize</span>(args=None,
+                model,
+                model_parameters,
+                training_data=None, ...,
+                config=None, config_params=None,
+                mpu=None,                  <span class="cmt"># 外部并行信息注入点（Megatron-DeepSpeed 融合）</span>
+                dist_init_required=None, ...):</pre>
+    <div class="annotation"><b>装配顺序（engine.py 里逐步展开）：</b>① 解析 config json → ② distributed_init（若进程组未初始化）→ ③ 用 <code class="inline">mpu</code> 参数接入外部并行信息（第 2 章 2.2 节的插头——Megatron-DeepSpeed 融合走这里）→ ④ 按 zero_stage 选择优化器包装（stage 0/1/2/3 对应不同的 ZeroOptimizer 类）→ ⑤ 注册 hook 与梯度累积器。返回的 <code class="inline">engine</code> 才是后续训练的主角：<code class="inline">engine.backward(loss)</code> / <code class="inline">engine.step()</code> 是<strong>引擎的方法，不是 torch 原生</strong>——这是所有 DS 用户代码的统一姿势，也是容易出 bug 的地方（绕过引擎直接 loss.backward() 会跳过全部缩放与归约逻辑）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>forward / backward / step 三部曲</h2>
+    <div class="code-title">deepspeed/runtime/engine.py — 三部曲（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># backward（engine.py:3286 附近）</span>
+<span class="kw">def</span> <span class="fn">backward</span>(self, loss, allreduce_gradients=True, release_loss=False):
+    <span class="cmt"># ① GAS：microbatch 间的 loss 先除以累积步数（平均而非求和）</span>
+    loss = self.<span class="fn">scale_loss</span>(loss)
+    <span class="kw">if</span> not self.is_gradient_accumulation_boundary():
+        <span class="kw">return</span>  <span class="cmt"># 不会走到这里——除法总是做的，见下文</span>
+    <span class="cmt"># ② 反传（scale 内部已乘 loss scale）</span>
+    loss.backward()
+    <span class="cmt"># ③ 收尾：ZeRO-1/2 的梯度分桶归约挂在 epilogue</span>
+    self.<span class="fn">_backward_epilogue</span>()
+
+<span class="cmt"># step（engine.py:3471 附近）</span>
+<span class="kw">def</span> <span class="fn">step</span>(self):
+    <span class="kw">if</span> not self.is_gradient_accumulation_boundary():
+        <span class="kw">return</span>              <span class="cmt"># 非边界：no-op，继续累积</span>
+    self.<span class="fn">_take_model_step</span>() <span class="cmt"># 边界处：真正执行</span></pre>
+    <div class="annotation"><b>逐行读：</b>backward 里最关键的一行在 scale_loss 内部：<code class="inline">loss = loss / self.gradient_accumulation_steps()</code>——<strong>除法必须在 backward 之前</strong>，因为 fp16 下还有 loss scale 乘回来，除和乘的次序决定最终梯度是「平均」还是「平均后再缩放」。实际代码把「除 GAS」与「乘 loss scale」都放进 scale_loss 链条里一次完成。<b>step 的关键</b>：非边界直接 return——「step 被调 N 次、真正执行 1 次」由 GAS 边界决定，用户循环里每 microbatch 调 step 也完全正确，正确性不依赖用户数对步数。<code class="inline">_take_model_step</code> 里依次是：overflow 检查 → optimizer.step()（ZeRO 语义在这一步，第 7/8 章）→ 更新 lr schedule → zero grad buffer。</div>
+
+    <div class="code-title">deepspeed/runtime/engine.py — is_gradient_accumulation_boundary（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">is_gradient_accumulation_boundary</span>(self):
+    <span class="kw">return</span> self.global_steps % self.gradient_accumulation_steps() == <span class="nu">0</span> <span class="kw">or</span> self.is_last_step()</pre>
+    <div class="annotation"><b>一切节拍的总开关：</b>microsteps 计数器到 GAS 即边界。GAS、数据 dataloader 步进、梯度归约、优化器 step 全部挂在这一个判定上——引擎替用户管理「什么时候真的 step」，这是 DS 相对裸 PyTorch 最省心的地方。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>16 字节/参数的显存账</h2>
+    <p>为什么需要 ZeRO？先把账摆出来。混合精度训练（Adam）下每个参数占的显存：</p>
+    <table class="tbl">
+      <tr><th>存储</th><th>精度</th><th>字节</th><th>说明</th></tr>
+      <tr><td>参数（前向用）</td><td>fp16/bf16</td><td>2</td><td>Float16Module cast 的目标</td></tr>
+      <tr><td>梯度</td><td>fp16/bf16</td><td>2</td><td>autograd 产物</td></tr>
+      <tr><td>master 权重</td><td>fp32</td><td>4</td><td>optimizer 侧的更新基准</td></tr>
+      <tr><td>Adam m、v</td><td>fp32 × 2</td><td>8</td><td>一阶/二阶动量</td></tr>
+      <tr><td><strong>合计</strong></td><td></td><td><strong>16</strong></td><td>7B 模型 → 112 GB，单卡放不下</td></tr>
+    </table>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t61 d61">
+        <title id="t61">16 bytes/param 的显存账与 ZeRO 各 stage 切什么</title>
+        <desc id="d61">一个参数在混合精度下的四份存储横条：fp16 参数 2B、fp16 梯度 2B、fp32 master 4B、Adam m/v 8B，合计 16B。下方三行分别显示 stage1 切掉优化器状态、stage2 再切掉梯度、stage3 连参数也切，各自剩余的字节数。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="30" font-weight="bold">单卡（ZeRO-0）：每卡完整 16B/参数</text>
+        <rect class="node core" x="20" y="42" width="120" height="34" rx="4"></rect>
+        <text class="lbl sm" x="80" y="63" text-anchor="middle">fp16 参数 2B</text>
+        <rect class="node" x="142" y="42" width="120" height="34" rx="4"></rect>
+        <text class="lbl sm" x="202" y="63" text-anchor="middle">fp16 梯度 2B</text>
+        <rect class="node" x="264" y="42" width="240" height="34" rx="4"></rect>
+        <text class="lbl sm" x="384" y="63" text-anchor="middle">fp32 master 4B</text>
+        <rect class="node acc" x="506" y="42" width="300" height="34" rx="4"></rect>
+        <text class="lbl sm" x="656" y="63" text-anchor="middle">Adam m + v　8B</text>
+
+        <text class="lbl" x="20" y="110" font-weight="bold">ZeRO-1：优化器状态按 DP 切 → 每卡 2+2+16/DP</text>
+        <rect class="node core" x="20" y="122" width="120" height="30" rx="4"></rect>
+        <text class="lbl sm" x="80" y="141" text-anchor="middle">参数 2B</text>
+        <rect class="node" x="142" y="122" width="120" height="30" rx="4"></rect>
+        <text class="lbl sm" x="202" y="141" text-anchor="middle">梯度 2B</text>
+        <rect class="node acc" x="264" y="122" width="480" height="30" rx="4" fill-opacity="0.55"></rect>
+        <text class="lbl sm" x="504" y="141" text-anchor="middle">12B / DP 份（master+m+v 分片）</text>
+
+        <text class="lbl" x="20" y="182" font-weight="bold">ZeRO-2：再切梯度 → 每卡 2+4/DP；ZeRO-3：参数也切 → 每卡 16/DP 全套</text>
+        <rect class="node core" x="20" y="194" width="120" height="30" rx="4"></rect>
+        <text class="lbl sm" x="80" y="213" text-anchor="middle">参数 2B</text>
+        <rect class="node" x="142" y="194" width="180" height="30" rx="4" fill-opacity="0.55"></rect>
+        <text class="lbl sm" x="232" y="213" text-anchor="middle">梯度 2B/DP 份</text>
+        <rect class="node acc" x="324" y="194" width="420" height="30" rx="4" fill-opacity="0.4"></rect>
+        <text class="lbl sm" x="534" y="213" text-anchor="middle">12B/DP 份</text>
+
+        <text class="lbl sm" x="20" y="236" fill="#8f2d2d">stage 越高每卡显存越低，但通信次数越多——第 7 章算这笔通信账，第 8 章讲 ZeRO-3 的 fetch/prefetch</text>
+      </svg>
+      <div class="fig-cap">图 6.1：16 字节账与 ZeRO 三级削减。注意 DP 份数是数据并行的卡数：DP=8 时 ZeRO-1 每卡优化器状态只剩 1.5B/参数。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>配置与启动器</h2>
+    <p>DS 的全部行为由一个 json 驱动，启动器负责多进程：</p>
+    <div class="code-title">deepseek 融合配置示例（ds_config.json，示意）</div>
+    <pre class="code"><span class="lang-tag">json</span>{
+  <span class="st">"train_batch_size"</span>: 1024,          <span class="cmt">// = micro_batch × DP × GAS，引擎反推各值</span>
+  <span class="st">"gradient_accumulation_steps"</span>: 4,
+  <span class="st">"zero_optimization"</span>: { <span class="st">"stage"</span>: 2 },
+  <span class="st">"optimizer"</span>: { <span class="st">"type"</span>: <span class="st">"Adam"</span>, <span class="st">"params"</span>: { <span class="st">"lr"</span>: 3e-4 } },
+  <span class="st">"fp16"</span>: { <span class="st">"enabled"</span>: true, <span class="st">"loss_scale_window"</span>: 1000 }
+}</pre>
+    <div class="annotation"><b>三个必懂的键：</b>① <code class="inline">train_batch_size</code> 与 GAS/micro_batch 互相约束——给两个引擎推第三个，冲突直接报错（很多新手在这报错里打转）；② <code class="inline">zero_optimization.stage</code> 是第 7/8 章的全部内容；③ <code class="inline">fp16.enabled</code> 决定 scaler 类型（动态 vs 静态，第 7 章对比 Megatron 的选择器）。启动用 <code class="inline">deepspeed --num_gpus=8 train.py</code>——launcher 负责把 rank/env 立起来，用户脚本里 <code class="inline">deepspeed.init_distributed()</code> 或 initialize() 隐式完成。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>用户代码</th><th>引擎内部展开</th><th>对应章节</th></tr>
+      <tr><td>initialize(model, ...)</td><td>装配 config/mpu/optimizer 包装/hook</td><td>本章</td></tr>
+      <tr><td>engine.forward(...)</td><td>GAS pre-forward 清理、ZeRO-3 fetch</td><td>第 8 章</td></tr>
+      <tr><td>engine.backward(loss)</td><td>loss/GAS → loss scale → backward → epilogue 归约</td><td>第 7 章</td></tr>
+      <tr><td>engine.step()</td><td>边界外 no-op、边界处 _take_model_step</td><td>第 7/8 章</td></tr>
+      <tr><td>save/load_checkpoint</td><td>universal checkpoint</td><td>第 12 章</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      DeepSpeed 的用户契约只有五件事：initialize / forward / backward / step / config。自研 trainer 值得抄的是<strong>「边界判断集中在引擎」</strong>：用户每 microbatch 调 step()，每次都被边界挡回去，正确性不依赖用户数对 microbatch 数。另外记住次序：<strong>loss 先除 GAS 再 backward</strong>——backward 之后除是错的，梯度已经固化进缓冲。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="05-megatron-model.html">← 上一步：模型与数据</a>
+    <a href="07-zero.html">下一步：ZeRO 1/2 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 06 DS 引擎 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

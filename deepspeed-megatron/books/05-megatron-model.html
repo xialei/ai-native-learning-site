@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 模型与数据 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a class="active" href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 模型与数据</div>
+    <h1>模型与数据：张量怎么在 3D 并行下流动</h1>
+    <div class="subtitle">前两章讲了怎么切（TP/PP/DP），这一章看切完之后模型代码长什么样、数据怎么喂进去。重点三件事：模型代码如何对并行透明、混合精度如何包裹模型（Float16Module）、数据管线如何让 TP/PP/CP 组内拿同一批样本而 DP 组间不重叠、序列维如何切给 CP。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>TransformerLayer 的组装：并行透明的关键</h2>
+    <p>模型代码完全不写 <code class="inline">torch.distributed</code>——切分发生在模块的<strong>构造函数里</strong>。看一个 transformer 层的拼装：</p>
+    <div class="code-title">megatron/core/transformer/transformer_layer.py — 组装链（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">TransformerLayer</span>(BaseTransformerLayer):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config, submodules, ...):
+        self.input_layernorm = build_module(
+            submodules.input_layernorm,
+            config.hidden_size,
+            ...,
+        )                                    <span class="cmt"># TP+SP 感知 LN</span>
+        self.self_attention = build_module(
+            submodules.self_attention, config, ...
+            attention_type=AttentionType.self_attention,
+        )
+        self.pre_mlp_layernorm = build_module(...)
+        self.mlp = build_module(
+            submodules.mlp, config, submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear,   <span class="cmt"># LN+列并行融合</span>
+                linear_fc2=TERowParallelLinear,               <span class="cmt"># 行并行</span>
+            ),
+        )
+        <span class="cmt"># TP 切分写进算子的构造参数——模型代码零切分逻辑</span></pre>
+    <div class="annotation"><b>读懂组装链：</b>「切分写进构造参数」是 Megatron 模型代码干净的根本原因：<code class="inline">MLP</code> 的 fc1 用 <code class="inline">TELayerNormColumnParallelLinear</code>（LN+列并行融合算子），fc2 用 <code class="inline">TERowParallelLinear</code>——<strong>换 TP=1 时只需换算子类</strong>（非 TE 路径对应 <code class="inline">ColumnParallelLinear</code>/<code class="inline">RowParallelLinear</code>，并行度 1 时自动退化为普通 Linear）。层内还可以包 <code class="inline">checkpointed_forward</code>（配置 <code class="inline">--recompute-granularity full</code> 时），在第 10 章展开。</div>
+
+    <h3>GPTModel.forward：3D 并行下的输入形态</h3>
+    <div class="code-title">megatron/core/models/gpt/gpt_model.py — GPTModel.forward 签名（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(
+    self,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    decoder_input: torch.Tensor = <span class="kw">None</span>,       <span class="cmt"># PP 非首阶段：直接吃上一阶段的激活</span>
+    inference_context: <span class="cl">InferenceContext</span> = <span class="kw">None</span>,
+    packed_seq_params: <span class="cl">PackedSeqParams</span> = <span class="kw">None</span>,  <span class="cmt"># 变长序列打包（THD 格式）</span>
+    ...,
+):</pre>
+    <div class="annotation"><b>三个特殊参数：</b>① <code class="inline">decoder_input</code>——PP 非首阶段不需要 embedding 输出，直接以「上一阶段传来的激活」为输入（首阶段则先过 <code class="inline">embedding</code>）；② <code class="inline">packed_seq_params</code>——变长 packing 后的段边界信息，配合 FA2 的 varlen 路径；③ <code class="inline">inference_context</code>——推理时携带 KV cache 状态。训练主路径里它们多半为 None，但签名本身就是 3D 并行下的输入全景。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>混合精度包裹：Float16Module</h2>
+    <div class="code-title">megatron/core/transformer/module.py — Float16Module（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Float16Module</span>(torch.nn.Module):
+    <span class="st">"""Wrap the module with fp16/bf16 conversion in forward pass"""</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, input):
+        <span class="kw">if</span> isinstance(input, (tuple, list)):
+            <span class="kw">return</span> [self.forward(i) <span class="kw">for</span> i <span class="kw">in</span> input]
+        <span class="kw">if</span> torch.is_autocast_enabled():     <span class="cmt"># autocast 已接管 → 不重复 cast</span>
+            <span class="kw">return</span> input
+        <span class="kw">return</span> input.to(self.config.params_dtype)  <span class="cmt"># 强制转到 fp16/bf16</span></pre>
+    <div class="annotation"><b>位置与作用：</b>Float16Module 是模型外层的<strong>一层壳</strong>：<code class="inline">pretrain()</code> 里 <code class="inline">setup_model_and_optimizer</code> 时，fp16/bf16 配置下模型被包住，forward 时把输入 cast 到半精度。权重在模块内部本身就是 params_dtype 存储，而<strong>真正的 fp32 master 权重属于 optimizer</strong>（第 7 章）——Float16Module 只管前向 cast，不管缩放。loss scaling 也属于 optimizer（scaler），这条边界在自研时很容易划错。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>数据管线：组内同批、DP 间不重叠</h2>
+    <p>3D 并行下数据加载有两个特殊要求：① 同一 TP/PP/CP 组内各卡必须拿到<strong>同一批样本</strong>（它们在算同一个模型的同一段）；② 不同 DP 副本拿到<strong>不重叠的样本</strong>。Megatron 用 rank 算偏移：</p>
+    <div class="code-title">megatron/training/data_samplers.py — MegatronPretrainingSampler.__iter__（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__iter__(self)</span>:
+    batch = []
+    <span class="cmt"># start/end 由 consumed_samples + 全局 batch 推出；组内各卡算出同一个区间</span>
+    <span class="kw">for</span> idx <span class="kw">in</span> <span class="fn">range</span>(start, end, self.data_parallel_rank_delta):
+        batch.append(idx)
+        <span class="kw">if</span> len(batch) == self.micro_batch_times_data_parallel_size:
+            <span class="kw">yield</span> batch[batch_start:batch_end]  <span class="cmt"># 每张 DP 卡切走自己的 microbatch</span>
+            batch = []</pre>
+    <div class="annotation"><b>批大小公式：</b><strong>global batch = micro_batch × DP × grad_accum</strong>。TP/PP/CP 不影响全局 batch——它们切的是模型不是数据。采样器一次产出的区间覆盖整个 DP 组（micro_batch_times_data_parallel_size），再按 DP rank 切走各自那份。这行公式是新手最常搞错的地方：把 micro_batch × TP 误当成全局 batch，然后困惑「loss 曲线和论文对不上」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>CP 切序列：get_batch_on_this_cp_rank</h2>
+    <p>第 2 章 2.4 节讲过 PP 气泡；CP 的 zigzag 原理（因果注意力载荷是三角形，连续切会让首卡闲、尾卡忙）。这里看数据侧实现：</p>
+    <div class="code-title">megatron/core/utils.py — get_batch_on_this_cp_rank（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_batch_on_this_cp_rank</span>(batch):
+    cp_size = ...
+    <span class="kw">if</span> cp_size &gt; <span class="nu">1</span>:
+        <span class="cmt"># per-sequence zigzag：序列对半折返，cp rank i 拿第 i 段 + 对称尾段</span>
+        <span class="kw">for</span> key, val <span class="kw">in</span> batch.items():
+            <span class="kw">if</span> key <span class="kw">in</span> [<span class="st">'tokens'</span>, <span class="st">'position_ids'</span>, <span class="st">'labels'</span>]:
+                batch[key] = <span class="fn">zigzag 分段</span>(val)
+        <span class="cmt"># per-document：变体——文档边界重排后整段分配（document mask 配合）</span>
+        <span class="cmt"># hybrid CP：另一变体——不同注意力后端配不同切法</span></pre>
+    <div class="annotation"><b>读代码要抓的两点：</b>① 切的是 <code class="inline">batch</code> 里每一个 key（tokens/position_ids/labels 必须同步切，错一个 key 就是 label 对不上的静默错误）；② zigzag 的实现是「第 i 段 + 第 cp_size·2−1−i 段」的配对，保证每卡两侧合计工作量相等。per-document 变体在文档数量多且长短不均时更优（避免跨文档 padding），hybrid CP 则服务于不同注意力后端的通信形态差异。哪个变体生效由配置选择，数据侧只负责按选定的方式切。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>部件</th><th>切分方式</th><th>关键机制</th></tr>
+      <tr><td>TransformerLayer</td><td>TP 切分写进构造参数</td><td>build_module + submodules</td></tr>
+      <tr><td>GPTModel.forward</td><td>PP 边界体现在 decoder_input 参数</td><td>首阶段过 embedding，其余吃激活</td></tr>
+      <tr><td>Float16Module</td><td>只做前向 cast，不碰缩放</td><td>fp32 master 属于 optimizer</td></tr>
+      <tr><td>数据采样</td><td>组内同 batch、DP 间不重叠</td><td>consumed_samples 算偏移</td></tr>
+      <tr><td>CP</td><td>序列维 zigzag</td><td>get_batch_on_this_cp_rank</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      「切分写进构造参数」是自研可复用的最强模式：<strong>换并行度 = 换算子类，模型代码不动</strong>。测试基线同样简单：同一配置下 TP=1 与 TP=2 的 loss 曲线必须重合（第 3 章 3.6 节初始化一致性的坑）。数据侧先写死 <code class="inline">global = micro_batch × DP × grad_accum</code> 这条公式再写代码——CP 加入后它变成 micro_batch × DP × CP × grad_accum（CP 也是一种数据切分），但 TP/PP 永远不进这条公式。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="04-pp-1f1b.html">← 上一步：流水线并行</a>
+    <a href="06-deepspeed-engine.html">下一步：DeepSpeed 引擎 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 05 模型与数据 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

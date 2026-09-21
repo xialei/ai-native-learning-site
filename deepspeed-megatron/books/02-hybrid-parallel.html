@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 3D 并行 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a class="active" href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 3D 并行</div>
+    <h1>3D 并行：五种切法的组合拳</h1>
+    <div class="subtitle">TP、PP、DP、CP、EP——每种切法切的对象不同、通信模式不同、装卡约束不同。这一章建立全景坐标系：后面每章的通信细节，都挂在这张坐标系的某个轴上。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>为什么需要并行：单卡的三堵墙</h2>
+    <p><strong>放不下（显存墙）</strong>：第 6 章会算的账——混合精度下每个参数 16 字节状态，671B 模型仅模型状态就 10 TB 量级，任何单卡都装不下。<strong>算不动（算力墙）</strong>：即便放得下（如 7B 模型 + ZeRO-2 offload），单卡每秒浮点数有上限，吞吐上不去。<strong>等不起（时间墙）</strong>：就算吞吐够，一次训练动辄数周，容错和迭代速度都要求把时间维也并行掉。</p>
+    <p>三种约束对应三类切法，再叠加两种特种切法，构成五种并行：</p>
+    <table class="tbl">
+      <tr><th>并行</th><th>切的对象</th><th>每步通信</th><th>通信量级</th><th>卡间带宽要求</th></tr>
+      <tr><td><strong>TP</strong> 张量并行</td><td>单层权重矩阵</td><td>每层 2 次（f/g 共轭）</td><td>∝ 层数×激活大小</td><td>极高 → 限单机 NVLink</td></tr>
+      <tr><td><strong>SP</strong> 序列并行</td><td>TP 层间激活（沿序列）</td><td>与 TP 合并成 RS/AG</td><td>同上（换了通信原语）</td><td>极高</td></tr>
+      <tr><td><strong>PP</strong> 流水线并行</td><td>层段</td><td>每 stage 边界 2 次（激活+梯度）</td><td>∝ 边界激活大小</td><td>低 → 可跨机</td></tr>
+      <tr><td><strong>DP</strong> 数据并行</td><td>什么都不切（复制）</td><td>每步 1 次梯度规约</td><td>∝ 参数量</td><td>中（可被 ZeRO 压缩）</td></tr>
+      <tr><td><strong>CP</strong> 上下文并行</td><td>序列维</td><td>注意力内部 ring 交换</td><td>∝ 序列长/CP 数</td><td>中高</td></tr>
+      <tr><td><strong>EP</strong> 专家并行</td><td>MoE 的专家</td><td>all-to-all ×2</td><td>∝ 派发的 token 数</td><td>中高</td></tr>
+    </table>
+    <div class="annotation"><b>记忆法：</b>切「层内权重」= TP（通信最贵，只能在 NVLink 域内）；切「层间」= PP（通信最便宜，可跨机）；切「数据」= DP（什么都不切，所以才有冗余可优化——ZeRO 的战场）；切「序列」= CP/SP；切「专家」= EP。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>用代码看｜world_size 与并行组是怎么定义的</h2>
+    <p>Megatron 把「建组」集中在一个函数里。<code class="inline">initialize_model_parallel()</code> 的签名就是全书的坐标系：</p>
+    <div class="code-title">megatron/core/parallel_state.py — initialize_model_parallel（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">initialize_model_parallel</span>(
+    tensor_model_parallel_size: <span class="cl">int</span> = <span class="nu">1</span>,
+    pipeline_model_parallel_size: <span class="cl">int</span> = <span class="nu">1</span>,
+    virtual_pipeline_model_parallel_size: <span class="cl">Optional</span>[<span class="cl">int</span>] = <span class="kw">None</span>,
+    context_parallel_size: <span class="cl">int</span> = <span class="nu">1</span>,
+    expert_model_parallel_size: <span class="cl">int</span> = <span class="nu">1</span>,
+    expert_tensor_parallel_size: <span class="cl">Optional</span>[<span class="cl">int</span>] = <span class="kw">None</span>,
+    order: <span class="cl">str</span> = <span class="st">"tp-cp-ep-dp-pp"</span>,   <span class="cmt"># rank 的排列顺序！</span>
+    ...
+):</pre>
+    <div class="annotation"><b>三个关键事实：</b>
+    ① <strong>总卡数 = 各轴之积</strong>：docstring 明确写出 world_size = TP × CP × PP × DP（EP/GTP 是叠在上面的细分轴）。配置 64 卡可以拆成 TP=4×PP=4×DP=4，也可以 TP=8×DP=8——没有唯一解，第 4 章的 bubble 公式和带宽决定取舍。
+    ② <strong>order 参数决定 rank 映射</strong>：默认 "tp-cp-ep-dp-pp" 意思是相邻的 rank 先构成一个 TP 组（这样 TP 的 all-reduce 走机内 NVLink）；PP 组则由跨机器的 rank 构成。改 order 就改变「哪一维吃机内带宽」。
+    ③ 每个并行组是一种「窄通信域」：TP 组内每层通信、PP 组只有 stage 边界通信、DP 组每步规约一次——把通信限制在最小集合里，这是所有并行组设计的共同动机。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
+        <title id="t21">16 卡、TP=2 PP=2 DP=4 的 rank 布局</title>
+        <desc id="d21">两台机器各 8 卡。rank 排列 tp-cp-ep-dp-pp：rank 0-1 是一个 TP 组，rank 0/2/4/6… 构成 DP 组的副本轴，rank 0-7 是 PP stage 0、rank 8-15 是 stage 1。节点间只有 PP 边界通信与 DP 梯度规约。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="30" y="26" font-weight="bold" fill="#8f2d2d">机器 0（8 卡）</text>
+        <text class="lbl" x="500" y="26" font-weight="bold" fill="#8f2d2d">机器 1（8 卡）</text>
+
+        <rect class="node" x="20" y="40" width="450" height="200" rx="10"></rect>
+        <rect class="node ok" x="490" y="40" width="450" height="200" rx="10"></rect>
+
+        <text class="lbl sm" x="40" y="62">PP stage 0（前半模型）</text>
+        <text class="lbl sm" x="510" y="62">PP stage 1（后半模型）</text>
+
+        <rect class="node core" x="40" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="70" y="97" text-anchor="middle">rank 0</text>
+        <text class="lbl sm" x="70" y="113" text-anchor="middle">TP0</text>
+        <rect class="node core" x="108" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="138" y="97" text-anchor="middle">rank 1</text>
+        <text class="lbl sm" x="138" y="113" text-anchor="middle">TP1</text>
+        <rect class="node" x="176" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="206" y="97" text-anchor="middle">rank 2</text>
+        <text class="lbl sm" x="206" y="113" text-anchor="middle">TP0</text>
+        <rect class="node" x="244" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="274" y="97" text-anchor="middle">rank 3</text>
+        <text class="lbl sm" x="274" y="113" text-anchor="middle">TP1</text>
+        <rect class="node" x="312" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="342" y="97" text-anchor="middle">rank 4</text>
+        <text class="lbl sm" x="342" y="113" text-anchor="middle">TP0</text>
+        <rect class="node" x="380" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="410" y="97" text-anchor="middle">rank 5</text>
+        <text class="lbl sm" x="410" y="113" text-anchor="middle">TP1</text>
+
+        <rect class="node core" x="520" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="550" y="97" text-anchor="middle">rank 8</text>
+        <text class="lbl sm" x="550" y="113" text-anchor="middle">TP0</text>
+        <rect class="node core" x="588" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="580" y="97" text-anchor="middle">rank 9</text>
+        <text class="lbl sm" x="580" y="113" text-anchor="middle">TP1</text>
+        <rect class="node" x="656" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="650" y="97" text-anchor="middle">rank 10</text>
+        <text class="lbl sm" x="650" y="113" text-anchor="middle">TP0</text>
+        <rect class="node" x="724" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="754" y="97" text-anchor="middle">rank 11</text>
+        <text class="lbl sm" x="754" y="113" text-anchor="middle">TP1</text>
+        <rect class="node" x="792" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="822" y="97" text-anchor="middle">rank 12</text>
+        <text class="lbl sm" x="822" y="113" text-anchor="middle">TP0</text>
+        <rect class="node" x="860" y="72" width="60" height="60" rx="5"></rect>
+        <text class="lbl sm" x="890" y="97" text-anchor="middle">rank 13</text>
+        <text class="lbl sm" x="890" y="113" text-anchor="middle">TP1</text>
+
+        <text class="lbl sm" x="40" y="160">DP 副本 0（rank 0-1）   DP 副本 1（rank 2-3）   DP 副本 2（rank 4-5）…</text>
+        <text class="lbl sm" x="40" y="182">同色一对 = 一个 TP 组（层内切分，机内 all-reduce）</text>
+        <text class="lbl sm" x="40" y="204">rank 0 与 rank 2/4/6 同为「TP0 的不同 DP 副本」→ 梯度 all-reduce 走 DP 组</text>
+        <text class="lbl sm" x="40" y="226">跨机箭头只有两类：PP 激活传递（前向/反向各一）与 DP 梯度规约</text>
+
+        <line class="edge acc" x1="470" y1="102" x2="518" y2="102"></line>
+        <text class="lbl sm" x="494" y="94" text-anchor="middle" fill="#b45309">PP</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>同一个 TP 组（相邻 rank）</span>
+        <span class="lg-item"><span class="sw"></span>同一 stage 的其它 DP 副本</span>
+        <span class="lg-item"><span class="sw ok"></span>下一 stage（跨机）</span>
+      </div>
+      <div class="fig-cap">图 2.1：64 卡里的 16 卡示意（TP=2×PP=2×DP=4×2 机器）。rank 顺序决定拓扑：TP 相邻（机内）、PP 跨机。改变 initialize_model_parallel 的 order 即改变这张图的形状。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>DeepSpeed 侧的世界：它只认 DP，其余靠搭档</h2>
+    <p>DeepSpeed 的世界观简单得多：引擎只看到「数据并行组」，模型切分交给搭档。但它有两个入口能感知并行结构：</p>
+    <div class="code-title">deepspeed.initialize() 的 mpu 参数（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>mpu: <span class="cl">Any</span> = <span class="kw">None</span>,
+<span class="cmt"># A model parallelism unit object that implements</span>
+<span class="cmt"># get_{model,data}_parallel_{rank,group,world_size}()</span></pre>
+    <div class="annotation"><b>读懂这段：</b><code class="inline">mpu</code> 是两库协作的插销——把 Megatron 的 <code class="inline">mpu</code> 模块传进来，DeepSpeed 的梯度规约就知道「我的数据并行组是哪些 rank」，不会把 TP 组里的梯度也规约了。BLOOM-176B 的训练脚本正是这样接线的。而 DeepSpeed 自己的流水线（<code class="inline">runtime/pipe/</code>）与 Ulysses 序列并行（<code class="inline">deepspeed/sequence/</code>）则是它自带的切分实现，适用于不带 Megatron 的场景。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>PP 气泡：必须先算清的账</h2>
+    <p>流水线并行用「分段接力」换低通信，代价是时间线上的<strong>气泡（bubble）</strong>。经典 1F1B 调度下，气泡占比有一个干净的下界公式：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t22 d22">
+        <title id="t22">1F1B 时间线与气泡</title>
+        <desc id="d22">4 个 stage、8 个 micro-batch 的 1F1B 调度甘特图。stage 0 从 t=0 开始连续前向，随后进入 F/B 交替稳态，结尾 cooldown 排空。最后 stage 的前向起点比 stage 0 晚 3 拍，这正是 warmup。气泡总量 = (stages-1) 拍 /(micro-batches) 分摊到每张卡。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl sm" x="60" y="50">t →</text>
+        <text class="lbl sm" x="20" y="78" text-anchor="middle">stage 0</text>
+        <text class="lbl sm" x="20" y="130" text-anchor="middle">stage 1</text>
+        <text class="lbl sm" x="20" y="206" text-anchor="middle">stage 2</text>
+        <text class="lbl sm" x="20" y="270" text-anchor="middle">stage 3</text>
+
+        <rect class="node core" x="60" y="36" width="56" height="24" rx="3"></rect>
+        <rect class="node core" x="96" y="36" width="56" height="24" rx="3"></rect>
+        <rect class="node core" x="134" y="36" width="56" height="24" rx="3"></rect>
+        <rect class="node core" x="170" y="36" width="56" height="24" rx="3"></rect>
+        <rect class="node core" x="206" y="36" width="56" height="24" rx="3"></rect>
+        <text class="lbl sm" x="90" y="52" text-anchor="middle">F0</text><text class="lbl sm" x="162" y="52" text-anchor="middle">F1</text><text class="lbl sm" x="206" y="52" text-anchor="middle">F2</text><text class="lbl sm" x="226" y="52" text-anchor="middle">F3</text><text class="lbl sm" x="466" y="50">…warmup = stages-1 = 3 拍</text>
+
+        <rect class="node core" x="60" y="66" width="56" height="24" rx="3" fill="#f3ddd8"></rect>
+        <text class="lbl sm" x="88" y="82" text-anchor="middle">F0</text>
+        <rect class="node warn" x="60" y="94" width="56" height="24" rx="3"></rect>
+        <text class="lbl sm" x="88" y="98" text-anchor="middle">B0</text>
+        <text class="lbl sm" x="240" y="82" text-anchor="middle" fill="#8f2d2d">稳态：一次 F 紧接一次 B（1F1B）→ 在飞 micro-batch 不超过 stage 数</text>
+
+        <rect class="node" x="30" y="240" width="150" height="18" rx="3" fill="#fdecec"></rect>
+        <text class="lbl sm" x="95" y="62" text-anchor="middle"></text>
+        <text class="lbl sm" x="90" y="286" text-anchor="middle" fill="#d33">尾部 cooldown：反向排空，越早的 stage 空越久</text>
+        <text class="lbl sm" x="300" y="180" text-anchor="middle">气泡/步 = (stages−1) ÷ micro_batches —— micro-batch 越多气泡越稀释，但激活显存同步上涨</text>
+        <text class="lbl sm" x="90" y="200" text-anchor="middle"></text>
+      </svg>
+      <div class="fig-cap">图 2.2：1F1B 气泡示意。理想气泡率 ≈ (pp−1)/(num_microbatches + pp − 1)；pp=8、micro-batch=32 时约 19%，靠加大 micro-batch 只能稀释到一定程度——interleaved 调度（第 4 章）才是根治手段。</div>
+    </div>
+    <p>这条账决定了组合拳的打法：<strong>先算 PP 需要的 micro-batch 数 → 气泡率可接受时才开 PP；剩下的卡给 TP×DP</strong>。Megatron 默认建议 TP ≤ 单机卡数（NVLink 域），PP 拿跨机带宽，DP 用 ZeRO 砍显存。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>选型速查 + 小结</h2>
+    <table class="tbl">
+      <tr><th>你的处境</th><th>第一步</th><th>理由</th></tr>
+      <tr><td>单卡放得下，只是想快</td><td>TP=2/4（机内）</td><td>通信全走 NVLink，收益线性</td></tr>
+      <tr><td>权重放不下单卡，但激活放得下</td><td>TP + ZeRO-1</td><td>TP 切权重，ZeRO 砍副本冗余</td></tr>
+      <tr><td>层数多、跨机带宽差</td><td>PP（跨机段）+ TP（机内）</td><td>PP 通信量小，天然适配跨机</td></tr>
+      <tr><td>超长序列（&gt;32K）</td><td>CP=2/4 + TP</td><td>注意力激活按序列切，ring 交换 K/V</td></tr>
+      <tr><td>MoE 大模型</td><td>EP + TP（非专家层）</td><td>专家按卡摊，路由通信交给 all-to-all</td></tr>
+      <tr><td>几百亿以上、任意条件</td><td>3D + ZeRO-1 + 重算</td><td>三条轴各管一维，缺一不可</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      五种并行的实现难度差距极大：<strong>DP 一周、TP 一月、PP 一季、CP/EP 更久</strong>。且它们的通信模式互不相同——先定「每种并行用哪个进程组、在哪插通信」的接口约定（Megatron 的 parallel_state 就是这个约定的参考实现），再写任何切分代码。下一章进入 TP 的分块数学。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="01-architecture.html">← 上一步：总架构</a>
+    <a href="03-megatron-tp.html">下一步：Megatron 张量并行 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 02 3D 并行 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

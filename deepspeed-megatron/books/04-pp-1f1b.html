@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · 流水线并行 1F1B — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a class="active" href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 流水线并行</div>
+    <h1>流水线并行：1F1B 调度怎么排</h1>
+    <div class="subtitle">PP 把模型按层切成阶段，各阶段占一张（组）卡。朴素的 GPipe 填满后再统一反传，激活显存随 microbatch 数线性涨；1F1B（one-forward-one-backward）改成「做一次前向就做一次反向」，激活只与阶段数相关。这一章同时看 Megatron 的实现和 DeepSpeed pipe 的另一条路——显式命令列表。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>一分钟版本</h2>
+    <p>PP 的核心矛盾：microbatch 越多吞吐越高，但每个 in-flight 的 microbatch 都要在每个阶段留一份激活。</p>
+    <ul>
+      <li><strong>GPipe</strong>：全部前向 → 全部反向。激活 = microbatches × stages 内激活量，microbatch 一多显存爆。</li>
+      <li><strong>1F1B</strong>：warmup 阶段先堆若干前向，之后<strong>严格一前一后交替</strong>。in-flight 数被钉在 stages − stage_id − 1，显存只跟阶段位置相关，microbatch 数随便加。</li>
+      <li><strong>Interleaved（虚拟流水线）</strong>：一张卡拿多个不连续的层段（virtual model chunks），进一步把气泡砍半，代价是通信次数变多。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">气泡公式</b>
+      1F1B 的空闲率 ≈ (pp − 1) / (num_microbatches + pp − 1)。pp=8、microbatch=32 时约 18%；pp=8、microbatch=8 时 47%——所以 PP 必须配大 microbatch，而 microbatch×DP 又决定全局 batch，三者的耦合在 2.5 节的选型表里。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>用代码看｜warmup 步数从哪来</h2>
+    <div class="code-title">megatron/core/pipeline_parallel/schedules.py — forward_backward_pipelining_without_interleaving（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># warmup 步数：越靠后的阶段 warmup 越少（最后一个阶段 0 步，直接 F1B1）</span>
+num_warmup_microbatches = p2p_communicator.total_stages - p2p_communicator.current_stage - <span class="nu">1</span>
+num_warmup_microbatches = <span class="fn">min</span>(num_warmup_microbatches, num_microbatches)
+
+<span class="cmt"># warmup：只做前向，发激活给下一阶段</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(num_warmup_microbatches):
+    input_tensor = <span class="fn">recv_forward</span>(...)
+    output_tensor = forward_step(input_tensor, model_chunk, ...)
+    <span class="fn">send_forward</span>(output_tensor, ...)
+
+<span class="cmt"># steady：1F1B——前向发出后立刻收反向梯度</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(num_microbatches - num_warmup_microbatches):
+    <span class="kw">if</span> forward_only:
+        input_tensor, output_tensor = forward_step_with_...
+    <span class="kw">else</span>:
+        output_tensor_grad = <span class="fn">recv_backward</span>(...)      <span class="cmt"># 先挂上反向的接收</span>
+        input_tensor, output_tensor = forward_step(...)
+        <span class="fn">send_forward</span>(output_tensor, ...)
+        <span class="fn">send_backward</span>(input_tensor_grad, ...)
+        <span class="fn">recv_backward</span>(...)
+
+<span class="cmt"># cooldown：剩下的全是反向</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(num_warmup_microbatches):
+    output_tensor_grad = <span class="fn">recv_backward</span>(...)
+    input_tensor_grad = backward_step(...)
+    <span class="fn">send_backward</span>(input_tensor_grad, ...)</pre>
+    <div class="annotation"><b>三段式结构：</b>warmup（堆前向）→ steady（F/B 交替）→ cooldown（清反向）。代码里最值得注意的是 steady 段的<strong>收发配对顺序</strong>：<code class="inline">recv_backward</code> 先挂上异步接收，前向算完立刻 <code class="inline">send_forward + send_backward + recv_backward</code>，让相邻阶段的通信全部异步飞着。另一个细节：<code class="inline">enable_grad_sync</code> 只在<strong>最后一个 microbatch</strong> 打开——梯度 all-reduce 不必每个 microbatch 都做，攒到最后一次即可（配合 DDP 的 grad buffer，第 7 章展开）。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t41 d41">
+        <title id="t41">四阶段 1F1B 时序</title>
+        <desc id="d41">四个阶段（stage0 到 stage3）在时间轴上各排一列格子。stage3 最先结束 warmup；stage0 warmup 4 步后进入 1F1B 交替；整体呈斜纹图案，尾部是 cooldown 的反向块。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="90" y="50" text-anchor="middle" font-weight="bold">stage0（第 1 层段）</text>
+        <text class="lbl" x="290" y="30" text-anchor="middle" font-weight="bold">stage1</text>
+        <text class="lbl" x="490" y="30" text-anchor="middle" font-weight="bold">stage2</text>
+        <text class="lbl" x="690" y="30" text-anchor="middle" font-weight="bold">stage3（最后）</text>
+
+        <g>
+          <rect class="node" x="20" y="44" width="140" height="34" rx="4" fill="#f3ddd8"></rect>
+          <text class="lbl sm" x="90" y="65" text-anchor="middle">F0 F1 F2 F3（warmup）</text>
+          <rect class="node" x="162" y="44" width="90" height="34" rx="4"></rect>
+          <text class="lbl sm" x="207" y="65" text-anchor="middle">B0</text>
+          <rect class="node" x="254" y="44" width="90" height="34" rx="4"></rect>
+          <text class="lbl sm" x="299" y="65" text-anchor="middle">B1</text>
+        </g>
+
+        <g>
+          <rect class="node" x="120" y="84" width="70" height="34" rx="4" fill="#f3ddd8"></rect>
+          <text class="lbl sm" x="145" y="105" text-anchor="middle">F4</text>
+          <rect class="node" x="290" y="84" width="70" height="34" rx="4" fill="#f3ddd8"></rect>
+          <text class="lbl sm" x="335" y="105" text-anchor="middle">F0..F2</text>
+          <rect class="node" x="382" y="84" width="70" height="34" rx="4"></rect>
+          <text class="lbl sm" x="417" y="105" text-anchor="middle">B0</text>
+        </g>
+
+        <text class="lbl sm" x="20" y="150">in-flight 上限 = stages − stage_id − 1（stage0 最多 3 个未清反向的激活，stage3 恒为 0）</text>
+        <text class="lbl sm" x="20" y="172">气泡集中在首尾：stage0 开头等数据、stage3 结尾等梯度；中段满载</text>
+
+        <rect class="node" x="20" y="200" width="900" height="2" rx="1" fill="none" stroke="none"></rect>
+        <text class="lbl sm" x="20" y="220" fill="#8f2d2d" font-weight="bold">公式：num_warmup = stages − stage_id − 1 → 每阶段的激活峰值只由「自己在流水线里的位置」决定，与 microbatch 总数无关</text>
+        <text class="lbl sm" x="20" y="244">对比 GPipe：全部 F 再全部 B，每个 microbatch 在每个阶段都留激活 → 显存 = microbatches × 阶段激活量</text>
+        <text class="lbl sm" x="20" y="266">1F1B：显存 = (stages − stage_id) × 阶段激活量，且首阶段最大、末阶段最小——天然不均衡，正好配合 PP 的负载分配</text>
+      </svg>
+      <div class="fig-cap">图 4.1：1F1B 的斜纹时序。格子里的 F0..Fn / B0..Bn 是 microbatch 编号；同一列（同一张卡）上 F 与 B 交替出现。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>Interleaved：一张卡跑多个不连续段</h2>
+    <p>1F1B 的气泡仍与 pp−1 成正比。Interleaved 让每张卡持有 <code class="inline">virtual_pipeline_model_parallel_size</code> 个<strong>互不相邻</strong>的层段（如 8 卡 32 层，每卡拿第 0、4、8、12 层那段和第 2、6、10、14 层那段），阶段逻辑数翻倍、每段更薄，气泡近似减半：</p>
+    <div class="code-title">megatron/core/pipeline_parallel/schedules.py — forward_backward_pipelining_with_interleaving（结构摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 两个约束：模型块数必须是流水线阶段数的整数倍</span>
+<span class="kw">assert</span> model_parallel_size % pipeline_parallel_size == <span class="nu">0</span>
+<span class="cmt"># 且 num_microbatches 必须是 pp 的整数倍——否则斜纹排不齐</span>
+<span class="kw">if</span> num_microbatches == pipeline_parallel_size:
+    chunk_and_microbatch_id = ...
+
+<span class="cmt"># 同一时刻一张卡上多个 chunk 交替 F/B；通信对象不再只是相邻阶段</span>
+<span class="cmt"># （本卡 chunk0 的下一阶段可能在别的卡上 chunk1）→ p2p 通信对数成倍增加</span>
+<span class="kw">for</span> k <span class="kw">in</span> <span class="fn">range</span>(num_model_chunks):
+    input_tensor, output_tensor = ...</pre>
+    <div class="annotation"><b>trade-off：</b>气泡从 (pp−1)/(m+pp−1) 降到约 (pp−1)/(2·v·m) 量级（v = virtual size），但 p2p 消息次数 ×v——小消息多了，带宽便宜延迟贵的机器（跨机网线）反而变慢。所以 interleaved 通常只在<strong>机内 TP 大、跨机 PP 小</strong>的拓扑下收益为正。这也是为什么默认配置不开。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>DeepSpeed pipe：把调度写成命令列表</h2>
+    <p>DeepSpeed 的 pipe 引擎走了另一条路：不把 F/B 糅在循环里，而是先<strong>生成一张显式命令表</strong>，再逐条执行。用户可以自定义调度（继承 PipeSchedule 重写 steps()）：</p>
+    <div class="code-title">deepspeed/runtime/pipe/schedule.py — TrainSchedule.steps()（结构摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">steps</span>(self):
+    <span class="cmt"># 与 Megatron 同样的 warmup 公式</span>
+    <span class="kw">for</span> step_id <span class="kw">in</span> <span class="fn">range</span>(self.total_steps()):
+        cmd = self.<span class="fn">_valid_micro_batch</span>(prev_micro_batch_id)  <span class="cmt"># …</span>
+        <span class="kw">yield</span> <span class="fn">LoadMicroBatch</span>(prev_micro_batch_id)
+        <span class="kw">yield</span> <span class="fn">RecvActivation</span>()          <span class="cmt"># 非首阶段</span>
+        <span class="kw">yield</span> ForwardPass()
+        <span class="kw">yield</span> <span class="fn">SendActivation</span>()          <span class="cmt"># 非末阶段</span>
+        <span class="kw">yield</span> <span class="fn">BackwardPass</span>()            <span class="cmt"># warmup 结束后</span>
+        <span class="kw">yield</span> SendGrad() / RecvGrad()   <span class="cmt"># 对应方向</span>
+    <span class="cmt"># 收尾：ReduceTiedGrads / ReduceGrads / OptimizerStep 由引擎统一追加</span></pre>
+    <div class="annotation"><b>两种调度哲学：</b>Megatron 把 1F1B 写死在 forward_backward_func 里（性能路径，不可换）；DeepSpeed 把它抽象成命令序列（可读、可换，引擎逐条解释执行）。DeepSpeed 还有 <code class="inline">num_pipe_buffers = max(2, min(stages − stage_id, micro_batches))</code>——每阶段只需这么多个缓冲区来接力。代价是抽象层开销与功能边界：DS pipe <strong>不支持 ZeRO-2/3</strong>（engine.py 的 assert <code class="inline">zero_optimization_stage() &lt; ZeroStageEnum.gradients</code>），所以真要把 PP 和 ZeRO-3 组合，得走 Megatron 主导的 MCore-DeepSpeed 路线（第 1 章 1.5 节的模式 C）。</div>
+    <div class="callout info">
+      <b class="tag">数据对比</b>
+      同样是 1F1B，Megatron 的 schedules.py 约 2500 行（含 interleaved、只前向、CP 融合等全部分支），DS 的 schedule.py 约 500 行。前者是生产主路径，后者是教学友好的参考实现——读懂后者，前者只是多了工程细节。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>维度</th><th>Megatron 1F1B</th><th>DeepSpeed pipe TrainSchedule</th></tr>
+      <tr><td>调度表达</td><td>过程式循环，写死在 schedule 函数</td><td>yield 命令流，可自定义</td></tr>
+      <tr><td>通信时机</td><td>recv 先行 + async send，通信藏在 F/B 步内</td><td>命令显式列出 Send/Recv</td></tr><tr><td>梯度同步</td><td>最后一个 microbatch 才开 grad_sync</td><td>ReduceGrads 命令统一收尾</td></tr>
+      <tr><td>虚拟流水线</td><td>支持（interleaved）</td><td>不支持</td></tr>
+      <tr><td>ZeRO 兼容</td><td>配合 DistributedOptimizer（ZeRO-1 等价）</td><td>仅 ZeRO-0/1</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 PP 的最小正确路径：先实现 <strong>GPipe（保证数值对）</strong>，再改成 1F1B（保证显存），warmup 公式照抄 <code class="inline">stages − 1 − stage_id</code>。最容易错的两点：① p2p 通信必须<strong>非阻塞</strong>且 recv 先于 send 挂起，否则相邻阶段互相等待直接死锁；② 梯度对 <code class="inline">input_tensor</code> 的反向要 <code class="inline">retain_graph=False</code> 且 activation 只保留 in-flight 那几个——测试方法是同一 batch 分别用 GPipe 和 1F1B 跑，逐 step 比对 loss 与梯度范数。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="03-megatron-tp.html">← 上一步：Megatron TP</a>
+    <a href="05-megatron-model.html">下一步：模型与数据 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 04 流水线 1F1B · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

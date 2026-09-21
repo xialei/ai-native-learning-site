@@ -180,10 +180,14 @@ createAllToolDefinitions(cwd, options)</code></pre>
       <li><strong><code class="inline">/thinking</code> 命令</strong>：slash 命令表里新增 <code class="inline">{ name: "thinking", argumentHint: "&lt;level&gt;" }</code>，让用户直接切思考级别（档位 <code class="inline">off/minimal/low/medium/high/xhigh/max</code>，即 <code class="inline">THINKING_LEVEL_OPTIONS</code>）。它最终调用第 8 章的 <code class="inline">setThinkingLevel()</code>。</li>
       <li><strong>模型 / 思考级别改默认「会话级」</strong>：切模型或调思考级别时，<code class="inline">setModel</code> / <code class="inline">setThinkingLevel</code> 现在带一个 <code class="inline">{ persist?: boolean }</code> 选项。默认 <strong>只写进当前会话的 transcript</strong>、不动全局默认；只有显式持久化（如 <kbd>Ctrl+S</kbd>）才写回 <code class="inline">settings</code>。这把「我这次想用别的模型」与「以后都用这个模型」分开了——临时实验不再污染全局配置。</li>
       <li><strong>压缩用量提示（compaction cost）</strong>：压缩和分支摘要会消耗 token，TUI 现在把这条用量从 transcript 里抽出来，渲染成 <code class="inline">compaction_cost</code> 提示行，让用户看见「这次压缩花了多少」。这是第 6 章那条「压缩有 usage」在交互层上的可见化。</li>
+      <li><strong>prompt cache 保温（cache warming）</strong>：provider 的 prompt cache 条目闲置一段时间就过期，暂停后再发请求要重付全价输入。生产层为此装了一个 <code class="inline">CacheWarmer</code>（<code class="inline">core/cache-warmer.ts</code>）：真实请求发出后，在缓存条目到期前（取该模型 <code class="inline">promptCache</code> 画像上对应档位的存活时长，90% 处刷新并留 10 秒余量）把<strong>同一个请求重发一遍，但 <code class="inline">maxTokens: 1</code></strong>——上下文原样进来，只吐一个 token，钱花在缓存读上，条目就续上了。发不发由一笔账决定：<code class="inline">continuationProbability × missCost − warmCost ≥ $0.05</code> 才值得保温（运行中概率算 1，空闲时用实测常数 0.15）。模式三档 <code class="inline">off/streaming/idle</code>，默认 <code class="inline">streaming</code>（agent 运行期间保温、结算即停；<code class="inline">idle</code> 连空闲时也续，30 分钟封顶）。每次成功刷新落成一条 <code class="inline">{ type: "usage", kind: "cache_warm" }</code> 会话条目——计入 token 与费用总额，但不进模型上下文。扩展可在 <code class="inline">cache_warming_decision</code> 事件上改判（最后说话的算数），<code class="inline">/session</code> 能看到下一次决策与账目。第 10 章的 <code class="inline">Model.promptCache</code> 画像（10.2 节）就是这条策略的前提：没填存活时长的模型一律不保温。还有个容易漏的反直觉细节：定时器可能因系统休眠或事件循环阻塞而<strong>晚点</strong>——条目可能已经过期了。此时刷新不再是「保温」而是<strong>全价的缓存写</strong>，比不刷还亏。所以每次刷新前查一道 <code class="inline">refreshDeadlineAt</code>（计划时刻 + 剩余 TTL 的一半）：迟到过头就干脆停掉，别花冤枉钱。</li>
       <li><strong>会话共享改走 Radius</strong>：<code class="inline">/share</code> 不再只靠 gist，而是优先通过 Radius provider 上传成 artifact、拿回 <code class="inline">canonical_url</code>。未登录 Radius 时退回 gist。共享链路与鉴权也收敛进 AI 层的 provider 体系，而不是另起一套。共享内容也不再只是消息流水：导出时会追加一条 <code class="inline">pi.share</code> 自定义条目，把当时的 <code class="inline">systemPrompt</code> 与工具清单（名称/描述/参数）一并带上，让接收方看到 Agent 运行时的完整上下文。</li>
     </ul>
     <div class="callout">
-      <strong>共同模式：</strong>这几项都遵循「<strong>内核不动，外壳做策略</strong>」——<code class="inline">/thinking</code> 只是 <code class="inline">setThinkingLevel</code> 的入口；会话级持久化靠 <code class="inline">persist</code> 选项分流；压缩提示复用 transcript 里已有的 <code class="inline">usage</code>；共享复用 Radius provider。这正是分层架构的红利：产品迭代可以很快，因为不必每次都下沉到内核。
+      <strong>共同模式：</strong>这几项都遵循「<strong>内核不动，外壳做策略</strong>」——<code class="inline">/thinking</code> 只是 <code class="inline">setThinkingLevel</code> 的入口；会话级持久化靠 <code class="inline">persist</code> 选项分流；压缩提示复用 transcript 里已有的 <code class="inline">usage</code>；共享复用 Radius provider；缓存保温则把「这条缓存值不值得续」做成扩展可改判的事件。这正是分层架构的红利：产品迭代可以很快，因为不必每次都下沉到内核。
+    </div>
+    <div class="callout">
+      <strong>扩展 API 顺带补两个后来长出来的点：</strong><code class="inline">pi.on()</code> 现在返回<strong>退订函数</strong>——事件处理器可以随用随拆，与 <code class="inline">unregisterProvider</code> 之类的注销 API 一起补全扩展的生命周期；另外，<strong>在事件分发过程中增删处理器是安全的</strong>（分发前拍快照，变更只影响下一次分发），不会碰到「边遍历边改」的经典坑。
     </div>
   </section>
 
@@ -214,7 +218,7 @@ createAllToolDefinitions(cwd, options)</code></pre>
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 11 编码 Agent（组装成产品） · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 11 编码 Agent（组装成产品） · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

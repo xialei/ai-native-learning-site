@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · ZeRO 1/2 与 Megatron 分布式优化器 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a class="active" href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 ZeRO 1/2</div>
+    <h1>ZeRO 1/2 与 Megatron 分布式优化器：同一思想的两个实现</h1>
+    <div class="subtitle">第 6 章的账本说优化器状态占 12B/参数。ZeRO-1 的主张：每个 DP 副本的优化器状态一模一样，那为什么要存 N 份？切成 N 份，各存一份。本章看 DeepSpeed 的实现（stage_1_and_2.py）与 Megatron 的独立实现（DistributedOptimizer）——两者是同一思想在不同库里的平行宇宙。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>一分钟版本</h2>
+    <ul>
+      <li><strong>ZeRO-1</strong>：优化器状态（fp32 master + m + v，12B/参数）按 DP 组分片。每卡只更新自己那片参数的 master/m/v，更新完 all-gather 同步新参数。</li>
+      <li><strong>ZeRO-2</strong>：再加一条——反向传播时每个参数的梯度最终只需要在<strong>负责它的那张卡</strong>上存在，其他卡的副本归约完即可丢弃 → 梯度也分片（reduce-scatter 代替 all-reduce）。</li>
+      <li><strong>Megatron DistributedOptimizer</strong>：不叫 ZeRO，但等价于 ZeRO-1——fp32 主参数和梯度缓冲按 DP 分片，蓝图是「bucket + range map」。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">为什么 ZeRO-2 止步于此</b>
+      参数不能像梯度那样「归约完就丢」——前向每一步都要用全部参数。参数分片意味着每次前向都要现场拼装（fetch），这就是 ZeRO-3，第 8 章专门讲它的代价与工程。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>用代码看｜DeepSpeed 的分桶与归约</h2>
+    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — DeepSpeedZeroOptimizer（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 梯度分桶：contiguous_gradients 开启时，梯度拷进一块连续 fp16 缓冲</span>
+<span class="cmt"># bucket 内按参数梯度到达顺序填充；满一块即触发一次 reduce</span>
+<span class="kw">def</span> <span class="fn">reduce_ready_partitions</span>(self, param, check_event=False):
+    <span class="kw">if</span> self.<span class="fn">contiguous_gradients</span> and self.<span class="fn">overlap_comm</span>:
+        <span class="cmt"># IPG bucket：梯度一就绪就拷进 bucket，异步归约</span>
+        self.ipg_buffer ...
+
+<span class="cmt"># 归约入口（engine._backward_epilogue 调用链）</span>
+<span class="kw">def</span> <span class="fn">reduce_gradients</span>(self, pipeline_parallel=False):
+    <span class="kw">if</span> self.<span class="fn">overlap_comm</span>:
+        self.<span class="fn">reduce_ready_partitions</span>(...)   <span class="cmt"># 边算边归</span>
+    <span class="kw">else</span>:
+        <span class="kw">for</span> group <span class="kw">in</span> self.bit16_groups:
+            self.<span class="fn">averaging</span>(...)             <span class="cmt"># 一口气全归</span></pre>
+    <div class="annotation"><b>读懂 IPG：</b>IPG = Independent Parallel Gradients。核心机制是把「全部 backward 结束后统一归约」改成「某个 bucket 的梯度齐了就立刻归约」——归约通信与后续层级的反向计算重叠。三个关键配置：<code class="inline">contiguous_gradients</code>（连续缓冲减少碎片）、<code class="inline">overlap_comm</code>（异步）、<code class="inline">reduce_bucket_size</code>（桶大小，KB 级调优空间）。bucket 满即触发，这是显存换通信节奏的标准手段。</div>
+
+    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — 优化器步进（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">independent_gradient_partition_epilogue</span>(self):
+    <span class="cmt"># ① 清理已归约分区的 fp16 梯度（ZeRO-2：非本卡的分区直接释放）</span>
+    self.<span class="fn">release_reduced_gradients</span>()
+    <span class="cmt"># ② 溢出检查（任一卡 NaN → 全组跳过本 step）</span>
+    <span class="kw">if</span> self.<span class="fn">overflow_sanitizer</span>(): ...
+    <span class="cmt"># ③ 只对本卡负责的分区做 optimizer.step</span>
+    <span class="kw">for</span> sub_group <span class="kw">in</span> self.<span class="fn">updated_params</span>():
+        <span class="kw">return</span> self.<span class="fn">step_with_ready_parameters</span>(sub_group)</pre>
+    <div class="annotation"><b>step 的分片语义：</b>epilogue 三步就是 ZeRO-1/2 的全部分区语义在 step 时刻的体现：释放非本卡梯度（省显存）、溢出检查（任何一卡溢出则全体跳过，保持副本一致）、只 step 本卡分区。<strong>master 权重（fp32）在这里按分区持有</strong>——本卡分区更新后，用 all-gather 把新参数广播回各卡的 fp16 副本。这一切对用户透明，engine.step() 内部完成。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>用代码看｜Megatron DistributedOptimizer</h2>
+    <p>Megatron 不用 DeepSpeed 的 ZeRO，但实现了一个等价物。核心数据结构是「主缓冲 + range map」：</p>
+    <div class="code-title">megatron/core/optimizer/distrib_optimizer.py — _build_model_gbuf_param_range_map（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每 (DP rank, buffer, bucket) 一张 range map：描述「本卡负责哪些参数」</span>
+<span class="kw">def</span> <span class="fn">_build_model_gbuf_param_range_map</span>(self, gbuf_world, gbuf_world_start, gbuf_world_end):
+    <span class="cmt"># gbuf_world：全局梯度缓冲的视角；gbuf_local：本卡的窗口</span>
+    <span class="kw">return</span> {
+        <span class="st">"gbuf_world"</span> : gbuf_world,              <span class="cmt"># 全局缓冲引用</span>
+        <span class="st">"gbuf_world_start"</span> : gbuf_world_start,  <span class="cmt"># 本卡分片的起点（全局坐标）</span>
+        <span class="st">"gbuf_world_end"</span> : ...,                  <span class="cmt"># 终点</span>
+        <span class="st">"gbuf_local"</span> : ...,                     <span class="cmt"># 换算成局部坐标</span>
+        <span class="st">"param_range_list"</span> : ...,                <span class="cmt"># 本卡窗口内的参数列表</span>
+    }</pre>
+    <div class="annotation"><b>读懂 range map：</b>每个参数在世界缓冲（gbuf world）里有一个位置区间；DP 组把世界缓冲均分成 N 份，每张卡持有其中一份的<strong>fp32 拷贝</strong>。归约时用 reduce-scatter 直接把每份梯度送进负责卡的窗口，不需要「先 all-reduce 再分片」。优化器只对窗口内的参数做 step。这套映射支撑了另一个重要功能：<code class="inline">checkpoint_fully_reshardable_formats</code>——保存的 checkpoint 可以被<strong>任意 DP 规模</strong>加载（第 12 章）。</div>
+
+    <div class="code-title">megatron/core/distributed/param_and_grad_buffer.py — _ParamAndGradBuffer（结构摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 参数与梯度各一块平坦缓冲；参数按 bucket_size 打包成 bucket</span>
+<span class="kw">class</span> <span class="cl">_ParamAndGradBuffer</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, ddp_config, params, data_parallel_group, bucket_size, ...):
+        self.param_data = ...        <span class="cmt"># fp32 主参数缓冲（DistributedOptimizer 时）</span>
+        self.grad_data = ...         <span class="cmt"># 梯度缓冲</span>
+        <span class="cmt"># 每个参数记录自己在缓冲里的 offset——梯度直接累加进缓冲对应位置</span>
+        param.main_grad = self.<span class="fn">_get</span>(self.grad_data, param.grad_added_to_main_grad, ...)</pre>
+    <div class="annotation"><b>main_grad 在这里落地：</b>第 3 章的 gradient_accumulation_fusion 把 wgrad 直接写进 main_grad；这里的代码是 main_grad 的<strong>分配处</strong>——每个参数的 main_grad 是缓冲里的一个视图（view），不是独立张量。DDP hook 把 param.grad 累进 main_grad，<code class="inline">zero_grad_buffer()</code>（train_step 的第一步）就是把这块缓冲清零。bucket 的边界按参数顺序切，边界参数会被 padding 对齐——这也是 checkpoint 布局的由来。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>两库对打：同一思想的差异清单</h2>
+    <table class="tbl">
+      <tr><th>维度</th><th>DeepSpeed ZeRO-1/2</th><th>Megatron DistributedOptimizer</th></tr>
+      <tr><td>分片对象</td><td>fp32 master + m/v（按参数分组）</td><td>fp32 主参数 + 梯度缓冲（按平坦缓冲窗口）</td></tr>
+      <tr><td>梯度归约</td><td>IPG bucket 异步 reduce</td><td>reduce-scatter 直达窗口</td></tr>
+      <tr><td>fp16 梯度</td><td>ZeRO-2 分片（非本卡释放）</td><td>始终全量（在 grad_data 缓冲）</td></tr>
+      <tr><td>与 PP/EP 关系</td><td>DS pipe 不兼容（第 4 章）</td><td>原生配合（train_step 全链路）</td></tr>
+      <tr><td>与 ZeRO-2 差异</td><td>——</td><td>更接近 ZeRO-1 + fp32 梯度缓冲（省 fp16→fp32 拷贝）</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">场景判断</b>
+      用 DS 主导的代码库（hf transformers + accelerate），ZeRO-2 是默认起点；用 Megatron 主导的训练栈，DistributedOptimizer 几乎总是开着（<code class="inline">use_distributed_optimizer</code>）。两者不要混用——Megatron 的 mpu 插头传给 DS 后，两套优化器状态会重复。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>loss scale：fp16 训练的最后一环</h2>
+    <div class="code-title">megatron/core/optimizer/__init__.py — scaler 选择（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># _get_optimizer_config_solver 附近：fp16 → DynamicLossScaler</span>
+<span class="kw">if</span> config.bf16:
+    <span class="kw">return</span> <span class="kw">None</span>                          <span class="cmt"># bf16 不需要缩放（指数位足够）</span>
+<span class="kw">elif</span> config.fp16:
+    <span class="kw">return</span> DynamicLossScaler(
+        initial_scale=...,
+        min_scale=...,
+        growth_interval=...,             <span class="cmt"># 连续多少 step 无溢出则 scale 翻倍</span>
+        hysteresis=...,                  <span class="cmt"># 溢出后回退几档，防止反复抖动</span>
+    )</pre>
+    <div class="annotation"><b>bf16 与 fp16 的分水岭：</b>bf16 指数位与 fp32 相同，动态范围够，<strong>不需要 loss scale</strong>；fp16 尾数位多但指数位窄，小梯度下溢 → 需要动态缩放。DS 与 Megatron 的 scaler 语义一致（growth_interval + 溢出回退 + hysteresis），DS 的配置键是 <code class="inline">loss_scale_window</code>/min_loss_scale。自研时如果只支持 bf16，可以直接跳过整个 scaler 模块——这是现代训练栈大幅简化的根源之一。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.6</span>小结 + 自研启示</h2>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 ZeRO-1 的最小正确路径：① 把 optimizer 状态（master/m/v）按 DP rank 分片——改动只在 optimizer.step 里，模型/梯度代码零改动，这就是为什么 ZeRO-1 是性价比之王；② step 后 all-gather 同步参数；③ 溢出检查用 <code class="inline">torch.isinf/isnan</code> 的 all-reduce（一票否决）。最容易错的三点：master 权重更新后忘记 all-gather（各副本参数漂移）、all-gather 用了错误的 group（DP group 而不是全局）、初始 lr 预热算在分片 optimizer 的 step 计数上（应算全局 step）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="06-deepspeed-engine.html">← 上一步：DS 引擎</a>
+    <a href="08-zero3.html">下一步：ZeRO-3 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 07 ZeRO 1/2 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

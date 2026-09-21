@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · MoE — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a class="active" href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 13 MoE</div>
+    <h1>MoE：专家并行与 token 的往返</h1>
+    <div class="subtitle">MoE 把 FFN 换成 N 个专家、每个 token 只走 top-k 个。参数量乘 N、计算量不变——但前提是 token 能被送到专家所在的卡上。这一章看 Megatron 的四段流水（route→dispatch→compute→combine）与三种 token dispatcher 家族，以及 DeepSpeed 的另一条路（residual MoE + Tutel）。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">13.1</span>一分钟版本</h2>
+    <p>MoE 层的一个 token 的旅程：</p>
+    <ol>
+      <li><strong>route</strong>：router（一个小线性层 + softmax）给每个 token 算出 N 个专家的得分，选 top-k。</li>
+      <li><strong>dispatch</strong>：token 按目的地重排（permute），跨卡发送到专家所在 rank（all-to-all）。</li>
+      <li><strong>compute</strong>：各专家在自己的卡上处理分到的 token（就是普通 MLP，EP 内部还可以再 TP）。</li>
+      <li><strong>combine</strong>：结果按原位重排（unpermute）送回，与 k 个专家的输出加权求和。</li>
+    </ol>
+    <div class="callout info">
+      <b class="tag">EP 与 DP 的纠缠</b>
+      专家是「参数的另一种切法」：普通 FFN 参数每个 DP 副本都有一份，专家参数被 EP 组瓜分。EP 组通常取自 DP 组（num_experts ≤ DP×EP），所以 MoE 训练里「DP 卡」同时是「EP 卡」——token 的 all-to-all 和数据的 DP 归约共享同一批卡，带宽预算要一起算。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.2</span>用代码看｜MoELayer 的四段流水</h2>
+    <div class="code-title">megatron/core/transformer/moe/moe_layer.py — MoELayer.forward（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states):
+    <span class="cmt"># ① route：router 打分 + top-k 选择 → probs + routing_map</span>
+    scores, routing_map = self.router(hidden_states)
+    <span class="cmt"># ② dispatch：按专家重排 token，跨卡 all-to-all（dispatcher 多态）</span>
+    dispatched, tokens_per_expert = self.token_dispatcher.<span class="fn">token_permutation</span>(
+        hidden_states, scores, routing_map)
+    <span class="cmt"># ③ compute：各专家自己的 MLP（专家内部可再 TP）</span>
+    expert_output, mlp_bias = self.experts(dispatched, tokens_per_expert)
+    <span class="cmt"># ④ combine：unpermute + 加权合并 + all-to-all 回程</span>
+    output, mlp_bias = self.token_dispatcher.<span class="fn">token_unpermutation</span>(expert_output, mlp_bias)
+    <span class="kw">return</span> output, mlp_bias</pre>
+    <div class="annotation"><b>命名约定值得记：</b>router 的输出链是 <code class="inline">logits → scores（softmax 后）→ probs（top-k 后归一）→ routing_map（bool：谁去哪）</code>——读 MoE 源码时抓住这四个名字就不迷路。② 与 ④ 是一对（permute/unpermute），dispatcher 决定它们的实现。aux loss（负载均衡）在 router 里算、加进总 loss，不在这四段里。</div>
+
+    <div class="code-title">megatron/core/transformer/moe/router.py — TopKRouter（结构摘录，译注）</div>
+    <pre class="code"><span class="kw">class</span> <span class="cl">TopKRouter</span>(...):
+    <span class="cmt"># 三种 aux loss（可叠加）：负载均衡 / 路由器 z-loss / 专家间方差</span>
+    <span class="kw">def</span> <span class="fn">routing</span>(self, logits):
+        scores = softmax(logits)              <span class="cmt"># 全专家概率</span>
+        <span class="cmt"># top-k 选择（带/不带 renormalize 两种）</span>
+        probs, routing_map = topk_softmax_with_capacity(
+            logits, topk, ..., capacity_factor, ...)   <span class="cmt"># 容量限制在此</span>
+        <span class="cmt"># aux loss 用「无 topk 的 scores」算——这是与主梯度不同的信号</span>
+        self.apply_load_balancing_loss(scores, ...)   <span class="cmt"># save_to_aux_losses_tracker</span></pre>
+    <div class="annotation"><b>aux loss 的语义：</b>负载均衡 loss 惩罚「专家间分配不均」——没有它，router 会早期锁死少数专家（富者愈富），其他专家永远得不到训练。注意代码细节：aux 用<strong>未截断的 scores</strong>（即使某 token 因容量限制没被派去那个专家，均衡信号仍然传递）。<code class="inline">capacity_factor</code> 是另一个正交机制：给每个专家设 token 容量上限，超出的 token 丢弃（或走 residual）——它是通信量与训练质量之间的旋钮。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.3</span>三种 token dispatcher 家族</h2>
+    <table class="tbl">
+      <tr><th>Dispatcher</th><th>机制</th><th>适用</th></tr>
+      <tr><td>AllGather</td><td>先 all-gather 全部 token，本地算完自己的专家再 reduce-scatter 回去</td><td>EP=1（专家不跨卡）或小规模</td></tr>
+      <tr><td>AlltoAll</td><td>token 按目的地跨卡精确发送（两跳：进专家、出结果）</td><td>标准 EP，生产默认</td></tr>
+      <tr><td>FlexDispatcher</td><td>融合 permute 与通信的优化实现（按后端选择）</td><td>大规模 + 特定硬件栈</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">通信形状</b>
+      AlltoAll 的通信量 = 每 token 发往 EP 组内其他卡的部分（top-k 决定）。它与 TP 的 all-reduce 不同：<strong>没有求和语义</strong>，纯路由——所以无法像 RS/AG 那样与 SP 合并。MoE + TP 时 Megatron 强制开 SP（第 3 章图 3.2 的注），就是为了把 token 路由与激活切分解耦。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.4</span>用代码看｜DeepSpeed 的 MoE 与 Tutel</h2>
+    <div class="code-title">deepspeed/moe/layer.py — MoE 类（docstring 摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">MoE</span>(torch.nn.Module):
+    <span class="st">"""    MoE(MLP): capacity_factor=1.0, top_k=1, ...
+        hidden_size, expert_repo_size, ...
+        noisy_gate_policy: 'Jitter' | 'RSample' | 'None'
+        use_tutel: 是否用 Tutel 的 all-to-all 优化实现"""</span>
+    <span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states):
+        <span class="cmt"># gate 打分 → expert 计算或 residual 分支</span>
+        <span class="kw">if</span> self.use_residual:
+            <span class="cmt"># residual MoE：输出 = 原始 FFN + 专家修正项（DeepSpeed 特色）</span>
+            output_mlp = self.deepspeed_moe(hidden_states)
+            ...</pre>
+    <div class="annotation"><b>两条特色路线：</b>① <strong>residual MoE</strong>——不是替换 FFN，而是在普通 FFN 之上并联一个「专家修正」分支，token 用不完的容量走原路径，对「先训 dense 再改 MoE」的迁移场景友好；② <strong>Tutel</strong>——微软的 all-to-all 优化库（自适应分块、与计算重叠的调度），<code class="inline">use_tutel: true</code> 一键切换。DS 的 noisy_gate_policy（Jitter/RSample）是 router 的噪声注入策略，与 Megatron 的 aux loss 是「鼓励探索」的两种手段。另有 top2_2nd_expert_sampling 之类的实现细节开关，属于复现论文行为用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.5</span>两库对打 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>维度</th><th>Megatron MoE</th><th>DeepSpeed MoE</th></tr>
+      <tr><td>架构定位</td><td>专家是模型内的一等公民（experts 层）</td><td>MoE 是可插拔模块（包一层 MLP）</td></tr>
+      <tr><td>dispatcher</td><td>AllGather / AlltoAll / Flex 三族</td><td>标准 all-to-all + Tutel 加速</td></tr>
+      <tr><td>特色机制</td><td>aux loss 家族 + 容量因子 + EP×TP 组合</td><td>residual MoE + noisy gate + Tutel</td></tr>
+      <tr><td>与并行栈关系</td><td>EP 与 3D 并行完整正交（rank 布局见第 2 章）</td><td>独立于 Megatron 布局（mpu 插头接入）</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 MoE 的最小正确路径：① 先做 <strong>EP=1 的本地 MoE</strong>（router + top-k + 按专家分组 GEMM），验证 aux loss 收敛行为；② 再上 all-to-all dispatch（dispatch 的正确性测试：EP=1 与 EP=2 在相同 seed 下输出应一致）；③ 容量因子最后加——它引入「丢 token」的非确定性，调试期关掉。最容易错的三点：unpermute 时 k 个专家输出的加权顺序错了（静默数值错误）、aux loss 忘了乘 aux_loss_coeff 就加进主损失（量级失衡）、EP 组 rank 计算复用 DP group（token 发错卡）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="12-checkpoint-io.html">← 上一步：Checkpoint</a>
+    <a href="14-build-own-trainer.html">下一步：自研 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

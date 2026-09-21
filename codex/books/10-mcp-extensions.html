@@ -34,11 +34,11 @@
 <div class="page">
 
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-2088-g31ffe2bc9a</span>
+    <span class="version-badge">openai/codex @ bb054a2b03</span>
     <h1>10 · MCP 与扩展：让 Agent 的能力可插拔</h1>
     <p class="lead">
       内置工具（shell、apply_patch）只是底线。Codex 真正的扩展性来自三条线：<b>MCP（Model Context Protocol）</b>接外部工具服务器，
-      <b>Connectors / Plugins</b>封装「应用」为 Agent 可调用的能力，<b>Skills</b>提供脚本化工作流。
+      <b>Connectors / Plugins</b>把 skills、MCP 服务器与可选的钩子/界面组合成可分发的能力包，<b>Skills</b>以 SKILL.md 为入口、按需向模型注入工作流指令。
       它们共享同一套 <code class="inline">ToolSpec</code> 暴露机制——对模型而言，内置工具和扩展工具没有分别。
     </p>
   </div>
@@ -186,34 +186,50 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">10.5</span>Plugins：可编程的扩展钩子</h2>
-    <p>Plugin（<code class="inline">plugin</code> + <code class="inline">core-plugins</code> crate）比 Connector 更底层，它提供<b>钩子（hooks）</b>——在 Agent 运行的特定时机插入自定义逻辑。一个 plugin 可以声明自己提供哪些能力。</p>
+    <h2><span class="num">10.5</span>Plugins：可组合的能力包</h2>
+    <p>Plugin（<code class="inline">plugin</code> + <code class="inline">core-plugins</code> crate）不是「钩子框架」这么单一：它是一个<b>可组合的能力包</b>——可以自带 skills、MCP 服务器、connector 应用，以及可选的钩子（hooks，在 Agent 运行的特定时机插入自定义逻辑）。看它的能力摘要就清楚了：</p>
 
     <pre class="code"><span class="lang-tag">codex-rs/plugin/src/lib.rs</span>
-<span class="kw">pub struct</span> <span class="cl">PluginCapabilitySummary</span> { .. }   <span class="cmt">// 插件能力摘要</span>
+<span class="kw">pub struct</span> <span class="cl">PluginCapabilitySummary</span> {
+    config_name: <span class="cl">String</span>,
+    display_name: <span class="cl">String</span>,
+    description: <span class="cl">Option</span>&lt;<span class="cl">String</span>&gt;,
+    has_skills: <span class="cl">bool</span>,                        <span class="cmt">// 可携带 skills</span>
+    mcp_server_names: <span class="cl">Vec</span>&lt;<span class="cl">String</span>&gt;,           <span class="cmt">// 可携带 MCP 服务器</span>
+    app_connector_ids: <span class="cl">Vec</span>&lt;<span class="cl">AppConnectorId</span>&gt;,  <span class="cmt">// 可携带 connector 应用</span>
+}
 
-<span class="kw">pub struct</span> <span class="cl">PluginHookSource</span> { .. }        <span class="cmt">// 钩子来源</span>
+<span class="kw">pub struct</span> <span class="cl">PluginHookSource</span> { .. }        <span class="cmt">// 钩子只是其中一种可选能力</span>
 <span class="kw">pub struct</span> <span class="cl">ExecutorPluginHookSource</span> { .. } <span class="cmt">// 执行器侧钩子</span>
 
 <span class="lang-tag">codex-rs/core-plugins/src/lib.rs</span>
 <span class="kw">pub type</span> <span class="cl">LoadedPlugin</span> = codex_plugin::LoadedPlugin&lt;codex_config::McpServerConfig&gt;;
 <span class="cmt">// 一个 plugin 可以自带 MCP 服务器配置（overlay）</span></pre>
 
-    <p>关键设计在最后一行：一个 <code class="inline">LoadedPlugin</code> 参数化在 <code class="inline">McpServerConfig</code> 上，意味着<b>插件可以携带 MCP 服务器配置作为 overlay</b>。装一个 plugin，等于同时注入了它的钩子逻辑和它依赖的 MCP 工具服务器。这让插件成为一个自洽的能力包——这是 Codex 走向「应用市场」式分发的基石（<code class="inline">core-plugins</code> 里有 <code class="inline">manager</code> 模块管 <code class="inline">ConfiguredMarketplacePlugin</code>）。</p>
+    <p>关键设计在最后一行：一个 <code class="inline">LoadedPlugin</code> 参数化在 <code class="inline">McpServerConfig</code> 上，意味着<b>插件可以携带 MCP 服务器配置作为 overlay</b>。装一个 plugin，等于同时注入它声明的 skills、它依赖的 MCP 工具服务器，以及（如果有的话）钩子逻辑。这让插件成为一个自洽的能力包——这是 Codex 走向「应用市场」式分发的基石（<code class="inline">core-plugins</code> 里有 <code class="inline">manager</code> 模块管 <code class="inline">ConfiguredMarketplacePlugin</code>）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.6</span>Skills：脚本化工作流</h2>
-    <p>Skill 是面向「重复性操作」的扩展：把一套多步操作封装成脚本，模型按需调用。skill 脚本的执行<b>与普通 shell 命令走同一套沙箱/审批通道</b>——历史上曾有独立的 skill 审批开关（<code class="inline">GranularApprovalConfig.skill_approval</code>，字段仍保留在协议里），但后来被移除，统一交回普通 turn 沙箱与升级路径治理。</p>
+    <h2><span class="num">10.6</span>Skills：按需加载的工作流指令包</h2>
+    <p>Skill 是<b>以 SKILL.md 为入口的按需加载指令包</b>：每个 skill 是一个文件夹，必需的只有一个 <code class="inline">SKILL.md</code>（YAML frontmatter 给出 name / description，正文是模型被调用时才加载的指令）。脚本、参考文档、素材都是<b>可选</b>资源——有的 skill 就是几段纯文本指引，不需要任何可执行代码。模型平时只看到名字和描述（用于路由判断），用到时才读取正文——这和第 5 章的上下文工程是同一个思路：按需加载，不预塞上下文。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/skills/src/lib.rs</span>
+    <pre class="code"><span class="lang-tag">codex-rs/skills/src/model.rs</span>
+<span class="kw">pub struct</span> <span class="cl">SkillMetadata</span> {
+    name: <span class="cl">String</span>,
+    description: <span class="cl">String</span>,                    <span class="cmt">// 加载前就能看到的路由信息</span>
+    <span class="cmt">/// Path to the SKILL.md file that declares this skill.</span>
+    path_to_skills_md: <span class="cl">AbsolutePathBuf</span>,     <span class="cmt">// 入口：SKILL.md</span>
+    scope: <span class="cl">SkillScope</span>,
+    plugin_id: <span class="cl">Option</span>&lt;<span class="cl">String</span>&gt;,              <span class="cmt">// skill 也可由 plugin 携带</span>
+    ..
+}
+
+<span class="lang-tag">codex-rs/skills/src/lib.rs</span>
 <span class="cmt">// 系统级 skill 安装到 codex_home 下的缓存目录</span>
 <span class="kw">pub fn</span> system_cache_root_dir(codex_home) -&gt; <span class="cl">AbsolutePathBuf</span>;
-<span class="kw">pub fn</span> install_system_skills(codex_home) -&gt; <span class="cl">Result</span>&lt;(), <span class="cl">SystemSkillsError</span>&gt;;
+<span class="kw">pub fn</span> install_system_skills(codex_home) -&gt; <span class="cl">Result</span>&lt;(), <span class="cl">SystemSkillsError</span>&gt;;</pre>
 
-<span class="kw">pub enum</span> <span class="cl">SystemSkillsError</span> { .. }</pre>
-
-    <p>Skill 的特殊性在于它执行的是<b>脚本</b>（可能是 shell、python），而脚本天然比单条命令更难静态审计。Codex 曾经为它设过单独的审批开关，但现状是：<b>skill 脚本执行与普通命令一视同仁</b>，受相同的沙箱策略、审批模式与规则引擎约束（第 8 章）。这体现了另一个原则——「机制统一，配置分层」：与其为每种能力造独立通道，不如让所有执行共享同一套可审计的治理路径。</p>
+    <p>但 skill 声明的操作最终仍要<b>执行</b>——如果工作流含脚本（shell、python），它们的执行<b>与普通 shell 命令走同一套沙箱/审批通道</b>：历史上曾有独立的 skill 审批开关（<code class="inline">GranularApprovalConfig.skill_approval</code>，字段仍保留在协议里，仅影响提示词），但后来被移除，统一交回普通 turn 沙箱与升级路径治理。这体现了另一个原则——「机制统一，配置分层」：与其为每种能力造独立通道，不如让所有执行共享同一套可审计的治理路径（第 8 章）。</p>
   </section>
 
   <section class="block">
@@ -267,7 +283,7 @@
 </div>
 
 <footer>
-  Codex CLI · 10 MCP 与扩展 · 版本 rusty-v8-v150.4.0-2088-g31ffe2bc9a · 所有引用代码路径以仓库最新为准
+  Codex CLI · 10 MCP 与扩展 · 源码锚点 openai/codex @ bb054a2b03 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

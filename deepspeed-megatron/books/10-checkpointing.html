@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 激活重算 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a class="active" href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 激活重算</div>
+    <h1>激活重算：用 33% 的算力换显存</h1>
+    <div class="subtitle">第 6 章的账本只算了参数侧；长序列大 batch 下，<strong>激活</strong>才是显存大头。重算（activation checkpointing / gradient checkpointing）的策略简单粗暴：前向不存中间激活，反向用到时重算一遍。代价约 33% 额外算力。两库都有实现，且细节不同——DS 保存 RNG 状态、Megatron 做选择性重算。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>一分钟版本</h2>
+    <p>transformer 一层的激活量 ≈ <code class="inline">s × b × h × (34 + 5·a·s/h)</code> 字节（fp16，s 序列长、b batch、h hidden、a 头数）。长序列时注意力矩阵那项平方增长。三个档位：</p>
+    <ul>
+      <li><strong>不重算</strong>：全存。显存最大，速度最快。</li>
+      <li><strong>选择性重算</strong>：只重算便宜的、保留昂贵的——保存 QKV 线性层的输出（后面要用很多次），重算 LN/dropout/注意力概率（一次 GEMM 就能重得）。</li>
+      <li><strong>全重算</strong>：每层只存输入，反向时整层重算。显存 ≈ √层数 量级（最优分段），代价 ~33%。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">33% 从哪来</b>
+      反向本来就约等于 2 倍前向计算量（dgrad+wgrad 两套 GEMM）。重算给每层加 1 次前向 → 总计算从 3×F 变 4×F，即 +33%。全重算是上界；选择性重算通常 +15% 以内就能省一半以上激活显存，所以是生产默认。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>用代码看｜DeepSpeed 的 CheckpointFunction</h2>
+    <div class="code-title">deepspeed/runtime/activation_checkpointing/checkpointing.py — CheckpointFunction.forward（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">CheckpointFunction</span>(torch.autograd.Function):
+    <span class="kw">@staticmethod</span>
+    <span class="kw">def</span> <span class="fn">forward</span>(ctx, run_function, preserve_rng_state, *args):
+        ctx.run_function = run_function
+        <span class="kw">if</span> preserve_rng_state:
+            <span class="cmt"># 关键：保存 CPU/CUDA RNG 状态——dropout 位置必须可复现</span>
+            ctx.fwd_cpu_rng_state = torch.get_rng_state()
+            ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
+            <span class="cmt"># 以及张量并行专用的 RNG tracker（各卡不同的 dropout mask）</span>
+            ctx.fwd_cuda_rng_state_tracker = tensor_parallel.get_cuda_rng_tracker().get_state()
+        <span class="kw">with</span> torch.no_grad():
+            outputs = run_function(*args)          <span class="cmt"># 前向算一遍，不建图、不留中间激活</span>
+        <span class="cmt"># PARTITION_ACTIVATIONS：输入也切分（DP 内多级并行时）</span>
+        <span class="cmt"># CPU_CHECKPOINT：切下的输入再挪 CPU（更省，搬运更贵）</span>
+        ctx.save_for_backward(*args_for_backward)
+
+    <span class="kw">@staticmethod</span>
+    <span class="kw">def</span> <span class="fn">backward</span>(ctx, *args):
+        <span class="kw">with</span> torch.random.fork_rng(devices=...):
+            <span class="cmt"># 恢复 RNG → 重算前向（这次建图）→ 正常反传</span>
+            <span class="kw">with</span> torch.enable_grad():
+                outputs = ctx.run_function(*ctx.inputs)
+                <span class="cmt"># 重算时 PARTITION_ACTIVATIONS 需要先 all-gather 输入</span>
+        <span class="kw">return</span> <span class="kw">None</span>, <span class="kw">None</span>, *gradients</pre>
+    <div class="annotation"><b>RNG 状态是正确性的命门：</b>重算出来的前向必须和第一遍<strong>逐位相同</strong>——dropout 的 mask、TP 各卡不同的随机数（RNG tracker 给每张卡派不同 seed）都要原样恢复。漏一个就是「重算的前向 ≠ 原前向」，梯度悄悄错，loss 曲线看着正常但收敛变差——这类 bug 极难排查。<code class="inline">PARTITION_ACTIVATIONS</code> 服务于「DP 之内还有数据切分」的场景（如 MoE），<code class="inline">CPU_CHECKPOINT</code> 把存的输入也挪 CPU——三级显存/带宽的取舍。DS 用法是模型里显式包 <code class="inline">checkpoint(checkpoint, f, args)</code>，属于<strong>侵入式 API</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>用代码看｜Megatron 的层内重算与选择性重算</h2>
+    <div class="code-title">megatron/core/transformer/transformer_layer.py — checkpointed_forward（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># full granularity：整个 layer 一个 checkpoint 段</span>
+<span class="kw">def</span> <span class="fn">checkpointed_forward</span>(self, *args):
+    <span class="kw">def</span> <span class="fn">custom</span>(*args):
+        <span class="kw">return</span> self._get_layer()(*args)   <span class="cmt"># 一整层：LN+Attn+LN+MLP</span>
+    <span class="kw">if</span> self.config.recompute_granularity == <span class="st">"full"</span>:
+        <span class="cmt"># full：整层存一个输入；backward 时整层重算</span>
+        <span class="kw">return</span> tensor_parallel.checkpoint(...)
+    <span class="kw">elif</span> self.config.recompute_granularity == <span class="st">"selective"</span>:
+        <span class="cmt"># selective：只重算核心注意力段，其余正常建图</span>
+        <span class="cmt"># 挂点在 Attention 模块内部（core_attention 的输入输出保留）</span>
+        ...</pre>
+    <div class="annotation"><b>配置项的三档：</b>Megatron 用 <code class="inline">--recompute-granularity full|selective</code> + <code class="inline">--recompute-method uniform|block</code> + <code class="inline">--recompute-num-layers n</code> 组合表达档位。selective 的思想（论文 Checkmate/Reduction 系）：attention 概率矩阵是平方级显存大户，重算它最划算；QKV 输出保留（重算它要重跑两个 GEMM，不划算）。<strong>Megatron 的实现是非侵入的</strong>——配置开关决定层怎么包，模型代码不变；DS 是显式函数调用。自研选哪种取决于你的代码形态，但<strong>RNG 恢复是共同的责任</strong>，两库都处理了。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t101 d101">
+        <title id="t101">不重算 vs 全重算 vs 选择性重算</title>
+        <desc id="d101">三行对比：不重算存全部层内激活（长条）；全重算只存层输入（小方块）但反向多一段前向重算；选择性重算保留注意力线性输出（中块）只重算注意力概率（小方块），计算增加最少。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="30" font-weight="bold">不重算</text>
+        <rect class="node" x="120" y="14" width="560" height="30" rx="4"></rect>
+        <text class="lbl sm" x="400" y="33" text-anchor="middle">全部激活常驻：s×b×h×34 + 5a·s²（注意力矩阵）</text>
+        <text class="lbl sm" x="720" y="30" fill="#2e8b57">计算 +0%</text>
+
+        <text class="lbl" x="20" y="90" font-weight="bold">全重算</text>
+        <rect class="node core" x="120" y="74" width="140" height="30" rx="4"></rect>
+        <text class="lbl sm" x="190" y="93" text-anchor="middle">每层只存输入</text>
+        <text class="lbl sm" x="720" y="90" fill="#b45309">计算 +33%</text>
+        <text class="lbl sm" x="120" y="120" fill="#8f2d2d">反向：先整层重算一遍前向（RNG 恢复）→ 再反传</text>
+
+        <text class="lbl" x="20" y="170" font-weight="bold">选择性重算</text>
+        <rect class="node" x="120" y="134" width="240" height="30" rx="4"></rect>
+        <text class="lbl sm" x="240" y="153" text-anchor="middle">保留：QKV 输出、注意力上下文</text>
+        <rect class="node acc" x="380" y="134" width="160" height="30" rx="4" fill-opacity="0.6"></rect>
+        <text class="lbl sm" x="460" y="153" text-anchor="middle">重算：LN/dropout/概率</text>
+        <text class="lbl sm" x="720" y="150" fill="#2e8b57">计算 +10~20%</text>
+
+        <text class="lbl sm" x="20" y="200" fill="#8f2d2d" font-weight="bold">生产默认是 selective：省一半以上激活显存，算力代价不到全重算的一半</text>
+        <text class="lbl sm" x="20" y="222">激活显存估算（fp16，一层）：34·s·b·h + 5·a·s²·b —— s² 项是长序列爆炸的根源，也是 selective 的靶子</text>
+        <text class="lbl sm" x="20" y="244">两库的 checkpoint 段边界都避开了 TP 通信区：段内不跨 all-reduce/RS，否则重算会重复集合通信</text>
+      </svg>
+      <div class="fig-cap">图 10.1：三档重算的显存/算力交换比。注意最后一条：checkpoint 段边界必须与 TP 通信边界对齐——这是实现里最容易踩的坑。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>与 PP/ZeRO-3 的互动</h2>
+    <ul>
+      <li><strong>PP</strong>：1F1B 的 in-flight 激活本来就少（第 4 章），但 warmup 阶段的激活仍随阶段位置涨——重算把 in-flight 峰值再压一档，让 PP 能开更多 microbatch。</li>
+      <li><strong>ZeRO-3</strong>：fetch 参数本身要占显存，重算省下的激活空间正好给 <code class="inline">max_live_parameters</code> 让路——两者是互补而不是竞争。</li>
+      <li><strong>CP</strong>：zigzag 切分后每卡的注意力已是 O(s²/CP)，重算在 CP 内部段照常工作，无需特判。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">e2e 的排布顺序</b>
+      显存不够时的调参顺序（经验）：先开 selective 重算（几乎免费）→ 再上 ZeRO-2 → 还不够上 ZeRO-3 + offload_optimizer → 最后 offload_param / NVMe。每一步都比下一步便宜（带宽税更小）。很多训练事故源于直接跳到最重方案。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>实现</th><th>侵入性</th><th>RNG 处理</th><th>特色</th></tr>
+      <tr><td>DS CheckpointFunction</td><td>显式包裹函数</td><td>保存 CPU+CUDA+tracker 三份</td><td>PARTITION_ACTIVATIONS / CPU_CHECKPOINT</td></tr>
+      <tr><td>Megatron checkpointed_forward</td><td>配置开关，模型无感</td><td>复用 TP RNG tracker</td><td>selective 重算 + uniform/block 分段</td></tr>
+      <tr><td>torch.utils.checkpoint</td><td>原生 API</td><td>自动 fork_rng</td><td>use_reentrant 区别（新版默认 False）</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研重算的最小正确路径：直接用 <code class="inline">torch.utils.checkpoint</code>（非 reentrant 版），不要自己写 RNG 保存——TP 场景下 RNG tracker 的坑非常深。真正值得自己写的是<strong>分段策略</strong>：按「层输入大小 × 层数」做背包问题，均匀分段是基线。最容易错的三点：checkpoint 段内含 TP 通信（重算触发重复归约，结果错）、checkpoint 包住了带 dropout 的层但没恢复 RNG（静默数值错误）、非 reentrant 模式下在 checkpoint 内部修改了全局状态（第一次与重算结果不一致）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="09-offload.html">← 上一步：Offload</a>
+    <a href="11-kernel.html">下一步：Kernel →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 10 激活重算 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

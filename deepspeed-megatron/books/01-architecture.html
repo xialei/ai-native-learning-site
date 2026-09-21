@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 总架构 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a class="active" href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 总架构</div>
+    <h1>总架构：两库如何拼成一台训练机</h1>
+    <div class="subtitle">推理引擎是一台整机，训练系统更像积木——同一层有多个竞争实现。这一章先建立整机地图：一个 train step 从数据到参数更新，两库各自的代码在哪些环节被调用。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <p>训练一个 LLM 要回答三个问题，两个库各答了一半：</p>
+    <ul>
+      <li><strong>模型怎么切开？</strong>——Megatron。TP 把一层切给多卡，PP 把层分段，CP 切序列。切分逻辑长在模型与算子里（<code class="inline">megatron/core/</code>）。</li>
+      <li><strong>副本里的冗余怎么砍？</strong>——DeepSpeed。数据并行下每个副本都存着全量优化器状态、梯度、参数；ZeRO 把它们改成切分持有（<code class="inline">deepspeed/runtime/zero/</code>）。</li>
+      <li><strong>谁把这一切串起来跑？</strong>——两边都行：Megatron 用自己的 <code class="inline">pretrain()</code> 主循环 + 自带 DDP/优化器；DeepSpeed 用 <code class="inline">deepspeed.initialize()</code> 返回的引擎接管任意 PyTorch 模型。实践中两者可互相包裹——Megatron 的模型可以被 DeepSpeed 引擎包起来（Megatron-DeepSpeed 组合，BLOOM-176B 就是这么训的），Megatron 也内置了 ZeRO-1 思想的 DistributedOptimizer 不再依赖 DeepSpeed。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">读法</b>
+      本书第 3–5 章是 Megatron 线（计算侧），第 6–9 章是 DeepSpeed 线（显存侧），第 10–13 章两边都有。第 14 章汇合成自研路线图。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>两条入口：从各自的主脚本看系统形状</h2>
+    <p>两库的入口脚本形状完全不同，正好暴露了两种设计哲学。</p>
+
+    <h3>Megatron：pretrain() 主程序，回调式组装</h3>
+    <p>Megatron-LM 仓库根目录的 <code class="inline">pretrain_gpt.py</code> 是参考实现。用户不写训练循环，而是提供三个回调函数，塞给 <code class="inline">megatron/training/training.py</code> 的 <code class="inline">pretrain()</code>：</p>
+    <div class="code-title">pretrain_gpt.py — pretrain 主程序组装（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> megatron.training <span class="kw">import</span> pretrain, get_args
+<span class="kw">from</span> megatron.core.models.gpt <span class="kw">import</span> <span class="cl">GPTModel</span>
+
+<span class="kw">if</span> __name__ == <span class="st">"__main__"</span>:
+    pretrain(
+        train_valid_test_dataset_provider=provider,   <span class="cmt"># 数据管线回调</span>
+        model_provider=model_provider,                <span class="cmt"># 返回一个「裸模型」的回调</span>
+        forward_step_func=forward_step,               <span class="cmt"># 一个 micro-batch 怎么算 loss</span>
+        model_type=<span class="cl">ModelType</span>.encoder_or_decoder,
+    )</pre>
+    <div class="annotation"><b>读懂这段：</b><code class="inline">pretrain()</code> 的注释把流程写得很直白：① 初始化 Megatron（进程组）→ ② 用 model_provider 造模型、包 DDP、配优化器 → ③ 调 dataset provider 拿数据 → ④ 用 forward_step_func 驱动 <code class="inline">train()</code> 循环。所有并行决策（TP/PP/DP/CP 多大）来自命令行参数，在 <code class="inline">initialize_model_parallel()</code> 一处定型。</div>
+
+    <h3>DeepSpeed：initialize() 包裹任意模型</h3>
+    <p>DeepSpeed 不要求用户换主循环，而是把你的 <code class="inline">nn.Module</code> 包进 <code class="inline">DeepSpeedEngine</code>：</p>
+    <div class="code-title">deepspeed/__init__.py — initialize() 签名（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">initialize</span>(
+    args=<span class="kw">None</span>,
+    model: torch.nn.Module = <span class="kw">None</span>,                <span class="cmt"># 你的模型原样传入</span>
+    optimizer=<span class="kw">None</span>,                               <span class="cmt"># 也可只在 json 配置里给</span>
+    model_parameters=<span class="kw">None</span>,
+    training_data=<span class="kw">None</span>,
+    lr_scheduler=<span class="kw">None</span>,
+    config=<span class="kw">None</span>,                                 <span class="cmt"># json 配置：ZeRO stage、offload、累积步数…</span>
+) -&gt; <span class="cl">Tuple</span>[<span class="cl">DeepSpeedEngine</span>, Optimizer, DataLoader, Any]:
+    <span class="st">"""Initialize the DeepSpeed Engine."""</span></pre>
+    <div class="annotation"><b>读懂这段：</b>返回的 engine 顶替了原模型——之后的 <code class="inline">engine.forward/backward/step</code> 全部走 DeepSpeed 的编排。并行切分本身 DeepSpeed 基本不管（除非用它的 pipe 引擎或 AutoTP）：模型得先被 Megatron 或其它工具切好，再交给 DeepSpeed 管「副本内显存」。这就是两个库能长期协作的结构原因——<strong>接口彼此正交</strong>。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>用代码看｜一次 train step 里两库各自的调用链</h2>
+    <p>Megatron 的单步训练在 <code class="inline">megatron/training/training.py</code> 的 <code class="inline">train_step()</code> 里，主干只有几行（源文件 6000+ 行，但除去日志、容错、RL 分支后核心就是下面这些）：</p>
+    <div class="code-title">megatron/training/training.py — train_step 主干（摘录+删减，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">train_step</span>(forward_step_func, data_iterator, model, optimizer,
+                 opt_param_scheduler, config, forward_backward_func, ...):
+    <span class="kw">for</span> model_chunk <span class="kw">in</span> model:
+        model_chunk.<span class="fn">zero_grad_buffer</span>()          <span class="cmt"># 清零 DDP 梯度桶</span>
+    optimizer.<span class="fn">zero_grad</span>()
+
+    <span class="cmt"># 核心：一次调度完所有 micro-batch 的前向+反向</span>
+    forward_backward_func(
+        forward_step_func, data_iterator, model,
+        num_microbatches=get_num_microbatches(),
+        seq_length=args.seq_length, micro_batch_size=args.micro_batch_size,
+        forward_only=<span class="kw">False</span>, ...)
+
+    <span class="cmt"># 跨切分收尾：补规约 LN/嵌入梯度等 TP/PP 特有的遗漏项</span>
+    <span class="kw">for</span> model_chunk <span class="kw">in</span> model:
+        config.finalize_model_grads_func(model, num_tokens=num_tokens)
+
+    optimizer.<span class="fn">step</span>()
+    <span class="kw">return</span> loss_dict, skipped_iter, ...</pre>
+    <div class="annotation"><b>三个关键角色：</b>① <code class="inline">forward_backward_func</code> 是流水线调度器（<a href="04-pp-1f1b.html">第 4 章</a>），单卡时是普通循环，PP 时是 1F1B；② <code class="inline">zero_grad_buffer</code> 证明梯度不是散在参数上的，而是住在 DDP 的连续 buffer 里（<a href="07-zero.html">第 7 章</a>）；③ <code class="inline">finalize_model_grads</code> 处理「梯度不是简单 all-reduce 就完事」的收尾——序列并行的 LN 梯度、TP 首尾阶段的嵌入梯度等（<a href="03-megatron-tp.html">第 3 章</a>）。</div>
+    <p>DeepSpeed 侧对应的是用户手里的三行：</p>
+    <div class="code-title">用户训练循环 vs DeepSpeed 引擎（对比）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 普通 PyTorch              →   DeepSpeed</span>
+loss = model(batch)          →   loss = engine(batch)          <span class="cmt"># forward: 顺手挂钩子</span>
+loss.backward()              →   engine.backward(loss)         <span class="cmt"># 缩放 loss、触发 ZeRO 钩子</span>
+optimizer.step(); zero_grad()→   engine.step()                 <span class="cmt"># 只在 GAS 边界真更新</span></pre>
+    <div class="annotation"><b>对应关系：</b>engine 的 <code class="inline">backward()</code> 里把 loss 除以 <code class="inline">gradient_accumulation_steps</code> 再 <code class="inline">loss.backward()</code>（<code class="inline">deepspeed/runtime/engine.py:3286</code>）；<code class="inline">step()</code>（engine.py:3471）先判断 <code class="inline">is_gradient_accumulation_boundary()</code>，非边界直接跳过更新。Megatron 的「一个 train_step 吃掉所有 micro-batch」与 DeepSpeed 的「用户自己循环调 backward、攒够 GAS 次」是同一件事的两种调度粒度。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>分层图</h2>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
+        <title id="t12">训练系统四层架构，两库的覆盖范围</title>
+        <desc id="d12">L1 训练脚本层：Megatron pretrain 与 DeepSpeed initialize+用户循环并列。L2 切分层：Megatron 的 TP/PP/CP 与 DeepSpeed 的 pipe/AutoTP。L3 副本状态层：ZeRO 与 DistributedOptimizer。L4 kernel 层：两库各自的 CUDA/Triton 资产。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="20" y="20" width="440" height="86" rx="10"></rect>
+        <text class="lbl" x="40" y="44" font-weight="bold" fill="#8f2d2d">L1 · 训练脚本层（Megatron 侧）</text>
+        <text class="lbl code" x="40" y="64">pretrain_gpt.py → megatron/training/training.py</text>
+        <text class="lbl sm" x="40" y="82">pretrain() 主循环 · args 解析 · timers · one-logger</text>
+
+        <rect class="node ok" x="480" y="20" width="480" height="86" rx="10"></rect>
+        <text class="lbl" x="500" y="44" font-weight="bold" fill="#4c7a1e">L1 · 训练脚本层（DeepSpeed 侧）</text>
+        <text class="lbl code" x="500" y="64">deepspeed.initialize() → DeepSpeedEngine</text>
+        <text class="lbl sm" x="500" y="82">用户保留自己的训练循环 · engine 三件套接管</text>
+        <text class="lbl sm" x="500" y="98">launcher: deepspeed 启动器 · torchrun 均可拉起</text>
+
+        <rect class="node core" x="20" y="126" width="940" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="150" font-weight="bold" fill="#8f2d2d">L2 · 并行切分层 —— 主场：Megatron</text>
+        <rect class="node" x="40" y="160" width="180" height="46" rx="6"></rect>
+        <text class="lbl sm" x="130" y="180" text-anchor="middle">TP/SP</text>
+        <text class="lbl code" x="130" y="197" text-anchor="middle">tensor_parallel/</text>
+        <rect class="node" x="234" y="160" width="180" height="46" rx="6"></rect>
+        <text class="lbl sm" x="324" y="180" text-anchor="middle">PP + 调度</text>
+        <text class="lbl code" x="324" y="197" text-anchor="middle">pipeline_parallel/</text>
+        <rect class="node" x="428" y="160" width="170" height="46" rx="6"></rect>
+        <text class="lbl sm" x="513" y="180" text-anchor="middle">CP 序列切分</text>
+        <text class="lbl code" x="513" y="197" text-anchor="middle">context_parallel/</text>
+        <rect class="node" x="612" y="160" width="160" height="46" rx="6"></rect>
+        <text class="lbl sm" x="692" y="180" text-anchor="middle">EP + MoE</text>
+        <text class="lbl code" x="692" y="197" text-anchor="middle">transformer/moe/</text>
+        <rect class="node ok" x="786" y="160" width="150" height="46" rx="6"></rect>
+        <text class="lbl sm" x="861" y="180" text-anchor="middle">DS pipe 引擎</text>
+        <text class="lbl code" x="861" y="197" text-anchor="middle">runtime/pipe/</text>
+        <text class="lbl sm" x="40" y="228">规律：切分逻辑长在模型/算子里 —— 线性层知道自己是列并行还是行并行，通信是 autograd 的一部分</text>
+
+        <rect class="node core" x="20" y="252" width="940" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="276" font-weight="bold" fill="#4c7a1e">L3 · 副本状态层（DP 显存优化）—— 主场：DeepSpeed</text>
+        <rect class="node ok" x="40" y="286" width="200" height="46" rx="6"></rect>
+        <text class="lbl sm" x="140" y="304" text-anchor="middle">ZeRO stage 1/2/3</text>
+        <text class="lbl code" x="140" y="321" text-anchor="middle">runtime/zero/</text>
+        <rect class="node" x="254" y="286" width="200" height="46" rx="6"></rect>
+        <text class="lbl sm" x="354" y="304" text-anchor="middle">DistributedOptimizer</text>
+        <text class="lbl code" x="354" y="321" text-anchor="middle">core/optimizer/（同思想）</text>
+        <rect class="node ok" x="468" y="286" width="170" height="46" rx="6"></rect>
+        <text class="lbl sm" x="553" y="304" text-anchor="middle">offload / NVMe</text>
+        <text class="lbl code" x="553" y="321" text-anchor="middle">runtime/zero/ · nvme/</text>
+        <rect class="node" x="652" y="286" width="140" height="46" rx="6"></rect>
+        <text class="lbl sm" x="722" y="304" text-anchor="middle">DDP 梯度桶</text>
+        <text class="lbl code" x="722" y="321" text-anchor="middle">core/distributed/</text>
+        <rect class="node ok" x="806" y="286" width="130" height="46" rx="6"></rect>
+        <text class="lbl sm" x="871" y="304" text-anchor="middle">checkpoint</text>
+        <text class="lbl code" x="871" y="321" text-anchor="middle">ch12 两库</text>
+        <text class="lbl sm" x="40" y="354">规律：这里的一切都是「数据并行副本内部的记账」—— 与 L2 正交，所以能自由组合</text>
+
+        <line class="edge" x1="490" y1="362" x2="490" y2="378"></line>
+        <rect class="node" x="20" y="380" width="940" height="76" rx="10"></rect>
+        <text class="lbl" x="40" y="404" font-weight="bold" fill="#5c6b7a">L4 · Kernel 层</text>
+        <text class="lbl sm" x="40" y="424">Megatron：core/fusions/（softmax·bias-gelu·swiglu·cross-entropy）+ TransformerEngine（fp8/融合注意力）· DeepSpeed：csrc/（transformer·adam·aio 异步IO·quantizer）</text>
+        <text class="lbl sm" x="40" y="442">本章之后 kernel 细节见第 11 章；两库在此层互不复用，各自维护 CUDA 扩展</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw"></span>Megatron 代码</span>
+        <span class="lg-item"><span class="sw ok"></span>DeepSpeed 代码</span>
+        <span class="lg-item"><span class="sw core"></span>两库各有一份实现</span>
+      </div>
+      <div class="fig-cap">图 1.4：训练系统四层 × 两库覆盖图。注意 L2/L3 互相正交：ZeRO 不关心模型怎么切（拿到梯度就切分规约），TP/PP 不关心优化器状态放哪。</div>
+    </div>
+
+    <div class="annotation"><b>目录映射（按层）：</b>
+      L1 → <code class="inline">megatron/training/</code>（pretrain、arguments、checkpointing）与 <code class="inline">deepspeed/runtime/engine.py</code>、<code class="inline">deepspeed/launcher/</code>；
+      L2 → <code class="inline">megatron/core/{tensor_parallel,pipeline_parallel,context_parallel,transformer/moe}/</code> 与 <code class="inline">deepspeed/runtime/pipe/</code>、<code class="inline">deepspeed/sequence/</code>（Ulysses）、<code class="inline">deepspeed/module_inject/</code>（AutoTP）；
+      L3 → <code class="inline">deepspeed/runtime/zero/</code>、<code class="inline">megatron/core/distributed/</code>（DDP 与 param/grad buffer）、<code class="inline">megatron/core/optimizer/distrib_optimizer.py</code>；
+      L4 → <code class="inline">megatron/core/fusions/</code>、<code class="inline">deepspeed/csrc/</code>。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>组合方式：谁包谁</h2>
+    <p>两库实际协作时只存在三种合法姿势，各自的代表与代价：</p>
+    <table class="tbl">
+      <tr><th>组合</th><th>结构</th><th>代表</th><th>代价 / 局限</th></tr>
+      <tr><td><strong>Megatron 全家桶</strong></td><td>pretrain() + Megatron DDP + DistributedOptimizer + TE</td><td>NVIDIA 内部主推、Llama 系复现主流选择</td><td>绑定 Megatron 模型写法（必须用它的模块）</td></tr>
+      <tr><td><strong>Megatron-DeepSpeed</strong></td><td>pretrain() 循环保留，<code class="inline">mpu</code> 传给 DeepSpeed，ZeRO 替换优化器</td><td>BLOOM-176B（TP+PP+ZeRO-1 的 3D 并行实证）</td><td>ZeRO stage 与 PP 曾互斥（DeepSpeed pipe 引擎限制 stage&lt;2）；梯度收尾要两库协同</td></tr>
+      <tr><td><strong>DeepSpeed 任意模型</strong></td><td>HF Trainer / Lightning + DeepSpeed，模型不改</td><td>数万 HF 微调任务的事实标准</td><td>没有 TP/PP，规模上限取决于 ZeRO + offload</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">注意</b>
+      「ZeRO 与流水线并行互斥」曾经是硬约束：DeepSpeed 的 <code class="inline">PipelineEngine.__init__</code> 至今保留断言 <code class="inline">zero_optimization_stage() &lt; ZeroStageEnum.gradients</code>（即 pipe 引擎内 ZeRO 只能到 stage 1）。绕过方式是把 PP 交给 Megatron、ZeRO 只包 DeepSpeed 侧——这正是 Megatron-DeepSpeed 组合的意义。第 4 章展开。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.6</span>一张表记牢每个部件</h2>
+    <table class="tbl">
+      <tr><th>部件</th><th>仓库 / 目录</th><th>职责</th><th>章</th></tr>
+      <tr><td>pretrain()</td><td>Megatron · megatron/training/training.py</td><td>主循环、周期 checkpoint/eval、异常续跑</td><td><a href="01-architecture.html">01</a></td></tr>
+      <tr><td>parallel_state</td><td>Megatron · megatron/core/parallel_state.py</td><td>rank → 各并行组的唯一映射源</td><td><a href="02-hybrid-parallel.html">02</a></td></tr>
+      <tr><td>Column/RowParallelLinear</td><td>Megatron · core/tensor_parallel/layers.py</td><td>TP 的两块基石算子</td><td><a href="03-megatron-tp.html">03</a></td></tr>
+      <tr><td>schedules.py</td><td>Megatron · core/pipeline_parallel/</td><td>1F1B / interleaved 流水线时间表</td><td><a href="04-pp-1f1b.html">04</a></td></tr>
+      <tr><td>GPTModel / TransformerLayer</td><td>Megatron · core/models/gpt/ · core/transformer/</td><td>模型本体（切分感知）</td><td><a href="05-megatron-model.html">05</a></td></tr>
+      <tr><td>DeepSpeedEngine</td><td>DeepSpeed · deepspeed/runtime/engine.py</td><td>包裹模型，接管 fwd/bwd/step 与配置</td><td><a href="06-deepspeed-engine.html">06</a></td></tr>
+      <tr><td>ZeROOptimizer（stage 1/2/3）</td><td>DeepSpeed · runtime/zero/stage_1_and_2.py · stage3.py</td><td>切分式优化器</td><td><a href="07-zero.html">07</a> <a href="08-zero3.html">08</a></td></tr>
+      <tr><td>DistributedOptimizer</td><td>Megatron · core/optimizer/distrib_optimizer.py</td><td>Megatron 版 ZeRO-1</td><td><a href="07-zero.html">07</a></td></tr>
+      <tr><td>param_and_grad_buffer</td><td>Megatron · core/distributed/param_and_grad_buffer.py</td><td>连续梯度缓冲 + 分桶</td><td><a href="07-zero.html">07</a></td></tr>
+      <tr><td>DeepNVMe / aio</td><td>DeepSpeed · deepspeed/nvme/ · csrc/aio</td><td>NVMe 异步 IO 引擎</td><td><a href="09-offload.html">09</a></td></tr>
+      <tr><td>checkpointing（激活）</td><td>两库各自 · megatron/core/recompute.py · deepspeed/runtime/activation_checkpointing/</td><td>激活重算</td><td><a href="10-checkpointing.html">10</a></td></tr>
+      <tr><td>dist_checkpointing</td><td>Megatron · core/dist_checkpointing/ · DeepSpeed · checkpoint/</td><td>可重分片断点</td><td><a href="12-checkpoint-io.html">12</a></td></tr>
+      <tr><td>MoE</td><td>Megatron · core/transformer/moe/ · DeepSpeed · deepspeed/moe/</td><td>路由 / 派发 / 专家并行</td><td><a href="13-moe.html">13</a></td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.7</span>对「自研训练框架」的第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">要点</b>
+      别从并行开始。自研训练框架的 MVP 是<strong>单卡混合精度训练循环 + 一份正确的梯度累积</strong>（这就是 DeepSpeed engine 在 stage 0 做的事）。然后按痛感逐层加：<strong>显存先爆 → 上 ZeRO-1；单卡算力不够 → 上 TP；batch 上不去 → 上 PP。</strong>顺序错了，每一步都在给后面埋雷。路线图见<a href="14-build-own-trainer.html">第 14 章</a>。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-hybrid-parallel.html">下一步：3D 并行 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 01 总架构 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673 · 所有引用代码路径以仓库最新为准
+</footer>
+
+</body>
+</html>

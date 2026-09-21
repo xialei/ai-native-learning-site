@@ -39,8 +39,10 @@
 
 ## 打开方式
 
+从仓库根目录直接用浏览器打开 `codex/books/index.html`，或：
+
 ```bash
-cd docs/learning-site
+cd codex/books
 open index.html        # macOS
 # 或任何静态文件服务器
 python3 -m http.server
@@ -62,5 +64,5 @@ python3 -m http.server
 
 ## 备注
 
-- 内容基于当前仓库源码整理（章节内标注了具体文件与行号附近的要点，随版本演化可能略有出入，以源码为准）。
+- 内容基于 `openai/codex @ bb054a2b03`（完整 commit SHA，检索日期 2026-09-21；含于 rust-v0.156.0-alpha.13/14 标签）整理。章节内标注了具体文件与行号附近的要点，随主干演化可能略有出入，以源码为准。
 - 配色采用 Codex 的墨绿/青色品牌色调（`assets/codex-learn.css`），结构借鉴了自建的 Pi Agent Harness 学习站模板。

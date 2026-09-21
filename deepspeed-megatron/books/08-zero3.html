@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · ZeRO-3 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a class="active" href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 ZeRO-3</div>
+    <h1>ZeRO-3：参数也切了，前向怎么算</h1>
+    <div class="subtitle">ZeRO-1/2 切优化器状态和梯度，参数本身各卡仍有完整副本。ZeRO-3 把参数也按 DP 切——每卡只剩 16/DP 字节。代价：前向时参数不在本地，要用之前现场 all-gather、用完立刻释放。本章看三件事：参数怎么在 __init__ 里就被切走、前向时怎么 fetch/prefetch、step 时怎么做子组步进。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一分钟版本</h2>
+    <p>ZeRO-3 的生命周期是一个「借还循环」：</p>
+    <ul>
+      <li><strong>init 时</strong>：模型构造完成后，参数立刻被切走（每卡只留 1/N 的分片，记作 <code class="inline">ds_tensor</code>），原 param 换成空壳（metadata）。</li>
+      <li><strong>前向时</strong>：算到哪一层，就把该层参数 all-gather 成完整形状，算完<strong>立刻归还</strong>（除非在 prefetch 队列里要留着）。</li>
+      <li><strong>反向时</strong>：同样 fetch → 算 → 梯度留在本地分片（梯度归约成 reduce-scatter）。</li>
+      <li><strong>step 时</strong>：优化器状态也分片，子组逐个更新、逐个写回。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">与 TP 的本质区别</b>
+      TP 切参数是<strong>永久的计算切分</strong>（每卡永久持有固定一半，输出也是分片）；ZeRO-3 切参数是<strong>临时的存储分片</strong>（前向一凑就是完整的，凑是全量 all-gather，通信量 = 参数全量）。DP 内的卡跑的是完整模型——所以 ZeRO-3 后面不能再挂 TP 语义的东西（同一段模型所有 DP 卡一起算）。TP 便宜是因为算子级通信小且固定；ZeRO-3 的通信随模型大小线性涨，靠 prefetch 和重叠把代价藏进计算。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>用代码看｜PartitionedParameterCoordinator：借还的总管</h2>
+    <div class="code-title">deepspeed/runtime/zero/partitioned_param_coordinator.py — 核心配置（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PartitionedParameterCoordinator</span>:
+    <span class="st">"""Handles borrowing and returning parameters."""</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self,
+                 prefetch_bucket_size,      <span class="cmt"># 预取桶：提前多少参数开始 all-gather</span>
+                 max_reuse_distance,        <span class="cmt"># 距离内会再用的参数用完不还（省重复 fetch）</span>
+                 max_live_parameters,       <span class="cmt"># 同一时刻最多借出的参数量（显存上限）</span>
+                 prefetch_nvme, ...):</pre>
+    <div class="annotation"><b>三个旋钮的语义：</b>① <code class="inline">prefetch_bucket_size</code>：本层还在算，下一层的 all-gather 已经发出去——通信躲在计算后面；② <code class="inline">max_reuse_distance</code>：参数复用（如 tied embedding 与 output layer 共享权重）时，距离近就先不还，省一次 fetch；③ <code class="inline">max_live_parameters</code>：借出的总量上限，防止「要的太多同时借出」把显存挤爆——这是 ZeRO-3 显存峰值的主要决定项。三者默认值都是「层大小 × 若干倍」量级，通常不用动；改变它们的行为就是改变 ZeRO-3 的性能曲线。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t81 d81">
+        <title id="t81">ZeRO-3 前向的 fetch/prefetch 流水</title>
+        <desc id="d81">时间轴上三层：正在计算第 i 层（GPU 上持有其参数）、第 i+1 层参数正在 all-gather 通信中（prefetch）、第 i+2 层参数还在各卡的分片里。计算与通信错开一格，形成流水。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="30" font-weight="bold">时间 →</text>
+        <text class="lbl sm" x="180" y="30" text-anchor="middle">t0</text>
+        <text class="lbl sm" x="420" y="30" text-anchor="middle">t1</text>
+        <text class="lbl sm" x="660" y="30" text-anchor="middle">t2</text>
+
+        <rect class="node core" x="60" y="46" width="240" height="56" rx="8"></rect>
+        <text class="lbl" x="180" y="70" text-anchor="middle">第 i 层参数完整（借出）</text>
+        <text class="lbl sm" x="180" y="88" text-anchor="middle">计算进行中</text>
+
+        <rect class="node acc" x="300" y="120" width="240" height="56" rx="8"></rect>
+        <text class="lbl" x="420" y="144" text-anchor="middle">第 i+1 层 all-gather（prefetch）</text>
+        <text class="lbl sm" x="420" y="162" text-anchor="middle">通信飞行中</text>
+
+        <rect class="node" x="540" y="194" width="240" height="56" rx="8"></rect>
+        <text class="lbl" x="660" y="218" text-anchor="middle">第 i+2 层参数分片（沉睡）</text>
+        <text class="lbl sm" x="660" y="236" text-anchor="middle">各卡只持 1/N</text>
+
+        <line class="edge" x1="300" y1="74" x2="300" y2="118"></line>
+        <line class="edge" x1="540" y1="148" x2="540" y2="192"></line>
+
+        <text class="lbl sm" x="60" y="280" fill="#8f2d2d" font-weight="bold">三状态迁移：沉睡(分片) → 飞行(prefetch all-gather) → 借出(完整，参与计算) → 归还(超过 reuse distance 即释放)</text>
+        <text class="lbl sm" x="60" y="302">显存峰值 ≈ max_live_parameters + 当前层激活；通信时长 ≈ 参数全量 / 带宽，prefetch 让它藏进前一层计算</text>
+      </svg>
+      <div class="fig-cap">图 8.1：借还流水。prefetch 提前一层、all-gather 异步飞行，等第 i 层算完，第 i+1 层参数刚好完整落位。若 prefetch 桶太小，流水断档，前向变成「算一层等一层」。</div>
+    </div>
+
+    <div class="code-title">deepspeed/runtime/zero/partitioned_param_coordinator.py — fetch 链（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">fetch_sub_module</span>(self, sub_module):
+    <span class="cmt"># ① 登记：本模块参数加入「即将借用」集合</span>
+    params_to_fetch = ...
+    <span class="cmt"># ② 排队 all-gather（异步提交，事件名 FORWARD_FETCH_SUBMIT）</span>
+    self.__all_gather_params(params_to_fetch, FORWARD_FETCH_SUBMIT)
+    <span class="cmt"># ③ 更新可用参数计数（对照 max_live_parameters）</span>
+
+<span class="kw">def</span> <span class="fn">__all_gather_params</span>(self, params, event):
+    <span class="cmt"># 按桶凑批：够一桶才发一次 all-gather（减少小消息）</span>
+    <span class="kw">with</span> torch.cuda.stream(self.allgather_stream):   <span class="cmt"># 独立 stream</span>
+        <span class="cmt"># 全部 done 后才返回——fetch 是同步屏障，prefetch 是异步提交</span>
+        ...</pre>
+    <div class="annotation"><b>fetch 与 prefetch 的区别：</b>fetch（forward/backward hook 触发）是<strong>同步的</strong>——参数必须到位才能算；prefetch（前一层开始算时提前触发）是<strong>异步提交</strong>，等计算需要时再等待完成。事件名（FORWARD_FETCH_SUBMIT / FORWARD_FETCH_WAIT 等）是 DS 性能分析时的锚点。独立 allgather_stream 是为了不让通信阻塞计算 stream 的 kernel 排队。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>用代码看｜参数在 __init__ 里就被切走</h2>
+    <div class="code-title">deepspeed/runtime/zero/parameter_offload.py — hook 注册（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">setup_zero_stage3_hooks</span>(self, module):
+    <span class="cmt"># 对每个叶子 sub_module 挂 pre/post forward/backward 四个 hook</span>
+    <span class="kw">def</span> <span class="fn">_pre_sub_module_forward_function</span>(sub_module):
+        param_coordinator.<span class="fn">fetch_sub_module</span>(sub_module)   <span class="cmt"># 借参数</span>
+    <span class="kw">def</span> <span class="fn">_post_sub_module_forward_function</span>(sub_module):
+        param_coordinator.<span class="fn">release_sub_module</span>(sub_module) <span class="cmt"># 还参数</span>
+    <span class="kw">for</span> sub_module <span class="kw">in</span> module.modules():
+        <span class="kw">if</span> <span class="fn">has_parameter</span>(sub_module):        <span class="cmt"># 只挂有参数的叶子</span>
+            sub_module.register_forward_pre_hook(...)
+            sub_module.register_forward_hook(...)</pre>
+    <div class="annotation"><b>hook 即借还点：</b>ZeRO-3 不改模型代码——借还挂在 PyTorch 的 forward pre/post hook 上。每个有参数的叶子模块，进之前 fetch、出之后 return。这意味着 <strong>ZeRO-3 对模型结构的要求</strong>：参数必须挂在「模块的直属 _parameters」上，用户自己把参数藏在 list/dict 里（不在 register_parameter 里）会被漏掉——这是 ZeRO-3 的经典报错来源（persistent/leaf 参数问题，见下）。</div>
+
+    <div class="code-title">deepspeed/runtime/zero/stage3.py — step()（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">step</span>(self, closure=None):
+    <span class="cmt"># ① 梯度归约完成、参数全部归位（partition_all_parameters）</span>
+    self.<span class="fn">_pre_step</span>()
+    <span class="cmt"># ② 溢出检查：fp16 梯度 any NaN/Inf → 全组跳过</span>
+    <span class="kw">if</span> found_inf: <span class="kw">return</span>
+    <span class="cmt"># ③ 子组循环：每组（参数组的一段分片）单独走完全流程</span>
+    <span class="kw">for</span> sub_group <span class="kw">in</span> self.fp16_groups:
+        self.<span class="fn">_prepare_sub_group</span>(sub_group)          <span class="cmt"># 取回本组分片</span>
+        self.<span class="fn">unscale_and_clip_grads</span>(...)            <span class="cmt"># 去 loss scale + GAS 均值</span>
+        self.<span class="fn">_optimizer_step</span>(sub_group)             <span class="cmt"># 更新 fp32 分片</span>
+        self.<span class="fn">_reassign_or_swap_out_partitioned_parameters</span>(sub_group)  <span class="cmt"># 写回 fp16</span>
+        self.<span class="fn">_release_sub_group</span>(sub_group)          <span class="cmt"># 释放，下一组</span></pre>
+    <div class="annotation"><b>子组循环的意义：</b>不是「全部参数取回 → 一次 step → 全部还回」，而是<strong>每组取回→更新→写回→释放</strong>——任一时刻 GPU 上最多只有一组的完整参数。显存峰值进一步压低，代价是更多次小 all-gather（幸好子组间还能与通信重叠）。<code class="inline">unscale_and_clip_grads</code> 同时做两件事：去 loss scale、除 GAS（两库在这一步的语义一致——scale 与 GAS 均值都在优化器侧撤销，第 6 章 6.2 的边界在引擎侧）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>疑难杂症：persistent 参数与 unsupported dtype</h2>
+    <ul>
+      <li><strong>参数没被切到</strong>（显存异常高）：参数没挂进 <code class="inline">register_parameter</code>，hook 漏掉 → 检查模型写法。</li>
+      <li><strong>fp32 小参数</strong>：极小的参数（如若干 bias）逐个 all-gather 不划算，DS 允许保留不分片（<code class="inline">stage3_max_parameters_per_partition</code> 不适用，看 <code class="inline">prescale_unscale</code> 相关分支），过小参数留在 fp32。</li>
+      <li><strong>tied weights</strong>：两处引用同一 Parameter，切分时只认一个 owner；reuse distance 之内不还，否则两边各自 fetch。</li>
+      <li><strong>非训练参数（buffers）</strong>：不参与切分，各卡全量——模型大 buffer 多时这里反而是浪费。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">对照 FSDP</b>
+      PyTorch FSDP 与 ZeRO-3 思想相同（参数分片 + all-gather），差异在工程边界：FSDP 把逻辑做进 torch 原生（wrap 粒度 = FSDP unit），ZeRO-3 靠 hook + 模块遍历（粒度 = 有参数的叶子）。FSDP 与 ZeRO-3 各自适合自家的生态；DS 的优势在 offload（第 9 章）与 ZeRO 家族的一体化配置。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>小结 + 自研启示</h2>
+    <table class="tbl">
+      <tr><th>阶段</th><th>动作</th><th>代码位置</th></tr>
+      <tr><td>init</td><td>遍历叶子模块，参数切分、留 ds_tensor 分片</td><td>InsertPostInitMethodToModuleSubClasses</td></tr>
+      <tr><td>forward pre-hook</td><td>fetch_sub_module（all-gather 完整参数）</td><td>partitioned_param_coordinator.py</td></tr>
+      <tr><td>forward post-hook</td><td>release_sub_module（还参数）</td><td>同上</td></tr>
+      <tr><td>step</td><td>子组逐个取回→更新→写回→释放</td><td>stage3.py step()</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 ZeRO-3 的最小正确路径：① 不用 hook，先用<strong>显式上下文管理器</strong>（with gather(params): ...）手写借还——语义清楚、方便调试，跑通后再自动化成 hook；② prefetch 做成「提前一层」而非「提前一层+复用分析」，先跑对再跑快；③ 显存峰值盯 <code class="inline">max_live_parameters</code>，通信时长盯 all-gather 完成事件。最容易错的三点：借出参数忘记释放（显存线性涨到 OOM）、梯度写到了壳 param 的 .grad 上（应该在分片缓冲）、leaf 参数在 hook 外被直接访问（拿到的是空壳，静默产出 NaN）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="07-zero.html">← 上一步：ZeRO 1/2</a>
+    <a href="09-offload.html">下一步：Offload →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 08 ZeRO-3 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · Kernel 层 — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a class="active" href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 Kernel 层</div>
+    <h1>Kernel 层：并行框架底下的算子竞赛</h1>
+    <div class="subtitle">前面章节讲的都是「怎么切」；切完之后每个小 GEMM 的效率由算子决定。两库都在框架底下维护了自己的 kernel 层：Megatron 走「融合算子 + TransformerEngine fp8」，DeepSpeed 走「csrc 自研 kernel（transformer/adam/aio）」。这一章盘点两边的家底，并给出「哪些值得自研抄、哪些直接用现成」的判断。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>为什么融合：内存带宽的账</h2>
+    <p>一个 bias+GELU 若分开算，读两遍写两遍中间张量；融合后只读写一遍。激活函数融合省的不是计算，是<strong>显存往返</strong>：</p>
+    <ul>
+      <li>LLM 的 GEMM 是计算密集（tensor core 打满）；其间的 LN/激活/dropout 是<strong>带宽密集</strong>——kernel 启动 + 显存往返占比高。</li>
+      <li>融合的甜点区：把「带宽密集的小算子」并进相邻计算或彼此并成一个大 kernel，减少 launch 次数与中间张量。</li>
+      <li>scale 项：s×b×h×层×序列中间张量，每省一次往返就省一次全量读写。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">判断标准</b>
+      看 kernel 是否「拉满 tensor core」：GEMM 类不用管（cuBLAS/cuBLASLt 已极致）；LN+激活+dropout+残差这类元素级算子才值得融合——这也是两库融合清单的共同形态。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>Megatron：core/fusions/ 与 TransformerEngine</h2>
+    <div class="code-title">megatron/core/fusions/ — 融合算子清单（目录盘点）</div>
+    <pre class="code"><span class="lang-tag">text</span>megatron/core/fusions/
+├── fused_softmax.py            <span class="cmt"># 缩放+mask+softmax 一体（scale_mask_softmax）</span>
+├── fused_bias_swiglu.py        <span class="cmt"># bias + swiglu 融合（C++/CUDA，autograd 配对）</span>
+├── fused_bias_gelu.py          <span class="cmt"># bias + gelu 融合（forward/backward 各一 kernel）</span>
+├── fused_cross_entropy.py      <span class="cmt"># 词表投影后的并行 cross-entropy，不落地全量 logits</span>
+├── fused_layer_norm.py         <span class="cmt"># LN 融合（TE 之外的非 TE 路径）</span>
+├── fused_bias_dropout_add.py   <span class="cmt"># 残差段三合一：bias+dropout+residual add</span>
+└── __init__.py</pre>
+    <div class="annotation"><b>清单读法：</b>七个文件全在「带宽密集区」——softmax、激活、LN、残差、cross-entropy，没有一个 GEMM。这就是 11.1 判断标准的落地。每个融合算子都是 forward/backward 两个 kernel + autograd 配对（与第 3 章 f/g 的做法同构：通信/融合进 autograd，用户层无感）。<strong>TransformerEngine（TE）是更外的一层</strong>：NVIDIA 维护的库，提供 TEColumnParallelLinear 等「并行感知 + fp8 管理」的算子族（第 5 章 5.1 的 TELayerNormColumnParallelLinear 就来自它）。TE 的 fp8 路径做三件事：当前 scale 的动态调整、GEMM 输入输出量化、与延迟缩放的联调（fp8 需要按张量尺度管理，比 fp16 的全局 loss scale 细得多）。</div>
+
+    <div class="code-title">megatron/core/extensions/transformer_engine.py — TE 接入方式（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Megatron 的 TE 扩展：把自家并行语义接进 TE 算子</span>
+<span class="kw">class</span> <span class="cl">TELayerNormColumnParallelLinear</span>(TEColumnParallelLinear, _BaseNorm ...):
+    <span class="cmt"># LN + 列并行融合进一个 TE module——前向少一次往返，反向自动配对</span>
+    <span class="cmt"># fp8: TE 在 module 内部管理 amax 历史 + 当前 scale（per-tensor）</span>
+    <span class="cmt"># 与 Megatron 的对接点：config.recompute / TP group / SP 变体全部透传</span></pre>
+    <div class="annotation"><b>接入模式：</b>Megatron 不重写 fp8——它把并行边界（TP/SP 组、重算策略、分布式 optimizer 的 main_grad 通道）作为参数传给 TE，让 TE 在其内部处理 fp8。<strong>main_grad 是关键通道</strong>：TE 的 wgrad 也走 gradient_accumulation_fusion 写进主缓冲（第 3、7 章的伏笔在此汇合）。自研时若想上 fp8，直接用 TE，不要自己写量化调度。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>DeepSpeed：csrc/ 的三大家当</h2>
+    <div class="code-title">deepspeed/csrc/ — 自研 kernel 盘点</div>
+    <pre class="code"><span class="lang-tag">text</span>deepspeed/csrc/
+├── transformer/               <span class="cmt"># 推理/训练 transformer kernel：attn/ln/gelu 融合</span>
+│   └── (ds_attention, bias_gelu, ...)   <span class="cmt"># 与 Megatron fusions 同思路、独立实现</span>
+├── adam/                      <span class="cmt"># GPU fused Adam（第 6 章 _take_model_step 调用）</span>
+│   └── (multi-tensor Adam：多参数组一次 kernel，减少 launch)
+├── cpu_adam/                  <span class="cmt"># 第 9 章的 CPU 侧 SIMD Adam</span>
+├── aio/                       <span class="cmt"># 第 9 章的 DeepNVMe 异步 IO</span>
+├── quantizer/                 <span class="cmt"># 量化搬运（低精度 offload 的带宽减半）</span>
+└── csrc 通用（cpu_lion, ragged 等）</pre>
+    <div class="annotation"><b>两库家底的形态对比：</b>Megatron 的 fusions 服务「训练前向/反向的热路径」，DS 的 csrc 服务「训练周边（optimizer、IO、offload）+ 推理 kernel」——各自补自己主打场景的短板。共同点：<strong>multi-tensor / multi-param 的 batch 化</strong>（一次 kernel 处理多个参数张量，减少 launch 开销）——DS 的 fused Adam 与 Megatron 的分布式 optimizer 步进都受益于此思路。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>哪些值得抄，哪些直接用</h2>
+    <table class="tbl">
+      <tr><th>类别</th><th>建议</th><th>理由</th></tr>
+      <tr><td>GEMM</td><td>直接用 cuBLAS/cuBLASLt 或 TE</td><td>自研打不过厂商库</td></tr>
+      <tr><td>注意力</td><td>直接用 FlashAttention / TE</td><td>同样打不过，且变长支持复杂</td></tr>
+      <tr><td>LN+激活+残差融合</td><td>值得抄思路（简单、收益明确）</td><td>元素级 kernel，C++/Triton 一天能写</td></tr>
+      <tr><td>Fused optimizer</td><td>值得抄（multi-tensor batch 化）</td><td>launch 开销是 optimizer 热路径大头</td></tr>
+      <tr><td>异步 IO / offload</td><td>直接用 DS 的 DeepNVMe</td><td>调优过的 libaio 封装，重写不经济</td></tr>
+      <tr><td>fp8 量化调度</td><td>直接用 TE</td><td>scale 管理的状态机深，别自己碰</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      kernel 层的自研纪律：<strong>先 profile 再动手</strong>——nsight 里看到 launch gap 或带宽打满才值得写融合；GEMM 与注意力的时间占比决定了自研 kernel 的天花板（通常 < 40% 时间在元素级算子上，融合的全部收益在这 40% 里）。最容易错的三点：融合 kernel 的 backward 忘了与 forward 配对（autograd 断链静默错）、用了 fp16 累加（元素级 kernel 应 fp32 累加）、融合边界跨了 TP 通信（第 10 章同款坑）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="10-checkpointing.html">← 上一步：激活重算</a>
+    <a href="12-checkpoint-io.html">下一步：Checkpoint IO →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

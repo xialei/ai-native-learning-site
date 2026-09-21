@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · 分布式 Checkpoint — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a class="active" href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 分布式 Checkpoint</div>
+    <h1>分布式 Checkpoint：存的是分片，读回来还能变拓扑</h1>
+    <div class="subtitle">千亿模型的 checkpoint 是分片散落在几百张卡上的。麻烦在<strong>恢复</strong>：续训时并行度改了怎么办？微调时 DP 数量不同怎么办？两库的答案同构——把「物理布局」与「逻辑布局」分开存，加载时重分片（reshard）。Megatron 走得更远：定义了多种 reshardable 格式与异步保存。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>一分钟版本</h2>
+    <ul>
+      <li><strong>朴素做法的坑</strong>：每卡存自己的分片 + 全局 metadata。加载时若并行度变了，各卡的「自己那份」对不上号——要么报错，要么静默错。</li>
+      <li><strong>解决思路</strong>：存「每个张量的完整形状 + 分片位置描述」，加载时按新拓扑重新切。代价是加载时要跨卡读（reshard 本质是重新 all-gather/scatter）。</li>
+      <li><strong>DeepSpeed</strong>：universal checkpoint——把 ZeRO 分片布局转成「每参数完整 + 优化器状态分片」的规范形式，任意 ZeRO stage/DP 数恢复。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">三个独立问题</b>
+      checkpoint 的复杂性常被低估成一个问题，实际是三个：① <strong>存什么</strong>（模型/优化器/RNG/dataloader 状态）；② <strong>怎么存</strong>（分片布局 + metadata，保存速度）；③ <strong>怎么读</strong>（变拓扑 reshard + 部分加载如仅权重供推理）。两库的工程量大头在②③。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>用代码看｜Megatron 的 reshardable 格式</h2>
+    <div class="code-title">megatron/core/dist_checkpointing/strategies/ — 格式家族（目录盘点，译注）</div>
+    <pre class="code"><span class="lang-tag">text</span>megatron/core/dist_checkpointing/strategies/
+├── base.py                    <span class="cmt"># ShardedTensor 抽象：每个分片带全局坐标</span>
+├── fully_reshardable.py       <span class="cmt"># 全重分片：任意并行度可读（写入最规范）</span>
+├── fully_sharded_model_space.py  <span class="cmt"># 模型空间坐标系的分片</span>
+├── fsdp_dtensor.py            <span class="cmt"># 与 torch FSDP DTensor 互通的格式</span>
+└── (zarr/torch 基础后端)</pre>
+    <div class="annotation"><b>ShardedTensor 的语义：</b>每个分片不只是裸 tensor，而是「tensor 的哪个部分」（global_offset + local_shape + global_shape）。保存时把各卡的分片都写盘、metadata 记录完整坐标系；加载时给定新拓扑，每个新 rank 按 ShardedTensor 描述反查「我要的张量部分散落在哪些旧分片里」，读盘后拼装。<code class="inline">checkpoint_fully_reshardable_formats</code>（第 7 章 DistributedOptimizer 的开关）决定优化器状态也走这套坐标——否则优化器状态只能按原 DP 数恢复。</div>
+
+    <div class="code-title">megatron/training/checkpointing.py — async save（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 保存也可以异步：先把数据准备好，IO 放后台，训练不停</span>
+<span class="kw">def</span> <span class="fn">save_checkpoint</span>(...):
+    <span class="kw">if</span> async_save:
+        <span class="cmt"># ① 同步阶段：gather/整理分片数据（快，GPU 上完成）</span>
+        <span class="cmt"># ② 后台线程执行写盘；训练继续</span>
+        <span class="cmt"># ③ 下次 save 前等待上一次完成（同一时刻只有一份在写）</span>
+        async_save_fn(...)</pre>
+    <div class="annotation"><b>异步保存的语义：</b>千卡集群一次全量保存要数十秒到分钟级，训练停下来等 IO 是巨大浪费。Megatron 的 async save 把「整理分片」与「写盘」分开：整理（需要 GPU 参与的部分）同步做，纯 IO 扔后台。加载的对称功能是 <code class="inline">--ckpt-fully-parallel-load</code>（多 rank 并行读盘再互发）。实战纪律：async save 期间若训练崩溃，最后一次 checkpoint 可能不完整——所以保存目录用「写入完成后原子改名」或双目录轮换。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>用代码看｜DeepSpeed 的 universal checkpoint</h2>
+    <div class="code-title">deepspeed/checkpoint/utils.py + ds_to_universal.py（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 转换脚本：把普通 ZeRO checkpoint 转成 universal 布局</span>
+<span class="cmt"># deepspeed --num_nodes 1 --num_gpus N ds_to_universal.py --input_ckpt ...</span>
+<span class="cmt"># universal 布局的关键性质：</span>
+<span class="cmt">#   - 每个 parameter 的分片描述带「在完整张量中的位置」</span>
+<span class="cmt">#   - 加载时按当前 DP/stage 重新切分，不要求与保存时一致</span>
+<span class="kw">def</span> <span class="fn">main</span>():
+    <span class="cmt"># 读旧布局 → 重建全局视图 → 按目标 rank 数重切 → 写 universal 目录</span>
+    ...</pre>
+    <div class="annotation"><b>读法：</b>DS 的 universal checkpoint 是<strong>事后转换</strong>（先有普通 checkpoint，再用脚本转成 universal），Megatron 是<strong>原生保存</strong>（训练时直接存 reshardable 格式）。功能等价，工作流不同：DS 用户在扩缩容前跑一次转换脚本；Megatron 用户配置开关常开。加载侧 DS 的 <code class="inline">load_checkpoint(..., load_module_strict=False)</code> 还支持部分加载（只取权重，供推理导出）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>存的不只是参数</h2>
+    <table class="tbl">
+      <tr><th>内容</th><th>Megatron</th><th>DeepSpeed</th></tr>
+      <tr><td>模型参数</td><td>ShardedTensor 分片 + metadata</td><td>fp16 全量/分片 + ZeRO 布局</td></tr>
+      <tr><td>优化器状态</td><td>DistributedOptimizer 的窗口分片</td><td>master/m/v 分片（32bit 逐组）</td></tr>
+      <tr><td>lr scheduler / RNG</td><td>checkpoint 里带（RNG 决定 dropout 续训一致）</td><td>engine 内部状态</td></tr>
+      <tr><td>dataloader 位置</td><td>consumed_samples（第 5 章采样器靠它续位）</td><td>micro_steps + dataloader state</td></tr>
+      <tr><td>变拓扑加载</td><td>原生（reshardable formats）</td><td>universal checkpoint 转换</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">RNG 与 consumed_samples</b>
+      续训「无缝」的两个隐形条件：RNG 状态（不存则续训后 dropout 序列变了，loss 曲线在恢复点出现小跳变）与 consumed_samples（不存则数据从重头开始，重复样本扰动分布）。两者都是 metadata 级的小数据，漏了却最难察觉。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.5</span>小结 + 自研启示</h2>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 checkpoint 的最小正确路径：① 第一版就按「每参数完整张量 + 保存时 DP 无关」存（torch 的 state_dict 天然如此）——大不了保存慢，但<strong>永远能读</strong>；② 分片布局优化等真的遇到 IO 瓶颈再做；③ metadata 单独一个小 json（版本号、并行布局、参数形状表）——半年后你一定会感谢它。最容易错的三点：只存了模型没存 optimizer（续训 loss 跳变）、RNG 没存（续训曲线微抖）、保存目录名带 step 但进程崩溃留下半截文件（用原子改名）。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="11-kernel.html">← 上一步：Kernel</a>
+    <a href="13-moe.html">下一步：MoE →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 12 Checkpoint · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

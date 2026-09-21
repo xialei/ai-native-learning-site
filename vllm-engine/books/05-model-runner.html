@@ -183,6 +183,17 @@ self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} �
     <h3>限制：图的形状是死的，batch 是活的</h3>
     <p>CUDA graph 一旦录好，里面每个 kernel 的尺寸就固定了。而第 4 章的连续批处理意味着每个 step 的 batch 大小都在变——请求随时加入、退出。两件事要兼容，只有一个办法：把活 batch 补齐到某张图的尺寸再回放。</p>
     <p>具体做法：预先枚举一组「捕获尺寸」（<code class="inline">cudagraph_capture_sizes</code>，如 1、2、4、8、…直到最大批），batch 落在哪个区间，就补齐到该区间的上限。比如 50 个请求补到 56，多出来的 6 个槽位填上假 token——正是 5.2 里 <code class="inline">is_padding=True</code> 的来源。补的那几个 token 白算一点点计算，换回来的是整次前向只付一次启动开销，划算。</p>
+    <p>拿 5.2 的例子把这组尺寸和补齐算清楚。默认的捕获尺寸不是随便拍的——它是 <code class="inline">[1, 2, 4] + range(8, 256, 8) + range(256, 512 + 1, 16)</code>（源码：vllm/config/compilation.py:691 起的默认值文档，公式在 :699-700；上限默认 512，数据中心 Blackwell 卡可以到 1024）。展开开头一段就是：</p>
+    <div class="code-title">捕获尺寸数列（默认值展开）</div>
+    <pre class="code"><span class="lang-tag">text</span>1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, ... , 256, 272, 288, ... , 512</pre>
+    <p>于是「50 个请求」的去向一目了然：50 落在 48 和 56 之间，向上补齐到 <strong>56</strong>。这 6 个补出来的槽位：</p>
+    <ul>
+      <li><strong>身份</strong>：<code class="inline">is_padding=True</code>，<code class="inline">query_start_loc</code> 里相邻两个请求的起点差为 0——它们没有对应的真实请求；</li>
+      <li><strong>输入</strong>：input_ids 填 0，position 填 0（5.2 的拼接规则对假 token 照样生效）；</li>
+      <li><strong>slot</strong>：分到 <code class="inline">PAD_SLOT_ID = -1</code>（源码：vllm/v1/attention/backends/utils.py:46），写入 KV 时会被后端跳过，不会污染任何真请求的缓存；</li>
+      <li><strong>输出</strong>：5.5 的 <code class="inline">logits_indices = query_start_loc[1:] - 1</code>（input_batch.py:175）只会挑出真实请求的末位——空请求长度为 0，不产生 logits，采样阶段根本看不到它们。</li>
+    </ul>
+    <p>代价可以量化：56 个槽位里 6 个是假的，<strong>≈ 11% 的计算是白做的</strong>。但对比另一头——若不补齐，就得为 50 这一个形状单独录一张图，而请求数天天在 49、51、53 之间波动，等于为每种 batch 大小各录一张图，显存和启动时间都不允许。11% 的浪费买「任意 batch 都能整图回放」，这笔账是划算的。</p>
     <div class="annotation"><b>为什么 decode 单独一套尺寸：</b>decode 每步固定每个请求 +1 token，batch 之间只差请求数，形状种类少，枚举尺寸容易命中；prefill 的 token 数每个请求各不相同，命中预录形状的概率低得多。所以 vLLM 对 decode 用「枚举尺寸 + 补齐」，prefill 走别的路径（如 PIECEWISE 编译图），两者分开处理。</div>
   </section>
 

@@ -45,7 +45,7 @@
       <li>三种模式 read-only / workspace-write / danger-full-access 只管<strong>文件效果</strong>；网络与进程可见性明确排除在词汇表外。</li>
       <li><strong>审批</strong>：<code class="inline">ctx.approval</code>，政策 ask/never；结果封闭联合 allowed-once / rejected / cancelled / unavailable——<strong>唯一授权是 allowed-once</strong>，且只授权本次调用。</li>
       <li>每次 ask 在日志里留下 approval/asked + approval/decided <strong>审计对</strong>；必须在 open turn 内（turn 是日志的重放边界）。</li>
-      <li>模型否认不了沙箱：拒绝统一为 <code class="inline">[sandbox: file access denied under …]</code> 标记 + 同轮升级提示，模型可以带着 <code class="inline">sandbox_permissions + justification</code> 原样重试一次，由 approveEscalation 严格加宽并先过审批。</li>
+      <li>模型否认不了沙箱：拒绝统一为 <code class="inline">[sandbox: file access denied under …]</code> 标记 + 同轮升级提示，模型可以带着 <code class="inline">sandbox_permissions + justification</code> 原样重试一次，由 approveEscalation 判定——重复本次调用已生效的模式直接放行，严格加宽才需要审批。</li>
     </ul>
   </section>
 
@@ -176,9 +176,9 @@
 
           <rect x="560" y="140" width="180" height="90" rx="10" fill="#eceffe" stroke="#4156c8"/>
           <text x="650" y="165" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e2a6e">approveEscalation</text>
-          <text x="650" y="185" text-anchor="middle" font-size="10" fill="#444">① 严格加宽检查</text>
-          <text x="650" y="203" text-anchor="middle" font-size="10" fill="#444">② 无审批服务→抛错</text>
-          <text x="650" y="221" text-anchor="middle" font-size="10" fill="#444">③ approval.request()</text>
+          <text x="650" y="185" text-anchor="middle" font-size="10" fill="#444">⓪ 同模式重复→直接放行</text>
+          <text x="650" y="203" text-anchor="middle" font-size="10" fill="#444">① 严格加宽检查→无审批服务→抛错</text>
+          <text x="650" y="221" text-anchor="middle" font-size="10" fill="#444">② approval.request()</text>
 
           <rect x="800" y="140" width="140" height="90" rx="10" fill="#eceffe" stroke="#4156c8"/>
           <text x="870" y="168" text-anchor="middle" font-size="11" font-weight="bold" fill="#1e2a6e">人点头</text>
@@ -201,8 +201,11 @@
       </div>
       <div class="svg-legend">图 9-1 · 拒绝 → 标记 + 升级提示 → 带 sandbox_permissions 重试 → approveEscalation 严格加宽 + 审批 → 审计对落日志</div>
     </div>
-    <div class="code-title">packages/sandbox/sandbox/src/escalation.ts:157 — approveEscalation 的判定顺序</div>
+    <div class="code-title">packages/sandbox/sandbox/src/escalation.ts:153 — approveEscalation 的判定顺序</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export async function</span> <span class="fn">approveEscalation</span>&lt;<span class="cl">A</span>, <span class="cl">C</span>&gt;(request: <span class="cl">EscalationRequest</span>, approval: <span class="cl">EscalationApproval</span>&lt;A, C&gt;): <span class="cl">Promise</span>&lt;<span class="cl">SandboxMode</span>&gt; {
+  <span class="kw">const</span> { requestedMode: mode, effectiveMode, justification, subject } = request
+  <span class="cmt">// ⓪ 重复本次调用的生效模式不需要审批，直接返回</span>
+  <span class="kw">if</span> (mode === effectiveMode) <span class="kw">return</span> effectiveMode
   <span class="cmt">// ① 严格加宽是 EXECUTION 检查——schema enum 只是封闭目标词汇表，</span>
   <span class="cmt">//    生效模式是每次调用的真相</span>
   <span class="kw">if</span> (!(<span class="cl">WIDER_MODES</span>[effectiveMode] ?? []).<span class="fn">includes</span>(mode <span class="kw">as</span> <span class="cl">SandboxMode</span>)) {
@@ -220,6 +223,7 @@
   }
 }</pre>
     <div class="annotation"><b>结构学但不依赖</b>：EscalationApprover 是<strong>最小结构形状</strong>（只有 request 方法），不是 ApprovalService 类型——「the tool layer … closes over <code class="inline">ctx.approval.request(...)</code> and hands the closure down, so this package never depends on the approval or agent packages」。WIDER_MODES 阶梯是 read-only→{workspace-write, danger-full-access}、workspace-write→{danger-full-access}；schema enum 固定为完整 ESCALATION_TARGETS 而非按默认模式裁剪——否则一个 danger-full-access 默认部署会让窄模式会话失去升级杠杆。</div>
+    <div class="annotation"><b>同模式为什么放行</b>：函数体第一行 <code class="inline">if (mode === effectiveMode) return effectiveMode</code> 是后来加的捷径——工具带 <code class="inline">sandbox_permissions</code> 重试时，请求的模式可能恰好等于本次调用已生效的模式（比如宿主已经按会话政策把这次调用放在 workspace-write 里）。这不算加宽，走审批只会让人重复点一次头。只有<strong>严格更宽</strong>的模式才需要审批，且授权只对这一次调用生效。</div>
   </section>
 
   <section class="block">
@@ -235,7 +239,7 @@
     <div class="annotation"><b>bundler 不是 owner</b>：README 明说「It bundles the knobs; execution and approval keep their own values, so removing the package later leaves the last selection in effect」——预设包只是把两件事写进各自的事件，它不拥有任何执行语义；卸掉它，最后的模式与政策原样生效。它就是第 1 章判别法的应用：打包面（UI 概念）与能力面（enforcement）分开。</div>
     <div class="callout info">
       <b class="tag">auto 预设的例外位置</b>
-      <code class="inline">auto</code>（AUTO_PRESET，index.ts:80）目前是实验性预设，参数表里也是 danger-full-access + never——但它是唯一一个固定搭配之外还有<strong>运行时把关者</strong>的：宿主集成用 <code class="inline">registerAuto(admit)</code>（index.ts:311）发布当前会话有效的 auto 能力（重复注册抛错），持久身份仍是普通的 <code class="inline">permission/preset</code> 事件。选择 auto 后，experimental 的 dsh-auto-review 在每次工具调用前用独立 reviewer 调用按<strong>实际效果</strong>分类：low（项目内读写/分析/格式化/测试/构建/非破坏性 Git/本会话创建对象的精确清理）直接放行，medium（不可逆删除既有状态、force push、生产读写/部署、外部发送）只在带明确授权（动作+目标+范围）时放行，high（越信任边界的敏感数据外泄等硬拒效果）连显式请求也拒绝；歧义与超范围一律 fail-closed。委派时 <code class="inline">captureDelegatedPolicyOverrides</code>（subagent/child-agent.ts）只把 <code class="inline">'auto'|'danger-full-access'</code> 写进子的 permission/preset 事件——窄预设的子代理各自继承沙箱而不是复制审批政策。
+      <code class="inline">auto</code>（AUTO_PRESET，index.ts:80）目前是实验性预设，参数表里也是 danger-full-access + never——但它是唯一一个固定搭配之外还有<strong>运行时把关者</strong>的：宿主集成用 <code class="inline">registerAuto(admit)</code>（index.ts:313）发布当前会话有效的 auto 能力（重复注册抛错），持久身份仍是普通的 <code class="inline">permission/preset</code> 事件。选择 auto 后，experimental 的 dsh-auto-review 在每次工具调用前用独立 reviewer 调用按<strong>实际效果</strong>分类：low（项目内读写/分析/格式化/测试/构建/非破坏性 Git/本会话创建对象的精确清理）直接放行，medium（不可逆删除既有状态、force push、生产读写/部署、外部发送）只在带明确授权（动作+目标+范围）时放行，high（越信任边界的敏感数据外泄等硬拒效果）连显式请求也拒绝；歧义与超范围一律 fail-closed。委派时 <code class="inline">captureDelegatedPolicyOverrides</code>（subagent/child-agent.ts）只把 <code class="inline">'auto'|'danger-full-access'</code> 写进子的 permission/preset 事件——窄预设的子代理各自继承沙箱而不是复制审批政策。
     </div>
   </section>
 
@@ -243,7 +247,7 @@
     <h2><span class="num">9.8</span>要点</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      ① 政策与执行分家：resolve() 三层优先级（显式批准 &gt; 会话事件 &gt; 部署默认），confine() 只认完全指定的政策；② 词汇表刻意小：沙箱只管文件效果，网络/进程可见性排除在外；③ 审批唯一授权是 allowed-once，且 always 一次调用；'never' 在派发前短路；④ 审计对必须 turn-enclosed；⑤ 升级是共享编排：严格加宽 + 结构化审批接口 + 逐字错误文本，两个执行家族（bash/fs）共用同一套。下一步看其他能力缝的实例：<a href="10-seams.html">第 10 章：能力缝实战</a>。
+      ① 政策与执行分家：resolve() 三层优先级（显式批准 &gt; 会话事件 &gt; 部署默认），confine() 只认完全指定的政策；② 词汇表刻意小：沙箱只管文件效果，网络/进程可见性排除在外；③ 审批唯一授权是 allowed-once，且 always 一次调用；'never' 在派发前短路；④ 审计对必须 turn-enclosed；⑤ 升级是共享编排：同模式重复免审批、严格加宽 + 结构化审批接口 + 逐字错误文本，两个执行家族（bash/fs）共用同一套。下一步看其他能力缝的实例：<a href="10-seams.html">第 10 章：能力缝实战</a>。
     </div>
   </section>
 
@@ -255,7 +259,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 09 安全 · 版本 dsh-v0.1.5-rc.2-805 (HEAD 0d1f50007f) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 09 安全 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

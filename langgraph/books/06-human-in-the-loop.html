@@ -110,7 +110,7 @@
 
   <section class="block">
     <h2><span class="num">6.3</span>用代码看｜interrupt() + Command（resume=）（推荐）</h2>
-    <p>这是官方文档主推的方式（<code class="inline">interrupt()</code> 于 0.2.47、2024 年 11 月引入，定义在 <code class="inline">langgraph/types.py:851</code>，在节点内部直接调用）。先记住这条：<strong>同一个 <code class="inline">interrupt()</code> 会被执行两次——第一次抛异常让图暂停，图恢复后在同一个位置再被调到时，返回人的答案</strong>。带着这条看最小的可运行例子（可直接粘贴运行，注释里是实跑输出）：</p>
+    <p>这是官方文档主推的方式（<code class="inline">interrupt()</code> 于 0.2.47、2024 年 11 月引入，定义在 <code class="inline">langgraph/types.py:887</code>，在节点内部直接调用）。先记住这条：<strong>同一个 <code class="inline">interrupt()</code> 会被执行两次——第一次抛异常让图暂停，图恢复后在同一个位置再被调到时，返回人的答案</strong>。带着这条看最小的可运行例子（可直接粘贴运行，注释里是实跑输出）：</p>
 
     <div class="code-title">interrupt() + Command（resume=） 最小闭环 —— 两轮 stream 完成提问与回答</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> uuid
@@ -153,7 +153,7 @@ config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"<
 <span class="cmt"># 第一轮： 触发暂停</span>
 <span class="kw">for</span> chunk <span class="kw">in</span> graph.<span class="fn">stream</span>({<span class="st">"foo"</span>: <span class="st">"abc"</span>}, config):
     <span class="fn">print</span>(chunk)
-<span class="cmt"># &gt; {'__interrupt__': (Interrupt(value='what is your age?', id='45fda8478b2ef754419799e10992af06'),)}</span>
+<span class="cmt"># &gt; {'__interrupt__': (Interrupt(value='what is your age?', id='e1908d47cb1ac1bfd4b6c4b699091fdd', response_schema=None),)}</span>
 
 <span class="cmt"># 第二轮： 人回答 "30"， 用 Command(resume=...) 恢复</span>
 <span class="kw">for</span> chunk <span class="kw">in</span> graph.<span class="fn">stream</span>(<span class="cl">Command</span>(resume=<span class="st">"30"</span>), config):
@@ -183,10 +183,14 @@ config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"<
     <p>「框架怎么知道这次 <code class="inline">interrupt()</code> 该返回答案而不是再抛异常」也不是什么特殊机制——<strong>答案就记录在恢复数据里</strong>。同一个 <code class="inline">interrupt()</code> 第二次被调到时，框架从恢复数据里找到对应值，直接返回。两次执行在同一个位置分岔，靠的不是代码里埋的标记，而是恢复数据里「有没有待送达的答案」。</p>
 
     <h3 class="subhead">把这套机制拆开：interrupt() 源码逐行读</h3>
-    <p>上面这个「第一次抛、第二次返回」的行为，全部由 <code class="inline">langgraph/types.py:851</code> 的实现驱动。函数体核心逻辑只有四步，逐行看（源码里与主流程无关的子图透传和断言略去）：</p>
-    <div class="code-title">interrupt（） 源码核心逻辑（langgraph/types.py:851，注释为讲解）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">interrupt</span>(value: <span class="cl">Any</span>) -&gt; <span class="cl">Any</span>:
+    <p>上面这个「第一次抛、第二次返回」的行为，全部由 <code class="inline">langgraph/types.py:887</code> 的实现驱动。函数体核心逻辑只有四步，逐行看（源码里与主流程无关的子图透传、断言和 response_schema 校验略去）：</p>
+    <div class="code-title">interrupt（） 源码核心逻辑（langgraph/types.py:887，注释为讲解）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">interrupt</span>(value: <span class="cl">Any</span>, *, response_schema: <span class="cl">dict</span>[<span class="cl">str</span>, <span class="cl">Any</span>] | <span class="cl">type</span> | <span class="cl">None</span> = <span class="cl">None</span>) -&gt; <span class="cl">Any</span>:
     conf = <span class="fn">get_config</span>()[<span class="st">"configurable"</span>]
+    <span class="cmt"># response_schema 传 Pydantic 模型/TypedDict/dataclass 时会包成校验器</span>
+    <span class="cmt"># （JSON Schema dict 则透传、只给前端看不校验）—— 详见 6.3 末尾</span>
+    adapter = (<span class="cl">None</span> <span class="kw">if</span> response_schema <span class="kw">is</span> <span class="cl">None</span> <span class="kw">or</span> <span class="fn">isinstance</span>(response_schema, <span class="cl">dict</span>)
+               <span class="kw">else</span> <span class="fn">TypeAdapter</span>(response_schema))
     scratchpad = conf[CONFIG_KEY_SCRATCHPAD]
     <span class="cmt"># ① 本次是节点内第几次调 interrupt()： 0、1、2...</span>
     <span class="cmt">#    （LazyAtomicCounter，每次调用 +1，同一节点内递增）</span>
@@ -195,22 +199,31 @@ config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"<
     <span class="cmt"># ② 已收集的恢复值列表： 多个 interrupt 恢复时按位置对号</span>
     <span class="kw">if</span> scratchpad.resume:
         <span class="kw">if</span> idx &lt; <span class="fn">len</span>(scratchpad.resume):
-            <span class="kw">return</span> scratchpad.resume[idx]    <span class="cmt"># 本次的恢复值已就位 → 直接返回</span>
+            v = scratchpad.resume[idx]
+            <span class="cmt"># 注意这行 SEND 投影： 把「到目前为止已消费的恢复值」重新写一遍，</span>
+            <span class="cmt"># 保证恢复时更早的 interrupt 不会因状态回放而丢记录</span>
+            conf[CONFIG_KEY_SEND]([(RESUME, scratchpad.resume[: idx + <span class="nu">1</span>])])
+            <span class="kw">return</span> adapter.<span class="fn">validate_python</span>(v) <span class="kw">if</span> adapter <span class="kw">else</span> v
 
     <span class="cmt"># ③ 本轮刚送达的恢复值： 裸值 Command(resume="30") 走的就是这条</span>
     v = scratchpad.<span class="fn">get_null_resume</span>(<span class="kw">True</span>)
     <span class="kw">if</span> v <span class="kw">is not</span> <span class="kw">None</span>:
+        validated = adapter.<span class="fn">validate_python</span>(v) <span class="kw">if</span> adapter <span class="kw">else</span> v
         scratchpad.resume.<span class="fn">append</span>(v)          <span class="cmt"># 记入列表， 供同节点后续 interrupt() 对号</span>
-        <span class="kw">return</span> v
+        conf[CONFIG_KEY_SEND]([(RESUME, scratchpad.resume)])
+        <span class="kw">return</span> validated
 
     <span class="cmt"># ④ 没有恢复值（人还没回答）→ 抛 GraphInterrupt：</span>
     <span class="cmt">#    异常一路冒泡出节点， 被图的主循环（pregel/_loop.py）捕获——</span>
     <span class="cmt">#    当前图状态 + 这个 interrupt 一起落盘， 执行干净地停止</span>
     <span class="kw">raise</span> <span class="cl">GraphInterrupt</span>(
-        (<span class="cl">Interrupt</span>.<span class="fn">from_ns</span>(value=value, ns=conf[CONFIG_KEY_CHECKPOINT_NS]),)
+        (<span class="cl">Interrupt</span>.<span class="fn">from_ns</span>(
+            value=value, ns=conf[CONFIG_KEY_CHECKPOINT_NS],
+            response_schema=adapter.<span class="fn">json_schema</span>() <span class="kw">if</span> adapter <span class="kw">else</span> response_schema,
+        ),)
     )
 </pre>
-    <div class="annotation"><b>读懂这段：</b>拆完就清楚了：判断「第几次」靠一个随调用递增的计数器（①）；拿「答案」有两条相邻的路径——②是已收集的恢复值列表（多个 interrupt 恢复时按位置对号），③是本轮刚送达的恢复值（<strong>最简单的裸值 <code class="inline">Command(resume="30")</code> 走的就是这条</strong>）；④「暂停」则是抛异常后由框架主循环接住并持久化。②③执行的是同一条规则：<strong>第 idx 次 interrupt() 对应第 idx 个恢复值</strong>——源码 docstring（<code class="inline">types.py:866</code>）原话是 "matches resume values to interrupts based on their order in the node"。两次执行之间不能改变 <code class="inline">interrupt()</code> 的数量或顺序（比如把它挪进条件分支），否则恢复值会喂错对象。</div>
+    <div class="annotation"><b>读懂这段：</b>拆完就清楚了：判断「第几次」靠一个随调用递增的计数器（①）；拿「答案」有两条相邻的路径——②是已收集的恢复值列表（多个 interrupt 恢复时按位置对号），③是本轮刚送达的恢复值（<strong>最简单的裸值 <code class="inline">Command(resume="30")</code> 走的就是这条</strong>）；④「暂停」则是抛异常后由框架主循环接住并持久化。②③执行的是同一条规则：<strong>第 idx 次 interrupt() 对应第 idx 个恢复值</strong>——源码 docstring（<code class="inline">types.py:904</code>）原话是 "matches resume values to interrupts based on their order in the node"。两次执行之间不能改变 <code class="inline">interrupt()</code> 的数量或顺序（比如把它挪进条件分支），否则恢复值会喂错对象。②③里那两行 <code class="inline">CONFIG_KEY_SEND</code> 投影是恢复机制的另一半：节点重跑前框架会把「已消费到第几个恢复值」重新写进 pending writes，保证重跑时 scratchpad 状态一致——读源码时别把它当成冗余。</div>
 
     <p>上面④号机制还解释了一个高频坑：<strong>别用裸 <code class="inline">except Exception</code> 包住 <code class="inline">interrupt()</code></strong>。<code class="inline">GraphInterrupt</code> 继承自 <code class="inline">Exception</code>（<code class="inline">langgraph/errors.py:102</code>，继承链 <code class="inline">GraphInterrupt</code> → <code class="inline">GraphBubbleUp</code> → <code class="inline">Exception</code>），宽口径的 <code class="inline">except</code> 会把它吞在节点里——异常到不了框架主循环，图既不暂停也不落盘，HITL 静默失效。要么不包，要么捕获后先对 <code class="inline">GraphInterrupt</code> 放行（<code class="inline">raise</code>）再处理其他异常。</p>
 
@@ -224,7 +237,27 @@ config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"<
     <p>正确顺序是反过来：<code class="inline">interrupt()</code> 拿到答案（= 确认）之后，再执行副作用。这正是 6.8 节审批流 <code class="inline">plan → approve → execute</code> 三段结构的设计根源。</p>
     <p><strong>纪律二：同一节点多次 <code class="inline">interrupt()</code> 时，恢复值按调用顺序对号入座。</strong>原因就是上面源码②③共同的规则。配合两个实践推论：① 恢复时若图里有多个<strong>同时待处理</strong>的 interrupt（典型场景：两个并行节点各自 interrupt），必须用 <code class="inline">Command(resume={interrupt_id: 值})</code> 按 id 定向恢复，只传裸值会被框架直接拒绝（实跑验证：<code class="inline">RuntimeError: When there are multiple pending interrupts, you must specify the interrupt id when resuming</code>）——而同一节点内先后调用的多个 interrupt 不算「同时待处理」，裸值会按序逐个消费，同样安全；② 验证循环（反复问人直到答案合法）不要写成节点内 <code class="inline">while True</code>——循环次数不定会改变两次执行间 <code class="inline">interrupt()</code> 的调用序，恢复匹配就乱了，正确做法见 6.10 节铁律三。</p>
 
-    <div class="callout warn"><b class="tag">注意</b> checkpointer 与 <code class="inline">interrupt()</code> 的准确关系：<strong>不配 checkpointer，第一轮 <code class="inline">invoke</code> 不会报错</strong>——图照样执行到 <code class="inline">interrupt()</code> 照样停（实跑验证：返回值里带 <code class="inline">__interrupt__</code>）。但状态没有落盘，<strong>恢复时会直接抛 <code class="inline">RuntimeError: Cannot use Command(resume=...) without checkpointer</code></strong>（<code class="inline">pregel/_loop.py:907</code>）。也就是说，checkpointer 不是「暂停」的前提，而是「暂停之后还能恢复」的前提。另外 <code class="inline">InMemorySaver</code> 只存内存，进程退出即丢，生产审批流请用 <code class="inline">AsyncPostgresSaver</code> 等持久化实现——checkpointer 在，暂停几小时甚至几天后换个进程也能凭同一个 <code class="inline">thread_id</code> 恢复（见 6.5 节）。</div>
+    <h3 class="subhead">response_schema：把「答案长什么样」写进暂停事件</h3>
+    <p>1.2.11 之后的源码（2026 年 9 月，#8886，写作时未发版）给 <code class="inline">interrupt()</code> 加了一个可选的关键字参数 <code class="inline">response_schema</code>。它解决的是一个前端老问题：暂停事件里的 <code class="inline">value</code> 只是任意 JSON，前端想知道「该让用户填什么、格式是什么」，只能靠 <code class="inline">value.type</code> 这类<strong>约定俗成的字段</strong>（12.5 节的 AutoML 案例就是这么做的）。<code class="inline">response_schema</code> 把这个契约变成了<strong>框架级字段</strong>——它随 <code class="inline">Interrupt</code> 一起出现在 <code class="inline">__interrupt__</code> 事件和 <code class="inline">stream_mode="debug"</code> 的载荷里，客户端（LangGraph Studio 先行）据此直接渲染出类型化的表单，而不是一个裸 JSON 输入框。</p>
+    <div class="code-title">response_schema 的三种形态（源码 langgraph/types.py:887，实跑验证）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> pydantic <span class="kw">import</span> BaseModel
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> TypedDict
+
+<span class="kw">class</span> <span class="cl">Decision</span>(BaseModel):
+    approved: <span class="cl">bool</span>
+    reason: <span class="cl">str</span>
+
+<span class="kw">def</span> <span class="fn">node</span>(state):
+    <span class="cmt"># 形态一： Pydantic 模型 / TypedDict / dataclass → 转成 JSON Schema 给前端，</span>
+    <span class="cmt">#         并在恢复时校验；interrupt() 返回的是校验后的对象（可能已做类型强转）</span>
+    d = <span class="fn">interrupt</span>(<span class="st">"需要审批"</span>, response_schema=Decision)
+
+    <span class="cmt"># 形态二： JSON Schema dict → 原样透传给客户端，恢复值不校验</span>
+    <span class="cmt"># d = interrupt("需要审批", response_schema={"type": "object", ...})</span>
+
+    <span class="cmt"># 形态三： 不传（默认 None）→ 一切照旧，和旧版行为完全一致</span>
+    <span class="kw">return</span> {<span class="st">"decision"</span>: d}</pre>
+    <div class="annotation"><b>读懂这段：</b>三种形态的差别在<strong>「校不校验」</strong>：传 Pydantic 模型/TypedDict/dataclass 时，源码里用 <code class="inline">TypeAdapter</code> 包一层，暂停事件里带的是 <code class="inline">adapter.json_schema()</code>（JSON Schema dict），恢复时 <code class="inline">adapter.validate_python(v)</code>——<strong>非法的恢复值在节点内就抛 <code class="inline">pydantic.ValidationError</code></strong>，此时该步尚未提交，修好后再 resume 就行（实跑验证：resume 一个 <code class="inline">"not-a-bool"</code> 给 <code class="inline">approved: bool</code>，确实抛 ValidationError，且同一 thread 下次用合法值能正常恢复）；传 JSON Schema dict 则只透传不校验，校验责任完全在前端；不传则零变化。注意返回值类型也变了：有校验器时返回的是<strong>校验后的对象</strong>（Pydantic 模型返回模型实例，直接 <code class="inline">d.approved</code> 属性访问；TypedDict/dataclass 返回 dict/实例），不是原始 dict——下游代码按属性取值时别再当字典下标。这对前端是纯增量——没 schema 的旧图，事件里该字段就是 <code class="inline">None</code>（第一个例子的实跑输出里已经能看到 <code class="inline">response_schema=None</code>）。自建客户端时它和 12.5 的 <code class="inline">value.type</code> 约定并不冲突：schema 管「表单长什么样」，type 管「用哪个组件渲染」，一个字段管结构、一个字段管路由。</div>
   </section>
 
   <section class="block">

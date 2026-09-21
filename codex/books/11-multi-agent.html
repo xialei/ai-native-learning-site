@@ -34,7 +34,7 @@
 <div class="page">
 
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-2088-g31ffe2bc9a</span>
+    <span class="version-badge">openai/codex @ bb054a2b03</span>
     <h1>11 · 多 Agent 与协作：分而治之的运行时</h1>
     <p class="lead">
       单个 Agent 受限于一个上下文窗口、一条注意力线。Codex 的多 Agent 系统让一个「主 Agent」能<b>派生（spawn）子 Agent</b>，
@@ -44,25 +44,22 @@
   </div>
 
   <section class="block">
-    <h2><span class="num">11.1</span>协作工具：V1 的 spawn / send_input / wait_agent / close_agent / resume_agent 与 V2 的 spawn / send_message / followup_task / interrupt_agent / list_agents</h2>
-    <p>多 Agent 能力对模型暴露为一组工具。主 Agent 通过调用它们来管理子 Agent 的生命周期。注意分版本：<b>V1 面向模型暴露 5 个工具</b>（spawn_agent / send_input / wait_agent / resume_agent / close_agent，其中 spawn_agent 另行注册，其余 4 个是 <code class="inline">required_child_management_tool_names</code> 的必选名单，spec_plan.rs:674）；<b>V2 是另一套名字</b>（spawn_agent / send_message / followup_task / interrupt_agent / list_agents，spec_plan.rs:680-685）——V2 里没有 send_input / close_agent / resume_agent，改用 send_message 投递消息、用 interrupt_agent 打断，且 wait_agent 在 V2 受 <code class="inline">multi_agent_v2.wait_agent_enabled</code> 开关控制。V1 靠 wait/close 的返回与既有上下文掌握子 Agent 状态。</p>
-
-    <pre class="code"><span class="lang-tag">codex-rs/core/src/tools/handlers/multi_agents_spec.rs:65 / :143</span>
-<span class="cmt">// v1: 每个 V1 工具各自包成一个 multi_agent_v1 Namespace（单工具）；</span>
-<span class="cmt">// v2: 直接是顶层 Function。V1 的 spawn_agent 是这样：</span>
-<span class="kw">pub fn</span> create_spawn_agent_tool_v1(options) -&gt; <span class="cl">ToolSpec</span> {
-    <span class="cl">ToolSpec</span>::Namespace(<span class="cl">ResponsesApiNamespace</span> {
-        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
-        tools: <span class="kw">vec</span>![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
-            name: <span class="st">"spawn_agent"</span>, description: spawn_agent_tool_description(..), ..
-        })],
-    })
-}
-
-<span class="cmt">// send_input 同样包在 Namespace 里，描述强调可复用已有 Agent：</span>
-<span class="st">"Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."</span></pre>
-
-    <p>两版注册的是<b>两套不同的工具名</b>，不是同一套的两个子集：<code class="inline">add_collaboration_tools</code>（spec_plan.rs:1286）里 <code class="inline">multi_agent_v2_enabled</code> 为真是 V2 分支，为假走 V1 分支，二者互斥。只有 <code class="inline">spawn_agent</code> 和 <code class="inline">wait_agent</code> 两版同名（各有 v1/v2 两份 spec）；V1 独有的 <code class="inline">send_input</code> / <code>resume_agent</code> / <code>close_agent</code> 在 V2 下不注册，V2 用 <code class="inline">send_message</code> / <code>followup_task</code> / <code>interrupt_agent</code> 取代。</p>
+    <h2><span class="num">11.1</span>协作工具：V1 / V2 两套工具面</h2>
+    <div class="callout warn">
+      <b class="tag">快照实现</b>
+      本节的工具名、feature flag 与注册路径都是锚点提交的<b>实验线实现</b>，主干仍在演进——学机制，别背清单。
+    </div>
+    <p><b>用户可见的一面</b>：多 Agent 能力对模型暴露为一组工具，主 Agent 通过调用它们管理子 Agent 的生命周期。V1 与 V2 是两套<b>互斥</b>的暴露方案，由 <code class="inline">multi_agent_v2_enabled</code> 开关二选一：</p>
+    <table class="tbl">
+      <thead><tr><th></th><th>V1（5 个工具）</th><th>V2（5 个工具）</th></tr></thead>
+      <tbody>
+        <tr><td>派生</td><td><code>spawn_agent</code></td><td><code>spawn_agent</code></td></tr>
+        <tr><td>投递消息</td><td><code>send_input</code>（可复用已有 Agent，interrupt=true 立即重定向）</td><td><code>send_message</code> / <code>followup_task</code></td></tr>
+        <tr><td>等待 / 列举</td><td><code>wait_agent</code></td><td><code>wait_agent</code>（受 <code class="inline">multi_agent_v2.wait_agent_enabled</code> 开关控制）/ <code>list_agents</code></td></tr>
+        <tr><td>恢复 / 打断 / 关闭</td><td><code>resume_agent</code> / <code>close_agent</code></td><td><code>interrupt_agent</code></td></tr>
+      </tbody>
+    </table>
+    <p>V1 靠 wait/close 的返回与既有上下文掌握子 Agent 状态；V2 把「打断」独立成工具，但没有恢复与关闭。下表是各工具的实现位置：</p>
     <table class="tbl">
       <thead><tr><th>工具</th><th>作用</th><th>版本</th><th>文件</th></tr></thead>
       <tbody>
@@ -77,6 +74,27 @@
         <tr><td><code>list_agents</code></td><td>列举当前派生的子 Agent 及状态</td><td>仅 V2</td><td><code>multi_agents_v2/list_agents.rs</code></td></tr>
       </tbody>
     </table>
+    <p><b>内部注册的一面</b>：两版怎么挂进工具目录，源码里各有讲究。</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/tools/handlers/multi_agents_spec.rs:65 / :100</span>
+<span class="cmt">// v1: 每个 V1 工具各自包成一个 multi_agent_v1 Namespace（单工具）；</span>
+<span class="cmt">// v2: spec 本体是顶层 Function（多agents_spec.rs:143），但注册前还要过一道模型目录协商。</span>
+<span class="cmt">// V1 的 spawn_agent 是这样：</span>
+<span class="kw">pub fn</span> create_spawn_agent_tool_v1(options) -&gt; <span class="cl">ToolSpec</span> {
+    <span class="cl">ToolSpec</span>::Namespace(<span class="cl">ResponsesApiNamespace</span> {
+        name: MULTI_AGENT_V1_NAMESPACE.to_string(),
+        tools: <span class="kw">vec</span>![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: <span class="st">"spawn_agent"</span>, description: spawn_agent_tool_description(..), ..
+        })],
+    })
+}
+
+<span class="cmt">// send_input 同样包在 Namespace 里，描述强调可复用已有 Agent：</span>
+<span class="st">"Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."</span></pre>
+
+    <p>V2 的 spec 还会被 <code class="inline">multi_agent_v2_handler</code>（tools/multi_agent_tool.rs:21）二次包装：当提供方具备 namespace 能力且配置了 <code class="inline">multi_agent_v2.tool_namespace</code> 时，顶层 Function 会被包进 V2 Namespace（描述固定为「Tools for spawning and managing sub-agents.」）；同时套用模型目录的 description / parameters 覆盖（<code class="inline">ResolvedModelMessages::from_model</code>，codex-prompts crate），无效的目录 schema 会被拒掉并回退到内置 spec。没有 namespace 也没有覆盖时原样放行。</p>
+
+    <div class="annotation"><b>源码注记：</b> V1 的 spawn_agent 单独注册，其余 4 个工具是 <code class="inline">required_child_management_tool_names</code> 的必选名单（spec_plan.rs:656）；V2 工具名单在 spec_plan.rs:674-679，wait_agent 开关注入在同函数尾部（spec_plan.rs:686-688）。注册入口 <code class="inline">add_collaboration_tools</code>（spec_plan.rs:1242）按 <code class="inline">multi_agent_v2_enabled</code> 互斥二选一；只有 <code class="inline">spawn_agent</code> 和 <code class="inline">wait_agent</code> 两版同名（各有 v1/v2 两份 spec）。</div>
 
     <div class="callout info">
       <b class="tag">复用 vs 新建</b>
@@ -88,7 +106,7 @@
     <h2><span class="num">11.2</span>Agent 角色：内置 default / explorer / worker</h2>
     <p>派生子 Agent 时可指定 <code class="inline">agent_type</code>（角色）。角色不是空泛的标签，而是<b>带配置覆盖的预设</b>——它能在子 Agent 继承的父配置之上叠加限制（如换模型、调低推理强度、关闭某些 feature）。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/role.rs:343 (built_in 模块)</span>
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/role.rs:341 (built_in 模块)</span>
 <span class="kw">pub(super) fn</span> configs() -&gt; &amp;'static <span class="cl">BTreeMap</span>&lt;<span class="kw">String</span>, <span class="cl">AgentRoleConfig</span>&gt; {
     <span class="cl">BTreeMap</span>::from([
         (<span class="st">"default"</span>, <span class="cl">AgentRoleConfig</span> { description: <span class="st">"Default agent."</span>, .. }),
@@ -141,9 +159,9 @@ Rules:
 
   <section class="block">
     <h2><span class="num">11.3</span>派生流程：从工具调用到子线程</h2>
-    <p><code class="inline">handle_spawn_agent</code> 是核心。它把一次工具调用翻译成 <code class="inline">AgentControl::spawn_agent_with_metadata</code>，真正起一个子 <code class="inline">CodexThread</code>。</p>
+    <p><code class="inline">handle_spawn_agent</code> 是核心。它把一次工具调用翻译成 <code class="inline">AgentControl::spawn_agent_with_metadata</code>，真正起一个子 <code class="inline">CodexThread</code>。构建子配置的那一坨「继承父配置 + 角色覆盖」逻辑已被收拢到独立模块 <code class="inline">agent/child_config.rs</code> 的 <code class="inline">prepare_agent_spawn_config</code>——V1/V2 两个 handler 共用这一个入口。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:47</span>
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/tools/handlers/multi_agents/spawn.rs:50</span>
 <span class="kw">async fn</span> handle_spawn_agent(invocation) -&gt; <span class="cl">Result</span>&lt;..&gt; {
     <span class="kw">let</span> role_name = args.agent_type.as_deref().map(str::trim).filter(|r| !r.is_empty());
 
@@ -154,32 +172,34 @@ Rules:
         <span class="kw">return</span> <span class="cl">Err</span>(RespondToModel(<span class="st">"Agent depth limit reached. Solve the task yourself."</span>));
     }
 
-    <span class="cmt">// 2. 构建派生配置（继承父配置 + 角色覆盖；fork 时角色不生效）</span>
-    build_agent_spawn_config(&amp;session.get_base_instructions().await, turn.as_ref())?;
-    <span class="kw">if</span> args.fork_context {
-        reject_full_fork_agent_type_override(role_name)?;      <span class="cmt">// fork 时禁止角色全量覆盖</span>
-    }
-    apply_requested_spawn_agent_model_overrides(..).await?;     <span class="cmt">// 应用模型覆盖</span>
-    <span class="kw">if</span> !args.fork_context {
-        apply_spawn_agent_role(&amp;session, &amp;<span class="kw">mut</span> config, role_name).await?;  <span class="cmt">// 应用角色</span>
-    }
-    apply_spawn_agent_runtime_overrides(&amp;<span class="kw">mut</span> config, turn.as_ref())?;
+    <span class="cmt">// 2. 构建派生配置：统一收拢在 agent/child_config.rs（继承 + 角色 + fork 约束）</span>
+    <span class="kw">let</span> prepared = prepare_agent_spawn_config(
+        &amp;session, step_context.as_ref(),
+        SpawnConfigOptions {
+            version: SpawnConfigVersion::V1,
+            full_history_fork: args.fork_context,   <span class="cmt">// fork 时角色让位（child_config.rs 内部处理）</span>
+            role_name,
+            model: args.model.as_deref(),
+            reasoning_effort: args.reasoning_effort.clone(),
+        },
+    ).await?;
 
     <span class="cmt">// 3. 真正派生：AgentControl 起子线程</span>
     <span class="kw">let</span> result = session.services.agent_control
-        .spawn_agent_with_metadata(.., SpawnAgentOptions {
-            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()), ..
+        .spawn_agent_with_metadata(prepared.config, input_items, .., SpawnAgentOptions {
+            fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),
+            fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory), ..
         })?;
 }</pre>
 
-    <p>三步逻辑清晰：先查深度限额，再组装配置（继承 + 角色覆盖），最后交给 <code class="inline">AgentControl</code> 起线程。注意 fork 与普通 spawn 的分工：fork 路径下角色覆盖整体让位（只做 <code class="inline">reject_full_fork_agent_type_override</code> 防御），普通路径才应用 <code class="inline">apply_spawn_agent_role</code>。失败会返回可读的错误给模型，让模型自行决定换策略。</p>
+    <p>三步逻辑清晰：先查深度限额，再把配置组装整个交给 <code class="inline">prepare_agent_spawn_config</code>（agent/child_config.rs:51）——fork 约束（<code class="inline">reject_full_fork_agent_type_override</code>）、模型覆盖、角色应用（<code class="inline">apply_spawn_agent_role</code>）都在里面按序执行——最后交给 <code class="inline">AgentControl</code> 起线程。失败会返回可读的错误给模型，让模型自行决定换策略。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">11.4</span>派生深度与递归护栏</h2>
     <p>子 Agent 也是 Agent，也能再派生孙子 Agent。若无限制，会出现无限递归的 Agent 树，耗尽资源。Codex 用<b>派生深度（spawn depth）</b>护栏：</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/registry.rs:87</span>
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/registry.rs:80</span>
 <span class="kw">pub(crate) fn</span> next_thread_spawn_depth(session_source) -&gt; i32 {
     session_depth(session_source).saturating_add(1)   <span class="cmt">// 父深度 + 1</span>
 }
@@ -223,22 +243,28 @@ Rules:
 
   <section class="block">
     <h2><span class="num">11.5</span>AgentControl：子 Agent 的控制面</h2>
-    <p><code class="inline">AgentControl</code> 是管理所有子线程的中心对象，提供完整的控制 API：</p>
+    <p>控制面拆成了<b>契约与实现两层</b>：<code class="inline">AgentControl</code> 是一个 trait（agent/api.rs:50），定义 spawn / send / interrupt / close / inspect / list / watch 等控制契约，注释明确写着「boxed Send futures allow callers to use <code class="inline">Arc&lt;dyn AgentControl&gt;</code>」——为将来替换本地实现留了口子。当前唯一实现是 <code class="inline">LocalAgentControl</code>（agent/control.rs:97），由每个根会话持有（<code class="inline">SessionServices.agent_control</code>），整个派生树共享同一实例，让 registry 限定在根线程范围内。实现体按职责拆进 <code class="inline">agent/control/</code> 子模块（spawn / delivery / interrupt / budget / completion / residency 等）。</p>
 
-    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/control.rs:124</span>
-<span class="kw">pub(crate) struct</span> <span class="cl">AgentControl</span> { .. }
+    <pre class="code"><span class="lang-tag">codex-rs/core/src/agent/api.rs:50 (trait) / agent/control.rs (实现)</span>
+<span class="kw">pub trait</span> <span class="cl">AgentControl</span>: <span class="cl">Send</span> + <span class="cl">Sync</span> {   <span class="cmt">// 契约：spawn / resume / send / interrupt /</span>
+    <span class="cmt">// close / inspect / list / watch / admit_turn / record_usage / turn_finished ...</span>
+}
 
-<span class="kw">impl</span> <span class="cl">AgentControl</span> {
-    <span class="kw">pub(crate) async fn</span> send_input(..)              <span class="cmt">// 向子 Agent 投递输入</span>
-    <span class="kw">pub(crate) async fn</span> send_inter_agent_communication(..) <span class="cmt">// Agent 间通信</span>
-    <span class="kw">pub(crate) async fn</span> emit_sub_agent_activity(..)  <span class="cmt">// 上报子 Agent 活动</span>
-    <span class="kw">pub(crate) async fn</span> interrupt_agent(agent_id)   <span class="cmt">// 打断某子 Agent</span>
-    <span class="kw">pub(crate) async fn</span> get_status(agent_id) -&gt; <span class="cl">AgentStatus</span>
-    <span class="kw">pub(crate) async fn</span> list_live_agent_subtree_thread_ids(..)
+<span class="kw">pub(crate) struct</span> <span class="cl">LocalAgentControl</span> { .. }  <span class="cmt">// control.rs:97，本机实现</span>
+<span class="kw">impl</span> <span class="cl">LocalAgentControl</span> {                    <span class="cmt">// 部分 facade 方法（仍在 control.rs）</span>
+    <span class="kw">pub(crate) async fn</span> send_input(..)              <span class="cmt">// 向子 Agent 投递输入（:186）</span>
+    <span class="kw">pub(crate) async fn</span> send_inter_agent_communication(..) <span class="cmt">// Agent 间通信（:215）</span>
+    <span class="kw">pub(crate) async fn</span> emit_sub_agent_activity(..)  <span class="cmt">// 上报子 Agent 活动（:238）</span>
+    <span class="kw">pub(crate) async fn</span> interrupt_agent(agent_id)   <span class="cmt">// 打断某子 Agent（:354）</span>
+    <span class="kw">pub(crate) async fn</span> get_status(agent_id) -&gt; <span class="cl">AgentStatus</span>  <span class="cmt">//（:389）</span>
+    <span class="kw">pub(crate) async fn</span> subscribe_status(..)        <span class="cmt">// 订阅状态变化（:464）</span>
     <span class="kw">pub(crate) async fn</span> list_agents(..)
-    <span class="kw">pub(crate) async fn</span> subscribe_status(..)        <span class="cmt">// 订阅状态变化</span>
-    <span class="kw">pub(crate) async fn</span> spawn_agent_with_metadata(..) <span class="cmt">// 派生（实现在 agent/control/spawn.rs:263）</span>
-}</pre>
+}
+
+<span class="cmt">// agent/control/ 子模块（按职责拆分）：</span>
+<span class="cmt">//   spawn.rs:271  spawn_agent_with_metadata —— 派生</span>
+<span class="cmt">//   spawn.rs:287  spawn_agent_with_communication —— V2 带通信上下文的派生</span>
+<span class="cmt">//   budget.rs / completion.rs / delivery.rs / interrupt.rs / residency.rs / ...</span></pre>
 
     <p>注意 <code class="inline">send_inter_agent_communication</code>——子 Agent 之间可以通信，不只限于「父→子」。这让协作模式更丰富：一个 worker 完成自己的部分后，可以把结果直接发给另一个 worker，而不必回父 Agent 中转。配合 <code class="inline">subscribe_status</code>，父 Agent 能异步感知所有子 Agent 的进度。</p>
 
@@ -253,6 +279,8 @@ Rules:
 fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),</pre>
 
     <p>fork 适用于「我想在当前理解的基础上，并行探索多个方向」的场景。它复用了第 4 章 rollout 的快照能力——fork 本质是创建一个共享父历史的子会话。配合 <code class="inline">reject_full_fork_agent_type_override</code>（禁止 fork 时全量覆盖角色），保证 fork 出的子 Agent 仍在受控范围内。</p>
+
+    <p>V1 与 V2 的 fork 参数不同：V1 是布尔 <code class="inline">fork_context</code>（全量继承），V2 换成 <code class="inline">fork_turns</code> 字符串参数，支持 <code class="inline">none</code>（不继承）、<code class="inline">all</code>（等价 FullHistory）、正整数 N（只带最近 N 轮，<code class="inline">SpawnAgentForkMode::LastNTurns</code>，agent/types.rs:22-24），解析在 multi_agents_v2/spawn.rs:278-315。V2 里再传旧的 <code class="inline">fork_context</code> 会被明确拒绝——「fork_context is not supported in MultiAgentV2; use fork_turns instead」。fork 粒度从开关变成了可调的窗口，主 Agent 可以按任务需要只带「最近几轮」上下文，而不是整个历史。</p>
   </section>
 
   <section class="block">
@@ -263,7 +291,7 @@ fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),</pre>
         <tr><td>并行侦察</td><td>同时 spawn 多个 explorer</td><td>多个独立的代码库问题</td></tr>
         <tr><td>分块执行</td><td>spawn 多个 worker，各管一块文件</td><td>大重构拆分</td></tr>
         <tr><td>复用上下文</td><td>send_input 给已有 Agent（V1；V2 对应 send_message）</td><td>依赖前序上下文的后续任务</td></tr>
-        <tr><td>fork 探索</td><td>fork 出继承父状态的子 Agent</td><td>在当前理解上多向探索</td></tr>
+        <tr><td>fork 探索</td><td>fork 出继承父状态的子 Agent（V1 fork_context；V2 fork_turns 可选 none / all / 最近 N 轮）</td><td>在当前理解上多向探索</td></tr>
         <tr><td>Agent 间通信</td><td>send_inter_agent_communication（AgentControl 内部通道）</td><td>worker 间直接交接结果</td></tr>
         <tr><td>打断重定向</td><td>send_input(interrupt=true)（V1；V2 对应 interrupt_agent）</td><td>子 Agent 走偏时纠偏</td></tr>
       </tbody>
@@ -289,7 +317,7 @@ fork_parent_spawn_call_id: args.fork_context.then(|| call_id.clone()),</pre>
 </div>
 
 <footer>
-  Codex CLI · 11 多 Agent 与协作 · 版本 rusty-v8-v150.4.0-2088-g31ffe2bc9a · 所有引用代码路径以仓库最新为准
+  Codex CLI · 11 多 Agent 与协作 · 源码锚点 openai/codex @ bb054a2b03 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

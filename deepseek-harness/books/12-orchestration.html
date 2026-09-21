@@ -102,7 +102,7 @@ persistence, and model boundaries.</pre>
 
   <section class="block">
     <h2><span class="num">12.3</span>continuable 子 agent：durable、可续聊、可冷恢复</h2>
-    <div class="code-title">packages/subagent/subagent/src/index.ts:228 — 注册表上的三个操作</div>
+    <div class="code-title">packages/subagent/subagent/src/index.ts:262 — 注册表上的三个操作</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 建立一个 durable continuable child 并送达初始 prompt。
     在子 inbox 接受 prompt 时即 resolve——不等 turn 开始、不等消息落日志。 */</span>
 <span class="kw">async</span> <span class="fn">startContinuable</span>(spec: <span class="cl">ContinuableStartSpec</span>): <span class="cl">Promise</span>&lt;<span class="cl">ContinuableStart</span>&gt;
@@ -116,6 +116,20 @@ persistence, and model boundaries.</pre>
     宿主协议侧另有 @Remote('interruptByParent') 的异步面，让父 Agent 离线时子仍可被打断。 */</span>
 <span class="fn">interrupt</span>(targetSessionId: <span class="cl">SessionId</span>, authority: <span class="cl">SubagentInterruptAuthority</span>): <span class="kw">void</span></pre>
     <div class="annotation"><b>与第 4 章的钩子一一对应</b>：sendMessage 的三种目标状态（running → 最近 step 边界 / idle → 启动 turn / absent → 冷恢复）分别对应第 4 章的 inbox 待处理注入、whenIdle/wakeDriver 路径、以及第 5 章的持久化重载。子 agent 的会话是独立的 Session log，parentSession 记录父 session id——发现与时序由 session 投影从日志折叠（subagentTimingProjection / subagentIdentityProjection；v0.1.5-rc 起新增第三个投影 subagentCatalog：父会话在子发布成功时追加一条 <code class="inline">subagent/catalog</code> 事件，直系子目录从这份父有的持久事实折叠，fork 继承前缀不计入）。 Adjacency（只许直系父子互发）由服务从「exact live sender」派生——模型不能伪造发送者。</div>
+    <div class="code-title">packages/subagent/subagent/src/index.ts:190 — 委托的两个用户旋钮（v0.1.6 新增）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Host configuration for continuable subagent capacity. */</span>
+<span class="kw">export interface</span> <span class="cl">Config</span> {
+  <span class="cmt">/** Maximum live children sharing uninterrupted continuable parent links; defaults to 8. */</span>
+  maxActiveSubagents?: <span class="cl">number</span>
+  <span class="cmt">/** Default delegation depth for tools without an explicit limit; defaults to 1. */</span>
+  maxDepth?: <span class="cl">number</span>
+}
+
+<span class="kw">static</span> Config: <span class="cl">z</span>&lt;<span class="cl">Config</span>&gt; = z.<span class="fn">object</span>({
+  maxDepth: z.<span class="fn">number</span>().<span class="fn">step</span>(<span class="nu">1</span>).<span class="fn">min</span>(<span class="nu">0</span>).<span class="fn">default</span>(<span class="nu">1</span>),
+  maxActiveSubagents: z.<span class="fn">number</span>().<span class="fn">step</span>(<span class="nu">1</span>).<span class="fn">min</span>(<span class="nu">1</span>).<span class="fn">default</span>(<span class="nu">8</span>),
+})</pre>
+    <div class="annotation"><b>两个旋钮管两件独立的事</b>：<code class="inline">maxDepth</code> 是<strong>深度</strong>——委托工具没有自己的深度配置时从 settings 取（默认 1 = 只许直系子），显式工具深度（含 <code class="inline">provider-managed</code>）优先，<code class="inline">resolveMaxDepth</code>（index.ts:248）就是这条规则；深度 0 通过工具关掉委托，改动在下一次委托尝试时生效。<code class="inline">maxActiveSubagents</code> 是<strong>并发容量</strong>——限「共享不间断 continuable 父链的存活子」个数。实现在 continuation-activation.ts:41 的 <code class="inline">ActivationPool</code>：进程内一个 <code class="inline">Set&lt;symbol&gt;</code> 做槽位，物化（fresh 创建或冷恢复）前 <code class="inline">reserve()</code>，超容抛 <code class="inline">ACTIVATION_LIMIT_REACHED</code>（浏览器提示路径收到 <code class="inline">subagent/delivery-unavailable</code>）。池的继承规则值得记：非 continuable 父开新池且自己不占槽，continuable 后代继承同一池；等待中的父、待投递 inbox、正在停止的 Activation 都占槽；常驻子复用自己的槽；one-shot 父不跨池。满员时<strong>不排队</strong>——排队会让等待后代的父同时占着自己的槽死锁。槽位是进程本地的，不约束累计会话历史或 token 用量。这延续了第 5 章「状态在日志、进程只是缓存」的立场：容量是活体属性，不是持久事实。</div>
   </section>
 
   <section class="block">
@@ -236,7 +250,7 @@ by the file policy.</pre>
     <h2><span class="num">12.7</span>要点</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      ① 委派缝是注册表不是单实现：进程内与跨进程 provider 共存，模型工具不感知差异；② one-shot 与 continuable 分开建模，continuation manager 独占子的全部运行时，provider 只出创建参数；③ 工作流脚本隔离是 containment 不是 security，安全语义走沙箱/审批；④ ralph 用「新鲜 agent + 有界报告 + 外置记忆」对抗上下文腐化，报告校验与轮数上限防止无限循环。下一步是全书的收束：<a href="13-roadmap.html">第 13 章：自制 Harness 路线图</a>。
+      ① 委派缝是注册表不是单实现：进程内与跨进程 provider 共存，模型工具不感知差异；② one-shot 与 continuable 分开建模，continuation manager 独占子的全部运行时，provider 只出创建参数；③ 委托的两个旋钮分开管深度与并发容量，容量是进程本地的槽位协议，满员不排队；④ 工作流脚本隔离是 containment 不是 security，安全语义走沙箱/审批；⑤ ralph 用「新鲜 agent + 有界报告 + 外置记忆」对抗上下文腐化，报告校验与轮数上限防止无限循环。下一步是全书的收束：<a href="13-roadmap.html">第 13 章：自制 Harness 路线图</a>。
     </div>
   </section>
 
@@ -248,7 +262,7 @@ by the file policy.</pre>
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.5-rc.2-805 (HEAD 0d1f50007f) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 12 编排 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

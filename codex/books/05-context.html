@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">rusty-v8-v150.4.0-2088-g31ffe2bc9a</span>
+    <span class="version-badge">openai/codex @ bb054a2b03</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 上下文构建</div>
     <h1>★ 上下文构建：模型每一轮到底看到什么</h1>
     <div class="subtitle">Codex 不是简单地把会话历史拼成字符串发给模型——它把上下文拆成可组合的「片段（Fragment）」，按角色（developer/user/system）和时机注入，并在每轮 turn 重新组装。本章拆开 Fragment 体系、AGENTS.md 注入、ContextManager 与 build_prompt 的完整流水线。</div>
@@ -49,7 +49,7 @@
   <section class="block">
     <h2><span class="num">5.1</span>一个 Prompt 由什么组成</h2>
     <p>第 3 章看到 <code class="inline">run_sampling_request</code> 每轮调用 <code class="inline">build_prompt</code>。来看看它到底装了什么：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1517 — build_prompt</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1558 — build_prompt</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) fn</span> build_prompt(
     input: Vec&lt;ResponseItem&gt;,              <span class="cmt">// 会话历史（消息/工具调用/结果）</span>
     step_context: &amp;StepContext,
@@ -62,11 +62,11 @@
         parallel_tool_calls: <span class="kw">true</span>,                    <span class="cmt">// ③ 允许并行工具</span>
         base_instructions,                            <span class="cmt">// ④ 基础指令</span>
         output_schema: turn_context.final_output_json_schema.clone(), <span class="cmt">// ⑤ 输出 schema</span>
-        output_schema_strict: !is_basic_session_source(...),
-        cyber_access_program: turn_context.cyber_access_program, <span class="cmt">// ⑥ cyber 访问程序（ChatGPT 认证）</span>
+        output_schema_strict: !is_basic_session_source(...), <span class="cmt">// ⑥ 严格 schema 校验开关</span>
+        cyber_access_program: turn_context.cyber_access_program, <span class="cmt">// ⑦ cyber 访问程序（ChatGPT 认证）</span>
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 一个 Prompt 有六部分：<strong>① 会话历史 input</strong>（<code class="inline">ResponseItem</code> 列表，含已注入的 fragment）；<strong>② 工具规格</strong>（告诉模型有哪些工具可用）；<strong>③ 并行工具开关</strong>（Codex 默认允许模型一次请求多个工具）；<strong>④ base_instructions</strong>（系统级指令）；<strong>⑤ 输出 schema</strong>（结构化输出约束）；<strong>⑥ cyber_access_program</strong>（ChatGPT 认证下的 cyber 治理选项）。注意 <code class="inline">input</code> 不只是用户消息——它已经包含了被注入的 developer/user fragment（见 5.3）。</div>
+    <div class="annotation"><b>读懂这段：</b> 一个 Prompt 有七部分：<strong>① 会话历史 input</strong>（<code class="inline">ResponseItem</code> 列表，含已注入的 fragment）；<strong>② 工具规格</strong>（告诉模型有哪些工具可用）；<strong>③ 并行工具开关</strong>（Codex 默认允许模型一次请求多个工具）；<strong>④ base_instructions</strong>（系统级指令）；<strong>⑤ 输出 schema</strong>（结构化输出约束）；<strong>⑥ output_schema_strict</strong>（Responses API 是否严格校验 output_schema——普通会话开启，guardian/basic 会话关闭）；<strong>⑦ cyber_access_program</strong>（ChatGPT 认证下的 cyber 治理选项）。注意 <code class="inline">input</code> 不只是用户消息——它已经包含了被注入的 developer/user fragment（见 5.3）。</div>
   </section>
 
   <section class="block">
@@ -77,7 +77,6 @@
 <span class="kw">mod</span> developer_instructions;        <span class="cmt">// developer 角色指令</span>
 <span class="kw">mod</span> user_instructions;             <span class="cmt">// user 角色指令</span>
 <span class="kw">mod</span> apps_instructions;             <span class="cmt">// 已启用 app 的指令</span>
-<span class="kw">mod</span> permissions_instructions;      <span class="cmt">// 权限/审批规则说明</span>
 <span class="kw">mod</span> current_time_reminder;         <span class="cmt">// 当前时间提醒</span>
 <span class="kw">mod</span> compaction_summary;            <span class="cmt">// 压缩摘要（替代旧历史）</span>
 <span class="kw">mod</span> model_switch_instructions;     <span class="cmt">// 模型切换说明</span>
@@ -85,10 +84,10 @@
 <span class="kw">mod</span> hook_additional_context;       <span class="cmt">// hook 注入的额外上下文</span>
 <span class="kw">mod</span> token_budget_context;          <span class="cmt">// token 预算提醒</span>
 <span class="kw">mod</span> user_shell_command;            <span class="cmt">// 用户 shell 信息</span>
-<span class="kw">mod</span> multi_agent_role_instructions; <span class="cmt">// 多 Agent 角色指令</span>
 <span class="kw">mod</span> guardian_policy;               <span class="cmt">// 守护策略</span>
-<span class="cmt">// ... 还有 37 个其他 fragment（mod 声明共 49 个）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 每一种「要告诉模型的东西」都是一个独立 fragment 模块。<strong>这种拆分让上下文可组合、可按需启用</strong>——例如多 Agent 模式才注入 <code class="inline">multi_agent_role_instructions</code>，压缩后才注入 <code class="inline">compaction_summary</code>。这是 Codex 上下文工程的核心设计：不是一整块写死的 system prompt，而是可独立启用的片段。</div>
+<span class="cmt">// permissions_instructions / multi_agent_role_instructions 已上移 codex-prompts crate（经 re-export 提供）</span>
+<span class="cmt">// ... 还有 35 个其他 fragment（mod 声明共 47 个）</span></pre>
+    <div class="annotation"><b>读懂这段：</b> 每一种「要告诉模型的东西」都是一个独立 fragment 模块。<strong>这种拆分让上下文可组合、可按需启用</strong>——例如多 Agent 模式才注入 <code class="inline">MultiAgentRoleInstructions</code>（现由 codex-prompts crate 统一提供），压缩后才注入 <code class="inline">compaction_summary</code>。这是 Codex 上下文工程的核心设计：不是一整块写死的 system prompt，而是可独立启用的片段。</div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t52 d52">
         <title id="t52">Fragment 组装成 Prompt</title>
@@ -167,7 +166,7 @@
     state: Mutex&lt;AgentsMdState&gt;,
 }
 
-<span class="cmt">/// 根会话保留 provider；子 Agent 只继承已应用的快照。</span>
+<span class="cmt">/// 子代理继承已应用快照；声明共享的 thread provider 也会一并继承。</span>
 <span class="kw">pub(crate) struct</span> SessionInstructions {
     user: Option&lt;Instructions&gt;,                    <span class="cmt">// 全局/用户指令（可由 provider 在请求边界刷新）</span>
     thread: Option&lt;Instructions&gt;,                  <span class="cmt">// 线程级指令（ThreadInstructionsProvider 提供）</span>
@@ -219,14 +218,14 @@
     <h2><span class="num">5.6</span>工具结果截断与图像处理</h2>
     <p>上下文里最占 token 的是工具输出（尤其 shell 命令的长输出）和图像。ContextManager 也管这些的截断：</p>
     <div class="code-title">codex-rs/core/src/context_manager/mod.rs — 截断与估算工具</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) use</span> history::estimate_image_bytes;          <span class="cmt">// 估算图像字节</span>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) use</span> history::estimate_image_reference_bytes; <span class="cmt">// 估算图像字节（内联 + 文件 ID 引用）</span>
 <span class="kw">pub(crate) use</span> history::estimate_item_token_count;     <span class="cmt">// 估算 item 的 token 数</span>
 <span class="cmt">// 截断实现在 codex_utils_output_truncation crate：</span>
 <span class="cmt">//   truncate_function_output_payload / truncate_text / TruncationPolicy</span>
 <span class="cmt">// context_manager/history.rs 在记录工具结果时内联调用截断：</span>
 <span class="cmt">//   预算优先用 metadata.history_truncation_token_limit（逐工具上限），</span>
 <span class="cmt">//   否则回退到 序列化预算 + 序列化余量（with_serialization_allowance）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 工具输出不会无脑全塞进 prompt——记录历史时就地按策略截断（保留头尾、中间省略），避免一个 <code class="inline">ls -R</code> 就把上下文撑爆。截断预算支持<strong>逐工具覆盖</strong>：MCP 服务器可在配置里给单个工具设 <code class="inline">output_token_limit</code>，随 <code class="inline">CodexHarnessMetadata.history_truncation_token_limit</code>（serde 名 <code class="inline">fallback_token_limit_override</code>）一路带进历史，并且跨 resume/fork 保留。图像也估算 token 占用。这些都是「上下文预算管理」的一部分，与第 6 章的压缩配合。</div>
+    <div class="annotation"><b>读懂这段：</b> 工具输出不会无脑全塞进 prompt——记录历史时就地按策略截断（保留头尾、中间省略），避免一个 <code class="inline">ls -R</code> 就把上下文撑爆。截断预算支持<strong>逐工具覆盖</strong>：MCP 服务器可在配置里给单个工具设 <code class="inline">output_token_limit</code>，随 <code class="inline">CodexHarnessMetadata.history_truncation_token_limit</code>（serde 名 <code class="inline">fallback_token_limit_override</code>）一路带进历史，并且跨 resume/fork 保留。图像也估算 token 占用。这些是「上下文预算管理」的一部分，与第 6 章的压缩配合。此外还有一组反方向的开销：Codex 把<strong>近期执行过的工具调用</strong>以压缩元数据的形式重新附着进每次采样请求（<code class="inline">executed_tool_calls.attach_to_prompt</code>，单参数 8KB、总量 32KB 字节预算，优先保留最近的调用）——模型无需靠复述历史就能「记得」刚做过什么；压缩提示词则只附加 Code Mode 的调用。</div>
   </section>
 
   <section class="block">
@@ -248,7 +247,7 @@
 </div>
 
 <footer>
-  Codex CLI · 05 上下文构建 · 版本 rusty-v8-v150.4.0-2088-g31ffe2bc9a · 所有引用代码路径以仓库最新为准
+  Codex CLI · 05 上下文构建 · 源码锚点 openai/codex @ bb054a2b03 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

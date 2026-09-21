@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · Offload — 深入浅出 DeepSpeed · Megatron</title>
+<link rel="stylesheet" href="assets/dsm-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>DS·Megatron</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="index.html">索引</a>
+      <a href="01-architecture.html">总架构</a>
+      <a href="02-hybrid-parallel.html">3D并行</a>
+      <a href="03-megatron-tp.html">Megatron TP</a>
+      <a href="04-pp-1f1b.html">流水线</a>
+      <a href="05-megatron-model.html">模型与数据</a>
+      <a href="06-deepspeed-engine.html">DS 引擎</a>
+      <a href="07-zero.html">ZeRO 1/2</a>
+      <a href="08-zero3.html">ZeRO-3</a>
+      <a class="active" href="09-offload.html">Offload</a>
+      <a href="10-checkpointing.html">重算</a>
+      <a href="11-kernel.html">Kernel</a>
+      <a href="12-checkpoint-io.html">Checkpoint</a>
+      <a href="13-moe.html">MoE</a>
+      <a href="14-build-own-trainer.html">自研</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 Offload</div>
+    <h1>Offload：GPU 装不下，内存与 NVMe 来凑</h1>
+    <div class="subtitle">ZeRO 分片到极限还不够时，DeepSpeed 的第二张牌是「挪出去」：优化器状态挪 CPU（Offload）、参数也挪 CPU（ZeRO-Infinity）、再往后挪 NVMe（DeepNVMe 异步读写）。挪出是容易的，难的是带宽账：PCIe 与 NVMe 比显存带宽慢两个数量级，所有设计都在回答「怎么让挪动的时间藏进计算」。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>一分钟版本</h2>
+    <table class="tbl">
+      <tr><th>方案</th><th>挪什么</th><th>挪到哪</th><th>带宽假设</th></tr>
+      <tr><td>ZeRO-Offload</td><td>优化器状态 + fp32 master</td><td>CPU 内存</td><td>PCIe ~25 GB/s</td></tr>
+      <tr><td>ZeRO-Offload（梯度也挪）</td><td>+ fp16 梯度在 CPU 上更新</td><td>CPU 内存</td><td>同上，CPU Adam 消耗算力</td></tr>
+      <tr><td>ZeRO-Infinity</td><td>+ 参数分片</td><td>CPU / NVMe</td><td>NVMe ~6 GB/s/盘</td></tr>
+      <tr><td>SuperOffload</td><td>参数/梯度/状态分层放置</td><td>NVMe 优先</td><td>多盘并行 + 计算重叠</td></tr>
+    </table>
+    <div class="callout info">
+      <b class="tag">带宽是第一性约束</b>
+      每个训练 step，offload 方案至少要挪两次：梯度下行（GPU→CPU）+ 更新后的参数上行（CPU→GPU）。7B 模型 DP=8（ZeRO 切过）：每卡每 step 仍有 ~2 GB 级别的数据要过 PCIe。带宽不够，GPU 就在等——offload 的性能下限由 PCIe 决定，上限由「重叠做得好不好」决定。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>用代码看｜CPU Adam：更新的算力从哪来</h2>
+    <p>Offload 后优化器状态在 CPU，那 Adam 的更新公式在哪算？DS 用一个编译好的 CPU kernel：</p>
+    <div class="code-title">deepspeed/runtime/cpu_adam.py — DeepSpeedCPUAdam（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">DeepSpeedCPUAdam</span>(torch.optim.Optimizer):
+    <span class="st">"""  与 torch.optim.AdamW 等价的 CPU 实现，SIMD 向量化（AVX2/AVX512）  """</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, model_params, ..., fp32_optimizer_states=True, ...):
+        self.<span class="fn">ds_opt_adam_init</span>(...)   <span class="cmt"># csrc/adam 的 C++ 实现，多线程</span>
+
+    <span class="kw">@torch.no_grad</span>()
+    <span class="kw">def</span> <span class="fn">step</span>(self, closure=None):
+        <span class="cmt"># 对每个分片参数组：m/v 更新 + master 权重更新全在 CPU</span>
+        <span class="cmt"># open_set / 同步语义与 GPU Adam 一致（one-timestep 等价）</span>
+        self.<span class="fn">ds_adam</span>(fp16 params..., exp_avg, exp_avg_sq, ...)</pre>
+    <div class="annotation"><b>为什么专门写 CPU kernel：</b>PyTorch 原生 optimizer 在 CPU 上是单标量循环，7B 模型的 12B/参数更新慢到不可用。DS 的 CPU Adam 用 SIMD + 多线程把更新压到「与 PCIe 传输同量级」。这带来一个部署约束：<strong>CPU Adam 吃满物理核</strong>——offload 训练时 CPU 是第二台「优化器机器」，dataloader 的 worker 要让核，否则两边抢核互相拖慢。机器选型时核数与内存带宽（不止容量）一起看。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>用代码看｜ZeRO-2 + offload 的挂点</h2>
+    <div class="code-title">deepspeed/runtime/zero/parameter_offload.py — DeepSpeedZeroParameterOffload（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">DeepSpeedZeroParameterOffload</span>:
+    <span class="st">"""Stage 1/2 + offload 的宿主：管理 fp16 参数/梯度 与 CPU 持久副本的同步"""</span>
+
+    <span class="kw">def</span> <span class="fn">persistent_parameters</span>(self):
+        <span class="cmt"># 有些参数从不换出（太小/被 persistent 标记）：留在 GPU</span>
+
+    <span class="cmt"># forward 前：把 fp16 参数从 CPU 搬回 GPU（本卡分片）</span>
+    <span class="cmt"># backward 后：把 fp16 梯度搬到 CPU（ZeRO-2 归约后即 CPU 分片）</span>
+    <span class="cmt"># step 时：CPU Adam 直接在 CPU 的 master/m/v 上更新</span></pre>
+    <div class="annotation"><b>数据流三段：</b>① 前向前，fp16 参数从 CPU pinned memory 拷回 GPU（非阻塞，与上一步计算重叠）；② 反向后，梯度在 GPU 归约成分片，立即搬到 CPU；③ step 在 CPU 完成，新参数留在 CPU、下一 step 拷回。<strong>GPU 上任一时刻只有一份东西：当前正在算的</strong>。这个设计把 GPU 显存压到「模型激活 + 当前层参数」，但也决定了它只适合 DP 大组（分片越多，单卡要搬的越少）。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t91 d91">
+        <title id="t91">Offload 的数据流与重叠</title>
+        <desc id="d91">GPU 与 CPU 两条泳道：GPU 泳道上依次是反向计算、通信归约；CPU 泳道上依次是接收梯度、CPU Adam 更新、发回参数。下一个 microbatch 的前向与 CPU 更新重叠。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="40" y="40" font-weight="bold">GPU</text>
+        <rect class="node core" x="40" y="54" width="220" height="44" rx="6"></rect>
+        <text class="lbl sm" x="150" y="80" text-anchor="middle">反向计算（最后一个 microbatch）</text>
+        <rect class="node" x="270" y="54" width="180" height="44" rx="6"></rect>
+        <text class="lbl sm" x="360" y="80" text-anchor="middle">梯度分片 → PCIe 下行</text>
+        <rect class="node core" x="460" y="54" width="200" height="44" rx="6"></rect>
+        <text class="lbl sm" x="560" y="80" text-anchor="middle">CPU 更新后参数 → 上行</text>
+        <rect class="node core" x="650" y="54" width="200" height="44" rx="6"></rect>
+        <text class="lbl sm" x="750" y="80" text-anchor="middle">下一 step 前向计算</text>
+
+        <text class="lbl" x="40" y="150" font-weight="bold">CPU</text>
+        <rect class="node acc" x="270" y="164" width="360" height="44" rx="6"></rect>
+        <text class="lbl sm" x="460" y="176" text-anchor="middle">CPU Adam 更新（SIMD 多线程，吃满核）</text>
+
+        <line class="edge" x1="360" y1="98" x2="270" y2="148"></line>
+        <text class="lbl sm" x="300" y="128" fill="#8f2d2d">① 梯度下行</text>
+        <line class="edge" x1="640" y1="194" x2="650" y2="98"></line>
+        <text class="lbl sm" x="600" y="210" fill="#8f2d2d">② 参数上行</text>
+
+        <text class="lbl sm" x="40" y="240" fill="#8f2d2d" font-weight="bold">重叠目标：CPU Adam 的更新时长 ≈ 下一个 microbatch 的前向时长 → GPU 不空转</text>
+        <text class="lbl sm" x="40" y="262">若 CPU 更新慢于 GPU 计算，瓶颈在 CPU 核数；若数据搬运慢于两者，瓶颈在 PCIe/内存带宽</text>
+        <text class="lbl sm" x="40" y="284">NVMe 路线（ZeRO-Infinity）再叠一层：CPU 内存不够时用 DeepNVMe 异步 AIO 直读盘，参数按需换入换出</text>
+      </svg>
+      <div class="fig-cap">图 9.1：offload 的两段搬运与重叠窗口。瓶颈三选一：GPU 算力、CPU 更新算力、PCIe 带宽——监控三者利用率是调优 offload 的第一步。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>DeepNVMe：NVMe 当扩展内存用</h2>
+    <div class="code-title">deepspeed/runtime/zero/offload_states.py 相关 + csrc/aio — DeepNVMe（结构摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># offload 配置示例（ds_config.json 片段）</span>
+{
+  <span class="st">"offload_optimizer"</span>: {
+    <span class="st">"device"</span>: <span class="st">"nvme"</span>,
+    <span class="st">"nvme_path"</span>: <span class="st">"/local_nvme"</span>,       <span class="cmt"># 本地盘，不是网络盘</span>
+    <span class="st">"pin_memory"</span>: <span class="kw">true</span>                 <span class="cmt"># CPU 侧固定内存，DMA 直传</span>
+  },
+  <span class="st">"aio"</span>: {
+    <span class="st">"block_size"</span>: 1048576,             <span class="cmt"># 1MB 块——顺序 IO 的甜点区</span>
+    <span class="st">"queue_depth"</span>: 8,                  <span class="cmt"># 异步队列深度</span>
+    <span class="st">"single_submit"</span>: false,
+    <span class="st">"overlap_events"</span>: <span class="kw">true</span>
+  }
+}</pre>
+    <div class="annotation"><b>读懂 aio 配置：</b>DeepNVMe 是 DS 自研的异步 IO 层（csrc/aio，libaio 封装）：请求切成大块（block_size）、排进深队列（queue_depth）、多请求并行在途（overlap_events）——把 NVMe 的随机小 IO 劣势扭成顺序大 IO。实战数字：企业级 NVMe 盘 4–7 GB/s，两盘并行可到 10+ GB/s；训练 step 的参数搬运若能压进计算窗口内，GPU 利用率几乎不掉。<strong>盘选本地 NVMe，不要网络盘</strong>——网络盘的延迟抖动会直接打穿重叠窗口。</div>
+
+    <div class="callout info">
+      <b class="tag">SuperOffload / ZenFlow 一句话</b>
+      论文级扩展：SuperOffload 用「NVMe 优先 + CPU 副本保留热数据 + 专用算子」进一步压 PCIe 依赖；ZenFlow 研究「把不活跃参数长期留在远端、活跃参数留在 GPU」的放置策略。两者是 Offload 思想的延伸，主线配置里先掌握 offload_optimizer / offload_param 两个开关即可。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>选型决策树</h2>
+    <table class="tbl">
+      <tr><th>情况</th><th>建议</th></tr>
+      <tr><td>单卡/小 DP 组，模型放不下</td><td>ZeRO-3 + offload_optimizer(cpu)——优化器状态 12B/参数最重，先挪它</td></tr>
+      <tr><td>CPU 内存也紧张</td><td>offload_param + offload_optimizer 都开，参数按需换入</td></tr>
+      <tr><td>内存+显存都不够</td><td>device 改 nvme，确认本地盘 + aio 调优</td></tr>
+      <tr><td>DP 组很大（≥16）</td><td>先别 offload——ZeRO-3 纯 GPU 分片往往已经够了，offload 是带宽税</td></tr>
+    </table>
+    <div class="callout warn">
+      <b class="tag">自研启示</b>
+      自研 offload 的最小正确路径：① 只挪优化器状态（性价比最高的一步）；② CPU 侧用 pinned memory + torch 的 <code class="inline">.to('cpu', non_blocking=True)</code>，配 stream 同步；③ 先不做重叠，量出「每 step 搬运总时长」再决定要不要重叠。最容易错的三点：pin_memory 忘了开（搬运走慢速路径）、CPU 侧用了默认 dtype（fp32 搬运量翻倍）、NVMe 用了网络盘（延迟抖动打穿重叠窗口）。bandwidth 账先算再写代码：搬运字节 ÷ PCIe 带宽 = 每 step 的最低时间下限。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="08-zero3.html">← 上一步：ZeRO-3</a>
+    <a href="10-checkpointing.html">下一步：激活重算 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出 DeepSpeed · Megatron · 09 Offload · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+</footer>
+
+</body>
+</html>

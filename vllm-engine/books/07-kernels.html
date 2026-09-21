@@ -276,6 +276,16 @@
       <li>不同硬件/场景给不同列表，例如 SM100f 的非因果注意力优先 FlashAttention，普通 CUDA 平台一般默认 <code class="inline">FLASH_ATTN</code> → <code class="inline">FLASHINFER</code> → <code class="inline">TRITON_ATTN</code> → <code class="inline">FLEX_ATTENTION</code>。</li>
     </ul>
     <p>所以「是否 enable_flashinfer」这类开关并不是硬编码一个 if，而是：<strong>每个后端声明自己的 <code class="inline">supports_*</code> 能力（dtype、head_size、block_size、是否是 MLA、是否支持 sliding window、GPU 算力…），选择器用这些能力把所有候选过滤一遍，再在剩下的里挑优先级最高的</strong>。这样新增一个后端只需要注册到枚举并实现能力检查，选择器零改动。</p>
+    <p>这套过滤最好用一个具体的（也是故意刁难的）请求走一遍。假设模型要求：<strong>MLA + FP8 KV cache + sliding window</strong>。候选一开始是全家族的 MLA 后端，逐个过 <code class="inline">validate_configuration</code>：</p>
+    <table class="tbl">
+      <tr><th style="width:22%">候选后端</th><th style="width:26%">逐项检查</th><th>结果</th></tr>
+      <tr><td>FLASH_ATTN_MLA</td><td>is_mla ✓；算力 SM90 ✓；KV dtype 清单只有 auto/fp16/bf16</td><td><code class="inline">✗ FP8 KV 不支持</code></td></tr>
+      <tr><td>FLASHMLA</td><td>is_mla ✓；算力 SM90/SM100 ✓；dtype 含 fp8_e4m3 ✓；块 64 ✓——但 <code class="inline">supports_sliding_window()</code> 返回 False</td><td><code class="inline">✗ 滑窗不支持</code></td></tr>
+      <tr><td>FLASHINFER_MLA / CUTLASS_MLA</td><td>is_mla ✓；dtype fp8_e4m3 ✓——但算力只认 SM100，本机是 SM90</td><td><code class="inline">✗ 算力不符</code></td></tr>
+      <tr><td>TRITON_MLA</td><td>is_mla ✓；算力不限 ✓；dtype 含 fp8_e4m3 ✓；块 16 的倍数 ✓——<code class="inline">supports_sliding_window()</code> 同样返回 False</td><td><code class="inline">✗ 滑窗不支持</code></td></tr>
+    </table>
+    <p>四个候选全军覆没——而且这不是巧合：<strong>检查完整个 MLA 家族，没有任何一个后端声明支持 sliding window</strong>（基础接口的默认实现就是返回 False，MLA 系没有谁去覆盖它）。如果此时用户还显式指定了 <code class="inline">--attention-backend FLASHMLA</code>，得到的是一条 <code class="inline">ValueError</code>；没指定的话，候选集为空，平台层抛出「No valid attention backend found」。报错信息里能看到每个后端被淘汰的具体原因（<code class="inline">invalid_reasons</code>）——这份「体检报告」正是逐项过滤留下的痕迹。</p>
+    <div class="annotation"><b>这个例子的普适性：</b>把需求换成「SM90 + fp16 + 无滑窗」，表里 FLASH_ATTN_MLA 一路绿灯直接当选——同一套检查既负责「为什么选了它」也负责「为什么没选它」。能力声明 + 过滤 + 优先级排序三段式，是 vLLM 里所有「多实现挑一个」问题的通用答案（采样器、量化方案同理）。</div>
   </section>
 
   <section class="block">

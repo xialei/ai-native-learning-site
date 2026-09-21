@@ -96,20 +96,21 @@
 
   <section class="block">
     <h2><span class="num">7.3</span>派遣与回传契约</h2>
-    <p>从主代理的视角，派遣子代理就是发出一次 <code class="inline">Task</code> 工具调用——描述目标、指定用哪个代理类型，子代理跑完自己的循环，把最终文本作为 <code class="inline">tool_result</code> 回灌：</p>
-    <div class="code-title">概念示例：主代理发出 Task 工具调用</div>
+    <p>从主代理的视角，派遣子代理就是发出一次 <code class="inline">Agent</code> 工具调用——描述目标、指定用哪个代理类型，子代理跑完自己的循环，把最终文本作为 <code class="inline">tool_result</code> 回灌：</p>
+    <div class="code-title">概念示例：主代理发出 Agent 工具调用</div>
     <pre class="code"><span class="lang-tag">json</span>{
   <span class="st">"type"</span>: <span class="st">"tool_use"</span>,
-  <span class="st">"name"</span>: <span class="st">"Task"</span>,
+  <span class="st">"name"</span>: <span class="st">"Agent"</span>,
   <span class="st">"input"</span>: {
     <span class="st">"description"</span>: <span class="st">"调研 src/auth 目录的鉴权流程"</span>,
     <span class="st">"subagent_type"</span>: <span class="st">"code-explorer"</span>,     <span class="cmt">// 专职代理类型</span>
-    <span class="st">"prompt"</span>: <span class="st">"找出登录鉴权的完整调用链，列出关键文件与函数"</span>
+    <span class="st">"prompt"</span>: <span class="st">"找出登录鉴权的完整调用链，列出关键文件与函数"</span>,
+    <span class="st">"run_in_background"</span>: <span class="st">false</span>            <span class="cmt">// 缺省为 true：后台跑，完成时唤醒主代理</span>
   }
 }
 <span class="cmt">// 子代理在自己的窗口里读文件、grep、跑循环，最终产出一段文本</span>
 <span class="cmt">// → 作为 tool_result 回灌给主代理：调用链摘要 + 关键文件清单</span></pre>
-    <div class="annotation"><b>读懂这段（关键契约）：</b> 子代理内部干了什么——读了哪些文件、产生了多少 tool_result、来回多少轮——<strong>统统不回传</strong>，主代理拿到的只有 <code class="inline">tool_result</code> 里那段最终文本。这就是<strong>上下文隔离契约</strong>：噪声留在子窗口，结论进入主窗口。主代理据此决定下一步（比如亲自去改那些关键文件）。</div>
+    <div class="annotation"><b>读懂这段（关键契约）：</b> 子代理内部干了什么——读了哪些文件、产生了多少 tool_result、来回多少轮——<strong>统统不回传</strong>，主代理拿到的只有 <code class="inline">tool_result</code> 里那段最终文本。这就是<strong>上下文隔离契约</strong>：噪声留在子窗口，结论进入主窗口。主代理据此决定下一步（比如亲自去改那些关键文件）。两点补充：<strong>① 名字变了</strong>——这个工具早期叫 <code class="inline">Task</code>，现更名 <code class="inline">Agent</code>；仓库官方插件的命令 frontmatter 里仍有写 <code class="inline">Task</code> 的（如 pr-review-toolkit），可见旧名并未一刀切失效。<strong>② 默认后台</strong>——<code class="inline">run_in_background</code> 缺省为 true：派遣立即返回，子代理在后台跑自己的循环，完成时以通知唤醒主代理（呼应 §8.6 的 asyncRewake：都是「后台干活、结论回灌」）；要同步等结论才传 false。</div>
   </section>
 
   <section class="block">
@@ -181,7 +182,28 @@ model: sonnet                      <span class="cmt"># 可指定模型档位</sp
   </section>
 
   <section class="block">
-    <h2><span class="num">7.6</span>何时用子代理</h2>
+    <h2><span class="num">7.6</span>结果的可信边界：子代理输出带标记</h2>
+    <p>子代理回传的结论是一段<strong>模型生成的文本</strong>——它可能读了带恶意内容的文件（issue 里的提示注入、网页里的指令），把「请忽略之前的指令」之类的话带回来。早期版本里，这段文本和其它 tool_result 长得一样，主代理难以区分「这是子代理的转述」还是「会话自己的指令」。现在的处理：子代理结果进入主上下文时<strong>先加一行 header 标明它是子代理输出，正文整体缩进</strong>——子代理结果里的文本无法冒充会话自身的指令。</p>
+    <div class="annotation"><b>为什么值得单讲：</b> 这是对<strong>间接提示注入</strong>的防线之一。子代理天然要读大量外部内容（这正是派遣它的原因），它的最终结论就成了把外部指令带进主上下文的通道；header + 缩进给了主模型一个结构化信号：「以下内容出自另一个代理的转述，不是用户说的」。理解这一点，也解释了为什么专职代理的提示里常写「只回传结论，不要试图自己改代码」——把子代理的输出当<strong>数据</strong>，不当<strong>指令</strong>。</div>
+    <p>另一个相关的开关：<code class="inline">omitClaudeMd</code> frontmatter（2.1.271 新增）——给专职代理加这个字段，它启动时就不加载用户/项目/本地三层 CLAUDE.md（企业托管策略文件仍加载）。适合纯机械任务（批量格式化、统计），省掉与角色无关的上下文。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.7</span>团队模式：常驻的队友，而不是一次性派遣</h2>
+    <p>§7.3 的派遣是<strong>一次性的</strong>：派出去、跑完、回传、结束。团队模式（agent teams）把这层关系变成<strong>常驻</strong>：一个 leader 带若干 teammate，各自跑独立的循环，靠消息互通推进一个共享的任务清单——形态上更接近「一个带班的多代理团队」，而不是「主代理的临时外包」。</p>
+    <table class="tbl">
+      <tr><th>维度</th><th>子代理（§7.3）</th><th>团队队友</th></tr>
+      <tr><td>生命周期</td><td>一次派遣一次回收</td><td>常驻，反复接活，直到被关停</td></tr>
+      <tr><td>通信</td><td>tool_result 单向回传</td><td>双向消息（收件箱、空闲通知、关停协议）</td></tr>
+      <tr><td>任务协调</td><td>prompt 里说清楚</td><td>共享任务清单：TaskCreated / TaskCompleted / TeammateIdle 事件（§8.2）在清单变化、队友空闲时触发 hook</td></tr>
+      <tr><td>跑在哪</td><td>主进程内</td><td>主进程内（in-process）或 tmux/iTerm2 分屏窗格（<code class="inline">teammateMode</code> 设置），每个队友一个可见面板</td></tr>
+    </table>
+    <div class="annotation"><b>读懂这张表：</b> 关键差别是<strong>谁在调度</strong>。子代理的调度权完全在主代理手里——派几个、派谁、什么时候收，都是主代理的 Agent 调用决定的。团队模式里队友是<strong>平等的消息接收方</strong>：leader 给它派活、它干完了发 idle 通知，leader 靠这些通知驱动下一步，而不是靠等一个 tool_result。这带来两个工程问题，源码里都有对应的处理：<strong>① 缓存要稳</strong>——队友重发首轮的工具/技能声明会破坏提示缓存，引擎为此把 hook 上下文与预载技能钉在提示前缀里；<strong>② 挂了要报</strong>——队友在 API 错误上死掉要向 leader 报「failed」，卡住的队友收到消息要被唤醒重试，而不是傻等。团队模式是「多代理协作」从概念变成可用的那一步：任务清单管分工，消息管同步，hook 事件管自动化。</div>
+    <p>与它配套的还有「分身」：<code class="inline">context: fork</code> 的技能会派出一个<strong>继承父上下文</strong>的分支代理（默认后台跑，<code class="inline">background: false</code> 可关），以及 <code class="inline">/fork</code> 把整场会话转入后台继续跑。它们与团队模式的共同点是：主对话不再必须同步等待——活跃任务都能在 <code class="inline">/tasks</code> 里看到、能单独停止。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.8</span>何时用子代理</h2>
     <table class="tbl">
       <tr><th>场景</th><th>用子代理？</th><th>理由</th></tr>
       <tr><td>大范围探查（全仓库搜索、读一堆文件做调研）</td><td>✅</td><td>噪声大，隔离掉保护主线</td></tr>
@@ -194,7 +216,7 @@ model: sonnet                      <span class="cmt"># 可指定模型档位</sp
   </section>
 
   <section class="block">
-    <h2><span class="num">7.7</span>对使用的启示</h2>
+    <h2><span class="num">7.9</span>对使用的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
       <strong>① 脏活累活派给子代理</strong>——保护主线上下文信噪比，这是最常用收益。<strong>② 并行独立维度</strong>——审查、调研类任务用 fan-out/fan-in 又快又全。<strong>③ 把可复用的角色固化成专职代理</strong>——配最小工具集、合适模型档位，既安全又省钱。<strong>④ 代价是不透明</strong>——子代理内部过程被封装，调试时记得让它把结论写详细些。

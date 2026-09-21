@@ -106,7 +106,7 @@ _BANK_BYTES_PER_EXPERT = {
         <rect class="node" x="30" y="40" width="240" height="110" rx="10"></rect>
         <text class="lbl" x="150" y="70" text-anchor="middle">host banks（pinned）</text>
         <text class="lbl sm" x="150" y="90" text-anchor="middle">每层 [E, ...row]，按 bank 分列</text>
-        <text class="lbl sm" x="150" y="108" text-anchor="middle">bf16 / fp8_block / nvfp4 / q4_0 / mxfp4 / ds_fp4</text>
+        <text class="lbl sm" x="150" y="108" text-anchor="middle">bf16 / fp8_block / nvfp4 / q4_0 等 8 种</text>
         <text class="lbl sm" x="150" y="126" text-anchor="middle">FTW 读盘 → O_DIRECT → pin-after-fill</text>
 
         <rect class="node core" x="350" y="40" width="280" height="330" rx="10"></rect>
@@ -115,11 +115,11 @@ _BANK_BYTES_PER_EXPERT = {
         <text class="lbl" x="490" y="110" text-anchor="middle">slot 0 … 2E-1</text>
         <text class="lbl sm" x="490" y="128" text-anchor="middle">prefill 双缓冲借用区</text>
         <text class="lbl sm" x="490" y="186" text-anchor="middle">…… 自由槽 ……</text>
-        <rect class="node acc" x="380" y="220" width="220" height="46" rx="6"></rect>
-        <text class="lbl" x="490" y="242" text-anchor="middle">slot cache_size-1</text>
-        <text class="lbl sm" x="490" y="258" text-anchor="middle">argmin(usage) = 驱逐候选</text>
-        <text class="lbl sm" x="490" y="308" text-anchor="middle">usage[slot]=step 盖时间戳</text>
-        <text class="lbl sm" x="490" y="326" text-anchor="middle">id_of_slot[slot]=layer*E+expert</text>
+        <rect class="node acc" x="380" y="214" width="220" height="46" rx="6"></rect>
+        <text class="lbl" x="490" y="236" text-anchor="middle">slot cache_size-1</text>
+        <text class="lbl sm" x="490" y="252" text-anchor="middle">argmin(usage) = 驱逐候选</text>
+        <text class="lbl sm" x="490" y="296" text-anchor="middle">usage[slot]=step 盖时间戳</text>
+        <text class="lbl sm" x="490" y="314" text-anchor="middle">id_of_slot[slot]=layer*E+expert</text>
 
         <rect class="node" x="700" y="120" width="210" height="76" rx="10"></rect>
         <text class="lbl" x="805" y="148" text-anchor="middle">slot_for_id [L, E]</text>
@@ -129,12 +129,12 @@ _BANK_BYTES_PER_EXPERT = {
         <rect class="node" x="700" y="240" width="210" height="76" rx="10"></rect>
         <text class="lbl" x="805" y="268" text-anchor="middle">id_of_slot [cache_size]</text>
         <text class="lbl sm" x="805" y="286" text-anchor="middle">反查：槽→flat id</text>
-        <line class="edge" x1="700" y1="278" x2="632" y2="272"></line>
+        <line class="edge" x1="700" y1="278" x2="632" y2="260"></line>
 
-        <text class="lbl sm" x="150" y="230" fill="#55685e">decode：ensure_experts 把 topk_ids</text>
-        <text class="lbl sm" x="150" y="248" fill="#55685e">就地改写为槽 id，缺的经 PCIe 搬入</text>
+        <text class="lbl sm" x="150" y="220" fill="#55685e">decode：ensure_experts 把 topk_ids</text>
+        <text class="lbl sm" x="150" y="238" fill="#55685e">就地改写为槽 id，缺的经 PCIe 搬入</text>
         <line class="edge" x1="200" y1="152" x2="348" y2="130"></line>
-        <text class="lbl sm" x="252" y="112">PCIe（fused copy，一次 launch）</text>
+        <text class="lbl sm" x="210" y="172">PCIe（fused copy）</text>
       </svg>
       <div class="fig-cap">图 11.1：一个扁平槽池服务所有层的所有 bank。双映射让「路由改写」查 slot_for_id、「驱逐」查 id_of_slot 各走各的；前 2E 槽平时也当普通缓存用，prefill overlap 时被临时征用为双缓冲（11.5）。</div>
     </div>
@@ -305,7 +305,7 @@ moe_cache_size = max(lo, min(raw, hi))
 total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 <span class="kw">assert</span> total &lt;= budget_bytes, (...)</pre>
     <div class="annotation"><b>读懂这段：</b> 策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:43 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
-    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:841 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
+    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:874 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
   </section>
 
   <section class="block">
@@ -366,7 +366,7 @@ total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b11028 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

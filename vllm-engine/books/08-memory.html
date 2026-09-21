@@ -121,6 +121,21 @@ self.available_kv_cache_memory_bytes = (
     - cudagraph_memory_estimate_applied  <span class="cmt"># CUDA graph 缓冲也要留</span>
 )
 <span class="cmt"># 之后据这个字节数算 num_blocks，见 8.3</span></pre>
+    <p>公式看着抽象，代进一张具体的卡算一遍就清楚了。设定：单张 80 GiB 数据中心卡，跑一个 7B 级 FP16 模型，<code class="inline">gpu_memory_utilization</code> 取默认 0.92，块大小 16，KV 每 token 128 KiB（8.1 里那个 2 × 32 层 × 8 KV 头 × 128 head_dim × 2 字节的例子）。一步步扣：</p>
+    <table class="tbl">
+      <thead><tr><th style="width:6%">步</th><th style="width:34%">算什么</th><th style="width:22%">结果</th><th>依据</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>总预算 = 80 GiB × 0.92</td><td><code class="inline">≈ 73.6 GiB</code></td><td><code class="inline">requested_memory</code>（留给系统与其他进程约 8%）</td></tr>
+        <tr><td>2</td><td>扣权重：7B 参数 × 2 字节</td><td><code class="inline">−14 GiB → 余 59.6</code></td><td>profile 实测的 non_kv_cache_memory 的大头</td></tr>
+        <tr><td>3</td><td>扣 activation 峰值（<code class="inline">_dummy_run</code> 顶出来的最大 batch 假前向）</td><td><code class="inline">−2 GiB → 余 57.6</code></td><td>同上，profile 的另一部分</td></tr>
+        <tr><td>4</td><td>扣 CUDA graph 缓冲估计值</td><td><code class="inline">−1.6 GiB → 余 56.0</code></td><td><code class="inline">cudagraph_memory_estimate_applied</code></td></tr>
+        <tr><td>5</td><td>得到 KV 总字节 56 GiB ≈ 6.0 × 10¹⁰ B</td><td><code class="inline">available_kv_cache_memory_bytes</code></td><td>gpu_worker.py:626 的减法结果</td></tr>
+        <tr><td>6</td><td>÷ 每 token 128 KiB → 再 ÷ 块 16 token</td><td><code class="inline">≈ 28 600 块</code></td><td>8.3 的除法（每块 2 MiB）</td></tr>
+        <tr><td>7</td><td>÷ 每请求块数（如 4K token 序列 ÷ 16 = 256 块）</td><td><code class="inline">≈ 110 并发请求</code></td><td>理论上限，未计 watermark</td></tr>
+        <tr><td>8</td><td>预留 watermark（默认 0.0 关闭；按 1% 举例，约 286 块）——只对 WAITING/PREEMPTED 请求的准入生效，给它们留出免于反复抢占的余量</td><td><code class="inline">运行中可用 ≈ 28 314 块</code></td><td><code class="inline">kv_cache_manager.py:513</code> 的 <code class="inline">watermark_blocks</code>（config/scheduler.py:188 默认 0.0）</td></tr>
+      </tbody>
+    </table>
+    <p>注意第 4 步和第 8 步是纯预留：CUDA graph 缓冲和水印块平时都闲着，但前者保证回放时不会 OOM，后者让新请求和被抢占的请求恢复时「总有一个块可拿」。反过来读这张表也成立：线上问「为什么并发上不去」，答案就藏在哪一行扣掉了多少——权重超预期？activation 峰值没量准？还是 watermark 留多了。</p>
     <p>而「怎么把能用的显存试出来」靠两大段 warm-up。其一：<code class="inline">GPUModelRunner.profile_run()</code> 在 profile 期间用一个 <code class="inline">_dummy_run(max_num_tokens)</code> 的假前向把 weights + activation 的<strong>峰值</strong>顶出来（第 5 章讲过这个假前向）。其二：<code class="inline">vllm/v1/worker/gpu/warmup.py</code> 里跑一批真实的 <code class="inline">warmup_kernels</code>，把要用的 kernel 都先执行一遍，并用 <code class="inline">run_mixed_prefill_decode_warmup</code> 专门验证「KV 块够不够塞下我准备调的 batch」：</p>
     <div class="code-title">vllm/v1/worker/gpu/warmup.py — 用 KV 块数决定 warmup 批大小（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>num_reqs = <span class="fn">min</span>(

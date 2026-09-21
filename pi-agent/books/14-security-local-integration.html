@@ -100,7 +100,7 @@
   <span class="cmt">// 输出经 onData 流式回传 → 上层 tool_execution_update</span>
 }</code></pre>
     <p>这里「杀整棵进程树」不是细节，而是<strong>安全与资源的基本盘</strong>：一条 <code class="inline">sleep 100000</code> 或一个 <code class="inline">npm install</code>，若只杀父进程，它的子进程会变成孤儿继续占机器、甚至继续写文件。Pi 用 <code class="inline">exec</code> 封装把进程树治理收拢成一处，配合第 9 章的 <code class="inline">signal</code> 参数，让「用户打断」真正落到 OS 层面。</p>
-    <p>再往外一层才是「把整个 pi 隔离起来」——那是<b>容器化</b>的范畴：用 Docker、Gondolin 或 OpenShell 把 pi 装进沙箱跑。此时「Agent 能碰到的」从「当前目录」缩小到「容器的文件系统」，Bash 执行的就不是宿主机命令而是容器内命令（<code class="inline">bash-executor.ts</code> 也支持 SSH/远端容器的远程执行）。这是信任模型之外<strong>真正的强隔离</strong>——信任是「软边界」（决定放行与否），容器是「硬边界」（决定能力范围）。</p>
+    <p>再往外一层才是「把整个 pi 隔离起来」——那是<b>容器化</b>的范畴：用 Docker、Gondolin 或 OpenShell 把 pi 装进沙箱跑。此时「Agent 能碰到的」从「当前目录」缩小到「容器的文件系统」，Bash 执行的就不是宿主机命令而是容器内命令（<code class="inline">bash-executor.ts</code> 也支持 SSH/远端容器的远程执行）。这是信任模型之外的<strong>强隔离</strong>（前提是挂载、网络、权限等隔离边界配置正确）——信任是「软边界」（决定放行与否），容器是「硬边界」（决定能力范围）。</p>
     <p>还有一条容易漏掉的路径：用户在 TUI 里用 <code class="inline">!</code> 亲手敲的命令不经过工具，直接跑在终端里。它同样被安全模型覆盖——<code class="inline">user_bash</code> 事件让扩展可以换掉执行器（如远程容器）或完全接管执行；而且扩展处理出错时<strong>不回退到本地执行</strong>，宁可这条命令不跑。第 9 章 §9.5.1 已展开，这里只补一句安全视角的定位：执行器抽象（<code class="inline">BashOperations</code>）正是容器化的挂载点——「命令跑在哪」与「谁批准执行」因此解耦。</p>
     <div class="callout">
       <strong>区分四个层次：</strong>信任系统决定「<strong>要不要问</strong>」，<code class="inline">beforeToolCall</code> 钩子决定「<strong>放不放行</strong>」，AbortSignal→杀进程树决定「<strong>能不能停</strong>」，容器/Gondolin 决定「<strong>能碰到什么</strong>」。四层叠加才是完整的安全纵深。你自己做 Runtime 时，至少要把前两层（信任 + 放行）和「可中止」做扎实，容器化可以后补。
@@ -146,19 +146,28 @@
         <text class="lbl" x="450" y="271" font-size="12" fill="#b45309" text-anchor="middle">本地推理可控 · 离线 · 隐私</text>
       </svg>
     </div>
-    <p>看两个关键翻译。一是 <code class="inline">toPiModel</code>——把 llama 服务器的模型信息映射成 Pi 的 <code class="inline">Model</code> 值对象（上下文窗口从 <code class="inline">n_ctx</code> 取，取不到回退 128000）：</p>
-    <div class="code-title">extensions/llama/provider.ts · toPiModel</div>
-    <pre class="code"><code><span class="kw">function</span> <span class="fn">toPiModel</span>(model: LlamaModelInfo, serverUrl: <span class="kw">string</span>): Model&lt;<span class="st">"openai-completions"</span>&gt; {
+    <p>看两个关键翻译。一是 <code class="inline">toPiModel</code>——把 llama 服务器的模型信息映射成 Pi 的 <code class="inline">Model</code> 值对象（上下文窗口从 <code class="inline">n_ctx</code> 取，取不到回退 128000；<code class="inline">props</code> 是从服务器 <code class="inline">/props</code> 端点查到的信息，用于探测思考模板）：</p>
+    <div class="code-title">extensions/llama/provider.ts · toPiModel（节选）</div>
+    <pre class="code"><code><span class="kw">function</span> <span class="fn">toPiModel</span>(model: LlamaModelInfo, serverUrl: <span class="kw">string</span>, props?: LlamaServerProps): Model&lt;<span class="st">"openai-completions"</span>&gt; {
   <span class="kw">const</span> reportedContextWindow = model.meta?.n_ctx ?? model.meta?.n_ctx_train;
   <span class="kw">const</span> contextWindow =
     reportedContextWindow &amp;&amp; reportedContextWindow &gt; <span class="nu">0</span> ? reportedContextWindow : <span class="nu">128000</span>;
+  <span class="cmt">// 聊天模板带 "enable_thinking"（如 Qwen3 系）→ 声明支持思考，且只开放 off/medium 两档</span>
+  <span class="kw">const</span> reasoning = props?.chat_template?.<span class="fn">includes</span>(<span class="st">"enable_thinking"</span>) === <span class="kw">true</span>;
   <span class="kw">return</span> {
     id: model.id, name: model.id,
     api: <span class="st">"openai-completions"</span>,      <span class="cmt">// 就借通用协议族</span>
     provider: LLAMA_PROVIDER_ID,       <span class="cmt">// "llama.cpp"</span>
+    reasoning,
+    ...(reasoning &amp;&amp; {
+      <span class="cmt">// 模板里没有按档位细分的参数：medium 映射到 "medium"，其余档位一律 null（不支持）</span>
+      thinkingLevelMap: { off: <span class="st">"off"</span>, minimal: <span class="kw">null</span>, low: <span class="kw">null</span>, medium: <span class="st">"medium"</span>, high: <span class="kw">null</span>, xhigh: <span class="kw">null</span> },
+    }),
     contextWindow, <span class="kw">...</span>
+    ...(reasoning &amp;&amp; { compat: { <span class="kw">...</span>, thinkingFormat: <span class="st">"qwen-chat-template"</span> } }),
   };
 }</code></pre>
+    <p>那个 <code class="inline">thinkingFormat: "qwen-chat-template"</code> 值得单独看一眼：这类模板不认识 <code class="inline">reasoning_effort</code> 之类的顶层参数，开/关思考靠往请求里塞 <code class="inline">chat_template_kwargs: { enable_thinking, preserve_thinking: true }</code>。pi 把「这家端点听什么暗号」收编成 compat 里的一个枚举值（<code class="inline">openai-completions.ts</code> 按值分发），上层依旧只说「medium 档思考」这个统一意图——与 10.6.1 的 <code class="inline">thinkingTokenBudgetField</code> 是同一种收编手法。注意 <code class="inline">reasoning</code> 的判定来源：<strong>只有已加载的模型才会被查询模板</strong>（查询未加载的会触发加载、查询休眠的可能把它唤醒，这些模型保持未分类，等下次目录刷新再补上）。</p>
     <p>二是 Provider 的 <code class="inline">stream</code>/<code class="inline">streamSimple</code> <strong>直接复用 pi-ai 的 OpenAI 兼容流</strong>，<code class="inline">refreshModels</code> 里还会先恢复「上次持久化的模型清单」，并从 <code class="inline">catalog</code> 里筛出<strong>可选模型</strong>作为活跃目录——判定由 <code class="inline">modelIsSelectable</code> 收口：</p>
     <div class="code-title">extensions/llama/provider.ts · 模型可选性判定</div>
     <pre class="code"><code><span class="kw">function</span> <span class="fn">modelIsSelectable</span>(model: LlamaModelInfo, routerAutoload: <span class="kw">boolean</span>): <span class="kw">boolean</span> {
@@ -272,7 +281,7 @@ models = catalog
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 14 安全边界·本地模型·程序化集成 · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 14 安全边界·本地模型·程序化集成 · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

@@ -259,6 +259,10 @@ prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(ren
       <b class="tag">演进痕迹</b>
       logprobs 的 <code class="inline">bytes</code> 字段最近也修了一处静默损坏：<code class="inline">_build_token_logprobs_from_raw</code>（serving_chat.py:2436）的 docstring 讲得很清楚——引擎返回的三元组里 token id 永远是真的，但 token text 是<strong>展示用的反解码字符串</strong>，会丢碎片字节 token：比如 U+20BB7 的四个单字节 BPE 片段各自 decode 都是坏字节，拼出来是 U+FFFD。此前 OpenAI 响应里的 <code class="inline">bytes</code> 字段从展示文本反推，多字节字符就被这几个 U+FFFD 毁掉；现在改成从 token_id 走 GPT-2 字节解码器恢复真实字节。SentencePiece 系 tokenizer 没有这种字节回退表，仍退回展示文本。凡是做「把内部 (logprob, token_id, text) 三元组映射成 OpenAI 格式」的适配层，这条「id 才是真身、text 是投影」的教训都直接适用。
     </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      input-logprob 的临时显存最近开始「借」CUDA Graph 池的空地（commit 9e5a62a767，#40038）。问题背景：chunked prefill 开 input-logprob 时，LM-head 的 logits 矩阵（行数 × 词表 × 4 字节）是整段临时分配的大块显存，prefill batch 一大就直接顶到 OOM；而 CUDA Graph 捕获用的内存池里，两次捕获之间天然留着大片空闲（最大连续空闲段，<code class="inline">graph_pool_borrow_largest_run()</code>）。现在 <code class="inline">logprob_processor.py</code> 的 <code class="inline">_can_borrow_logprob_memory</code> 会先算「这块空地按 1~3 个矩阵/行能躺多少行」，不够放整个 chunk 就不借——<strong>chunk 边界必须与图池布局无关</strong>（借不到就退回常驻 workspace，注释写明：改 chunk 大小会改变 LM-head GEMM 的形状与取整），TP 下还要跨 rank all-reduce 取最小。借来的空间当然随时可能被图重放覆写，所以复制结果时挂一个 <code class="inline">input_logprobs_copy_done</code> CUDA event，<code class="inline">LogitsProcessorOutput.finalize_input_logprobs()</code> 在消费侧同步它，再把借址上按 span 排布的片段拉平成列表。这是「图池死空间再利用」的一例——第 6 章讲的 CUDA Graph 捕获策略决定了这块空地有多大。
+    </div>
 
     <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
     <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — tool call 约束构建（摘录，注释为译注）</div>
@@ -390,7 +394,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9767-g0b0d2c257a · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

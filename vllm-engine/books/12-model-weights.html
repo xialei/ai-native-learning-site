@@ -238,11 +238,55 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
       <div class="fig-cap">图 12.3：stacked_params_mapping 把若干 HF 小投影「拼」成一个 vLLM 大投影，一次 GEMM 处理更多参数。</div>
     </div>
     <div class="annotation"><b>逐行拆解：</b><code class="inline">(param_name, shard_name, shard_id)</code> 三件套的意思是：vLLM 的 <code class="inline">param_name</code> 由 HF 的 <code class="inline">shard_name</code> 在 <code class="inline">shard_id</code> 这个位置拼接而成。读权重的循环里看到 <code class="inline">gate_proj</code> 就写进 <code class="inline">gate_up_proj</code> 的 0 号切片，看到 <code class="inline">up_proj</code> 写进 1 号切片。这不只是「换个名」，而是<strong>真的把两个矩阵贴在一起</strong>变成一个更大的算子输入。</div>
+    <p>「贴在一起」具体长什么样？拿 MLP 最常见的 gate/up 组合看形状（设 hidden = H，中间层 = I）：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">磁盘布局（HF checkpoint，两个独立矩阵）</text>
+
+        <rect class="node" x="20" y="44" width="300" height="56" rx="6"></rect>
+        <text class="lbl code" x="170" y="66" text-anchor="middle">mlp.gate_proj.weight</text>
+        <text class="lbl sm" x="170" y="86" text-anchor="middle">[I × H] —— 一个独立 .safetensors 条目</text>
+
+        <rect class="node" x="20" y="120" width="300" height="56" rx="6"></rect>
+        <text class="lbl code" x="170" y="142" text-anchor="middle">mlp.up_proj.weight</text>
+        <text class="lbl sm" x="170" y="162" text-anchor="middle">[I × H] —— 另一个独立条目，互不相干</text>
+
+        <text class="lbl" x="430" y="80" font-weight="bold" fill="#165a7b">↓</text>
+        <text class="lbl sm" x="430" y="100" text-anchor="middle">stacked_params_mapping</text>
+        <text class="lbl sm" x="430" y="118" text-anchor="middle">gate → 切片0 · up → 切片1</text>
+
+        <text class="lbl" x="590" y="24" font-weight="bold" fill="#165a7b">计算布局（vLLM，一个融合矩阵）</text>
+
+        <rect class="node acc" x="560" y="44" width="320" height="132" rx="6"></rect>
+        <rect class="node core" x="566" y="50" width="308" height="58" rx="4"></rect>
+        <text class="lbl code" x="720" y="74" text-anchor="middle">gate_up_proj.weight</text>
+        <text class="lbl sm" x="720" y="94" text-anchor="middle">上半：[I × H]（原 gate_proj，切片 0）</text>
+        <rect class="node" x="566" y="112" width="308" height="58" rx="4"></rect>
+        <text class="lbl code" x="720" y="136" text-anchor="middle">（下半接 up_proj）</text>
+        <text class="lbl sm" x="720" y="156" text-anchor="middle">下半：[I × H]（原 up_proj，切片 1）</text>
+
+        <text class="lbl sm" x="20" y="216">计算时一次 GEMM：x[H] × gate_up_proj[H → 2I] = y[2I]</text>
+        <text class="lbl sm" x="20" y="238">然后 y 切成两半：前半过 SiLU、逐元素乘上后半——</text>
+        <text class="lbl sm" x="20" y="256">数学上与两次独立 GEMM 完全等价，kernel launch 却从 2 次变 1 次</text>
+
+        <line class="edge" x1="320" y1="110" x2="560" y2="110"></line>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw node"></span>磁盘上的独立权重</span>
+        <span class="lg-item"><span class="sw core"></span>融合矩阵的上半</span>
+        <span class="lg-item"><span class="sw acc"></span>融合后的整体</span>
+      </div>
+      <div class="fig-cap">图 12.4：gate_proj + up_proj → gate_up_proj 的形状账——沿输出维度拼成 [2I × H]，一次 GEMM 出 [2I]，再在激活处劈开；磁盘布局不变，改动只发生在加载时。</div>
+    </div>
+    <div class="annotation"><b>为什么按输出维度拼：</b><code class="inline">MergedColumnParallelLinear</code>（linear.py:673）把多个子层沿<strong>输出维度</strong>连成一个权重，靠的就是「输入是同一份 x」这一点：两次 <code class="inline">x @ W</code> 拼成一次 <code class="inline">x @ [W; W']</code>。TP 切分时每个 rank 只拿自己那份输出列，两个子层各切各的、互不干扰。Qwen、Llama 等所有 SwiGLU 结构的模型都靠它合并；DeepSeek 的 <code class="inline">q_a_proj + kv_a_proj</code>（图 12.3）同理——只要输入相同，就能贴。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.6</span>让它「跑得好」：量化 + KV cache + 稀疏后端一起调</h2>
-    <p>权重加载进来了。但「跑得好」还差最后一层：<strong>用什么 dtype 存权重、用什么格式存 KV、用哪个注意力后端</strong>。三者必须配合，DeepSeek-V4 / GLM 这类 DSA 稀疏模型尤其如此。</p>
+    <p>权重加载进来了。但「跑得好」还差最后一层：<strong>用什么 dtype 存权重、用什么格式存 KV、用哪个注意力后端</strong>。三者必须配合，DeepSeek-V4 / GLM 这类 DSA 稀疏模型尤其如此。本章只回答加载侧的问题——这三个配置怎么写、对不上会发生什么；DSA 稀疏注意力本身为什么长这样、各家的索引器方案怎么演化，见<a href="14-model-evolution.html">第 14 章</a>。</p>
     <ul>
       <li><strong>权重量化</strong>：FP8 / MXFP4 等。<code class="inline">vllm/models/deepseek_v4/quant_config.py</code> 是 DeepSeek-V4 的量化配置；GLM-5.2 也常见 <code class="inline">amd/GLM-5.2-MXFP4</code> 这类已量化 checkpoint（见 <code class="inline">quark/utils.py</code> 注释）。权重越小，I/O 越省、显存越够。</li>
       <li><strong>KV cache dtype</strong>：稀疏 MLA 用的是 <code class="inline">--kv-cache-dtype fp8_ds_mla</code> 的专用分页布局（FlashMLA 稀疏）。见 <code class="inline">vllm/v1/attention/backends/mla/sparse_swa.py:114-126</code>——<code class="inline">fp8_ds_mla</code> 还需要 576B 对齐。</li>
@@ -293,7 +337,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
         <span class="lg-item"><span class="sw"></span>三项配置（需协同）</span>
         <span class="lg-item"><span class="sw core"></span>协同后的加速效果</span>
       </div>
-      <div class="fig-cap">图 12.4：权重量化、KV dtype、注意力后端三者必须协同，才能触发 FlashMLA 稀疏等加速路径。</div>
+      <div class="fig-cap">图 12.5：权重量化、KV dtype、注意力后端三者必须协同，才能触发 FlashMLA 稀疏等加速路径。</div>
     </div>
     <div class="annotation"><b>为什么必须协同：</b>FlashMLA 稀疏 backend 要求 KV 用 <code class="inline">fp8_ds_mla</code> 布局；如果只量化权重、KV 仍用 bf16，就走不到这条稀疏快路。<code class="inline">--kv-cache-dtype</code>、<code class="inline">--quantization</code>、<code class="inline">--dtype</code> 这三个 flag 是给 DSA 模型调优时最先要对齐的。</div>
   </section>
@@ -390,9 +434,9 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
       </tr>
       <tr>
         <td><strong>GLM-5.2</strong></td>
-        <td>复用 DSA 重映射思路<br>架构类经 <code class="inline">deepseek_v32</code>（CUDA 别名）</td>
+        <td>架构类经 <code class="inline">deepseek_v32</code>（CUDA 别名）</td>
         <td><code class="inline">GlmMoeDsaForCausalLM</code></td>
-        <td>常直接加载 <code class="inline">amd/GLM-5.2-MXFP4</code> 已量化权重；与 DeepSeek 同为 DSA，重映射思路相通（具体映射表因模型而异）</td>
+        <td>常直接加载 <code class="inline">amd/GLM-5.2-MXFP4</code> 已量化权重；重映射思路与 DeepSeek 同族，具体映射表因模型而异</td>
       </tr>
       <tr>
         <td><strong>Kimi-K2.5</strong></td>

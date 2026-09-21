@@ -64,7 +64,7 @@
 <span class="cmt"># num_tokens_with_spec. This is general enough to cover</span>
 <span class="cmt"># chunked prefills, prefix caching, speculative decoding,</span>
 <span class="cmt"># and the "jump decoding" optimization in the future.</span></pre>
-    <div class="annotation"><b>读懂这段：</b>每步调度不过是：给每个请求定一个 <code class="inline">num_new_tokens</code>，然后把 <code class="inline">num_computed_tokens</code> 往前推一点，让它朝 <code class="inline">num_tokens_with_spec</code> 逼近。当 <code class="inline">num_computed_tokens</code> 还没到 <code class="inline">num_prompt_tokens</code> 即「还没把 prompt 算完」→ 那就是 prefill（可能是一个 prefill chunk）；一旦追平、开始追加输出 token → 那就是 decode。二者是<strong>同一个循环</strong>的两个瞬间，而不是两套流程。</div>
+    <div class="annotation"><b>读懂这段：</b>每步调度不过是：给每个请求定一个 <code class="inline">num_new_tokens</code>，然后把 <code class="inline">num_computed_tokens</code> 往前推一点，让它朝 <code class="inline">num_tokens_with_spec</code> 逼近。当 <code class="inline">num_computed_tokens</code> 还没到 <code class="inline">num_prompt_tokens</code> 即「还没把 prompt 算完」→ 那就是 prefill（可能是一个 prefill chunk）；一旦追平、开始追加输出 token → 那就是 decode。二者是<strong>同一个循环</strong>的两个瞬间，而不是两套流程。如果读到这里还是抽象，先往下走——本节末尾的图 4.2 会把五个典型时刻各画成一根进度条，到时回头再看这段注释就具象了。</div>
     <p>这两个计数器在 <code class="inline">Request</code> 上有真实定义：</p>
     <div class="code-title">vllm/v1/request.py:182 与 :295 — 两个计数器（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>self.num_computed_tokens = <span class="nu">0</span>            <span class="cmt"># 已算出 KV 的 token 数（前缀可真可假看缓存）</span>
@@ -77,12 +77,242 @@
 <span class="kw">def</span> <span class="fn">num_tokens_with_spec</span>(self) <span class="kw">-&gt;</span> <span class="cl">int</span>:
     <span class="kw">return</span> <span class="fn">len</span>(self._all_token_ids) + <span class="fn">len</span>(self.spec_token_ids)</pre>
     <div class="annotation"><b>为什么「统一模型」是成立的：</b>新请求若前缀缓存命中，<code class="inline">num_computed_tokens</code> 一上来就已推进到命中长度，不必从 0 算；被抢占后重算的请求则从「已算 + 输出」的进度继续。<code class="inline">num_tokens_with_spec</code> 里的 <code class="inline">+ len(spec_token_ids)</code> 把投机解码的 draft token 也并进来；<code class="inline">max_tokens</code>（来自 <code class="inline">sampling_params.max_tokens</code>，见 request.py:113）决定什么时候算「完事」可以收尾。因为一切都被表达成「数字追数字」，所以 <code class="inline">chunked prefill</code>（prefill 拆小）、<code class="inline">prefix caching</code>（开头直接算好）、<code class="inline">speculative decoding</code>（提前多算几个）在调度器眼里都只是同一套机制的不同「追赶距离」——这正是那份注释说的 generality。自研引擎最大的启示也在这里。</div>
+    <p>抽象说「追赶」容易，落到一个具体请求身上，这两个数字是怎么变的？下面用一个请求走完五种典型时刻——注意 <code class="inline">num_computed_tokens</code> 全书只有三个地方会变：<strong>入队时直接设、调度成功后按排上的 token 数推进、被抢占时清零</strong>（投机解码被拒时还会小幅回退）。示例设定：prompt 100 个 token，<code class="inline">max_tokens</code> 足够大，块大小 16，token_budget 充足。</p>
+    <table class="tbl">
+      <thead>
+        <tr><th style="width:16%">时刻</th><th style="width:34%">发生了什么</th><th style="width:17%">num_computed_tokens</th><th style="width:15%">num_tokens_with_spec</th><th>下一步的「追赶距离」</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>① 首轮入队</td>
+          <td>请求刚建好，一个 token 都没算过</td>
+          <td><code class="inline">0</code></td>
+          <td><code class="inline">100</code></td>
+          <td>整段 prompt 都要算——这就是纯 prefill</td>
+        </tr>
+        <tr>
+          <td>② 被切成 chunk</td>
+          <td>本步 token_budget 只分给它 40，prompt 前 40 个先算</td>
+          <td><code class="inline">0 → 40</code></td>
+          <td><code class="inline">100</code></td>
+          <td>还差 60，下一步接着算剩下的 prompt</td>
+        </tr>
+        <tr>
+          <td>③ 命中前缀缓存</td>
+          <td>该请求被抢占后重新入队，前 64 个 token 的 KV 在前缀缓存里能直接找到</td>
+          <td><code class="inline">0 → 64</code></td>
+          <td><code class="inline">100</code></td>
+          <td>前 64 个 token 白捡，只需真算后 36 个</td>
+        </tr>
+        <tr>
+          <td>④ 投机 token</td>
+          <td>prompt 算完进入 decode，draft 模型一次塞来 3 个猜测 token</td>
+          <td><code class="inline">100 → 103</code></td>
+          <td><code class="inline">100 → 103</code></td>
+          <td>追赶距离 = 3；验证后没被采纳的部分会在出结果时回滚</td>
+        </tr>
+        <tr>
+          <td>⑤ 被抢占</td>
+          <td>块不够，调度器选中它让位：进度清零、draft token 丢弃，整条重新排队</td>
+          <td><code class="inline">103 → 0</code></td>
+          <td><code class="inline">103 → 100</code></td>
+          <td>下一轮靠 ③ 的前缀缓存把算过的 KV 找回来，不必真的从零重算</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="annotation"><b>对照源码：</b>初值 0 在 request.py:182；调度成功后的推进在 <code class="inline">_update_after_schedule</code> 里（<code class="inline">num_computed_tokens += num_scheduled_token</code>，scheduler.py:1584）；投机被拒的回退在同文件约 :2040（<code class="inline">-= num_rejected</code>）；抢占清零在 <code class="inline">_preempt_request</code>（scheduler.py:1548）。这四处合起来就是这张表的全部规则。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 430" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow42" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+
+        <text class="lbl" x="20" y="22" font-weight="bold" fill="#165a7b">调度算法就一句话：让蓝色（已算）不断填满整根条（要算），红色是还差的</text>
+
+        <!-- 图例 -->
+        <rect x="20" y="36" width="14" height="14" fill="#dbe9f7" stroke="#2f6db4" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="40" y="47">num_computed_tokens（已算出 KV 的，可白捡）</text>
+        <rect x="330" y="36" width="14" height="14" fill="#fdecec" stroke="#d33" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="350" y="47">还差的 = num_new_tokens（每步真正排给 GPU 的）</text>
+        <rect x="640" y="36" width="14" height="14" fill="#f0f3f6" stroke="#5c6b7a" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="660" y="47">条总长 = num_tokens_with_spec</text>
+
+        <!-- ====== 时刻① ====== -->
+        <text class="lbl sm" x="20" y="92" font-weight="bold" fill="#165a7b">① 首轮入队</text>
+        <rect x="130" y="78" width="740" height="20" fill="#f0f3f6" stroke="#5c6b7a"></rect>
+        <rect x="130" y="78" width="740" height="20" fill="#fdecec" opacity="0.55"></rect>
+        <text class="lbl sm" x="135" y="92" fill="#d33">全部要算：100（纯 prefill）</text>
+
+        <!-- ====== 时刻② ====== -->
+        <text class="lbl sm" x="20" y="142" font-weight="bold" fill="#165a7b">② 切成 chunk</text>
+        <rect x="130" y="128" width="740" height="20" fill="#f0f3f6" stroke="#5c6b7a"></rect>
+        <rect x="426" y="128" width="444" height="20" fill="#fdecec" opacity="0.55"></rect>
+        <rect x="130" y="128" width="296" height="20" fill="#dbe9f7" stroke="#2f6db4"></rect>
+        <text class="lbl code sm" x="135" y="142" fill="#2f6db4">40</text>
+        <text class="lbl sm" x="440" y="118" fill="#d33">token_budget 只给了 40 → 先算前 40，剩 60 下一步接着追</text>
+
+        <!-- ====== 时刻③ ====== -->
+        <text class="lbl sm" x="20" y="192" font-weight="bold" fill="#165a7b">③ 前缀缓存命中</text>
+        <rect x="130" y="178" width="740" height="20" fill="#f0f3f6" stroke="#5c6b7a"></rect>
+        <rect x="603" y="178" width="267" height="20" fill="#fdecec" opacity="0.55"></rect>
+        <rect x="130" y="178" width="473" height="20" fill="#dbe9f7" stroke="#2f6db4"></rect>
+        <text class="lbl code sm" x="135" y="192" fill="#2f6db4">64</text>
+        <text class="lbl sm" x="610" y="168" fill="#d33">前 64 白捡（缓存命中）→ 只真算后 36</text>
+
+        <!-- ====== 时刻④ ====== -->
+        <text class="lbl sm" x="20" y="242" font-weight="bold" fill="#165a7b">④ 投机 token</text>
+        <rect x="130" y="228" width="740" height="20" fill="#f0f3f6" stroke="#5c6b7a"></rect>
+        <rect x="130" y="228" width="740" height="20" fill="#dbe9f7" stroke="#2f6db4"></rect>
+        <rect x="870" y="228" width="22" height="20" fill="#fdecec" opacity="0.75" stroke="#d33"></rect>
+        <text class="lbl sm" x="130" y="266" fill="#2e8b57">decode 100 个全部算完（蓝满）→ draft 又猜了 3 个，条向右长出一截（100 → 103），追赶距离 = 3</text>
+
+        <!-- ====== 时刻⑤ ====== -->
+        <text class="lbl sm" x="20" y="312" font-weight="bold" fill="#165a7b">⑤ 被抢占</text>
+        <rect x="130" y="298" width="740" height="20" fill="#f0f3f6" stroke="#5c6b7a"></rect>
+        <rect x="130" y="298" width="740" height="20" fill="#fdecec" opacity="0.55"></rect>
+        <text class="lbl sm" x="135" y="312" fill="#d33">进度清零（103 → 0）：蓝色全倒掉，条长也退回 100（draft 丢弃）</text>
+
+        <text class="lbl sm" x="20" y="356" fill="#165a7b" font-weight="bold">为什么这一个模型能同时覆盖三种机制：</text>
+        <text class="lbl sm" x="20" y="376">chunked prefill = 条太长一步填不完（②）；prefix caching = 开局蓝格白捡一截（③）；</text>
+        <text class="lbl sm" x="20" y="394">speculative decoding = 条本身会变长、验证后没填上的还得退（④⑤）。</text>
+        <text class="lbl sm" x="20" y="418" fill="#8a95a1">同一根条、同一套「蓝填红」规则——没有 prefill / decode 两个阶段，只有这一个循环。</text>
+      </svg>
+      <div class="fig-cap">图 4.2：五个典型时刻画成五根进度条。调度器的全部工作就是每步把蓝格往右推（能推多少受 token_budget 限制），条本身会因投机解码变长、因抢占清零——这就是 4.2 那段注释说的「没有阶段，只有两个计数器」。</div>
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.3</span>用代码看 schedule()：每一步怎么填满 GPU</h2>
-    <p><code class="inline">schedule()</code> 每次被调用，都对应模型的一次 forward。它维护一个 <code class="inline">token_budget</code>——这步总共最多能算多少个 token（来自 <code class="inline">max_num_scheduled_tokens</code>），然后逐请求「分」这个预算。开头是这样的：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:570 — schedule() 开头</div>
+    <p><code class="inline">schedule()</code> 每次被调用，都对应模型的一次 forward。它维护一个 <code class="inline">token_budget</code>——这步总共最多能算多少个 token（来自 <code class="inline">max_num_scheduled_tokens</code>），然后逐请求「分」这个预算。图 4.3 先把一次 <code class="inline">schedule()</code> 的全程画出来：开场定三道预算 → 逐个发放给 RUNNING → 用剩余预算过 WAITING 的闸 → 产出 SchedulerOutput。下面三段代码摘录（标了 ①②③）就是图上的三个区域，建议对照着读。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 760" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow43" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+
+        <text class="lbl" x="20" y="22" font-weight="bold" fill="#165a7b">一次 schedule() 的全程：一份预算，两段发放——RUNNING 先拿，WAITING 用剩下的</text>
+
+        <rect x="20" y="32" width="14" height="14" fill="#dbe9f7" stroke="#2f6db4" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="40" y="43">主干流程（对应摘录①②③）</text>
+        <rect x="250" y="32" width="14" height="14" fill="#fdecec" stroke="#d33" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="270" y="43">抢占分支</text>
+        <rect x="390" y="32" width="14" height="14" fill="#e9f6ee" stroke="#2e8b57" stroke-width="1.5"></rect>
+        <text class="lbl sm" x="410" y="43">成功 / 产出</text>
+        <line x1="560" y1="39" x2="584" y2="39" stroke="#5c6b7a" stroke-width="1.6" stroke-dasharray="6 4"></line>
+        <text class="lbl sm" x="590" y="43">回到循环头</text>
+
+        <rect class="node" x="170" y="58" width="560" height="48" rx="8"></rect>
+        <text class="lbl" x="450" y="78" text-anchor="middle" font-weight="bold">schedule() 开场：先定三道预算（scheduler.py:590-593）</text>
+        <text class="lbl code sm" x="450" y="96" text-anchor="middle">token_budget 定额 · input_budget = max_num_batched_tokens · draft_slots 投机预留</text>
+
+        <line class="edge" x1="450" y1="106" x2="450" y2="116" marker-end="url(#arrow43)"></line>
+
+        <rect x="30" y="118" width="840" height="336" rx="10" fill="none" stroke="#9db4c8" stroke-dasharray="7 5"></rect>
+        <text class="lbl sm" x="45" y="140" font-weight="bold" fill="#165a7b">第一段：逐个处理 RUNNING（摘录①；scheduler.py:621 循环头）</text>
+
+        <rect class="node" x="330" y="148" width="240" height="30"></rect>
+        <text class="lbl sm" x="450" y="168" text-anchor="middle">取下一个 RUNNING 请求</text>
+
+        <line class="edge" x1="450" y1="178" x2="450" y2="188" marker-end="url(#arrow43)"></line>
+
+        <rect class="node core" x="240" y="190" width="420" height="62"></rect>
+        <text class="lbl code sm" x="450" y="208" text-anchor="middle">num_new_tokens = num_tokens_with_spec − num_computed_tokens</text>
+        <text class="lbl sm" x="450" y="224" text-anchor="middle">「还差多少没算」；min()：token_budget、input_budget − draft_slots</text>
+        <text class="lbl sm" x="450" y="240" text-anchor="middle" fill="#8a95a1">另有长 prefill 阈值、max_model_len 等护栏（:670-689）</text>
+
+        <line class="edge" x1="450" y1="252" x2="450" y2="262" marker-end="url(#arrow43)"></line>
+
+        <rect class="node" x="330" y="264" width="240" height="30"></rect>
+        <text class="lbl sm" x="450" y="284" text-anchor="middle">削完之后 == 0 ？</text>
+
+        <line class="edge" x1="570" y1="279" x2="596" y2="279" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="580" y="272">是</text>
+        <rect class="node" x="600" y="264" width="240" height="40"></rect>
+        <text class="lbl sm" x="720" y="280" text-anchor="middle">continue：跳过它，试后面的请求</text>
+        <text class="lbl sm" x="720" y="296" text-anchor="middle" fill="#8a95a1">（刻意不严格 FCFS，:715-733）</text>
+        <polyline class="edge back" points="840,284 856,284 856,163 578,163" marker-end="url(#arrow43)" fill="none"></polyline>
+        <text class="lbl sm" x="660" y="156" fill="#8a95a1">回到循环头</text>
+
+        <line class="edge" x1="450" y1="294" x2="450" y2="306" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="462" y="300">否</text>
+
+        <rect class="node" x="310" y="308" width="280" height="30"></rect>
+        <text class="lbl sm" x="450" y="328" text-anchor="middle">allocate_slots 拿到 KV 块？</text>
+
+        <polyline class="edge" points="308,323 180,323 180,344" marker-end="url(#arrow43)" fill="none"></polyline>
+        <text class="lbl sm" x="240" y="315">是</text>
+        <rect class="node ok" x="40" y="348" width="230" height="56"></rect>
+        <text class="lbl sm" x="155" y="366" text-anchor="middle">计入本步，扣预算</text>
+        <text class="lbl code sm" x="155" y="381" text-anchor="middle">token_budget −= num_new_tokens</text>
+        <text class="lbl sm" x="155" y="396" text-anchor="middle" fill="#8a95a1">回循环头取下一个</text>
+
+        <line class="edge" x1="450" y1="338" x2="450" y2="350" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="462" y="347">否</text>
+
+        <rect class="node" x="330" y="352" width="240" height="30"></rect>
+        <text class="lbl sm" x="450" y="371" text-anchor="middle">connector 有没落账的块释放？</text>
+
+        <line class="edge" x1="570" y1="367" x2="596" y2="367" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="580" y="360">是</text>
+        <rect class="node" x="600" y="352" width="250" height="30"></rect>
+        <text class="lbl sm" x="725" y="371" text-anchor="middle">break：等块归还，别白抢（:748）</text>
+
+        <line class="edge" x1="450" y1="382" x2="450" y2="394" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="462" y="390">否</text>
+
+        <rect class="node warn" x="290" y="396" width="320" height="46"></rect>
+        <text class="lbl sm" x="450" y="412" text-anchor="middle" font-weight="bold">抢占最低优先级请求，腾出 KV 块</text>
+        <text class="lbl sm" x="450" y="428" text-anchor="middle">抢到 → 重试 allocate_slots；抢不到 → break 结束本段</text>
+        <polyline class="edge back" points="290,419 282,419 282,323 304,323" marker-end="url(#arrow43)" fill="none"></polyline>
+        <text class="lbl sm" x="276" y="436" text-anchor="end" fill="#8a95a1">抢到 → 重试</text>
+
+        <line class="edge" x1="450" y1="454" x2="450" y2="476" marker-end="url(#arrow43)"></line>
+        <text class="lbl sm" x="462" y="470">RUNNING 段结束，剩余预算交给 waiting</text>
+
+        <rect x="30" y="478" width="840" height="200" rx="10" fill="none" stroke="#9db4c8" stroke-dasharray="7 5"></rect>
+        <text class="lbl sm" x="45" y="498" font-weight="bold" fill="#165a7b">第二段：WAITING 准入闸（摘录③；scheduler.py:867）</text>
+
+        <rect class="node" x="50" y="510" width="230" height="42"></rect>
+        <text class="lbl sm" x="165" y="527" text-anchor="middle">waiting 队头请求</text>
+        <text class="lbl sm" x="165" y="544" text-anchor="middle" fill="#8a95a1">循环条件：waiting 非空且预算 &gt; 0</text>
+
+        <line class="edge" x1="280" y1="531" x2="296" y2="531" marker-end="url(#arrow43)"></line>
+
+        <rect class="node" x="300" y="516" width="330" height="30"></rect>
+        <text class="lbl sm" x="465" y="536" text-anchor="middle">闸一：预算只剩 draft 槽？（input_budget ≤ draft_slots）</text>
+        <line class="edge" x1="465" y1="540" x2="465" y2="554" marker-end="url(#arrow43)"></line>
+
+        <rect class="node" x="300" y="556" width="330" height="30"></rect>
+        <text class="lbl sm" x="465" y="576" text-anchor="middle">闸二：running 满员？（max_num_active_reqs）</text>
+        <line class="edge" x1="465" y1="586" x2="465" y2="594" marker-end="url(#arrow43)"></line>
+
+        <rect class="node" x="300" y="596" width="330" height="30"></rect>
+        <text class="lbl sm" x="465" y="616" text-anchor="middle">闸三：allocate_slots 拿不到块？</text>
+
+        <polyline points="630,531 640,531 640,611 630,611" fill="none" stroke="#5c6b7a" stroke-width="1.6"></polyline>
+        <line class="edge" x1="640" y1="571" x2="650" y2="571" marker-end="url(#arrow43)"></line>
+
+        <rect class="node" x="654" y="552" width="210" height="40"></rect>
+        <text class="lbl sm" x="759" y="568" text-anchor="middle">任一命中 → break</text>
+        <text class="lbl sm" x="759" y="584" text-anchor="middle" fill="#8a95a1">本步到此为止，不再放新请求</text>
+
+        <line class="edge" x1="465" y1="626" x2="465" y2="638" marker-end="url(#arrow43)"></line>
+        <rect class="node ok" x="300" y="638" width="330" height="36"></rect>
+        <text class="lbl sm" x="465" y="652" text-anchor="middle" font-weight="bold">三道闸全过 → 放行：请求进 running 开始算</text>
+        <text class="lbl sm" x="465" y="668" text-anchor="middle" fill="#8a95a1">可能是 prefill 首块，也可能是 decode 续命</text>
+
+        <line class="edge" x1="450" y1="678" x2="450" y2="698" marker-end="url(#arrow43)"></line>
+
+        <rect class="node ok" x="230" y="698" width="440" height="46"></rect>
+        <text class="lbl" x="450" y="716" text-anchor="middle" font-weight="bold">产出 SchedulerOutput</text>
+        <text class="lbl sm" x="450" y="734" text-anchor="middle">这步谁跑、每请求算几个 token → 交 Model Runner（第 5 章）</text>
+
+        <polyline class="edge back" points="670,721 880,721 880,82 738,82" marker-end="url(#arrow43)" fill="none"></polyline>
+        <text class="lbl sm" x="796" y="74" fill="#8a95a1">下一步再调一次</text>
+      </svg>
+      <div class="fig-cap">图 4.3：一次 schedule() 的全程，三个虚线区域对应本节三段代码摘录。开场定三道预算；第一段逐个发 RUNNING——算差距、夹预算、要 KV 块，块不够先问 connector、再抢占最低优先级；第二段用剩余预算过 WAITING 的三道闸。两处灰虚线回环正是正文强调的两个细节：num_new_tokens == 0 时 continue 不 break（不严格 FCFS）、抢到受害者就重试。图省略了 encoder 预算等次要分支。</div>
+    </div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:570 — schedule() 开头（摘录①；对应图 4.3 的开场与第一段上半）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">schedule</span>(self, throttle_prefills: <span class="cl">bool</span> = <span class="kw">False</span>) <span class="kw">-&gt;</span> <span class="cl">SchedulerOutput</span>:
     self.current_step += <span class="nu">1</span>
     ...
@@ -110,10 +340,13 @@
         <li><strong><code class="inline">token_budget = self.max_num_scheduled_tokens</code></strong>：这步的「总 token 定额」。每把一个请求纳入，就减掉它的 <code class="inline">num_new_tokens</code>；预算耗尽则停止继续塞。</li>
         <li><strong>先调度 RUNNING，再调度新请求</strong>：注释 <code class="inline"># First, schedule the RUNNING requests.</code> 说明优先级——已经在跑的请求（多数是 decode）优先续命，避免它们等太久；等 running 处理完、<code class="inline">token_budget</code> 还有富余，才去看 <code class="inline">waiting</code> 里的新请求（waiting 怎么进 RUNNING，本节末尾讲）。</li>
         <li><strong>待算 token 数的计算</strong>：<code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code>——「还差多少没算」，然后被 <code class="inline">min()</code> 约束在预算之内。这就是 4.2 那个「追赶模型」在代码里的直接落地。</li>
+        <li><strong>min() 里另外两个名字先交代清楚</strong>：<code class="inline">input_budget</code> 是「一次 forward 最多吃多少 token」（即 <code class="inline">max_num_batched_tokens</code>，scheduler.py:593；它怎么挤占显存见 8.4）；<code class="inline">draft_slots</code> 是投机解码给 draft token 预留的槽位数，不开投机时就是 0（scheduler.py:592）——所以平时这条约束就是 <code class="inline">input_budget</code> 本身。它与 <code class="inline">token_budget</code> 平时也是同一个数（后者默认取 <code class="inline">max_num_batched_tokens</code>，scheduler.py:134-138），分开写是因为调度预算可以被单独调小。下面 waiting 闸门里那句 <code class="inline">input_budget &lt;= draft_slots</code> 说的就是「预算全被 draft 槽占走、连一个正经 token 都放不下，别再放人」。</li>
       </ul>
     </div>
+    <p>算出 <code class="inline">num_new_tokens</code> 之后还有两处补丁值得看一眼。一是它可能被再削几次：超过 <code class="inline">long_prefill_token_threshold</code> 的长 prefill 被压到阈值（:670-671），超过 <code class="inline">max_model_len</code> 减本步已采样数的部分被砍掉（:678-683），混合模型还要求 prefill chunk 对齐 mamba 块（:686-689）——都是特定场景的护栏，主线逻辑不变。二是如果削完之后 <code class="inline">num_new_tokens == 0</code>，这个请求这步会被跳过，但注意跳的方式是 <code class="inline">continue</code> 而不是 <code class="inline">break</code>（scheduler.py:715-733）：</p>
+    <div class="annotation"><b>为什么是 continue 不是 break：</b>注释列了五种可能（PP&gt;1 时 prompt 已全排上但没算完、异步调度到达上限、encoder 预算/缓存耗尽、mamba 块对齐放不下、MTP lookahead 窗口放不下），然后 woosuk 特别标了一句：这里用 <code class="inline">continue</code> 而不是 <code class="inline">break</code>，<strong>刻意不严格遵守 FCFS</strong>——队头请求这步塞不下，就跳过它继续试后面的请求，让后面的「小请求」先走。这和 4.5 抢占时「先让低优先级让路」是同一个思想的另一面：FCFS 只是默认策略，预算真紧张时，让资源落到能立刻用起来的人手里。</div>
     <p>拿到 <code class="inline">num_new_tokens</code> 后，下一步是找 KV cache 要块。如果 KV 不够（比如被别的请求占满），<code class="inline">allocate_slots</code> 会返回 <code class="inline">None</code>，此时调度器要么抢占一个低优先级请求腾地方，要么放弃调度当前请求：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:735 — allocate_slots 失败则跳过</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:735 — allocate_slots 失败则跳过（摘录②；对应图 4.3 第一段下半）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Schedule newly needed KV blocks for the request.</span>
 <span class="kw">with</span> record_function_or_nullcontext(<span class="st">"schedule: allocate_slots"</span>):
     <span class="kw">while</span> <span class="kw">True</span>:
@@ -130,9 +363,10 @@
 <span class="kw">if</span> new_blocks <span class="kw">is</span> <span class="kw">None</span>:
     <span class="cmt"># Cannot schedule this request.</span>
     <span class="kw">break</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">allocate_slots</code> 返回 <code class="inline">None</code> 是核心的「背压」信号——KV cache 满时它拿不到新块，就不会硬塞。这一小块逻辑与 3.4 章你见过的 <code class="inline">allocate_slots</code> 正好呼应：调度侧用返回值决定「这个请求这步到底排不排」。<code class="inline">num_lookahead_tokens</code> 又为投机解码预留了 KV 空间，等下 4.5 里再说。</div>
+    <div class="annotation"><b>读懂这段：</b>本节只看调度器收到 <code class="inline">None</code> 之后怎么决策——按顺序两步：先抢占一个更低优先级的 RUNNING 请求腾地方；腾不出（没有可抢的，或受害者就是自己）才放弃这个请求，并且 <code class="inline">break</code> 直接停止本步对后续 RUNNING 请求的尝试。压力就这样逐层外泄：分配器拒绝 → 调度器抢占 → 抢不动就整个 step 减载，而不是硬塞导致 OOM。分配器为什么用 <code class="inline">None</code> 而不是异常表达拒绝，见 3.4 的契约说明。<code class="inline">num_lookahead_tokens</code> 又为投机解码预留了 KV 空间，等下 4.5 里再说。</div>
+    <div class="annotation"><b>重试循环还有个提前退出的口子：</b>抢占之前，先问一句 connector「有没有还挂着没落账的块释放」（scheduler.py:748-752 的 <code class="inline">has_pending_block_frees</code>）。有就 <code class="inline">break</code> 直接放弃——因为配了异步 KV connector 时，别的请求的块释放会被推迟，可能马上就轮到它们归还；与其费劲抢人，等一步白捡。这也是 4.5 那道 <code class="inline">_request_blocks_can_be_freed</code> 关卡的孪生：一边「现在抢也腾不出块就别抢」，一边「块的归还在路上就别抢」。</div>
     <p>上面只讲了 RUNNING 怎么续。waiting 侧的入口是一道独立的门：<code class="inline">schedule()</code> 在处理完 RUNNING 后进入 waiting 循环，每次放人前先数一数 RUNNING 里已经有多少请求，超了就停止放行：</p>
-    <div class="code-title">vllm/v1/core/sched/scheduler.py:867 — waiting 循环的准入闸</div>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py:867 — waiting 循环的准入闸（摘录③；对应图 4.3 第二段）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">while</span> (self.waiting <span class="kw">or</span> self.skipped_waiting) <span class="kw">and</span> token_budget &gt; <span class="nu">0</span>:
     <span class="kw">if</span> input_budget &lt;= draft_slots:
         <span class="kw">break</span>

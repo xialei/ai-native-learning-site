@@ -41,7 +41,7 @@
 
   <section class="block">
     <h2><span class="num">6.1</span>先用一段话讲清楚</h2>
-    <p>Compaction = <strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。这样模型永远只看到「摘要 + 最近细节」，而不是无限增长的完整转写。</p>
+    <p>Compaction = <strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。压缩成功后的后续请求里，模型通常只看到「摘要 + 最近细节」，而不是无限增长的完整转写——但压缩关闭、未触发或失败时，请求仍带完整历史。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t6 d6">
         <title id="t6">Compaction 流程</title>
@@ -175,8 +175,8 @@
 
   <section class="block">
     <h2><span class="num">6.3</span>切割点：该压掉多少</h2>
-    <p><code class="inline">findCutPoint</code> 从新到旧累加每条消息的估计 token，直到凑足 <code class="inline">keepRecentTokens</code>，再回退到一个「安全切点」（合法切点包括 user/assistant/bashExecution/custom 消息、branchSummary/compactionSummary 消息，以及独立的 <code class="inline">branch_summary</code> 条目），避免从一条工具结果（toolResult）中间切开。</p>
-    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — findCutPoint 要点</div>
+    <p><code class="inline">findCutPoint</code> 从新到旧累加每条消息的估计 token，直到凑足 <code class="inline">keepRecentTokens</code>，再回退到一个「安全切点」（合法切点包括 user/assistant/bashExecution/custom 消息、branchSummary/compactionSummary 消息，以及独立的 <code class="inline">branch_summary</code> 条目），避免从一条工具结果（toolResult）中间切开。coding-agent 侧的实现（<code class="inline">core/compaction/compaction.ts</code>）里，选点这一步有一处精细的回退语义：</p>
+    <div class="code-title">packages/coding-agent/src/core/compaction/compaction.ts — findCutPoint 选点（要点）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">findCutPoint</span>(entries, startIndex, endIndex, keepRecentTokens): <span class="cl">CutPointResult</span> {
   <span class="kw">const</span> cutPoints = <span class="fn">findValidCutPoints</span>(entries, startIndex, endIndex);
   <span class="cmt">// findValidCutPoints：合法切点 = message 的若干角色（user/assistant/bashExecution/custom/</span>
@@ -184,11 +184,15 @@
   <span class="cmt">//   toolResult 不行（不能从"工具结果"切断对话）。</span>
   <span class="kw">let</span> accumulatedTokens = <span class="nu">0</span>, cutIndex = cutPoints[<span class="nu">0</span>];
   <span class="kw">for</span> (<span class="kw">let</span> i = endIndex - <span class="nu">1</span>; i &gt;= startIndex; i--) {   <span class="cmt">// 从新到旧累加</span>
-    <span class="cmt">// ...累加 estimateTokens，一旦 ≥ keepRecentTokens 就选中当前最近的合法切点</span>
+    <span class="cmt">// ...累加 estimateTokens，一旦 ≥ keepRecentTokens：</span>
+    <span class="cmt">// 选离当前消息最近的合法切点；若结尾的工具结果自己就超预算，</span>
+    <span class="cmt">// 取不到 ≥ i 的切点时回退到<strong>最后一个</strong>合法切点（前面那条 assistant 调用）</span>
+    cutIndex = cutPoints.<span class="fn">find</span>((c) =&gt; c &gt;= i) ?? cutPoints[cutPoints.length - <span class="nu">1</span>];
+    <span class="kw">break</span>;
   }
   <span class="kw">return</span> { firstKeptEntryIndex: cutIndex, turnStartIndex, isSplitTurn };
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 一个<strong>精细的细节</strong>——切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>。此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的turn也有上下文。这是「压掉一半对话」时仍不丢语义的关键。</div>
+    <div class="annotation"><b>读懂这段：</b> 两个<strong>精细的细节</strong>。其一，切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>——此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的 turn 也有上下文，这是「压掉一半对话」时仍不丢语义的关键。其二，<code class="inline">?? cutPoints[cutPoints.length - 1]</code> 这个回退改过一次（commit 8bdcd4498）：变量初值本来就是 <code class="inline">cutPoints[0]</code>（从头保留），旧代码里若「凑满预算的位置」找不到「≥ 它」的合法切点，循环什么都不选，<code class="inline">cutIndex</code> 就停在初值上——等价于这次什么都不压。触发场景是<strong>结尾一堆工具结果自己就超过了 <code class="inline">keepRecentTokens</code></strong>：此时回退到<strong>最新的</strong>安全切点（<code class="inline">cutPoints[length - 1]</code>），保住它们前面那条 assistant 工具调用作为边界，让更旧的历史得以在下一轮请求前被压掉。两个方向都是「别让压缩空转」：要么压得动，要么别白跑。</div>
   </section>
 
   <section class="block">
@@ -332,7 +336,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 </div>
 
 <footer>
-  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.85.1-85-ge4c75a732 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

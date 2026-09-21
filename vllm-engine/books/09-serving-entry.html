@@ -100,8 +100,8 @@ register_completion_api_router(app)</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>异步引擎与流式：background loop + StreamingResponse</h2>
-    <p>服务端<strong>流式</strong>的核心在 <code class="inline">vllm/v1/engine/async_llm.py</code> 的 <code class="inline">AsyncLLM</code>。它的关键设计是：</p>
+    <h2><span class="num">9.3</span>异步引擎：background loop 与按请求队列</h2>
+    <p>9.2 的路由把请求交给了 engine client；引擎侧接住它的是 <code class="inline">vllm/v1/engine/async_llm.py</code> 的 <code class="inline">AsyncLLM</code>。它回答的问题是「引擎的输出怎么变成调用方能逐个取的流」，关键设计是：</p>
     <ul>
       <li>构造时通过 <code class="inline">EngineCoreClient.make_async_mp_client(...)</code> 在<strong>后台进程</strong>里拉起 EngineCore（见 9.4）。</li>
       <li><code class="inline">_run_output_handler()</code> 起一个随事件循环跑的 <code class="inline">asyncio</code> 后台任务（<code class="inline">output_handler</code>），不断 <code class="inline">await engine_core.get_output_async()</code> 从引擎拉输出，交给 <code class="inline">output_processor</code> 处理后推给每个请求自己的队列。</li>
@@ -118,15 +118,15 @@ register_completion_api_router(app)</pre>
         finished = out.finished
         <span class="kw">if</span> out is <span class="kw">not</span> <span class="cl">STREAM_FINISHED</span>:
             <span class="kw">yield</span> out                     <span class="cmt"># 边生成边交，不攒批</span></pre>
-    <div class="annotation"><b>贯通整条链：</b><code class="inline">/v1/completions?stream=true</code> → <code class="inline">create_completion</code> → <code class="inline">OpenAIServingCompletion</code> 调 <code class="inline">engine_client.generate(...)</code>（拿到上面的异步生成器）→ 逐 token 包成 <code class="inline">data: {...}\n\n</code> 事件片 → 经 <code class="inline">StreamingResponse</code> 立即写回 TCP。于是客户端<strong>第一个 token 一生成就能收到</strong>，这就是「流式」的落地点。</div>
+    <div class="annotation"><b>看懂这段：</b>流式在引擎侧就是队列语义——输出处理器把每个 <code class="inline">RequestOutput</code> 推进该请求自己的队列，<code class="inline">generate()</code> 拿到一个就 yield 一个，调度上不存在「攒一批再交」的动作。这些 yield 出去的对象如何被包成 SSE 字节流写回 TCP，是 9.2 那段路由和 9.5 完整代码的事，这里不重复。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.4</span>引擎/核心分离部署：无状态 API + 有状态 EngineCore</h2>
-    <p>vLLM 的现代架构把「HTTP 接入」和「真正干活的引擎」<strong>拆成两个进程</strong>：</p>
+    <p>第 <a href="01-architecture.html">1.4 节</a>从引擎内部边界讲过 EngineCore 为什么是独立进程；站在部署视角，这个拆分买到的直接回报是：<strong>「HTTP 接入」和「有状态的部分」可以各自独立伸缩</strong>：</p>
     <ul>
-      <li><strong>API server / AsyncLLM（无状态、可水平扩）</strong>：只做 HTTP 解析、请求翻译、流式回包。它不持有模型权重、不占 GPU，可以起很多个副本。</li>
-      <li><strong>EngineCoreProc（有状态、常驻）</strong>：持有模型、KV cache、调度器，常驻后台进程，监听 ZMQ 端口。见 <code class="inline">vllm/v1/engine/core.py</code> 的 <code class="inline">EngineCoreProc</code>——类 docstring 直接写着「ZMQ-wrapper for running EngineCore in background process」。</li>
+      <li><strong>API server / AsyncLLM（无状态）</strong>：只做 HTTP 解析、请求翻译、流式回包，不持有模型权重、不占 GPU——因此能起任意多副本。</li>
+      <li><strong>EngineCoreProc（有状态、常驻）</strong>：模型、KV cache、调度器全在它里面（内部职责见 1.4），监听 ZMQ 端口对外服务，通常每个引擎只此一份。</li>
       <li>两端通过 <code class="inline">vllm/v1/engine/core_client.py</code> 里的 <code class="inline">MPClient</code> 家族通信：<strong>input_socket 推请求，output_socket 拉输出，底层是 ZMQ</strong>。</li>
     </ul>
     <p>看 <code class="inline">MPClient</code> 的类注释，它说明了这套传输模型：</p>
@@ -181,11 +181,15 @@ register_completion_api_router(app)</pre>
       <div class="fig-cap">图 9.4：无状态 API server 副本 ↔ 有状态 EngineCore ↔ Executor/GPU，全程走 ZMQ。</div>
     </div>
     <div class="annotation"><b>为什么这么拆：</b>把 HTTP/编排逻辑从昂贵、有状态的推理进程里拿出去，调度器（KV、并发）专心在 EngineCore 里做；API 层随便复制、随便重启而不影响引擎，也方便在 API 前面加 nginx 做负载均衡与限流。</div>
+    <div class="callout info">
+      <b class="tag">预告：无状态的边界</b>
+      这里说的「无状态」特指<strong>会话语义层面</strong>：API server 不跨请求保留「这轮对话聊了什么」，每个请求必须自包含。可真实的 Agent 应用偏偏需要这种跨请求的会话状态——<code class="inline">previous_response_id</code> 续聊、服务端工具循环、多轮编排。vLLM 刻意不把它放进引擎（放进来的代价就是失去水平扩展能力），而是交给一个坐在 API server 前面的独立网关去做。那层网关怎么设计，见<a href="13-agentic-gateway.html">第 13 章：Agentic 网关</a>。
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.5</span>用代码看：输出怎么走到客户端</h2>
-    <p>承接 9.3，我们把 <code class="inline">AsyncLLM</code> 里那个「后台输出循环」看完整。它在一个 <code class="inline">asyncio</code> 任务里无限循环，从引擎拉 <code class="inline">EngineCoreOutputs</code>，处理成各请求的 <code class="inline">RequestOutput</code> 塞进队列：</p>
+    <p>9.3 给了取流循环的主干；这一节把它背后的「后台输出循环」看完整。它在一个 <code class="inline">asyncio</code> 任务里无限循环，从引擎拉 <code class="inline">EngineCoreOutputs</code>，处理成各请求的 <code class="inline">RequestOutput</code> 塞进队列：</p>
     <div class="code-title">vllm/v1/engine/async_llm.py — _run_output_handler 里的 output_handler 协程（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">output_handler</span>():
     <span class="kw">while True</span>:
@@ -204,6 +208,64 @@ register_completion_api_router(app)</pre>
 
 self.output_handler = asyncio.create_task(output_handler())</pre>
     <div class="annotation"><b>逐行拆解：</b>(1) <code class="inline">get_output_async()</code> 是跨进程（ZMQ）拉取，是真正「读引擎」的地方；(2) 切成小片处理是为了<strong>不长期占住事件循环</strong>，让其他请求（包括流式连接的 IO）也能跑；(3) 某些终止条件（stop string）由输出处理器判定后，反向通知引擎 abort——注意这是一个<strong>回环</strong>：请求的结局也可能是引擎外决定的。</div>
+    <h3>「这个请求该结束了」由谁判定？</h3>
+    <p>第 (3) 步的回环值得单独展开，因为它暴露了一个分层事实：<strong>终止条件不是一个地方判定的</strong>。「一个请求什么时候停」的判断散落在两层，划分标准是「要不要看到具体 token 是什么」：</p>
+    <table class="tbl">
+      <thead><tr><th style="width:30%">终止条件</th><th style="width:18%">在哪层判定</th><th>为什么要在这层</th></tr></thead>
+      <tbody>
+        <tr><td>采到 EOS token</td><td>EngineCore（调度器）</td><td>只看 token id 本身，不需要解码成文字</td></tr>
+        <tr><td>命中 <code class="inline">stop_token_ids</code> 列表</td><td>EngineCore（调度器）</td><td>同上——token id 级别的匹配</td></tr>
+        <tr><td>长度封顶：<code class="inline">max_model_len</code> / <code class="inline">max_tokens</code></td><td>EngineCore（调度器）</td><td>只数个数，与内容无关</td></tr>
+        <tr><td>重复检测（repetition）</td><td>EngineCore（调度器）</td><td>基于 token id 序列的窗口比较</td></tr>
+        <tr><td>stop <strong>字符串</strong>（如 <code class="inline">"用户："</code>）</td><td>API 层（detokenizer 之后）</td><td>字符串边界可能横跨多个 token——必须先把 token 解码成文本才能匹配；引擎每步只回 token id</td></tr>
+      </tbody>
+    </table>
+    <p>前四类在 <code class="inline">vllm/v1/core/sched/utils.py</code> 的 <code class="inline">check_stop</code>（:98 起）里：每个新 token 产出时，调度器在引擎内就地判定，直接给请求记上 <code class="inline">FINISHED_STOPPED</code> 或 <code class="inline">FINISHED_LENGTH_CAPPED</code>，KV 立刻释放，不用任何进程间往返。最后一类不同：token id 到文本的转换发生在 API 层的 detokenizer（<code class="inline">output_processor.process_outputs → detokenizer.update</code>），所以 stop string 只能在这里判——判中后把请求 id 塞进 <code class="inline">reqs_to_abort</code>，走上面第 (3) 步的回环请引擎收尾。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">两层终止判定：token 级在引擎内就地收尾，字符串级要绕 API 层一圈再回来</text>
+
+        <rect class="node core" x="20" y="50" width="240" height="120" rx="8"></rect>
+        <text class="lbl sm" x="140" y="74" text-anchor="middle" font-weight="bold">EngineCore（每步都查）</text>
+        <text class="lbl sm" x="140" y="98" text-anchor="middle">check_stop()：EOS / stop_token_ids</text>
+        <text class="lbl sm" x="140" y="116" text-anchor="middle">长度封顶 / 重复检测</text>
+        <text class="lbl sm" x="140" y="140" text-anchor="middle">命中 → 直接置 FINISHED_*</text>
+        <text class="lbl sm" x="140" y="158" text-anchor="middle">KV 当步释放，零往返</text>
+
+        <rect class="node" x="330" y="50" width="240" height="120" rx="8"></rect>
+        <text class="lbl sm" x="450" y="74" text-anchor="middle" font-weight="bold">API 层（detokenizer 后）</text>
+        <text class="lbl sm" x="450" y="98" text-anchor="middle">token id → 文本（增量解码）</text>
+        <text class="lbl sm" x="450" y="116" text-anchor="middle">在文本里找 stop string</text>
+        <text class="lbl sm" x="450" y="140" text-anchor="middle">命中 → 记入 reqs_to_abort</text>
+        <text class="lbl sm" x="450" y="158" text-anchor="middle">（其余 token 照常下发给客户端）</text>
+
+        <line class="edge" x1="260" y1="110" x2="330" y2="110"></line>
+        <text class="lbl sm" x="295" y="100" text-anchor="middle">token 流</text>
+
+        <path class="edge back" d="M330,150 L300,150 L300,190 L180,190 L180,170"></path>
+        <text class="lbl sm" x="250" y="206" text-anchor="middle" fill="#b56917">abort_requests(命中的请求 id) —— 引擎侧补上 FINISHED，释放 KV</text>
+
+        <text class="lbl sm" x="620" y="80">分层的代价与收益：</text>
+        <text class="lbl sm" x="620" y="102">• 引擎内判定：快（当步收尾、KV 即放）</text>
+        <text class="lbl sm" x="620" y="124">• API 层判定：慢一拍（token 已发给客户端、</text>
+        <text class="lbl sm" x="620" y="146">  KV 多占几步），但只有这里看得到文本</text>
+        <text class="lbl sm" x="620" y="176">客户端视角：</text>
+        <text class="lbl sm" x="620" y="198">两类终止的 finish_reason 都是 stop，</text>
+        <text class="lbl sm" x="620" y="220">字符串命中时额外带 stop_reason=命中的串</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>引擎侧判定</span>
+        <span class="lg-item"><span class="sw node"></span>API 侧判定</span>
+      </div>
+      <div class="fig-cap">图 9.5：终止判定的两层分工——token 级条件在 check_stop（引擎内）就地收尾；stop 字符串必须等 detokenizer 解码后在 API 层判定，再经 abort 回环让引擎释放资源。</div>
+    </div>
+    <div class="callout warn">
+      <b class="tag">自研提示</b>
+      自研引擎时容易把所有终止条件堆在 API 层「图省事」——那意味着引擎里每个已判死的请求还多跑几步 forward、占着 KV 不放。反过来把 stop string 也塞进引擎判，就得把 detokenizer 拖进 EngineCore，破坏 9.4 的进程边界。按「看得到什么就判什么」分层：token 级条件进引擎，字符串级条件留在 API 层，是这套架构里代价最小的切法。
+    </div>
     <p>再回头把「流式字节流」那段看一遍，它是 9.2 那段路由里 <code class="inline">StreamingResponse</code> 实际消费的内容。在 <code class="inline">OpenAIServingCompletion.completion_stream_generator</code> 里，每个 <code class="inline">RequestOutput</code> 被序列化成 OpenAI 风格的事件片：</p>
     <div class="code-title">vllm/entrypoints/openai/completion/serving.py — 流式生成器（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async for</span> i, res <span class="kw">in</span> result_generator:   <span class="cmt"># 迭代引擎输出流</span>
@@ -213,6 +275,7 @@ self.output_handler = asyncio.create_task(output_handler())</pre>
 <span class="kw">yield</span> f<span class="st">"data: {final_usage_data}\n\n"</span>  <span class="cmt"># 结束前补 usage</span>
 <span class="kw">yield</span> <span class="st">"data: [DONE]\n\n"</span>              <span class="cmt"># SSE 终止标记</span></pre>
     <div class="annotation"><b>看懂：</b>这就是 HTTP 侧的「边想边说」——每个 <code class="inline">data: {...}</code> 都是一个新的 SSE 事件，含当前已生成的那一小段 delta。<code class="inline">StreamingResponse</code> 一拿到就 flush 给客户端，直到最后发 <code class="inline">[DONE]</code> 收尾。</div>
+    <p>不过这套流式只覆盖<strong>单轮推理</strong>：一个请求进引擎，一条流出来。Agent 应用里一次客户端请求往往要驱动 N 轮推理，每轮各发一套带序号的 SSE 事件——怎么把 N 条乱序的流重组成一条序号单调的平滑流，是网关层的问题，见<a href="13-agentic-gateway.html">第 13.6 节</a>。</p>
   </section>
 
   <section class="block">
@@ -308,6 +371,7 @@ name=<span class="st">"vllm:request_num_preemptions"</span>          <span class
       <tr><td>在线/并发</td><td>AsyncLLM（asyncio 常驻循环）</td><td>自研第二步再加 asyncio + 请求队列</td></tr>
       <tr><td>流式</td><td>AsyncGenerator + StreamingResponse</td><td>引擎每步产出就 yield，绝不攒批</td></tr>
       <tr><td>分层</td><td>API server ↔ EngineCore（ZMQ）</td><td>把「HTTP 壳」与「引擎」解耦，才能水平扩</td></tr>
+      <tr><td>会话状态</td><td>引擎侧完全不持有（见第 13 章网关）</td><td>续聊、多轮循环拆到引擎外的状态层，别塞进引擎</td></tr>
       <tr><td>可观测</td><td>RequestStateStats 时间戳 + Prometheus 直方图（TTFT/ITL/e2e）</td><td>第一版只记 arrival/first_token/last_token 三个时间戳就够——没有度量的优化是盲目的</td></tr>
     </table>
     <div class="callout warn">

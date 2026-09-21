@@ -128,18 +128,19 @@
     supports_pp: <span class="cl">bool</span> = <span class="kw">False</span>  <span class="cmt"># 是否支持流水线并行(PP)</span>
     <span class="cmt"># 下面都是统一入口，交给 subclass 实现：</span>
     ...</pre>
-    <p><code class="inline">get_class(vllm_config)</code> 根据 <code class="inline">parallel_config.distributed_executor_backend</code> 选出具体实现。vLLM 提供三种主流后端：</p>
-    <ul>
-      <li><strong>uni（UniProcExecutor）</strong>：<span class="mono">单进程</span>。worker 和一个 driver worker 跑在<strong>同一个进程</strong>里，没有任何跨进程调度。适用于单卡、不需要分布式的场景，最简单也最快。</li>
-      <li><strong>mp（MultiprocExecutor）</strong>：<span class="mono">多进程</span>。每个 worker 是 <code class="inline">context.Process(target=WorkerProc.worker_main, name=f"VllmWorker-{rank}")</code> 拉起的独立进程，进程间用<strong>共享内存消息队列 MessageQueue</strong> 通信。vLLM 默认的多卡后端，<strong>不依赖 Ray</strong>，只需标准库多进程，适合单机多卡。</li>
-      <li><strong>ray（RayDistributedExecutor / RayExecutorV2）</strong>：<span class="mono">Ray 编排</span>。每个 worker 是一个 Ray actor（<code class="inline">ray.remote(RayWorkerProc)</code>，远端对象），能跨节点、跨机调度，支持 PP 的编译 DAG。适合大规模、多机集群。注意 <code class="inline">RayExecutorV2</code> 继承自 <code class="inline">MultiprocExecutor</code>，复用了后者的基于消息队列（MQ）的控制平面，但 worker 进程由 Ray 管理、是 Ray actor 而非裸多进程。</li>
-    </ul>
-    <div class="annotation"><b>小结：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把并行配置给它，它拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。</div>
+    <p><code class="inline">get_class(vllm_config)</code> 根据 <code class="inline">parallel_config.distributed_executor_backend</code> 选出具体实现。vLLM 提供三种主流后端，先一张表看差异，10.3 再看代码：</p>
+    <table class="tbl">
+      <tr><th>后端</th><th>worker 怎么来</th><th>怎么通信</th><th>适用场景</th></tr>
+      <tr><td><strong>uni</strong>（UniProcExecutor）</td><td>没有独立 worker 进程，driver 直接执行</td><td>同进程直接调用，无 IPC</td><td>单卡，最简单也最快</td></tr>
+      <tr><td><strong>mp</strong>（MultiprocExecutor）</td><td><code class="inline">context.Process(target=WorkerProc.worker_main, name=f"VllmWorker-{rank}")</code> 拉起独立进程</td><td>共享内存消息队列 MessageQueue</td><td>单机多卡（默认多卡后端，不依赖 Ray）</td></tr>
+      <tr><td><strong>ray</strong>（RayDistributedExecutor / RayExecutorV2）</td><td>每个 worker 是 Ray actor（<code class="inline">ray.remote(RayWorkerProc)</code>）</td><td>复用 MultiprocExecutor 的消息队列控制平面，进程编排交给 Ray</td><td>多机集群；支持 PP 编译 DAG</td></tr>
+    </table>
+    <div class="annotation"><b>小结：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把并行配置给它，它拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。注意 <code class="inline">RayExecutorV2</code> 继承自 <code class="inline">MultiprocExecutor</code>——两种跨进程后端的差别只在 worker 进程谁来管，不在控制面。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">10.3</span>用代码看：三种 Executor 的差异 & 并行配置</h2>
-    <p>先看后端是怎么被选出来的。下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
+    <p>10.2 的表格落到代码上是三件事：后端怎么被选出来、两种 IPC 形态（同进程直调 vs 远程 actor）长什么样、并行规模怎么算。先看后端是怎么被选出来的，下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
     <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">elif</span> distributed_executor_backend == <span class="st">"ray"</span>:
     executor_class = RayDistributedExecutor
