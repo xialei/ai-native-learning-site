@@ -6,8 +6,8 @@
 
 | 仓库 | 本地路径 | 锚点 |
 |---|---|---|
-| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-28-g43c53e9b`（version.txt: 0.19.8） |
-| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2630-g64d15673`（core 包版本 0.20.0） |
+| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-42-g4a5856c25`（version.txt: 0.19.8） |
+| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2652-ge27e9d08f`（core 包版本 0.20.0） |
 
 所有引用代码路径以仓库最新为准——若源码演进导致行号偏移，以文件名 + 函数名定位。
 
@@ -39,8 +39,16 @@
 - **两库分工论**：Megatron 管「算不过来」（TP/PP/CP/EP 切计算），DeepSpeed 管「存不下」（ZeRO/offload 压副本）。两个握手点：rank 布局的 mpu 插头（ch2）、main_grad 通道（ch3/ch7）。
 - **16 字节/参数账**（ch6）：fp16 参数 2 + fp16 梯度 2 + fp32 master 4 + Adam m/v 8。ZeRO 三级分别切掉后两项、梯度项、参数项。
 - **DS pipe 与 ZeRO-2/3 互斥**：`PipelineEngine` assert `zero_optimization_stage() < ZeroStageEnum.gradients`——PP + ZeRO-3 只能走 Megatron 主导路线（ch1 模式 C、ch4）。
-- **RNG 状态是重算正确性的命门**（ch10）：DS 保存 CPU/CUDA/tracker 三份；重算不一致 = 静默数值错误。
+- **RNG 状态决定重算正确性**（ch10）：DS 保存 CPU/CUDA/tracker 三份；重算不一致 = 静默数值错误。
 - **CUDA_DEVICE_MAX_CONNECTIONS=1**（ch3）：TP 通信-计算重叠的正确性前提，一个环境变量决定结果对错。
+
+## 演化记录
+
+- **2026-09-21 二次核实**（DeepSpeed 8 commits / Megatron 4 commits，重锚 `v0.19.7-42-g4a5856c25` / `core_v0.15.0rc7-2652-ge27e9d08f`）：
+  - ch11 fusions 目录盘点修正：`fused_bias_dropout_add.py` → `fused_bias_dropout.py`（预存文件名错误，`_add` 是 DeepSpeed 侧叫法）；新增 `fused_gated_norm.py` / `fused_pre_gated_delta_rule.py`（GDN 线性注意力融合，#5532 Pre-GDR kernel fusion）
+  - ch08 新增演化痕迹：`_allgather_params_coalesced` 曾只等最后一个 all-gather handle 导致读到未初始化内存（#8539 修复，wait-all）
+  - engine.py 行号刷新：backward 3286→3295、step 3471→3480（cast 白名单 + vocab CE backend 两 commit 引入偏移，ch01/ch06 三处 pin）
+  - 其余 commits（HPU CI、AutoEP、Gram NS、TiledLoss 移除、多模态初始化、GDP 投机解码、training 配置构造重构）不触及书中覆盖面，未改章
 
 ## 维护
 

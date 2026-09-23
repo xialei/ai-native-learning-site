@@ -174,7 +174,7 @@ adder = <span class="cl">PrefillAdder</span>(
         <span class="kw">if</span> res == <span class="cl">AddReqResult</span>.NO_TOKEN:
             running_batch.batch_is_full = <span class="kw">True</span>
         <span class="kw">break</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 三个细节值得注意。① <code class="inline">batch_is_full</code> 是 sticky 标志——一旦置位，后续每轮直接跳过 prefill，直到 decode 批收缩（<code class="inline">update_running_batch</code> 里 <code class="inline">batch.batch_size() &lt; initial_bs</code> 时复位）；② 排序发生在预算检查之前，因为 LPM 排序需要先对每个请求做 match_prefix（见第 3 章）；③ 队列循环遇到第一个拒绝就 break，不做「跳过它试下一个」——SGLang 选择保序而非捡漏，避免大请求永远饿死在小请求后面。</div>
+    <div class="annotation"><b>三个细节值得注意：</b> <code class="inline">batch_is_full</code> 是 sticky 标志——一旦置位，后续每轮直接跳过 prefill，直到 decode 批收缩（<code class="inline">update_running_batch</code> 里 <code class="inline">batch.batch_size() &lt; initial_bs</code> 时复位）；排序发生在预算检查之前，因为 LPM 排序需要先对每个请求做 match_prefix（见第 3 章）；队列循环遇到第一个拒绝就 break，不做「跳过它试下一个」——SGLang 选择保序而非捡漏，避免大请求永远饿死在小请求后面。</div>
   </section>
 
   <section class="block">
@@ -214,7 +214,7 @@ adder = <span class="cl">PrefillAdder</span>(
             + self.tree_cache.<span class="fn">evictable_size</span>()   <span class="cmt"># 前缀缓存可随时淘汰的部分</span>
         )
         <span class="kw">return</span> available_and_evictable - self.rem_total_token_offset</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">evictable_size()</code> 把第 3 章的基数树接进了调度：树里没被锁住的前缀 KV 平时占着显存，但在预算眼里它们是「随时可腾」的。所以一个请求可以放心地被收进来——真到不够用时先淘汰别人的缓存前缀。这是 RadixCache 和调度器真正的耦合点，比「复用」本身更深。混合 SWA/Mamba 模型各有变体分支（<code class="inline">is_hybrid_swa</code>、<code class="inline">rem_mamba_slots</code>），机制相同、账本分开。</div>
+    <div class="annotation"><b>树就这样接进了调度：</b> <code class="inline">evictable_size()</code> 把第 3 章的基数树接进了调度：树里没被锁住的前缀 KV 平时占着显存，但在预算眼里它们是「随时可腾」的。所以一个请求可以放心地被收进来——真到不够用时先淘汰别人的缓存前缀。这是 RadixCache 和调度器真正的耦合点，比「复用」本身更深。混合 SWA/Mamba 模型各有变体分支（<code class="inline">is_hybrid_swa</code>、<code class="inline">rem_mamba_slots</code>），机制相同、账本分开。</div>
 
     <p>收请求时的预算计算只有几行，但每行都是生产事故换来的：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_policy.py — add_one_req 的预算判断（摘录，注释为译注）</div>
@@ -231,7 +231,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
 ...
 <span class="kw">if</span> total_tokens &gt;= self.rem_total_tokens:
     <span class="kw">return</span> <span class="cl">AddReqResult</span>.NO_TOKEN</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个数字各管一件事：<code class="inline">cand_extend_input_len</code> 是「扣掉缓存命中后真正要算的输入」；<code class="inline">max_new</code> 是输出预算，注意有 <code class="inline">CLIP_MAX_NEW_TOKENS</code>（默认 4096）封顶——用户报 <code class="inline">max_new_tokens=100000</code> 时只按 4096 估，否则调度器保守到拒绝一切；<code class="inline">+ self.page_size</code> 是给分页分配器的余量，<code class="inline">alloc_extend</code> 对每个请求可能多花一页，不预留就会在分配那一步才 OOM。收下请求后，<code class="inline">_update_prefill_budget</code> 把这三笔从账上扣掉。</div>
+    <div class="annotation"><b>三个数字各管一件事：</b> <code class="inline">cand_extend_input_len</code> 是「扣掉缓存命中后真正要算的输入」；<code class="inline">max_new</code> 是输出预算，注意有 <code class="inline">CLIP_MAX_NEW_TOKENS</code>（默认 4096）封顶——用户报 <code class="inline">max_new_tokens=100000</code> 时只按 4096 估，否则调度器保守到拒绝一切；<code class="inline">+ self.page_size</code> 是给分页分配器的余量，<code class="inline">alloc_extend</code> 对每个请求可能多花一页，不预留就会在分配那一步才 OOM。收下请求后，<code class="inline">_update_prefill_budget</code> 把这三笔从账上扣掉。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       <code class="inline">_update_prefill_budget</code> 的调用点里，记入输入的<strong>不是</strong>上面这个 <code class="inline">cand_extend_input_len</code>。普通请求传的是 <code class="inline">req.extend_range.length</code>，chunked 请求传的是本次切段的长度——都是「输入 token 数」的未对齐原值。<code class="inline">_update_prefill_budget</code> 内部对<strong>预算</strong>做页对齐（<code class="inline">ceil_paged_tokens</code>），但往指标账 <code class="inline">log_input_tokens</code> 上写的，是页对齐<strong>之前</strong>的那个数。源码在这里留了一句 TODO 和一个中间变量 <code class="inline">raw_extend_input_len</code>，把「按页预留」和「按真实 token 计数」两件事显式拆开：前者是内存安全需要，后者是给 <code class="inline">metrics_reporter</code> 算前缀缓存命中率用的——用对齐后的数字算命中率会被页对齐系统性地拉偏。一个函数里两种口径，读的时候别混。<br><br>预算扣账本身最近也动了：KV 预算从 PrefillAdder 内嵌的四个属性抽成了独立的 <code class="inline">mem_cache/prefill_budget.py</code>（<code class="inline">PrefillBudget</code> 基类 + SWA 变体子类），由分配器的 <code class="inline">create_prefill_budget()</code> 工厂创建，<code class="inline">rem_total_tokens</code> 等属性现在只是转发。另外新增了一条 <code class="inline">compute_charge</code> 口径——gfx95（<code class="inline">SGLANG_EXACT_CHUNK_FILL</code>）上 compute 预算（<code class="inline">rem_chunk_tokens</code>/<code class="inline">rem_input_tokens</code>）按未对齐 token 扣、KV 预算仍按页对齐扣，因为那块硬件的 kernel 按 BLOCK_SIZE_M 取整，短批代价翻倍，把取整的零头花满才划算。默认路径（非 gfx95）两者仍同一口径。
@@ -259,7 +259,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
         <span class="kw">if</span> self.rem_chunk_tokens <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> self.rem_chunk_tokens &lt;= <span class="nu">0</span>:
             <span class="kw">return</span> <span class="cl">AddReqResult</span>.OTHER
     <span class="kw">return</span> <span class="cl">AddReqResult</span>.CONTINUE</pre>
-    <div class="annotation"><b>读懂这段：</b> KV 池真不够 → NO_TOKEN（外层置 <code class="inline">batch_is_full</code>，并且这一批收了几个就能跑几个）；只是本轮配额用完 → OTHER（本批照常发，下轮再收）。两种「停」后果不同，所以分成两个枚举值——<code class="inline">AddReqResult.CONTINUE / NO_TOKEN / OTHER</code> 就这三个。<br><br><b>「够不够」不是一把尺子：</b>这个函数现在要依次过四道闸，每道闸量的是不同的东西。① 通用 KV：<code class="inline">memory_budget.has_capacity()</code>——KV 预算抽到 <code class="inline">mem_cache/prefill_budget.py</code> 后（<code class="inline">PrefillBudget</code> 基类 + SWA 变体），这里只剩一个委托调用；混合 SWA 的第三块配额（<code class="inline">remaining_swa</code>，滑动窗口层自己的余量）收在 <code class="inline">SWAPrefillBudget.has_capacity()</code> 的重写里，全注意力层剩余再多也补不上。② <strong>Mamba 槽位单独判</strong>——源码注释写得很清楚：<code class="inline">rem_total_tokens</code> 里「可全量驱逐」的那部分盖不住一个 mamba 槽位，因为槽位要的是 mamba 可恢复的字节数，两者是不同的池子。这是这套预算系统里最容易误读的一处：看到「总剩余 token 还很多」不等于「还能收请求」。③ 最后一道按模型类型分岔：DLLM 用 <code class="inline">rem_dllm_tokens</code>，普通模型用 <code class="inline">rem_chunk_tokens</code>（chunked prefill 的配额）。<br><br>返回值只有三个是刻意的：调用方只需要区分「继续收」「空间没了」「本轮配额没了」，再多枚举值就要在每个 <code class="inline">add_one_req</code> 的调用点重复一遍分支。</div>
+    <div class="annotation"><b>KV 池真不够 → NO_TOKEN：</b> KV 池真不够 → NO_TOKEN（外层置 <code class="inline">batch_is_full</code>，并且这一批收了几个就能跑几个）；只是本轮配额用完 → OTHER（本批照常发，下轮再收）。两种「停」后果不同，所以分成两个枚举值——<code class="inline">AddReqResult.CONTINUE / NO_TOKEN / OTHER</code> 就这三个。<br><br><b>「够不够」不是一把尺子：</b>这个函数现在要依次过四道闸，每道闸量的是不同的东西。第一道是通用 KV：<code class="inline">memory_budget.has_capacity()</code>——KV 预算抽到 <code class="inline">mem_cache/prefill_budget.py</code> 后（<code class="inline">PrefillBudget</code> 基类 + SWA 变体），这里只剩一个委托调用；混合 SWA 的第三块配额（<code class="inline">remaining_swa</code>，滑动窗口层自己的余量）收在 <code class="inline">SWAPrefillBudget.has_capacity()</code> 的重写里，全注意力层剩余再多也补不上。第二道是 <strong>Mamba 槽位单独判</strong>——源码注释写得很清楚：<code class="inline">rem_total_tokens</code> 里「可全量驱逐」的那部分盖不住一个 mamba 槽位，因为槽位要的是 mamba 可恢复的字节数，两者是不同的池子。这是这套预算系统里最容易误读的一处：看到「总剩余 token 还很多」不等于「还能收请求」。最后一道按模型类型分岔：DLLM 用 <code class="inline">rem_dllm_tokens</code>，普通模型用 <code class="inline">rem_chunk_tokens</code>（chunked prefill 的配额）。<br><br>返回值只有三个是刻意的：调用方只需要区分「继续收」「空间没了」「本轮配额没了」，再多枚举值就要在每个 <code class="inline">add_one_req</code> 的调用点重复一遍分支。</div>
   </section>
 
   <section class="block">
@@ -305,7 +305,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
         <span class="cmt"># 队列太长时关掉昂贵的前缀匹配和排序</span>
         <span class="kw">return</span> <span class="cl">CacheAgnosticPolicy</span>.FCFS
     <span class="kw">return</span> self.policy</pre>
-    <div class="annotation"><b>读懂这段：</b> 两处都值得停一下。① <code class="inline">temporary_deprioritized</code> 服务「批内前缀缓存」：几个请求彼此共享一个前缀、但当前缓存里都没有时，只放行一个进 prefill，其余暂时降级排在队尾——等第一个算完，后面的人就能白拿它的 KV。② 队列超过 128 时 LPM 直接退化成 FCFS：LPM 要对每个等待请求做一次 match_prefix，树操作是 Python 代码，排队太长时排序本身就成了瓶颈。这是个能直接抄走的取舍：优化策略自己也要有预算。<br><br><b>注意这个函数的名字和位置：</b>它不叫「选策略」，叫 <code class="inline">_determine_active_policy</code>——<em>active</em> 是关键词。用户配的 <code class="inline">self.policy</code> 不动，返回的只是「这一轮实际生效的策略」。<code class="inline">waiting_queue_prefix_matched</code> 也走这个函数来判断「要不要先做前缀匹配」——所以 128 这个阈值不只影响排序，还决定要不要付匹配的代价。这里只挑 LPM 和 HRRN 两个降级，<strong>不含 DFS_WEIGHT</strong>，所以它是唯一在长队列下仍做完整树排序的策略。</div>
+    <div class="annotation"><b>两处都值得停一下：</b> 一是 <code class="inline">temporary_deprioritized</code> 服务「批内前缀缓存」：几个请求彼此共享一个前缀、但当前缓存里都没有时，只放行一个进 prefill，其余暂时降级排在队尾——等第一个算完，后面的人就能坐享它的 KV。二是队列超过 128 时 LPM 直接退化成 FCFS：LPM 要对每个等待请求做一次 match_prefix，树操作是 Python 代码，排队太长时排序本身就成了瓶颈。这是个能直接抄走的取舍：优化策略自己也要有预算。<br><br><b>注意这个函数的名字和位置：</b>它不叫「选策略」，叫 <code class="inline">_determine_active_policy</code>——<em>active</em> 是关键词。用户配的 <code class="inline">self.policy</code> 不动，返回的只是「这一轮实际生效的策略」。<code class="inline">waiting_queue_prefix_matched</code> 也走这个函数来判断「要不要先做前缀匹配」——所以 128 这个阈值不只影响排序，还决定要不要付匹配的代价。这里只挑 LPM 和 HRRN 两个降级，<strong>不含 DFS_WEIGHT</strong>，所以它是唯一在长队列下仍做完整树排序的策略。</div>
 
     <p>HRRN 是对 LPM 饥饿问题的修补——响应比 = 1 + 等待量 / 待算量，等得越久越容易出头：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_policy.py — _sort_by_hrrn（摘录，注释为译注）</div>
@@ -321,7 +321,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
     <span class="kw">return</span> (-ratio_delta, rid)
 
 waiting_queue.<span class="fn">sort</span>(key=_key)</pre>
-    <div class="annotation"><b>读懂这段：</b> 经典 HRRN 用秒表计时，这里用 token 计数——<code class="inline">processed_tokens</code> 是 Scheduler 累计的 prefill token 数，请求入队时打一个 <code class="inline">arrival_processed_tokens</code> 戳，两者相减就是「等价等待时间」。用 token 不用时钟，是为了多轮计量与确定性。分母是 <em>uncached</em> 长度而不是总输入长度：缓存命中多的请求理应便宜，不该因为 prompt 长就一直排后面。</div>
+    <div class="annotation"><b>为什么用 token 计数不用秒表：</b> 经典 HRRN 用秒表计时，这里用 token 计数——<code class="inline">processed_tokens</code> 是 Scheduler 累计的 prefill token 数，请求入队时打一个 <code class="inline">arrival_processed_tokens</code> 戳，两者相减就是「等价等待时间」。用 token 不用时钟，是为了多轮计量与确定性。分母是 <em>uncached</em> 长度而不是总输入长度：缓存命中多的请求理应便宜，不该因为 prompt 长就一直排后面。</div>
 
     <div class="callout info">
       <b class="tag">困惑点</b>
@@ -329,7 +329,7 @@ waiting_queue.<span class="fn">sort</span>(key=_key)</pre>
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      新出的 <code class="inline">SHORTEST_PREFILL_FIRST</code>（commit 65ef55e2a8，#40024，实验性）和上面几族思路都不同：它不追求「先做最划算的」（LPM），而是直接削减队头单请求的 prefill 块——让最短的请求尽快走完，压的是尾延迟。排序键是「未命中缓存的待算量」：<code class="inline">max(1, len(origin_input_ids) + len(output_ids) - num_matched_prefix_tokens)</code>，同样带 <code class="inline">temporary_deprioritized</code> 降级、按入队时间打破平局。真正值得看的是它对 chunked prefill 的配合：<code class="inline">shortest_prefill_chunk_limit</code>（<code class="inline">schedule_policy.py:451</code>）会在收 chunked 请求之前，先把等待队列里更短请求的页对齐开销预留出来（逐个累加，直到剩余预算只够一页），然后把队头这一块的配额压到 <code class="inline">(budget - reserved) // page_size * page_size</code>。这块配额经 <code class="inline">scheduler.py:3940</code> 写进 <code class="inline">adder.chunked_req_limit</code>，最后在 <code class="inline">add_chunked_req</code> 里以 <code class="inline">_rem_tokens = min(_rem_tokens, self.chunked_req_limit)</code> 生效——长请求的每一块都被压短，短请求插空的间隔就变小了。使用门槛有三条：要求 prefix caching（tree_cache 被禁用时构造直接报错）、当前只在 <code class="inline">rem_chunk_tokens</code> 存在且预算 ≥ 2 页时介入、每 128 次排序打一条 info 日志（队列长度 + 队头待算量），方便验证它确实在起作用。
+      新出的 <code class="inline">SHORTEST_PREFILL_FIRST</code>（commit 65ef55e2a8，#40024，实验性）和上面几族思路都不同：它不追求「先做最划算的」（LPM），而是直接削减队头单请求的 prefill 块——让最短的请求尽快走完，压的是尾延迟。排序键是「未命中缓存的待算量」：<code class="inline">max(1, len(origin_input_ids) + len(output_ids) - num_matched_prefix_tokens)</code>，同样带 <code class="inline">temporary_deprioritized</code> 降级、按入队时间打破平局。真正值得看的是它对 chunked prefill 的配合：<code class="inline">shortest_prefill_chunk_limit</code>（<code class="inline">schedule_policy.py:451</code>）会在收 chunked 请求之前，先把等待队列里更短请求的页对齐开销预留出来（逐个累加，直到剩余预算只够一页），然后把队头这一块的配额压到 <code class="inline">(budget - reserved) // page_size * page_size</code>。这块配额经 <code class="inline">scheduler.py:3914</code> 写进 <code class="inline">adder.chunked_req_limit</code>，最后在 <code class="inline">add_chunked_req</code> 里以 <code class="inline">_rem_tokens = min(_rem_tokens, self.chunked_req_limit)</code> 生效——长请求的每一块都被压短，短请求插空的间隔就变小了。使用门槛有三条：要求 prefix caching（tree_cache 被禁用时构造直接报错）、当前只在 <code class="inline">rem_chunk_tokens</code> 存在且预算 ≥ 2 页时介入、每 128 次排序打一条 info 日志（队列长度 + 队头待算量），方便验证它确实在起作用。
     </div>
   </section>
 
@@ -358,7 +358,7 @@ self.<span class="fn">_update_prefill_budget</span>(
 
 <span class="cmt"># Return if chunked prefill not finished</span>
 <span class="kw">return</span> req <span class="kw">if</span> truncated <span class="kw">else</span> <span class="kw">None</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 返回值就是续传标记：还没算完返回 <code class="inline">req</code> 本身，Scheduler 把它存进 <code class="inline">self.chunked_req</code>；最后一段算完返回 <code class="inline">None</code>。注意一个反直觉的细节：中途某段收不了新请求时也必须把 chunked_req 加进 can_run_list——它上一段的 KV 已经占着内存，不继续算就泄漏了（源码里 <code class="inline">_rem_tokens &lt;= 0</code> 时硬性换成 <code class="inline">rem_chunk_tokens</code>，注释原话是 "otherwise, it will cause a memory leak"）。这是预算逻辑里少见的「宁可超预算也不能漏请求」的位置。</div>
+    <div class="annotation"><b>返回值就是续传标记：</b> 还没算完返回 <code class="inline">req</code> 本身，Scheduler 把它存进 <code class="inline">self.chunked_req</code>；最后一段算完返回 <code class="inline">None</code>。注意一个反直觉的细节：中途某段收不了新请求时也必须把 chunked_req 加进 can_run_list——它上一段的 KV 已经占着内存，不继续算就泄漏了（源码里 <code class="inline">_rem_tokens &lt;= 0</code> 时硬性换成 <code class="inline">rem_chunk_tokens</code>，注释原话是 "otherwise, it will cause a memory leak"）。这是预算逻辑里少见的「宁可超预算也不能漏请求」的位置。</div>
 
     <p>切段的落账在事件循环侧：<code class="inline">get_next_batch_to_run</code> 每轮先调用 <code class="inline">stash_chunked_request(self.chunked_req)</code>，其实现只有一行——<code class="inline">maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)</code>，把已完成段的 KV 插入基数树。所以长请求的第二段开始，<code class="inline">prefix_indices</code> 会命中自己（tree_cache.evictable_size 随之变化，三本账自动更新）。</p>
   </section>
@@ -380,7 +380,7 @@ self.<span class="fn">_update_prefill_budget</span>(
         self.<span class="fn">_add_request_to_queue</span>(req, is_retracted=<span class="kw">True</span>)
 <span class="kw">else</span>:
     self.new_token_ratio_tracker.<span class="fn">decay_step</span>()</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">check_decode_mem</code> 问的是「所有在跑请求再各解码一步，KV 池放不放得下」，答案由分配器给出（第 5 章）。放不下 → 抢占；放得下 → 新 token 估计比率衰减一档。</div>
+    <div class="annotation"><b>体检问的是一步之后：</b> <code class="inline">check_decode_mem</code> 问的是「所有在跑请求再各解码一步，KV 池放不放得下」，答案由分配器给出（第 5 章）。放不下 → 抢占；放得下 → 新 token 估计比率衰减一档。</div>
 
     <p><code class="inline">retract_decode</code> 的主循环——按「最不值得保留」的顺序一个个踢，直到体检通过：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_batch.py — retract_decode（摘录，注释为译注）</div>
@@ -412,7 +412,7 @@ self.<span class="fn">_update_prefill_budget</span>(
                 <span class="st">"Retraction host KV pool exhausted. Aborting the request."</span>,
                 status_code=<span class="cl">HTTPStatus</span>.INTERNAL_SERVER_ERROR,
             )</pre>
-    <div class="annotation"><b>读懂这段：</b> 谁先被踢由 <code class="inline">_get_decode_retraction_order</code> 决定，默认排序键是 <code class="inline">(len(output_ids), -len(origin_input_ids))</code> 取反序——已生成 token 多的先踢（沉没成本大、留着占的 KV 也多），输入长的次之（踢掉省得多）。被踢的请求做两件事：KV 释放回池（<strong>不</strong>进基数树，因为要的是立刻可用的空间），并把已生成的 KV 备份到主机内存，重新入队后用备份续跑。主机备份池也满时没有第三层兜底，只能 FINISH_ABORT 返回 500——代码里连注释都写明 "the request cannot resume"。</div>
+    <div class="annotation"><b>谁先被踢：</b> 由 <code class="inline">_get_decode_retraction_order</code> 决定，默认排序键是 <code class="inline">(len(output_ids), -len(origin_input_ids))</code> 取反序——已生成 token 多的先踢（沉没成本大、留着占的 KV 也多），输入长的次之（踢掉省得多）。被踢的请求做两件事：KV 释放回池（<strong>不</strong>进基数树，因为要的是立刻可用的空间），并把已生成的 KV 备份到主机内存，重新入队后用备份续跑。主机备份池也满时没有第三层兜底，只能 FINISH_ABORT 返回 500——代码里连注释都写明 "the request cannot resume"。</div>
 
     <p>抢占之后还有一段恢复动力学：<code class="inline">new_token_ratio</code> 是 PrefillAdder 估「每个 decode 请求每步要多少 KV」的系数。正常时它从初始值按固定步长衰减到下限，再由每次抢占按剩余请求的实际进度重估并抬高，之后重新衰减。初始值不是拍脑袋的 1.0，而是 <code class="inline">SGLANG_INIT_NEW_TOKEN_RATIO</code>（默认 0.7）乘上 <code class="inline">schedule_conservativeness</code> 再和 1.0 取 min——也就是说调度器一开始就假设「估不准输出长度」，宁可少估。效果是：刚抢占完的几轮里 prefill 准入变保守，给 decode 让路，然后逐渐放松。</p>
   </section>
@@ -421,7 +421,7 @@ self.<span class="fn">_update_prefill_budget</span>(
     <h2><span class="num">4.7</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：① 三本账的最简版（只算 rem_total）；② CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入；③ cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。下一步进入 <a href="05-memory.html">第 5 章：内存池与显存预算</a>。
+      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：先搭三本账的最简版（只算 rem_total），再加 CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入，cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。下一步进入 <a href="05-memory.html">第 5 章：内存池与显存预算</a>。
     </div>
     <p style="font-size:13.5px;color:#6b5d54">关联阅读：预算里的 <code class="inline">evictable_size()</code> 来自第 3 章的基数树；<code class="inline">check_decode_capacity</code> 的实现和 mem_fraction_static 的显存划分在第 5 章。</p>
   </section>
@@ -433,7 +433,7 @@ self.<span class="fn">_update_prefill_budget</span>(
 </div>
 
 <footer>
-  深入浅出SGLang · 04 调度器 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 04 调度器 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

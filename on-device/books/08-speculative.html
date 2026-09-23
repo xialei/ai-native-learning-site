@@ -55,7 +55,7 @@
     {<span class="st">"ngram-mod"</span>,     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
     {<span class="st">"ngram-cache"</span>,   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };</pre>
-    <div class="annotation"><b>读懂这段：</b> 两大家族：draft 系列（需要一个小模型/额外权重）和 ngram 系列（纯 CPU 自投机，不需要任何额外模型）。接口统一为 <code class="inline">common_speculative_impl</code> 的虚函数：process（随 target 批量喂 draft）/ draft（生成草稿 token 序列）/ accept（校验后回收）。</div>
+    <div class="annotation">注册表里的 11 种实现归成两大家族：draft 系列（需要一个小模型/额外权重）和 ngram 系列（纯 CPU 自投机，不需要任何额外模型）。接口倒是统一的，都是 <code class="inline">common_speculative_impl</code> 的虚函数：process（随 target 批量喂 draft）/ draft（生成草稿 token 序列）/ accept（校验后回收）。</div>
   </section>
 
   <section class="block">
@@ -81,7 +81,7 @@
         <span class="kw">return</span> <span class="kw">false</span>;   <span class="cmt">// 同 id 不同文本 → 拒绝</span>
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个 magic number 的含义：SPEC_VOCAB_CHECK_START_TOKEN_ID = 5 ——前几个 id 是 special tokens，不同模型分词器对它们的取舍不同，从 id=5 开始逐字比对；SPEC_VOCAB_MAX_SIZE_DIFFERENCE = 128 ——允许 target 比 draft 略大（通常用于相同分词器、target 多了几个微调 token 的情形）。这两个数字是「双模型投机」的准入门槛。</div>
+    <div class="annotation">代码里两个 magic number 各有来历。SPEC_VOCAB_CHECK_START_TOKEN_ID = 5：前几个 id 是 special tokens，不同模型分词器对它们的取舍不同，所以从 id=5 才开始逐字比对。SPEC_VOCAB_MAX_SIZE_DIFFERENCE = 128：允许 target 比 draft 略大——典型情形是相同分词器、target 多了几个微调 token。这两个数字就是「双模型投机」的准入门槛。</div>
   </section>
 
   <section class="block">
@@ -131,7 +131,7 @@
         }
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个旋钮的分工：n_max（最多猜几个）、n_min（少于这个数白猜——验证开销大于收益，整批作废）、p_min（draft 模型首候选概率低于它就停止继续猜——低置信度 token 大概率被拒，与其浪费验证算力不如提前收手）。草稿生成时 draft 模型逐 token decode，target 模型随后一次 decode 验证整串（server 端组织，见 8.5）。</div>
+    <div class="annotation">draft 循环就靠三个旋钮控制：n_max 管最多猜几个；n_min 管少于这个数就整批作废——验证一次的开销大于收益时，白猜；p_min 管何时提前收手——draft 模型首候选概率低于它就停止继续猜，低置信度 token 大概率被拒，与其浪费验证算力不如提前收手。草稿生成时 draft 模型逐 token decode，target 模型随后一次 decode 验证整串（server 端组织，见 8.5）。</div>
     <div class="callout info">
       <b class="tag">一段代码的进化痕迹</b>
       起始位置这个字段曾叫 <code class="inline">n_past</code>。名字埋着雷：n_past 在 llama.cpp 语境里到处是「token 数量」的意思，而这个字段要的是<strong>位置</strong>——server 端填 <code class="inline">slot.prompt.n_tokens()</code>（数量）在纯文本下恰好对得上，一旦 prompt 里插了图，图文 token 数与位置数就分道扬镳，从图之后投机全错位（#28715）。修复分两步：字段改名 <code class="inline">pos0</code>，server 端改传 <code class="inline">slot.prompt.tokens.pos_next()</code>（下一个真实位置）。<strong>类型不够用的地方，命名替你兜底；命名错了，类型系统也救不回来。</strong>
@@ -158,7 +158,7 @@ common_batch_add(batch, dp.id_last, pending_pos_last[seq_id], { seq_id }, <span 
 std::<span class="fn">memcpy</span>(batch.embd + (size_t)(batch.n_tokens - <span class="nu">1</span>) * n_embd_dec,
             pending_g_last[seq_id].data(),
             row_bytes);</pre>
-    <div class="annotation"><b>读懂这段：</b> EAGLE3 的草稿输入不是纯 token，而是「token + target 中间层特征」拼对——特征来自 verify 阶段 target 前向时顺带提取的中间层输出（verify_g 缓存，下一个周期复用）。这意味着 draft 解码器比独立小模型更准（它看得见 target 的「内心状态」），接受率显著更高。剩余变体一句话带过：<strong>draft-mtp</strong> 用模型自带的 multi-token prediction 头（无需第二个权重文件）——它一个驱动要覆盖三种模式：gemma4 共享 target KV、所有头跑一张图；step35 有 <code class="inline">n_mtp_layers</code> 个训练好的头，每个草稿步一个（chain_heads）；qwen35/qwen35moe 只有单个头（源码注释里点名的就是这三个家族）；<strong>draft-dflash/dspark</strong> 是另两种轻量 draft 结构；<strong>ngram 系列</strong>完全不用第二个模型——从最近输出里找 n-gram 匹配当作草稿，CPU 上零成本，适合结构化文本（代码、重复模式的 JSON）。</div>
+    <div class="annotation">EAGLE3 的草稿输入不是纯 token，而是「token + target 中间层特征」拼对——特征来自 verify 阶段 target 前向时顺带提取的中间层输出（verify_g 缓存，下一个周期复用）。这让它比独立小模型更准：draft 解码器看得见 target 的「内心状态」，接受率显著更高。剩余变体一句话带过：<strong>draft-mtp</strong> 用模型自带的 multi-token prediction 头（无需第二个权重文件）——它一个驱动要覆盖三种模式：gemma4 共享 target KV、所有头跑一张图；step35 有 <code class="inline">n_mtp_layers</code> 个训练好的头，每个草稿步一个（chain_heads）；qwen35/qwen35moe 只有单个头（源码注释里点名的就是这三个家族）；<strong>draft-dflash/dspark</strong> 是另两种轻量 draft 结构；<strong>ngram 系列</strong>完全不用第二个模型——从最近输出里找 n-gram 匹配当作草稿，CPU 上零成本，适合结构化文本（代码、重复模式的 JSON）。</div>
   </section>
 
   <section class="block">
@@ -187,7 +187,7 @@ std::<span class="fn">memcpy</span>(batch.embd + (size_t)(batch.n_tokens - <span
         SLT_DBG(slot, <span class="st">"created speculative checkpoint (pos_min = %d, pos_max = %d, ... size = %.3f MiB, draft = %.3f MiB)\n"</span>, ...);
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 验证失败后的回滚就是第 4 章那对原语：<code class="inline">seq_rm(seq, pos_max+1, -1)</code> 把草稿区的 KV 记账删掉。recurrent 模型（rs 序列状态）不能随便删，所以有 COMMON_CONTEXT_SEQ_RM_TYPE_RS 分支，草稿串超过 rs 容量时才做完整检查点快照（ckpt.update_tgt/dft）。投机解码的工程成本大半在这里：接受率提升是模型的事，<strong>回滚正确性是引擎的事</strong>。</div>
+    <div class="annotation">验证失败后的回滚就是第 4 章那对原语：<code class="inline">seq_rm(seq, pos_max+1, -1)</code> 把草稿区的 KV 记账删掉。recurrent 模型（rs 序列状态）不能随便删，所以才有 COMMON_CONTEXT_SEQ_RM_TYPE_RS 分支，草稿串超过 rs 容量时才做完整检查点快照（ckpt.update_tgt/dft）。投机解码的工程成本大半在这里：接受率提升是模型的事，<strong>回滚正确性是引擎的事</strong>。</div>
   </section>
 
   <section class="block">
@@ -197,19 +197,12 @@ std::<span class="fn">memcpy</span>(batch.embd + (size_t)(batch.n_tokens - <span
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">iter_expert_pieces</span>(model_path, config, kind, *, parallel=False, workers=8, chunk=8 &lt;&lt; <span class="nu">20</span>):
     <span class="cmt">"""Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0</span>
 <span class="cmt">    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""</span></pre>
-    <div class="annotation"><b>对照读：</b> 这个空缺不是疏忽而是排序：FreeToken 的 decode 路径被 CUDA Graph 焊死成固定形状（第 5 章），草稿串长度可变的投机验证会把形状打碎——要么每档草稿长度再录一批图（显存爆炸），要么放弃图。CUDA Graph 与投机解码在当前实现下<strong>互斥</strong>。反过来，llama.cpp 的动态图（第 5 章 can_reuse）恰好天然支持「草稿长度每次都变」——两种图策略的优势互换了一次。自研引擎若两条都要，得在 graph capture 时把草稿长度也做成档位（FreeToken 的 bs 档位思路可以平移过来）。</div>
+    <div class="annotation">这个空缺不是疏忽而是排序：FreeToken 的 decode 路径被 CUDA Graph 焊死成固定形状（第 5 章），草稿串长度可变的投机验证会把形状打碎——要么每档草稿长度再录一批图（显存爆炸），要么放弃图。CUDA Graph 与投机解码在当前实现下<strong>互斥</strong>。反过来，llama.cpp 的动态图（第 5 章 can_reuse）恰好天然支持「草稿长度每次都变」——两种图策略的优势互换了一次。自研引擎若两条都要，得在 graph capture 时把草稿长度也做成档位（FreeToken 的 bs 档位思路可以平移过来）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.7</span>小结</h2>
-    <ul>
-      <li>端侧 batch=1 + 带宽受限，投机解码收益最大：一次前向出 2-4 个等效 token。</li>
-      <li>11 种实现共用一个接口：draft（猜）→ target 一次验证 → accept/回滚。</li>
-      <li>词表对齐是 draft 系准入门槛（±128 容差 + 逐 token 文本一致）；ngram 系免模型。</li>
-      <li>p_min/n_min/n_max 三旋钮控制「猜多少、何时收手、何时白猜」。</li>
-      <li>验证失败的回滚 = seq_rm 记账删除；复杂度大半在簿记不在算法。</li>
-      <li>FreeToken：无投机（MTP 字段有、实现无），根因是 CUDA Graph 静态形状与变长草稿互斥。</li>
-    </ul>
+    <p>端侧是投机解码收益最大的地方——batch=1、带宽受限，一次前向出 2-4 个等效 token 就是实打实的加速。机制上 11 种实现共用一个接口：draft（猜）→ target 一次验证 → accept/回滚。draft 系的准入门槛是词表对齐（±128 容差 + 逐 token 文本一致），ngram 系连模型都不要。p_min/n_min/n_max 三个旋钮分别管「何时收手、何时白猜、最多猜多少」。真正费工的不是算法是簿记：验证失败的回滚就是 seq_rm 记账删除。FreeToken 一侧没有投机——MTP 字段有、实现无，根因是 CUDA Graph 静态形状与变长草稿互斥。</p>
     <p>引擎本体讲完了。下一章看 llama-server 怎么把它包成服务。<a href="09-server.html">第 9 章：服务入口</a>。</p>
   </section>
 
@@ -220,7 +213,7 @@ std::<span class="fn">memcpy</span>(batch.embd + (size_t)(batch.n_tokens - <span
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 08 投机解码 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 08 投机解码 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

@@ -37,11 +37,14 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 ZeRO 1/2</div>
     <h1>ZeRO 1/2 与 Megatron 分布式优化器：同一思想的两个实现</h1>
-    <div class="subtitle">第 6 章的账本说优化器状态占 12B/参数。ZeRO-1 的主张：每个 DP 副本的优化器状态一模一样，那为什么要存 N 份？切成 N 份，各存一份。本章看 DeepSpeed 的实现（stage_1_and_2.py）与 Megatron 的独立实现（DistributedOptimizer）——两者是同一思想在不同库里的平行宇宙。</div>
+    <div class="subtitle">优化器状态为什么能安全地按 DP 切、切完之后梯度归约怎么改、step 只更新本卡分区的语义怎么保证一致？Megatron 不叫 ZeRO 却做了等价物——它的「bucket + range map」和 DS 的「IPG bucket」差在哪？fp16 训练的 loss scale 归谁管？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">7.1</span>一分钟版本</h2>
+    <h2><span class="num">7.1</span>同一份优化器状态，为什么要存 N 份</h2>
+    <p>第 6 章的账本说优化器状态占 12B/参数。ZeRO-1 的主张就从这里来：每个 DP 副本的优化器状态<strong>一模一样</strong>，那为什么要存 N 份？切成 N 份，各存一份。听上去简单，但马上有一串追问：每个 DP 副本都要更新全部参数，凭什么只存 1/N 的状态，step 之后各副本参数怎么保持一致？梯度 all-reduce 之后每卡都有全量——可 ZeRO-2 说归约完就丢，用什么集合通信替换 all-reduce？Megatron 不用 DS 的 ZeRO，却实现了一个等价物，它的「bucket + range map」和 DS 的「IPG bucket」差在哪？最后，fp16 需要动态缩放、bf16 不需要，loss scale 归谁管、两库的 scaler 语义一致吗？</p>
+    <p>一句话结论先放在这：<strong>ZeRO-1/2 的全部改动收在 optimizer 侧——模型和梯度代码零改动，这是它性价比最高的原因。</strong>下面从 DeepSpeed 侧开始验证。</p>
+    <h3>一分钟版本</h3>
     <ul>
       <li><strong>ZeRO-1</strong>：优化器状态（fp32 master + m + v，12B/参数）按 DP 组分片。每卡只更新自己那片参数的 master/m/v，更新完 all-gather 同步新参数。</li>
       <li><strong>ZeRO-2</strong>：再加一条——反向传播时每个参数的梯度最终只需要在<strong>负责它的那张卡</strong>上存在，其他卡的副本归约完即可丢弃 → 梯度也分片（reduce-scatter 代替 all-reduce）。</li>
@@ -54,7 +57,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.2</span>用代码看｜DeepSpeed 的分桶与归约</h2>
+    <h2><span class="num">7.2</span>DeepSpeed 的分桶与归约</h2>
+    <p>状态怎么切、梯度归约怎么改——两件事在 stage_1_and_2.py 里是同一套代码。先看归约入口：</p>
     <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — DeepSpeedZeroOptimizer（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 梯度分桶：contiguous_gradients 开启时，梯度拷进一块连续 fp16 缓冲</span>
 <span class="cmt"># bucket 内按参数梯度到达顺序填充；满一块即触发一次 reduce</span>
@@ -70,7 +74,7 @@
     <span class="kw">else</span>:
         <span class="kw">for</span> group <span class="kw">in</span> self.bit16_groups:
             self.<span class="fn">averaging</span>(...)             <span class="cmt"># 一口气全归</span></pre>
-    <div class="annotation"><b>读懂 IPG：</b>IPG = Independent Parallel Gradients。核心机制是把「全部 backward 结束后统一归约」改成「某个 bucket 的梯度齐了就立刻归约」——归约通信与后续层级的反向计算重叠。三个关键配置：<code class="inline">contiguous_gradients</code>（连续缓冲减少碎片）、<code class="inline">overlap_comm</code>（异步）、<code class="inline">reduce_bucket_size</code>（桶大小，KB 级调优空间）。bucket 满即触发，这是显存换通信节奏的标准手段。</div>
+    <div class="annotation"><b>IPG（Independent Parallel Gradients）改的是归约时机：</b>把「全部 backward 结束后统一归约」改成「某个 bucket 的梯度齐了就立刻归约」——归约通信与后续层级的反向计算重叠。三个关键配置：<code class="inline">contiguous_gradients</code>（连续缓冲减少碎片）、<code class="inline">overlap_comm</code>（异步）、<code class="inline">reduce_bucket_size</code>（桶大小，KB 级调优空间）。bucket 满即触发，这是显存换通信节奏的标准手段。</div>
 
     <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — 优化器步进（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">independent_gradient_partition_epilogue</span>(self):
@@ -82,11 +86,59 @@
     <span class="kw">for</span> sub_group <span class="kw">in</span> self.<span class="fn">updated_params</span>():
         <span class="kw">return</span> self.<span class="fn">step_with_ready_parameters</span>(sub_group)</pre>
     <div class="annotation"><b>step 的分片语义：</b>epilogue 三步就是 ZeRO-1/2 的全部分区语义在 step 时刻的体现：释放非本卡梯度（省显存）、溢出检查（任何一卡溢出则全体跳过，保持副本一致）、只 step 本卡分区。<strong>master 权重（fp32）在这里按分区持有</strong>——本卡分区更新后，用 all-gather 把新参数广播回各卡的 fp16 副本。这一切对用户透明，engine.step() 内部完成。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t71 d71">
+        <title id="t71">ZeRO-1 的时序：reduce-scatter → 分区 step → all-gather</title>
+        <desc id="d71">DP=2 对照。上行（ZeRO 之前）：两卡各持全量 fp16 参数、全量梯度、全量 fp32 master/m/v——优化器状态冗余 DP 份。下行（ZeRO-1）：① reduce-scatter 让各卡只收自己窗口的梯度；② optimizer.step 只更新本卡窗口的 fp32 master/m/v；③ all-gather 把新参数广播回两卡 fp16 副本。三步全在 optimizer 内部。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="28" font-weight="bold">切之前：每卡完整 16B/参数（优化器状态部分冗余 DP 份）</text>
+
+        <text class="lbl sm" x="30" y="58">GPU0</text>
+        <rect class="node core" x="90" y="40" width="140" height="36" rx="6"></rect>
+        <text class="lbl sm" x="175" y="64" text-anchor="middle">fp16 参数 全量</text>
+        <rect class="node" x="300" y="40" width="140" height="36" rx="6"></rect>
+        <text class="lbl sm" x="375" y="64" text-anchor="middle">fp16 梯度 全量</text>
+        <rect class="node warn" x="510" y="40" width="200" height="36" rx="6"></rect>
+        <text class="lbl sm" x="610" y="64" text-anchor="middle">fp32 master + m + v（12B）</text>
+        <text class="lbl sm" x="60" y="112">GPU1</text>
+        <rect class="node" x="90" y="94" width="170" height="36" rx="6" fill-opacity="0.7"></rect>
+        <text class="lbl sm" x="175" y="118" text-anchor="middle">一模一样的另一份</text>
+        <text class="lbl sm" x="640" y="118">两卡冗余存同一份 → ZeRO-1 的靶子</text>
+
+        <line x1="20" y1="150" x2="920" y2="150" stroke="var(--fg-muted)" stroke-dasharray="4 5" stroke-width="1"></line>
+
+        <text class="lbl" x="20" y="178" font-weight="bold">切之后（ZeRO-1）：三步全在 optimizer 内部</text>
+
+        <rect class="node acc" x="20" y="196" width="260" height="52" rx="6"></rect>
+        <text class="lbl" x="185" y="212" text-anchor="middle">① reduce-scatter（梯度）</text>
+        <text class="lbl sm" x="185" y="232" text-anchor="middle">各卡只收自己窗口的梯度</text>
+        <rect class="node ok" x="330" y="200" width="200" height="60" rx="6"></rect>
+        <text class="lbl" x="430" y="224" text-anchor="middle">② step（窗口内）</text>
+        <text class="lbl sm" x="430" y="244" text-anchor="middle">只更新本卡 1/DP 的 master/m/v</text>
+        <rect class="node ok" x="650" y="200" width="220" height="60" rx="6"></rect>
+        <text class="lbl" x="750" y="224" text-anchor="middle">③ all-gather（参数）</text>
+        <text class="lbl sm" x="750" y="244" text-anchor="middle">新参数广播回各卡 fp16 副本</text>
+
+        <line class="edge" x1="290" y1="262" x2="328" y2="232"></line>
+        <line class="edge" x1="490" y1="230" x2="518" y2="230"></line>
+        <line class="edge" x1="648" y1="230" x2="676" y2="230"></line>
+        <text class="lbl sm" x="750" y="286" text-anchor="middle">两卡 fp16 副本恢复一致，进入下一个 microbatch</text>
+
+        <text class="lbl sm" x="20" y="322" fill="#8f2d2d" font-weight="bold">显存变化：优化器状态 12B → 12/DP B/参数；ZeRO-2 再把第①步后非本卡的 fp16 梯度直接释放</text>
+      </svg>
+      <div class="fig-cap">图 7.1：ZeRO-1 的分片时序。三步全在 optimizer 内部——这就是「模型和梯度代码零改动」的含义。ZeRO-2 的差别只在第①步：reduce-scatter 之后非本卡梯度直接释放（fp16 梯度也分片）。</div>
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.3</span>用代码看｜Megatron DistributedOptimizer</h2>
-    <p>Megatron 不用 DeepSpeed 的 ZeRO，但实现了一个等价物。核心数据结构是「主缓冲 + range map」：</p>
+    <h2><span class="num">7.3</span>Megatron DistributedOptimizer</h2>
+    <p>再看 Megatron 侧。它不用 DeepSpeed 的 ZeRO，但实现了一个等价物。核心数据结构是「主缓冲 + range map」：</p>
     <div class="code-title">megatron/core/optimizer/distrib_optimizer.py — _build_model_gbuf_param_range_map（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每 (DP rank, buffer, bucket) 一张 range map：描述「本卡负责哪些参数」</span>
 <span class="kw">def</span> <span class="fn">_build_model_gbuf_param_range_map</span>(self, gbuf_world, gbuf_world_start, gbuf_world_end):
@@ -98,7 +150,7 @@
         <span class="st">"gbuf_local"</span> : ...,                     <span class="cmt"># 换算成局部坐标</span>
         <span class="st">"param_range_list"</span> : ...,                <span class="cmt"># 本卡窗口内的参数列表</span>
     }</pre>
-    <div class="annotation"><b>读懂 range map：</b>每个参数在世界缓冲（gbuf world）里有一个位置区间；DP 组把世界缓冲均分成 N 份，每张卡持有其中一份的<strong>fp32 拷贝</strong>。归约时用 reduce-scatter 直接把每份梯度送进负责卡的窗口，不需要「先 all-reduce 再分片」。优化器只对窗口内的参数做 step。这套映射支撑了另一个重要功能：<code class="inline">checkpoint_fully_reshardable_formats</code>——保存的 checkpoint 可以被<strong>任意 DP 规模</strong>加载（第 12 章）。</div>
+    <div class="annotation"><b>range map 的窗口视角：</b>每个参数在世界缓冲（gbuf world）里有一个位置区间；DP 组把世界缓冲均分成 N 份，每张卡持有其中一份的<strong>fp32 拷贝</strong>。归约时用 reduce-scatter 直接把每份梯度送进负责卡的窗口，不需要「先 all-reduce 再分片」。优化器只对窗口内的参数做 step。这套映射支撑了另一个重要功能：<code class="inline">checkpoint_fully_reshardable_formats</code>——保存的 checkpoint 可以被<strong>任意 DP 规模</strong>加载（第 12 章）。</div>
 
     <div class="code-title">megatron/core/distributed/param_and_grad_buffer.py — _ParamAndGradBuffer（结构摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 参数与梯度各一块平坦缓冲；参数按 bucket_size 打包成 bucket</span>
@@ -112,7 +164,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.4</span>两库对打：同一思想的差异清单</h2>
+    <h2><span class="num">7.4</span>两份实现，同一思想：差异清单</h2>
+    <p>两份代码读完了，差异集中在哪？收进一张表——</p>
     <table class="tbl">
       <tr><th>维度</th><th>DeepSpeed ZeRO-1/2</th><th>Megatron DistributedOptimizer</th></tr>
       <tr><td>分片对象</td><td>fp32 master + m/v（按参数分组）</td><td>fp32 主参数 + 梯度缓冲（按平坦缓冲窗口）</td></tr>
@@ -129,6 +182,7 @@
 
   <section class="block">
     <h2><span class="num">7.5</span>loss scale：fp16 训练的最后一环</h2>
+    <p>分片、归约都解决了，fp16 下还剩最后一环——梯度太小会下溢。bf16 和 fp16 在这里走的是两条路：</p>
     <div class="code-title">megatron/core/optimizer/__init__.py — scaler 选择（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># _get_optimizer_config_solver 附近：fp16 → DynamicLossScaler</span>
 <span class="kw">if</span> config.bf16:
@@ -140,15 +194,21 @@
         growth_interval=...,             <span class="cmt"># 连续多少 step 无溢出则 scale 翻倍</span>
         hysteresis=...,                  <span class="cmt"># 溢出后回退几档，防止反复抖动</span>
     )</pre>
-    <div class="annotation"><b>bf16 与 fp16 的分水岭：</b>bf16 指数位与 fp32 相同，动态范围够，<strong>不需要 loss scale</strong>；fp16 尾数位多但指数位窄，小梯度下溢 → 需要动态缩放。DS 与 Megatron 的 scaler 语义一致（growth_interval + 溢出回退 + hysteresis），DS 的配置键是 <code class="inline">loss_scale_window</code>/min_loss_scale。自研时如果只支持 bf16，可以直接跳过整个 scaler 模块——这是现代训练栈大幅简化的根源之一。</div>
+    <div class="annotation"><b>bf16 与 fp16 的差别全在指数位：</b>bf16 指数位与 fp32 相同，动态范围够，<strong>不需要 loss scale</strong>；fp16 尾数位多但指数位窄，小梯度下溢 → 需要动态缩放。DS 与 Megatron 的 scaler 语义一致（growth_interval + 溢出回退 + hysteresis），DS 的配置键是 <code class="inline">loss_scale_window</code>/min_loss_scale。自研时如果只支持 bf16，可以直接跳过整个 scaler 模块——这是现代训练栈大幅简化的根源之一。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.6</span>小结 + 自研启示</h2>
+    <h2><span class="num">7.6</span>自研 ZeRO-1 还剩什么</h2>
+    <p>顺带回答一个动手党的问题：bf16 训练跳过整个 scaler 模块后，自研 ZeRO-1 还剩什么？</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
-      自研 ZeRO-1 的最小正确路径：① 把 optimizer 状态（master/m/v）按 DP rank 分片——改动只在 optimizer.step 里，模型/梯度代码零改动，这就是为什么 ZeRO-1 是性价比之王；② step 后 all-gather 同步参数；③ 溢出检查用 <code class="inline">torch.isinf/isnan</code> 的 all-reduce（一票否决）。最容易错的三点：master 权重更新后忘记 all-gather（各副本参数漂移）、all-gather 用了错误的 group（DP group 而不是全局）、初始 lr 预热算在分片 optimizer 的 step 计数上（应算全局 step）。
+      自研 ZeRO-1 的最小正确路径：把 optimizer 状态（master/m/v）按 DP rank 分片——改动只在 optimizer.step 里，模型/梯度代码零改动，这就是为什么 ZeRO-1 是性价比最高的起点；step 后 all-gather 同步参数；溢出检查用 <code class="inline">torch.isinf/isnan</code> 的 all-reduce（一票否决）。最容易错的三点：master 权重更新后忘记 all-gather（各副本参数漂移）、all-gather 用了错误的 group（DP group 而不是全局）、初始 lr 预热算在分片 optimizer 的 step 计数上（应算全局 step）。
     </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.7</span>小结</h2>
+    <p>本章从「为什么要存 N 份」的疑问出发，答案逐层落地：优化器状态能切，是因为 DP 副本间它完全冗余——分片语义收在 optimizer.step 内部，模型和梯度代码零改动；梯度归约跟着改——IPG bucket 满即异步归约与反向计算重叠，ZeRO-2 用 reduce 代替 all-reduce 让梯度只在负责卡存在；Megatron 的等价物是「bucket + range map」——与 DS 的差异是按平坦缓冲窗口而非按参数分组，reduce-scatter 直达窗口；loss scale 归 optimizer 管——bf16 指数位够直接跳过，fp16 的 growth_interval + hysteresis 两库语义一致。7.4 末尾那条场景判断是本章最实用的一句：用 DS 主导的代码库就从 ZeRO-2 起步，用 Megatron 栈就常开 DistributedOptimizer，两者不要混用。</p>
   </section>
 
   <div class="arrow-nav">
@@ -158,7 +218,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 07 ZeRO 1/2 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 07 ZeRO 1/2 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

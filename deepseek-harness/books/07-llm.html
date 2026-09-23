@@ -34,24 +34,25 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 LLM 层</div>
-    <h1>LLM 适配层与流式：一种协议，多种供应商</h1>
-    <div class="subtitle">dsh 不 import 任何 SDK 调用模型——它定义了一个词汇表（消息、块、流分片、错误码），任何供应商适配器都翻译成这个词汇表。这一章看协议本体、稳定的错误分类、重试插件，以及 DeepSeek 官方适配器的细节。</div>
+    <h1>LLM 适配层与流式：封闭词汇表与一条 Messages 直连</h1>
+    <div class="subtitle">问题：模型在进程外、循环在进程内，中间这条 HTTP 流怎么管？具体拆成四个——适配器的公共词汇表怎么定（①）？失败怎么分类才能被机器路由（②）？重试为什么拆成策略与执行两半（③）？DeepSeek 官方适配器怎么把一个请求发出去、收回来（④）？7.1 把问题摆出来，7.2–7.6 逐个作答，7.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">7.1</span>一分钟版本</h2>
+    <h2><span class="num">7.1</span>问题：进程内循环与进程外模型之间，这条流怎么管</h2>
+    <p>前几章的循环一遇到 <code class="inline">step()</code> 就要出进程调模型（第 3 章）；dsh 不 import 任何模型 SDK，而是自己定义词汇表、让供应商适配器来翻译。四个具体问题：</p>
     <ul>
-      <li>适配器注册在 <code class="inline">ctx.llm</code>（<code class="inline">packages/llm/llm</code>），按 <code class="inline">provider</code> 字符串路由；没有注册的 provider 在派发时报 <code class="inline">NO_ADAPTER</code>。</li>
-      <li>流式协议是 7 种 <code class="inline">StreamChunk</code> 的封闭联合——适配器把 SSE 翻译成它们；循环把 chunk 流聚合成块、工具调用与 usage。</li>
-      <li>失败统一为 <code class="inline">LlmFailure</code>：稳定机器路由码（AUTH/RATE_LIMIT/SERVER/…），<strong>永不靠解析 message 文本路由</strong>。</li>
-      <li>重试策略由供应商声明（retry-policy.ts），由独立插件 dsh-llm-retry 在 <code class="inline">agent/request-error</code> 上执行；循环只认 <code class="inline">{kind:'retry'}</code>。</li>
-      <li>DeepSeek 适配器自带 1M 上下文、256K 输出、5 分钟流空闲超时，以及 reasoning effort → <code class="inline">thinking</code>/<code class="inline">reasoning_effort</code> 的映射。</li>
+      <li>① <strong>公共词汇表怎么定</strong>——请求侧传什么、流上收什么，循环与适配器的接口切在哪，才让供应商差异进不来？</li>
+      <li>② <strong>失败怎么分类</strong>——网络断了、配额没了、上下文超了，怎么归成稳定码让重试与 compaction 各取所需，而不是解析错误文本？</li>
+      <li>③ <strong>重试为什么拆成两半</strong>——「哪些错可重试、退避多久」与「等着、记账、再发一次」为什么分属供应商与插件？</li>
+      <li>④ <strong>DeepSeek 官方适配器怎么发一个请求</strong>——消息怎么序列化、HTTP 错误怎么归类、图像走 Files 还是内联？</li>
     </ul>
+    <p>速览答案：① 请求侧是 <code class="inline">GenerateOptions</code>（消息类型为 <code class="inline">RequestMessage[]</code>），流侧是 7 种 <code class="inline">StreamChunk</code> 的封闭联合，词汇表两头的更新都有结构依据（7.2）；② 失败统一为 <code class="inline">LlmFailure</code>，稳定机器路由码 + 供应商无关的特征识别函数，永不解析 message 文本（7.3）；③ 策略归供应商路由（retry-policy.ts）、执行归 dsh-llm-retry 插件（<code class="inline">agent/request-error</code> 上的恢复缝），循环只认 <code class="inline">{kind:'retry'}</code>（7.4）；④ 官方适配器 v0.1.7 起是单协议 Messages 直连：serialize 组装线上体、fetch 拿 SSE、translate 翻译成 StreamChunk、providerError 归一化错误（7.5）。7.6 看适配器上的插件扩展缝 dsh_session_log。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.2</span>StreamChunk：流的封闭词汇表</h2>
-    <div class="code-title">packages/llm/llm/src/types.ts:426</div>
+    <h2><span class="num">7.2</span>① StreamChunk：流的封闭词汇表</h2>
+    <div class="code-title">packages/llm/llm/src/types.ts:440</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">StreamChunk</span> =
   | { type: <span class="st">'block-start'</span>; index: <span class="kw">number</span>; blockType: <span class="cl">ContentBlockType</span> }
   | { type: <span class="st">'text-delta'</span>; index: <span class="kw">number</span>; text: <span class="kw">string</span> }
@@ -62,21 +63,30 @@
   | {
     type: <span class="st">'finish'</span>
     reason: <span class="cl">FinishReason</span>       <span class="cmt">// stop | tool-calls | max-tokens | aborted | error</span>
-    <span class="cmt">/** 成功响应的重放元数据（ReplayEnvelope）。 */</span>
+    <span class="cmt">/** Replay metadata for a successful response; see ReplayEnvelope. */</span>
     replayState?: <span class="cl">ReplayEnvelope</span>
   }</pre>
     <div class="annotation"><b>读法</b>：块以 <code class="inline">index</code> 分组——<code class="inline">block-start</code> 开、若干 delta、<code class="inline">block-end</code> 收口并携带完整块。reasoning（思考）与 text 是不同块类型，因此「思考不进模型历史、但可上 UI」这类策略有结构依据。finish 的 reason 直接驱动循环的 step 结局（第 3 章）。<code class="inline">usage</code> 的缓存读写 token 计数是<strong>分离字段</strong>，不是互斥联合。</div>
 
     <p>请求侧的 <code class="inline">GenerateOptions</code>（同文件）值得注意的三个字段：</p>
-    <div class="code-title">packages/llm/llm/src/types.ts — GenerateOptions（节选）</div>
+    <div class="code-title">packages/llm/llm/src/types.ts — GenerateOptions（节选，types.ts:486）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">GenerateOptions</span> {
   <span class="cmt">/** Registered provider route selecting the adapter instance. */</span>
   provider: <span class="kw">string</span>
   model: <span class="kw">string</span>
   <span class="cmt">/** Adapter-owned reasoning effort selected for this exact model. */</span>
   reasoningEffort?: <span class="cl">ReasoningEffortId</span>
-  <span class="cmt">/** 有序对话消息——循环构建的请求 = 派生历史；手搓的一次性请求可传任意列表 */</span>
-  messages: <span class="cl">Message</span>[]
+  <span class="cmt">/**
+   * Ordered conversation messages, exactly as the provider sees them. A
+   * loop-built request passes the derived history (dsh-agent-loop), whose
+   * leading system-role message carries the system prompt; a hand-built
+   * one-shot may include identity-free user inputs.
+   */</span>
+  messages: <span class="cl">RequestMessage</span>[]        <span class="cmt">// RequestMessage = Message | RequestUserInput（types.ts:483）</span>
+  <span class="cmt">/**
+   * System prompt text for one-shot callers; adapters map it to the provider's
+   * system slot ahead of `messages`. Loop-built requests leave it undefined.
+   */</span>
   system?: <span class="kw">string</span>
   tools?: <span class="cl">ToolSchema</span>[]
   temperature?: <span class="kw">number</span>
@@ -89,17 +99,19 @@
    */</span>
   sessionId?: <span class="cl">Branded</span>&lt;<span class="st">'SessionId'</span>&gt;
   <span class="cmt">/**
-   * Provider-neutral classification for an auxiliary model call.
-   * 'compaction' | 'session-title'（…）。普通对话请求不设此字段。
+   * Provider-neutral classification for an auxiliary model call. Adapters may
+   * map the purpose to model-hidden transport metadata or purpose-specific
+   * generation policy. Ordinary conversation requests leave it unset.
    */</span>
   purpose?: <span class="st">'compaction'</span> | <span class="st">'session-title'</span>
 }</pre>
+    <div class="annotation"><b>messages 的类型签名在讲故事</b>：循环构建的请求传的是<strong>派生历史</strong>（dsh-agent-loop，第 2 章），首条系统消息带着 system prompt——所以 <code class="inline">system</code> 字段文档明确写着「one-shot 调用者专用；循环构建的请求不设它」。一次性调用者（会话标题、compaction）没有日志身份可引用，于是有了 <code class="inline">RequestUserInput</code>（types.ts:475）——<code class="inline">id?: never; source?: never</code> 用类型系统声明「这个 user 输入没有持久会话身份，别给它编 id」。工具定义侧还有一个 <code class="inline">deferLoading?: true</code>（ToolSchema，types.ts:467）：请求把工具定义延后装载进模型上下文，用 Anthropic 的 defer_loading 术语——工具清单变长时，不常用的定义不必占每次请求的前缀。</div>
     <div class="annotation"><b>还没定案的事：哪些字段算 epoch 级</b>：循环构建请求时用的 config 是 <code class="inline">LlmCallConfig</code>（call-config.ts:23）——provider/model/reasoningEffort/temperature/maxTokens/stop 六个字段，每个请求从日志 header 重建而非逐调用传入。哪些字段该进这个集合，作者自己留了 <code class="inline">TODO(call-config-shape)</code>（call-config.ts:15）：「Revisit which fields are epoch-level for cache reuse and where provider-specific request options belong」。为什么这个问题不好答：字段越多，header 变化越频繁（第 3 章 reason 'change' 的触发条件），每次变化都可能打断 KV 缓存前缀；字段越少，供应商特有的采样选项又没有安放位置。目前的分界线是「影响缓存复用的请求头状态」——temperature 和 maxTokens 都在集合里，所以改采样参数会记一条 request/header change，这是有意为之的可见性而非遗漏。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.3</span>LlmFailure：稳定错误码</h2>
-    <div class="code-title">packages/llm/llm/src/types.ts:40</div>
+    <h2><span class="num">7.3</span>② LlmFailure：稳定错误码</h2>
+    <div class="code-title">packages/llm/llm/src/types.ts:41</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">LlmFailure</span> {
   <span class="cmt">/** Human-readable provider or transport failure. */</span>
   <span class="kw">readonly</span> message: <span class="kw">string</span>
@@ -111,37 +123,48 @@
   <span class="kw">readonly</span> providerRetryAfterMs?: <span class="kw">number</span>
   <span class="cmt">/** Opaque provider-issued request identifier for diagnostics. */</span>
   <span class="kw">readonly</span> requestId?: <span class="cl">ProviderRequestId</span>
+  <span class="cmt">/**
+   * With code IMAGE_OFFLOAD_REQUIRED: how many more of the oldest retained
+   * image occurrences the route needs offloaded before the same request fits
+   * its exact byte accounting.
+   */</span>
+  <span class="kw">readonly</span> offloadImages?: <span class="kw">number</span>
 }</pre>
     <table class="tbl">
       <tr><th>码</th><th>来源</th><th>可重试（默认策略）</th></tr>
-      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:969）</td><td>否</td></tr>
+      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:971）</td><td>否</td></tr>
       <tr><td><code class="inline">MISSING_CREDENTIAL</code></td><td>请求时解析不到 API key（区别于 AUTH：修法不同——前者补凭据，后者换凭据）</td><td>否</td></tr>
-      <tr><td><code class="inline">AUTH</code></td><td>HTTP 401/403</td><td>否</td></tr>
+      <tr><td><code class="inline">AUTH</code></td><td>HTTP 401/403，或认证/权限类错误类型</td><td>否</td></tr>
       <tr><td><code class="inline">RATE_LIMIT</code></td><td>HTTP 429（尊重 Retry-After）</td><td>是</td></tr>
-      <tr><td><code class="inline">SERVER</code></td><td>HTTP ≥500</td><td>是</td></tr>
+      <tr><td><code class="inline">QUOTA</code></td><td>配额/余额特征词或 HTTP 402</td><td>否（终态：充钱或换账户，重试无意义）</td></tr>
+      <tr><td><code class="inline">SERVER</code></td><td>HTTP ≥500 或 overloaded_error</td><td>是</td></tr>
       <tr><td><code class="inline">TIMEOUT</code> / <code class="inline">TRANSPORT</code></td><td>流空闲超时 / 连接层故障</td><td>是</td></tr>
-      <tr><td><code class="inline">CONTEXT_WINDOW_EXCEEDED</code></td><td>400 且命中上下文超限特征</td><td>否（触发 compaction，见第 11 章）</td></tr>
+      <tr><td><code class="inline">CONTEXT_WINDOW_EXCEEDED</code></td><td>命中上下文超限特征（error.ts:80）</td><td>否（触发 compaction，见第 11 章）</td></tr>
+      <tr><td><code class="inline">INVALID_REQUEST</code></td><td>400/413 或 invalid_request_error</td><td>否</td></tr>
+      <tr><td><code class="inline">IMAGE_OFFLOAD_REQUIRED</code></td><td>图像预算超限，附 offloadImages 计数</td><td>否（触发 image-offload compaction，见第 11 章）</td></tr>
       <tr><td><code class="inline">EMPTY_RESPONSE</code></td><td>2xx 但无任何内容</td><td>是</td></tr>
     </table>
-    <div class="code-title">packages/llm/llm-deepseek/src/protocols/chat-completions/adapter.ts:97 — httpErrorCode()</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">httpErrorCode</span>(status: <span class="kw">number</span>, error?: <span class="cl">WireError</span>[<span class="st">'error'</span>]): <span class="kw">string</span> {
-  <span class="kw">if</span> (status === <span class="nu">401</span> || status === <span class="nu">403</span>) <span class="kw">return</span> <span class="st">'AUTH'</span>
-  <span class="kw">if</span> (status === <span class="nu">413</span>) <span class="kw">return</span> <span class="st">'INVALID_REQUEST'</span>
-  <span class="kw">const</span> detail = [error?.code, error?.type, error?.message].<span class="fn">filter</span>(<span class="cl">Boolean</span>).<span class="fn">join</span>(<span class="st">' '</span>)
-  <span class="kw">if</span> (<span class="fn">isQuotaExceededError</span>(detail)) <span class="kw">return</span> <span class="cl">QUOTA_EXCEEDED_CODE</span>
-  <span class="kw">if</span> (status === <span class="nu">429</span>) <span class="kw">return</span> <span class="st">'RATE_LIMIT'</span>
-  <span class="kw">if</span> (status === <span class="nu">400</span>) {
-    <span class="kw">if</span> (<span class="fn">isContextWindowExceededError</span>(detail)) <span class="kw">return</span> <span class="cl">CONTEXT_WINDOW_EXCEEDED_CODE</span>
-    <span class="kw">return</span> <span class="st">'INVALID_REQUEST'</span>
-  }
-  <span class="kw">if</span> (status &gt;= <span class="nu">500</span>) <span class="kw">return</span> <span class="st">'SERVER'</span>
-  <span class="kw">return</span> `HTTP_${status}`
+    <div class="code-title">packages/llm/llm-deepseek/src/transport.ts:22 — providerError()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Classify a provider error without trusting arbitrary response fields. */</span>
+<span class="kw">export function</span> <span class="fn">providerError</span>(raw: <span class="kw">unknown</span>, status: <span class="kw">number</span> | <span class="kw">undefined</span>, headers?: <span class="cl">Headers</span>): <span class="cl">LlmError</span> {
+  <span class="kw">const</span> error = …
+  <span class="kw">const</span> detail = `${type} ${typeof error.code === <span class="st">'string'</span> ? error.code : <span class="st">''</span>} ${message}`
+  <span class="kw">let</span> code: <span class="kw">string</span>
+  <span class="kw">if</span> (status === <span class="nu">401</span> || status === <span class="nu">403</span> || [<span class="st">'authentication_error'</span>, <span class="st">'permission_error'</span>].<span class="fn">includes</span>(type)) code = <span class="st">'AUTH'</span>
+  <span class="kw">else if</span> (<span class="fn">isQuotaExceededError</span>(detail) || status === <span class="nu">402</span>) code = <span class="st">'QUOTA'</span>
+  <span class="kw">else if</span> (status === <span class="nu">429</span> || type === <span class="st">'rate_limit_error'</span>) code = <span class="st">'RATE_LIMIT'</span>
+  <span class="kw">else if</span> (<span class="fn">isContextWindowExceededError</span>(detail)) code = <span class="st">'CONTEXT_WINDOW_EXCEEDED'</span>
+  <span class="kw">else if</span> (status === <span class="nu">400</span> || status === <span class="nu">413</span> || type === <span class="st">'invalid_request_error'</span>) code = <span class="st">'INVALID_REQUEST'</span>
+  <span class="kw">else if</span> ((status !== <span class="kw">undefined</span> && status &gt;= <span class="nu">500</span>) || [<span class="st">'api_error'</span>, <span class="st">'overloaded_error'</span>].<span class="fn">includes</span>(type)) code = <span class="st">'SERVER'</span>
+  <span class="kw">else</span> code = status === <span class="kw">undefined</span> ? <span class="st">'SERVER'</span> : `HTTP_${status}`
+  <span class="cmt">// retry-after → providerRetryAfterMs；request-id / x-request-id → requestId</span>
+  <span class="kw">return new</span> <span class="cl">LlmError</span>(message, code, { …status, requestId, providerRetryAfterMs })
 }</pre>
-    <div class="annotation"><b>设计价值</b>：错误注释明确写着「按 code 路由，绝不解析 message」——HTTP 状态、配额特征、上下文超限特征在适配器内归一化，重试/compaction/用户提示三类消费者就能跨供应商共享逻辑。适配器自己的错误仅用 <code class="inline">HTTP_&lt;status&gt;</code> 兜底码表示。</div>
+    <div class="annotation"><b>设计价值</b>：分类靠「HTTP 状态 + 特征识别函数 + 结构化 type 字段」三路证据，唯独不靠调用方解析 message。特征函数（error.ts:80/:94）识别的是<strong>措辞模式</strong>——上下文超限的五种正则、配额的六种说法——把「供应商换了措辞」的爆炸半径压在适配器内。消费者只有三种：llm-retry 看 code 决定重不重试（7.4），compaction 看 CONTEXT_WINDOW_EXCEEDED/IMAGE_OFFLOAD_REQUIRED 决定压不压（第 11 章），UI 看其余码决定怎么提示。流内错误（SSE error 事件）走同一个 providerError——status 传 undefined，兜底成 SERVER。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.4</span>重试：策略归供应商，执行归插件</h2>
+    <h2><span class="num">7.4</span>③ 重试：策略归供应商，执行归插件</h2>
     <p>重试配置长在供应商路由上（<code class="inline">packages/llm/llm/src/retry-policy.ts</code>），两种模式：</p>
     <div class="code-title">packages/llm/llm/src/retry-policy.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">DEFAULT_MAX_RETRIES</span> = <span class="nu">5</span>
@@ -194,17 +217,152 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.5</span>DeepSeek 官方适配器</h2>
-    <p><code class="inline">packages/llm/llm-deepseek</code> 注册唯一的 provider 路由 <code class="inline">deepseek-official</code>。适配器本体是一个<strong>协议选择器</strong>（<code class="inline">src/adapter.ts</code>）：配置项 <code class="inline">protocol</code>（默认 <code class="inline">'messages'</code>，可选 <code class="inline">'chat-completions'</code>）决定 <code class="inline">DeepSeekAdapter.implementation()</code> 返回两个实现中的哪一个，两者共享凭据解析、模型目录与文件存储（模型目录在 <code class="inline">common/</code>，两套协议实现在 <code class="inline">protocols/</code>，注释为译注）：</p>
-    <div class="code-title">packages/llm/llm-deepseek/src/common/models.ts（节选）</div>
+    <h2><span class="num">7.5</span>④ DeepSeek 官方适配器：Messages 直连</h2>
+    <p><code class="inline">packages/llm/llm-deepseek</code> 注册唯一的 provider 路由 <code class="inline">deepseek-official</code>（index.ts:57）。适配器在 v0.1.7 收拢成<strong>单协议 Messages 直连</strong>：v0.1.6 时代的协议选择器（<code class="inline">protocol</code> 配置项 + <code class="inline">protocols/</code>、<code class="inline">common/</code> 两个目录）被整体删除——适配器文件头自述「Direct Messages transport with one cancellable lifecycle per model request.」（commit 99e22ebbeb）。配置里再写 <code class="inline">protocol</code> 会直接报错：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/config.ts:215</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">if</span> (<span class="cl">Object</span>.<span class="fn">hasOwn</span>(config, <span class="st">'protocol'</span>)) {
+  <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">'llm-deepseek: protocol is not configurable; remove it and use a Messages-compatible baseURL'</span>)
+}</pre>
+    <p>这不是删掉了一个选择，而是把选择点外移：<strong>连哪家 API 由 baseURL 决定</strong>。公共 API 默认 <code class="inline">'https://api.deepseek.com/anthropic'</code>（PUBLIC_BASE_URL，config.ts:115）；内部部署走 <code class="inline">$DEEPSEEK_BASE_URL</code> 环境层（BASE_URL_ENV，config.ts:118，注释原话：honored only from trusted layers——产品信任自己启动于其中的检出，所以检出可以让自己的 agent 指向该检出要用的网关）。写一个 Messages 兼容的 baseURL，就得到一个 Messages 兼容的供应商，不需要 dsh 里存在第二个协议实现。</p>
+    <p>适配器本体（<code class="inline">src/adapter.ts</code>，144 行）是 <code class="inline">LlmAdapter</code> 的直接子类，请求生成器分三层。先看完整流水线：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/adapter.ts — generate() 与 request()（节选，:52/:76）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private async *</span> <span class="fn">generate</span>(options, connection): <span class="cl">AsyncGenerator</span>&lt;<span class="cl">StreamChunk</span>&gt; {
+  <span class="kw">const</span> signal = options.signal === <span class="kw">undefined</span> ? consumer.signal : <span class="cl">AbortSignal</span>.<span class="fn">any</span>([consumer.signal, options.signal])
+  <span class="kw">using</span> watchdog = <span class="fn">idleWatchdog</span>(signal, connection.streamIdleTimeoutMs, <span class="st">'MESSAGES_IDLE'</span>)
+  <span class="kw">const</span> iterator = <span class="kw">this</span>.<span class="fn">request</span>(options, connection, watchdog.signal, () =&gt; { watchdog.<span class="fn">pulse</span>() })
+  <span class="kw">try</span> {
+    <span class="kw">while</span> (<span class="kw">true</span>) {
+      <span class="kw">const</span> next = <span class="kw">await</span> watchdog.<span class="fn">next</span>(iterator)
+      <span class="kw">if</span> (next.done) <span class="kw">return</span>
+      <span class="kw">yield</span> next.value
+    }
+  } <span class="kw">catch</span> (error) {
+    <span class="kw">if</span> (超时) <span class="kw">throw new</span> <span class="cl">LlmError</span>(…, <span class="st">'TIMEOUT'</span>)       <span class="cmt">// 流空闲超时 → 可重试</span>
+    <span class="kw">if</span> (options.signal?.aborted) <span class="kw">throw new</span> <span class="cl">LlmError</span>(…, <span class="st">'ABORTED'</span>)
+    <span class="kw">if</span> (error <span class="kw">instanceof</span> <span class="cl">LlmError</span>) <span class="kw">throw</span> error
+    <span class="kw">throw new</span> <span class="cl">LlmError</span>(…, <span class="st">'TRANSPORT'</span>)               <span class="cmt">// 连接层故障 → 可重试</span>
+  } <span class="kw">finally</span> {
+    consumer.<span class="fn">abort</span>()
+    <span class="kw">try</span> { <span class="kw">await</span> iterator.<span class="fn">return</span>(<span class="kw">undefined</span>) } <span class="kw">catch</span> (_abortedRequestCleanup) {
+      <span class="cmt">// The request already settled; aborting its reader cannot replace that outcome.</span>
+    }
+  }
+}
+
+<span class="kw">private async *</span> <span class="fn">request</span>(options, connection, signal, activity): <span class="cl">AsyncGenerator</span>&lt;<span class="cl">StreamChunk</span>&gt; {
+  <span class="kw">const</span> { messages, versions } = <span class="kw">await</span> <span class="fn">prepareImages</span>(…)          <span class="cmt">// 附件引用 → 请求内图像版本</span>
+  <span class="kw">const</span> key = accountToken ?? <span class="kw">await</span> …<span class="fn">resolveApiKey</span>(connection)   <span class="cmt">// 凭据与端点同一快照（7.3 节）</span>
+  <span class="kw">const</span> files = <span class="kw">new</span> <span class="cl">RequestFiles</span>(this.files, { baseURL: connection.baseURL, apiKey: key, … }, …)
+  <span class="kw">let</span> inline = <span class="kw">false</span>
+  <span class="kw">while</span> (<span class="kw">true</span>) {                                                  <span class="cmt">// Files 失败退内联的重试圈</span>
+    files.<span class="fn">beginAttempt</span>()
+    <span class="kw">if</span> (!inline) {
+      <span class="kw">try</span> { fileIds = <span class="kw">await</span> <span class="fn">prepareFileIds</span>(messages, versions, files) }
+      <span class="kw">catch</span> (error) {
+        <span class="kw">if</span> (!(error <span class="kw">instanceof</span> <span class="cl">FileResolutionFailure</span>)) <span class="kw">throw</span> error
+        inline = <span class="kw">true</span>; <span class="kw">continue</span>                                 <span class="cmt">// 整体退回 base64 内联</span>
+      }
+    }
+    <span class="kw">const</span> history = inline ? <span class="fn">inlineImages</span>(messages, versions, connection) : messages
+    <span class="kw">const</span> body = <span class="fn">serialize</span>(options, connection, history, versions, <span class="kw">this</span>.imageAccess, …, fileIds)
+    <span class="kw">const</span> extensions = <span class="kw">await</span> <span class="fn">prepareRequestExtensions</span>(body, { signal, sessionId, purpose }, …)
+    <span class="kw">const</span> response = <span class="kw">await</span> <span class="fn">fetch</span>(`${<span class="fn">messagesApiRoot</span>(connection.baseURL)}/messages`, {
+      method: <span class="st">'POST'</span>, signal, body: extensions.payload, redirect: <span class="st">'error'</span>,
+      headers: {
+        …<span class="fn">attributionHeaders</span>(),
+        <span class="st">'content-type'</span>: <span class="st">'application/json'</span>, <span class="st">'accept'</span>: <span class="st">'text/event-stream'</span>,
+        …accountToken === <span class="kw">undefined</span> ? { <span class="st">'x-api-key'</span>: key } : { <span class="st">'x-dsh-auth-token'</span>: accountToken },
+        <span class="st">'anthropic-version'</span>: <span class="st">'2023-06-01'</span>,
+        …fileIds 非空 ? { <span class="st">'anthropic-beta'</span>: <span class="cl">MESSAGES_FILES_BETA</span> } : {},   <span class="cmt">// 'files-api-2025-04-14'（messages-api.ts:4）</span>
+        <span class="st">'x-deepseek-harness-user-id'</span>: …,
+        …options.sessionId === <span class="kw">undefined</span> ? {} : { <span class="st">'x-deepseek-harness-session-id'</span>: String(options.sessionId) },
+        …options.purpose === <span class="st">'compaction'</span> ? { <span class="st">'x-deepseek-harness-compact'</span>: <span class="st">'1'</span> } : {},
+      },
+    })
+    <span class="kw">if</span> (!response.ok) {
+      <span class="kw">if</span> (<span class="kw">await</span> files.<span class="fn">retry</span>(detail)) <span class="kw">continue</span>          <span class="cmt">// 仅文件配额类错误可重试</span>
+      <span class="kw">const</span> failure = <span class="fn">providerError</span>(raw, response.status, response.headers)   <span class="cmt">// transport.ts:22，7.3 节</span>
+      <span class="kw">throw new</span> <span class="cl">LlmError</span>(message, failure.code, { …failure.failure, cause: <span class="kw">new</span> <span class="cl">Error</span>(text) })
+    }
+    <span class="kw">await</span> extensions.<span class="fn">accept</span>()                          <span class="cmt">// 2xx 后、消费 SSE 前——7.6 节的投递接受</span>
+    <span class="kw">if</span> (response.body === <span class="kw">null</span>) <span class="kw">throw new</span> <span class="cl">LlmError</span>(…, <span class="st">'EMPTY_RESPONSE'</span>)
+    <span class="kw">yield*</span> <span class="fn">translate</span>(<span class="fn">parseSse</span>(response.body, activity), options.model)
+    <span class="kw">return</span>
+  }
+}</pre>
+    <div class="annotation"><b>读这个结构：三层各管一件事</b>。<code class="inline">generate()</code>（:52）管<strong>生命周期</strong>——idle watchdog（<code class="inline">@deepseek-ai/dsh-timeout</code>）用 <code class="inline">using</code> 守护，任何一次流读超过 streamIdleTimeoutMs（默认 300_000）就放弃读并把错误归为 TIMEOUT（可重试）；消费方取消归 ABORTED，其余归 TRANSPORT；<code class="inline">finally</code> 里 <code class="inline">iterator.return()</code> 保证取消时底层 fetch reader 被关闭，但注释明确写着 aborting its reader cannot replace that outcome——已结算的请求不许被清理动作改写结局。<code class="inline">request()</code>（:76）管<strong>内容</strong>——图像先试 Files 引用；解析失败且仅当失败类型是 <code class="inline">FileResolutionFailure</code> 时整体退回 base64 内联，从 beginAttempt 重走；<code class="inline">serialize()</code> 组装线上体；插件扩展字段在 fetch 前注入、2xx 后 <code class="inline">accept()</code>。<code class="inline">translate()</code>（translate.ts:104）管<strong>翻译</strong>——把供应商 SSE 事件翻成 7 种 StreamChunk，thinking 块原生重放（回放降级时回调 onReplayDegrade 上报，不暴露内容）。三层共享同一个 <code class="inline">activity()</code> 回调喂 watchdog 呼吸——连 Files API 等待期间也在续命，超时计的只是「无任何进展」的时间。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
+            <polygon points="0 0, 9 3.5, 0 7" fill="#5c6478"/>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="60" width="140" height="72" rx="9"/>
+        <text class="lbl sm" x="90" y="88" text-anchor="middle">agent-loop</text>
+        <text class="lbl sm" x="90" y="108" text-anchor="middle">GenerateOptions（7.2）</text>
+        <rect class="node core" x="210" y="60" width="170" height="72" rx="9"/>
+        <text class="lbl sm" x="295" y="82" text-anchor="middle">DeepSeekAdapter.generate</text>
+        <text class="lbl sm" x="295" y="100" text-anchor="middle">idleWatchdog · 取消融合</text>
+        <text class="lbl sm" x="295" y="118" text-anchor="middle">生命周期层</text>
+        <rect class="node core" x="430" y="60" width="170" height="72" rx="9"/>
+        <text class="lbl sm" x="515" y="82" text-anchor="middle">request()</text>
+        <text class="lbl sm" x="515" y="100" text-anchor="middle">prepareImages → Files 引用</text>
+        <text class="lbl sm" x="515" y="118" text-anchor="middle">失败退内联 · serialize</text>
+        <rect class="node core" x="650" y="60" width="130" height="72" rx="9"/>
+        <text class="lbl sm" x="715" y="82" text-anchor="middle">fetch POST</text>
+        <text class="lbl sm" x="715" y="100" text-anchor="middle">/messages（SSE）</text>
+        <text class="lbl sm" x="715" y="118" text-anchor="middle">attribution·beta 头</text>
+        <line class="edge" x1="160" y1="96" x2="208" y2="96"/>
+        <line class="edge" x1="380" y1="96" x2="428" y2="96"/>
+        <line class="edge" x1="600" y1="96" x2="648" y2="96"/>
+        <rect class="node" x="650" y="190" width="130" height="46" rx="9"/>
+        <text class="lbl sm" x="715" y="209" text-anchor="middle">官方 API / 网关</text>
+        <text class="lbl sm" x="715" y="227" text-anchor="middle">messagesApiRoot 补 /v1</text>
+        <line class="edge" x1="715" y1="134" x2="715" y2="188"/>
+        <rect class="node acc" x="240" y="150" width="240" height="56" rx="9"/>
+        <text class="lbl sm" x="375" y="170" text-anchor="middle">2xx → extensions.accept()（7.6 投递接受）</text>
+        <text class="lbl sm" x="375" y="190" text-anchor="middle">→ translate(parseSse(body)) → 7 种 StreamChunk</text>
+        <line class="edge acc" x1="648" y1="112" x2="474" y2="164"/>
+        <rect class="node warn" x="20" y="150" width="190" height="56" rx="9"/>
+        <text class="lbl sm" x="115" y="170" text-anchor="middle">非 2xx → providerError(raw,</text>
+        <text class="lbl sm" x="115" y="190" text-anchor="middle">status, headers)（7.3 分类表）</text>
+        <line class="edge" x1="300" y1="134" x2="200" y2="148"/>
+        <text class="lbl sm" x="480" y="250" text-anchor="middle">三层共享 activity() 喂 watchdog：连 Files API 等待期间也在续命，超时只计「无进展」时间</text>
+      </svg>
+      <div class="fig-cap">图 7-1 — 一次 Messages 直连请求的一生：生命周期层（generate）→ 内容层（request，含 Files→内联退化）→ 翻译层（translate→StreamChunk）。错误在边界上归一化，重试由 7.4 节的插件决定。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw node"></span>循环侧 / 远端</span><span class="lg-item"><span class="sw core"></span>适配器内三层</span><span class="lg-item"><span class="sw acc"></span>成功结算路径</span><span class="lg-item"><span class="sw warn"></span>失败分类路径</span></div>
+    </div>
+    <p>线上体的组装在 <code class="inline">src/serialize.ts</code>——注意 user/tool-result 块怎么映射、tool_result 怎么收拢到 user 角色、以及 reasoning 块怎么被剥掉（重放依赖供应商的原生 thinking 回传）：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/serialize.ts — 线上请求（节选，:140）</div>
+    <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">// effort 解析：session-title 强制 off；否则请求值 → 连接默认值 → high（:135）</span>
+  <span class="kw">const</span> effort = options.purpose === <span class="st">'session-title'</span> ? <span class="st">'off'</span> : …
+  <span class="cmt">// thinking 被部署禁用时任何非 off effort 抛 UNSUPPORTED_REASONING_EFFORT，不悄悄降级（:136）</span>
+  <span class="kw">const</span> system = [options.system, historySystem].<span class="fn">filter</span>(<span class="cl">Boolean</span>).<span class="fn">join</span>(<span class="st">'\n\n'</span>)
+  <span class="kw">return</span> {
+    model: options.model, stream: <span class="kw">true</span>, messages,
+    max_tokens: options.maxTokens ?? model?.maxTokens ?? connection.maxTokens,
+    thinking: { type: effort === <span class="st">'off'</span> ? <span class="st">'disabled'</span> : <span class="st">'enabled'</span> },
+    ...effort === <span class="st">'off'</span> ? {} : { output_config: { effort: effort <span class="kw">as</span> <span class="st">'low'</span> | <span class="st">'high'</span> | <span class="st">'max'</span> } },
+    ...system.length === <span class="nu">0</span> ? {} : { system },
+    ...options.temperature === <span class="kw">undefined</span> ? {} : { temperature: options.temperature },
+    ...options.stop === <span class="kw">undefined</span> ? {} : { stop_sequences: options.stop },
+    ...options.tools === <span class="kw">undefined</span> ? {} : {
+      tools: options.tools.map(tool =&gt; ({ name: tool.name, description: tool.description, input_schema: tool.parameters })),
+    },
+  }</pre>
+    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled/disabled + <code class="inline">output_config.effort</code> 两个字段（serialize.ts:143-144）；<code class="inline">off</code> 不作为线上 effort 暴露——wire 上表现为 thinking disabled。purpose 驱动生成策略在这里有了第三个实例：session-title 强制 off（compaction 则只通过请求头 x-deepseek-harness-compact 标记，不改 effort）。可选字段一律省略而非发 null，让供应商默认值生效。</div>
+    <p>模型目录与默认值（<code class="inline">src/models.ts:6</code> 与 <code class="inline">src/defaults.ts</code>）：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/models.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Advisory official model entries; deployments may replace the catalog. */</span>
 <span class="kw">export const</span> <span class="cl">DEFAULT_MODELS</span>: <span class="cl">DeepSeekCatalogModel</span>[] = [
   {
     id: <span class="st">'deepseek-flash'</span>,
     name: <span class="st">'DeepSeek-V41-Flash'</span>,
-    contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,      <span class="cmt">// 1_000_000（common/defaults.ts:6）</span>
-    inputModalities: [<span class="st">'text'</span>, <span class="st">'image'</span>],          <span class="cmt">// 图像输入（v0.1.6 起目录模型声明输入模态）</span>
-    systemPromptUpdate: <span class="st">'in-history'</span>,           <span class="cmt">// 会话中途换系统提示词时随历史追加，不重写首条</span>
+    contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,      <span class="cmt">// 1_000_000（defaults.ts:6）</span>
+    inputModalities: [<span class="st">'text'</span>, <span class="st">'image'</span>],
+    systemPromptUpdate: <span class="st">'in-history'</span>,           <span class="cmt">// 端点读历史中最新 system 消息为完整有效系统提示词（types.ts:32 注释）</span>
   },
   {
     id: <span class="st">'deepseek-v4-pro'</span>,
@@ -213,50 +371,20 @@
     contextWindow: <span class="cl">DEFAULT_CONTEXT_WINDOW</span>,
   },
 ]
-<span class="cmt">// 默认目录 2 个模型（v0.1.6 收缩：删去 V4 Flash 与 V4 Flash Vision Exp 两个条目）：</span>
-<span class="cmt">// deepseek-flash（V41，带视觉 + systemPromptUpdate）是默认首选，dsh-base 的默认路由（agent-default-model）也指向它；</span>
-<span class="cmt">// deepseek-v4-pro 面向更难的代理编码与推理任务。目录只是「官方建议」，部署可整体替换。</span>
-
-<span class="kw">export interface</span> <span class="cl">Config</span> {
-  <span class="cmt">/** Wire protocol; defaults to messages. Configure through Cordis YAML. */</span>
-  protocol?: <span class="st">'chat-completions'</span> | <span class="st">'messages'</span>
-  <span class="cmt">/** 凭据引用（环境变量名），逐请求解析；默认 DEEPSEEK_API_KEY。 */</span>
-  apiKeyEnv?: <span class="kw">string</span>
-  <span class="cmt">/** 端点基址；回退 $DEEPSEEK_BASE_URL（受信环境层），再回退公共 API。 */</span>
-  baseURL?: <span class="kw">string</span>
-  <span class="cmt">/** 部署级思考策略；disabled 把所有对话请求限制为 off。 */</span>
-  thinking?: <span class="st">'enabled'</span> | <span class="st">'disabled'</span> | <span class="kw">undefined</span>
-  reasoningEffort?: <span class="st">'off'</span> | <span class="st">'low'</span> | <span class="st">'high'</span> | <span class="st">'max'</span> | <span class="kw">undefined</span>
-}</pre>
+<span class="cmt">// 默认目录 2 个模型：deepseek-flash（V41，带视觉 + systemPromptUpdate）是默认首选；</span>
+<span class="cmt">// deepseek-v4-pro 面向更难的代理编码与推理任务。目录只是「官方建议」，部署可整体替换。</span></pre>
     <table class="tbl">
       <tr><th>适配器常量</th><th>值</th><th>含义</th></tr>
       <tr><td><code class="inline">DEFAULT_CONTEXT_WINDOW</code></td><td>1,000,000</td><td>模型目录默认上下文窗口</td></tr>
       <tr><td><code class="inline">DEFAULT_MAX_TOKENS</code></td><td>256,000</td><td>默认输出上限</td></tr>
       <tr><td><code class="inline">DEFAULT_STREAM_IDLE_TIMEOUT_MS</code></td><td>300,000（5 分钟）</td><td>流空闲超时（超时 → TIMEOUT 码 → 可重试）</td></tr>
-      <tr><td><code class="inline">DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES</code></td><td>20 MB</td><td>内联 base64 图像负载的上界——vision 模型默认走 Files API，只有上传失败<strong>退回到 base64</strong> 时才受这个预算约束（common/defaults.ts:9 注释原话：bound on accumulated base64 image payload after Files API fallback）</td></tr>
+      <tr><td><code class="inline">DEFAULT_MAX_INLINE_REQUEST_IMAGE_BYTES</code></td><td>20 MB</td><td>内联 base64 图像负载的上界——vision 模型默认走 Files API，只有上传失败<strong>退回到 base64</strong> 时才受这个预算约束（defaults.ts:9 注释原话：bound on accumulated base64 image payload after Files API fallback）</td></tr>
     </table>
-    <p>线上请求的组装在 chat-completions 协议目录（<code class="inline">packages/llm/llm-deepseek/src/protocols/chat-completions/serialize.ts</code>）：</p>
-    <div class="code-title">packages/llm/llm-deepseek/src/protocols/chat-completions/serialize.ts — 线上请求（节选）</div>
-    <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">const</span> resolvedThinking = <span class="fn">resolveThinking</span>(options, defaults)
-  <span class="kw">return</span> {
-    model: options.model,
-    messages,
-    stream: <span class="kw">true</span>,                              <span class="cmt">// 永远流式，usage 上报开启</span>
-    stream_options: { include_usage: <span class="kw">true</span> },
-    ...resolvedThinking.thinking !== <span class="kw">undefined</span> ? { thinking: { type: resolvedThinking.thinking } } : {},
-    ...resolvedThinking.reasoningEffort !== <span class="kw">undefined</span>
-      ? { reasoning_effort: resolvedThinking.reasoningEffort } : {},
-    ...tools !== <span class="kw">undefined</span> && tools.length &gt; <span class="nu">0</span> ? { tools } : {},
-    ...options.temperature !== <span class="kw">undefined</span> ? { temperature: options.temperature } : {},
-    ...options.maxTokens === <span class="kw">undefined</span> ? {} : { max_tokens: options.maxTokens },
-    ...options.stop !== <span class="kw">undefined</span> ? { stop: options.stop } : {},
-  }</pre>
-    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled + <code class="inline">reasoning_effort</code>；<code class="inline">off</code> 不作为线上 effort 暴露（resolveThinking 注释：不把 off 暴露为 wire effort——thinking 被部署禁用时所有请求强制 off，wire 上表现为 thinking disabled）。省略 effort 时解析为 <code class="inline">high</code>（Config 注释）。可选字段一律省略而非发 null，让供应商默认值生效。</div>
-    <div class="annotation"><b>messages 协议的两处端点细节（v0.1.6 收拢进 common/messages-api.ts）</b>：① URL——<code class="inline">messagesApiRoot(baseURL)</code>（messages-api.ts:11）只在配置基址的路径不以 <code class="inline">/v1</code> 结尾时补挂 <code class="inline">/v1</code>，部署把完整版本路径写进 baseURL 时不会得到 <code class="inline">/v1/v1</code>；② beta 头——请求带文件引用（fileIds 非空）时附加 <code class="inline">'anthropic-beta': MESSAGES_FILES_BETA</code>（'files-api-2025-04-14'，adapter.ts:128），纯文本请求不发这个头。之前这两条规则散在各自实现里，现在 messages 协议、Files API、file-store 共用同一个模块。</div>
+    <div class="annotation"><b>凭据与端点绑定成对</b>（<code class="inline">types.ts:54</code>）：配置只带凭据<strong>引用名</strong>（环境变量名），逐请求解析；类型注释原话「a request can never pair one generation's URL with another generation's secret」——凭据引用跟着同一次解析出的连接快照走，配置热更新换的是整个快照而不是单个字段。另外两处端点细节收拢在 <code class="inline">messages-api.ts</code>（messages 与 Files API 共用）：messagesApiRoot 只在基址路径不以 /v1 结尾时补挂 /v1（:11）；带文件引用的请求才附加 anthropic-beta 头（MESSAGES_FILES_BETA）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.6</span>扩展缝：dsh_session_log 请求字段</h2>
+    <h2><span class="num">7.6</span>扩展缝（接④）：dsh_session_log 请求字段</h2>
     <p>适配器暴露 <code class="inline">ctx.deepseekLlmApiExtensions</code> 注册表：插件可以往 DeepSeek 请求里注入自定义字段。内置的例子是会话日志上传（<code class="inline">packages/session/session-log-deepseek/README.md</code>）：</p>
     <div class="code-title">packages/session/session-log-deepseek — README 摘要</div>
     <pre class="code"><span class="lang-tag">text</span>为官方 DeepSeek LLM API 请求做增量式 canonical 会话日志上传。
@@ -281,10 +409,10 @@ dsh_session_log 请求字段与持久事件 session-log-deepseek/delivery-accept
   </section>
 
   <section class="block">
-    <h2><span class="num">7.7</span>要点</h2>
+    <h2><span class="num">7.7</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① dsh 与模型的所有交互都穿过一个自有的封闭词汇表（StreamChunk/ContentBlock/FinishReason），供应商差异被适配器吸收在边界上；② 错误是分类学不是字符串——稳定 code 驱动重试、compaction、用户提示三种消费；③ 重试的策略与执行分离，且每次重试先持久化再等待；④ 适配器暴露扩展缝，让请求字段也能插件化。下一步进入 <a href="08-scope-prompt.html">第 8 章：System Prompt 组装与 Scope</a>。
+      <b class="tag">答案回收</b>
+      ① 词汇表：请求侧 <code class="inline">GenerateOptions</code> 用 <code class="inline">RequestMessage[]</code> 把「持久历史」与「无身份的一次性输入」分型（RequestUserInput 的 id?: never），流侧 7 种 StreamChunk 封闭联合——供应商差异全部被适配器吸收在边界上（7.2）。② 错误分类：LlmFailure 的稳定 code 驱动三类消费者——重试、compaction、UI；分类靠 HTTP 状态 + 特征函数 + 结构化 type，唯独不解析 message 文本（7.3）。③ 重试：策略（哪些码可重试、退避曲线）长在供应商路由上，执行（等待、记账、再发）长在 dsh-llm-retry 插件里；持久化分两步——决定重试先写 llm/retry，等待走完才写 llm/retry-started（7.4）。④ 官方适配器：单协议 Messages 直连，generate/request/translate 三层分工——生命周期（idle watchdog、取消融合）、内容（Files→内联退化、serialize）、翻译（SSE→StreamChunk）；凭据与端点绑定同一快照（7.5）。扩展缝（7.6）则展示了适配器边界对外开放的那一面：请求字段也能插件化。下一步进入 <a href="08-scope-prompt.html">第 8 章：System Prompt 组装与 Scope</a>。
     </div>
   </section>
 
@@ -296,7 +424,7 @@ dsh_session_log 请求字段与持久事件 session-log-deepseek/delivery-accept
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

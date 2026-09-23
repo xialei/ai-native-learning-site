@@ -35,7 +35,7 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
-- **基于开源源码**：lerobot（真机栈与策略）、Isaac Lab v3.0.0（release/3.0.0 @ 694dbf45d，仿真与 RL）、openpi（π0 / π0-FAST / π0.5 官方栈）、Isaac-GR00T（N1.7 跨本体 VLA）、OpenVLA（7B 动作 token 化）、prismatic-vlms（VLM 底座）、unifolm-vla（VLA 框架）。
+- **基于开源源码**：lerobot（真机栈与策略）、Isaac Lab v3.0.0（release/3.0.0 @ d7cf4f111，仿真与 RL）、openpi（π0 / π0-FAST / π0.5 官方栈）、Isaac-GR00T（N1.7 跨本体 VLA）、OpenVLA（7B 动作 token 化）、prismatic-vlms（VLM 底座）、unifolm-vla（VLA 框架）。
 - 站点内代码片段均摘自上述仓库并标注文件路径；仓库持续演进，若某处函数/路径对不上，以仓库最新代码为准。
 
 ## 维护指南

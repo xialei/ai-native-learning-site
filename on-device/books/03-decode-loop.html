@@ -49,7 +49,7 @@
     <pre class="code"><span class="lang-tag">c++</span>GGML_ASSERT(n_tokens_all &lt;= cparams.n_batch);
 GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
     &amp;&amp; <span class="st">"non-causal attention requires n_ubatch &gt;= n_tokens"</span>);</pre>
-    <div class="annotation"><b>读懂这段：</b> 因果注意力下可以切 ubatch（每段独立算注意力）；非因果（fill-in-middle、某些编码器）必须一个 ubatch 装下全部——它要看到整段上下文。</div>
+    <div class="annotation">这条断言的依据：因果注意力下可以切 ubatch，每段独立算注意力；非因果（fill-in-middle、某些编码器）必须一个 ubatch 装下全部——它要看到整段上下文。</div>
   </section>
 
   <section class="block">
@@ -112,7 +112,7 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
   <section class="block">
     <h2><span class="num">3.3</span>源码：内存状态机</h2>
     <p>decode 的中段是一个循环，处理 KV cache「装不下」的情形。这是整个 llama.cpp 内存管理的枢纽：</p>
-    <div class="code-title">src/llama-context.cpp:1761-1798 — init_batch 状态机（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1809-1846 — init_batch 状态机（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span>llama_memory_context_ptr mctx;
 
 <span class="kw">while</span> (<span class="kw">true</span>) {
@@ -140,16 +140,13 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
     }
     <span class="kw">break</span>;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b>
-      ① <code class="inline">memory</code> 是 <code class="inline">llama_memory_i</code> 接口（<code class="inline">src/llama-memory.h</code>），统一三种实现：普通 KV、iswa 双缓存、循环状态（Mamba/GDN 类）。decode 只面对这个接口；
-      ② FAILED_PREPARE 的处理是「<strong>整理一次 + 重试一次</strong>」——did_optimize 标志保证不会无限循环。整理动作包括 context shift（把 KV 窗口平移）等，见第 4 章；
-      ③ 返回值约定容易记错：<strong>正数 = 业务性失败（没跑成但状态一致）</strong>，负数 = 系统性错误。</div>
+    <div class="annotation">三处值得展开。第一，<code class="inline">memory</code> 是 <code class="inline">llama_memory_i</code> 接口（<code class="inline">src/llama-memory.h</code>），统一三种实现：普通 KV、iswa 双缓存、循环状态（Mamba/GDN 类）——decode 只面对这个接口。第二，FAILED_PREPARE 的处理是「<strong>整理一次 + 重试一次</strong>」——did_optimize 标志保证不会无限循环，整理动作包括 context shift（把 KV 窗口平移）等，见第 4 章。第三，返回值约定容易记错：<strong>正数 = 业务性失败（没跑成但状态一致）</strong>，负数 = 系统性错误。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.4</span>源码：ubatch 执行与 logits 提取</h2>
     <p>状态机退出后进入 do-while 循环，每个 ubatch 调用 <code class="inline">process_ubatch</code>（内部做建图 + 执行，第 5 章展开）。成功后把 logits/embd <strong>异步</strong>搬回 host：</p>
-    <div class="code-title">src/llama-context.cpp:1877-1897 — logits 提取（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1925-1945 — logits 提取（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * t_logits = res-&gt;<span class="fn">get_logits</span>();
 ...
 <span class="cmt">// 从「logits 所在的设备」异步拷到 host 缓冲</span>
@@ -163,13 +160,13 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
             n_outputs*n_vocab*<span class="kw">sizeof</span>(<span class="kw">float</span>));
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个细节值得记住。① <code class="inline">sched_get_tensor_backend</code>：logits 可能落在任何一块设备上（sched 切图后输出张量挂在哪块卡就拷哪块）；② <code class="inline">n_outputs_prev</code>：多 ubatch 时输出按「先来先填」追加进 host 缓冲，顺序与用户提交顺序不一定一致——这正是下面 output_swaps 存在的原因。</div>
+    <div class="annotation">两个细节值得记住。<code class="inline">sched_get_tensor_backend</code>：logits 可能落在任何一块设备上，sched 切图后输出张量挂在哪块卡就拷哪块。<code class="inline">n_outputs_prev</code>：多 ubatch 时输出按「先来先填」追加进 host 缓冲，顺序与用户提交顺序不一定一致——这正是下面 output_swaps 存在的原因。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.5</span>源码：output_swaps 与选择排序</h2>
     <p>decode 的最后一段把输出顺序还原成「用户提交时的顺序」。llama.cpp 选择的算法值得一看：</p>
-    <div class="code-title">src/llama-context.cpp:2002-2035 — 输出重排（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:2050-2083 — 输出重排（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> &amp; out_ids = balloc-&gt;<span class="fn">get_out_ids</span>();
 GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 
@@ -193,7 +190,7 @@ GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
         output_swaps.push_back({ i, j_min });
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个反直觉的设计。① 用 O(n²) 的选择排序而不是 O(n log n)——注释写明目标是「最小化交换次数」，因为每次交换都要记录到 output_swaps，交换越少越好；② <strong>交换是惰性应用的</strong>：decode 结束时不真的移动数据，而是在调用方 <code class="inline">llama_get_logits_ith</code> 读第 i 个输出时，按 swaps 链条找到它实际存放的位置。单 token decode（最常见情形）完全零开销。</div>
+    <div class="annotation">这里有两个反直觉的设计。一是用 O(n²) 的选择排序而不是 O(n log n)——注释写明目标是「最小化交换次数」，因为每次交换都要记录到 output_swaps，交换越少越好。二是<strong>交换是惰性应用的</strong>：decode 结束时不真的移动数据，而是在调用方 <code class="inline">llama_get_logits_ith</code> 读第 i 个输出时，按 swaps 链条找到它实际存放的位置。单 token decode（最常见情形）完全零开销。</div>
     <div class="callout info">
       <b class="tag">为什么需要重排</b>
       recurrent（Mamba/GDN 类）模型按序列处理，ubatch 内的输出顺序由内部实现决定；KV unified 模式下多序列交错也同理。调用方（llama-server 的 slot）期望「我提交的第 k 个请求的输出在位置 k」——约定不能破，就在出口处还原。
@@ -219,17 +216,12 @@ GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
         <span class="kw">if not</span> self.runnable: <span class="kw">return</span> <span class="kw">None</span>
         <span class="kw">return</span> <span class="cl">Batch</span>(reqs=sorted(self.running_reqs, key=lambda req: req.uid),
                      phase=<span class="st">"decode"</span>)</pre>
-    <div class="annotation"><b>对照读：</b> llama.cpp 的 decode 是「引擎内一次调用的完整生命周期」；FreeToken 的 decode 是「调度器循环里的一个阶段」（<code class="inline">scheduler.py:207 overlap_loop</code>，第 10 章展开）。前者单请求深度优先，后者多请求时间片轮转——服务形态决定的：llama-server 的 slot 是「一个序列独占一个上下文」，FreeToken 是「4 个并发请求共享一个引擎」。</div>
+    <div class="annotation">两个引擎对「decode」这个词的定义就不一样。llama.cpp 的 decode 是「引擎内一次调用的完整生命周期」；FreeToken 的 decode 是「调度器循环里的一个阶段」（<code class="inline">scheduler.py:207 overlap_loop</code>，第 10 章展开）。前者单请求深度优先，后者多请求时间片轮转——服务形态决定的：llama-server 的 slot 是「一个序列独占一个上下文」，FreeToken 是「4 个并发请求共享一个引擎」。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.7</span>小结</h2>
-    <ul>
-      <li>n_batch（逻辑批，≤2048）与 n_ubatch（物理批）分离；KV 找槽以 ubatch 为单位。</li>
-      <li>内存状态机：FAILED_PREPARE → 整理一次 → 重试一次 → 放弃。返回值正数=业务失败、负数=错误。</li>
-      <li>logits 异步拷回，多 ubatch 追加填写；output_swaps + 选择排序在读取时还原顺序，零额外拷贝。</li>
-      <li>FreeToken 把同样的逻辑摊到 scheduler/engine/graph 三层，多请求共享而非 slot 独占。</li>
-    </ul>
+    <p>一次 llama_decode 走下来，处处是「逻辑与物理分离」的影子：n_batch（逻辑批，≤2048）与 n_ubatch（物理批）分离，KV 找槽以 ubatch 为单位；内存状态机失败时整理一次、重试一次、再失败才放弃，返回值正数是业务失败、负数才是错误；logits 异步拷回、多 ubatch 追加填写，乱序的代价用 output_swaps 加选择排序在读取时还清，零额外拷贝。FreeToken 把同样的逻辑摊到 scheduler/engine/graph 三层，多请求共享而非 slot 独占。</p>
     <p>下一章把「KV 找槽」展开：这个 decode 里最频繁失败的环节。<a href="04-kv-cache.html">第 4 章：KV cache 家族</a>。</p>
   </section>
 
@@ -240,7 +232,7 @@ GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 03 decode循环 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 03 decode循环 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

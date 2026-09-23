@@ -34,24 +34,25 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 流式输出</div>
     <h1>流式输出：让用户实时看到 Agent 在做什么</h1>
-    <div class="subtitle">Agent 跑起来往往要几秒到几十秒，如果用户只能干等一个最终结果，体验会很差。LangGraph 的 <code class="inline">stream()</code> 提供七种 stream_mode，既能拿到每步状态增量，也能逐 token 流式 LLM 输出，还能让节点主动推送自定义数据。本章基于本代码库 <code class="inline">langgraph/types.py</code> 与 <code class="inline">pregel/main.py</code> 的真实 API 讲透。</div>
+    <div class="subtitle">图一跑十几秒，用户只能盯着 loading 转圈。但「要流式」其实是一组不同的问题——每步状态增量、LLM 逐 token、节点自定义推送、工具执行进度，七种 stream_mode 各管一个切面，输出形状还分 v1/v2 两代；而子图边界默认会把内部的逐 token 事件挡掉。本章拆清每种模式给什么、什么时候给、形状长什么样。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">11.1</span>为什么 streaming 是「一等公民」</h2>
     <p>一个 ReAct Agent 从用户提问到给出答案，中间要经历「LLM 思考 → 决定调工具 → 工具执行 → LLM 再思考 → …」。如果整个过程是黑盒，用户只能盯着 loading 转圈——这在生产里几乎不可接受。LangGraph 把流式做成了框架的一等能力：执行图的每一步、LLM 的每一个 token，都可以实时推给前端。</p>
     <p>关键在于：streaming 在 LangGraph 里不是「额外加的补丁」，而是和图执行同源的——图本身就是一个 super-step 一个 super-step 地推进，每个 super-step 自然就是一个流式事件点。所以你不需要为了流式去改图结构，只需要在 <code class="inline">stream()</code> 调用时告诉它「你想看哪些切面」。</p>
+    <p>但「要流式」落到工程上，会拆成一串不同的问题，它们需要的输出切面各不相同。11.2–11.5 把切面逐个过一遍——每种模式的输出内容、触发时机、依赖条件；11.6 解决「不同模式输出形状不统一」的解析问题；11.7–11.9 处理三件容易卡住的事：子图（多 agent）内部的逐 token 事件为什么默认拿不到、工具执行进度怎么看、某次 LLM 调用怎么从流里隐藏。最后 11.10–11.11 收三类「静默失败」的坑和按症状排查的路子。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.2</span>七种 stream_mode:选你要的切面</h2>
+    <h2><span class="num">11.2</span>七种 stream_mode：选你要的切面</h2>
     <p>这是本章的核心。源码里 <code class="inline">StreamMode</code> 是一个 <code class="inline">Literal</code>（见 <code class="inline">langgraph/types.py:131</code>），明确定义了七种值：</p>
 
     <div class="code-title">langgraph/types.py — StreamMode 定义</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cl">StreamMode</span> = <span class="cl">Literal</span>[
     <span class="st">"values"</span>, <span class="st">"updates"</span>, <span class="st">"checkpoints"</span>, <span class="st">"tasks"</span>, <span class="st">"debug"</span>, <span class="st">"messages"</span>, <span class="st">"custom"</span>
 ]</pre>
-    <div class="annotation"><b>读懂这段：</b> 这七种不是任意拼凑的，各有明确职责。下面表格把每种模式「输出什么、什么时候输出、要不要 checkpointer」讲清——这三个维度是选 stream_mode 时的全部判断依据。</div>
+    <div class="annotation"><b>七种各有明确职责：</b> 这七种不是任意拼凑的，各有明确职责。下面表格把每种模式「输出什么、什么时候输出、要不要 checkpointer」讲清——这三个维度是选 stream_mode 时的全部判断依据。</div>
 
     <table class="tbl">
       <tr><th>Mode</th><th>输出什么</th><th>触发时机</th><th>需 checkpointer</th></tr>
@@ -63,7 +64,7 @@
       <tr><td><strong>tasks</strong></td><td>任务开始/结束事件（含结果与报错）</td><td>每个 task 开始与结束时</td><td>否</td></tr>
       <tr><td><strong>debug</strong></td><td>checkpoints + tasks 的合集 + 额外元数据</td><td>上述两者触发时</td><td>部分（仅 checkpoints 部分需）</td></tr>
     </table>
-    <p>注意三个细节：第一，<strong>messages 是逐 token 的</strong>——这是官方"first-class streaming"卖点对应的能力，能让你前端像 ChatGPT 那样一个字一个字蹦出来。第二，<strong>只有 checkpoints 模式必须配 checkpointer</strong>:它的 emit 被 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫，无 checkpointer 时静默跳过；而 <code class="inline">tasks</code> 的 emit 无此守卫，有没有 checkpointer 都正常输出。第三，<code class="inline">debug</code> 本质是 <code class="inline">checkpoints + tasks</code> 的合集（源码 docstring 原文： Emit `"checkpoints"` and `"tasks"` events for debugging purposes），不是独立信息源——所以无 checkpointer 时 <code class="inline">debug</code> 仍会输出 task 事件，只是少了 checkpoint 事件。</p>
+    <p>注意三个细节：第一，<strong>messages 是逐 token 的</strong>——这是官方"first-class streaming"卖点对应的能力，能让你前端像 ChatGPT 那样一个字一个字蹦出来。第二，<strong>只有 checkpoints 模式必须配 checkpointer</strong>：它的 emit 被 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫，无 checkpointer 时静默跳过；而 <code class="inline">tasks</code> 的 emit 无此守卫，有没有 checkpointer 都正常输出。第三，<code class="inline">debug</code> 本质是 <code class="inline">checkpoints + tasks</code> 的合集（源码 docstring 原文： Emit `"checkpoints"` and `"tasks"` events for debugging purposes），不是独立信息源——所以无 checkpointer 时 <code class="inline">debug</code> 仍会输出 task 事件，只是少了 checkpoint 事件。</p>
 
     <div class="callout info">
       <b class="tag">最常用的两种</b>
@@ -72,29 +73,29 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.3</span>updates / values:拿每步状态</h2>
+    <h2><span class="num">11.3</span>updates / values：拿每步状态</h2>
     <p><code class="inline">updates</code> 和 <code class="inline">values</code> 是最基础的两个模式，区别只在「输出完整 state 还是只输出变化部分」。<code class="inline">values</code> 每个 super-step 输出一份完整 state（适合前端整体刷新），<code class="inline">updates</code> 只输出当步变化的字段、按节点名分组（适合增量更新、日志展示）。</p>
 
-    <div class="code-title">updates 模式：看每个节点的增量</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># stream 签名(见 pregel/main.py:2655):</span>
+    <div class="code-title">updates 模式：看每个节点的增量（实测输出）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># stream 实现签名(见 pregel/main.py:2655)：</span>
 <span class="cmt">#   stream(input, config=None, *, stream_mode=None, version="v1", subgraphs=False, ...)</span>
 <span class="kw">for</span> chunk <span class="kw">in</span> graph.<span class="fn">stream</span>(
     {<span class="st">"messages"</span>: [(<span class="st">"user"</span>, <span class="st">"讲个笑话"</span>)]},
     config,
     stream_mode=<span class="st">"updates"</span>,   <span class="cmt"># 每个节点完成时输出增量</span>
 ):
-    <span class="cmt"># v1 默认下，chunk 是 {节点名： 该节点返回的更新}</span>
+    <span class="cmt"># v1 默认下，chunk 是 {节点名: 该节点返回的更新}（实测确认）</span>
     <span class="kw">for</span> node_name, state_update <span class="kw">in</span> chunk.items():
-        print(<span class="st">f"节点 `{node_name}` 更新： {state_update}"</span>)
+        print(<span class="st">f"节点 `{node_name}` 更新: {state_update}"</span>)
 <span class="cmt"># 输出示意：</span>
-<span class="cmt"># 节点 `agent` 更新： {messages: [AIMessage(tool_calls=[...])]}</span>
-<span class="cmt"># 节点 `tools` 更新： {messages: [ToolMessage(...)]}</span>
-<span class="cmt"># 节点 `agent` 更新： {messages: [AIMessage(content="...笑话...")]}</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 注意默认 <code class="inline">version="v1"</code> 时，chunk 是裸 dict，没有 <code class="inline">type/ns</code> 等元信息。同一 step 里若有多个节点并行，它们的 updates 会<strong>分开输出</strong>（源码 docstring: those updates are emitted separately），而不是合并——这是并行场景下需要留意的。</div>
+<span class="cmt"># 节点 `agent` 更新: {messages: [AIMessage(tool_calls=[...])]}</span>
+<span class="cmt"># 节点 `tools` 更新: {messages: [ToolMessage(...)]}</span>
+<span class="cmt"># 节点 `agent` 更新: {messages: [AIMessage(content="...笑话...")]}</span></pre>
+    <div class="annotation"><b>v1 的隐藏细节：</b> 注意默认 <code class="inline">version="v1"</code> 时，chunk 是裸 dict，没有 <code class="inline">type/ns</code> 等元信息。同一 step 里若有多个节点并行，它们的 updates 会<strong>分开输出</strong>（main.py:2687 docstring: those updates are emitted separately），而不是合并——这是并行场景下需要留意的。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.4</span>messages:逐 token 流式 LLM 输出</h2>
+    <h2><span class="num">11.4</span>messages：逐 token 流式 LLM 输出</h2>
     <p>这是体验上最重要的一种。<code class="inline">messages</code> 模式会捕获节点内<strong>任何</strong> LLM 调用产生的 token，以 <code class="inline">(message_chunk, metadata)</code> 二元组的形式逐个输出。源码里 <code class="inline">MessagesStreamPart</code> 的定义（见 <code class="inline">types.py:297</code>）明确： <code class="inline">data</code> 是 <code class="inline">tuple[AnyMessage, dict]</code>，metadata 含 <code class="inline">langgraph_step</code>、<code class="inline">langgraph_node</code>、<code class="inline">langgraph_triggers</code> 等键。</p>
 
     <div class="code-title">messages 模式：逐 token 输出</div>
@@ -110,16 +111,16 @@
             print(message_chunk.content, end=<span class="st">""</span>, flush=<span class="kw">True</span>)
         <span class="cmt"># metadata["langgraph_node"] 告诉你 token 来自哪个节点</span>
         <span class="cmt"># 可用它过滤，比如只展示 agent 节点的回答</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">message_chunk</code> 通常是 <code class="inline">AIMessageChunk</code>——它和完整 <code class="inline">AIMessage</code> 同构，只是 content 是增量片段。把所有 chunk 的 content 拼起来就是完整回答。metadata 里的 <code class="inline">langgraph_node</code> 很有用：多 agent 图里，你能据此区分「这段话是检索 agent 说的还是写作 agent 说的」。</div>
+    <div class="annotation"><b>拼起来就是完整回答：</b> <code class="inline">message_chunk</code> 通常是 <code class="inline">AIMessageChunk</code>——它和完整 <code class="inline">AIMessage</code> 同构，只是 content 是增量片段。把所有 chunk 的 content 拼起来就是完整回答。metadata 里的 <code class="inline">langgraph_node</code> 很有用：多 agent 图里，你能据此区分「这段话是检索 agent 说的还是写作 agent 说的」。实测 metadata 的完整键集是 <code class="inline">langgraph_step / langgraph_node / langgraph_triggers / langgraph_path / langgraph_checkpoint_ns / ls_integration</code>，比 docstring 列的三个多几个，按需取用。</div>
 
     <div class="callout warn">
-      <b class="tag">子图里的 token 默认拿不到</b>
-      默认 <code class="inline">subgraphs=False</code> 时，<strong>子图内部</strong>的 LLM token 不会被 emit——嵌了 <code class="inline">create_react_agent</code>（本质是子图）时，不开 <code class="inline">subgraphs=True</code> 就拿不到它内部的逐 token 输出。具体机制与诊断见 §11.7，常见错误形态见 §11.10③。
+      <b class="tag">子图里的 token 默认拿不到——症状是「卡住之后整段蹦出」，不是「完全没有」</b>
+      默认 <code class="inline">subgraphs=False</code> 时，子图内部 LLM 调用的<strong>逐 token 事件</strong>会在 <code class="inline">_messages.py:145</code> 被静默丢弃（<code class="inline">len(ns) &gt; 0</code> 说明事件来自子图内部）。实测：子图节点里的 LLM 调用，不开 <code class="inline">subgraphs=True</code> 时逐 token 事件一个都收不到。但这不等于「什么都没有」——节点返回时，消息随状态更新走 <code class="inline">on_chain_end</code> 路径（_messages.py:223）整条 emit 一次。所以前端的表现是：用户盯着空白等十几秒，然后完整回答「啪」地整段蹦出来。见到这个症状，先查 <code class="inline">subgraphs</code>。机制与诊断见 §11.7，常见错误形态见 §11.10③。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.5</span>custom:节点主动推送任意数据</h2>
+    <h2><span class="num">11.5</span>custom：节点主动推送任意数据</h2>
     <p>前三种模式都是「框架自动输出」，<code class="inline">custom</code> 不同——它让你在节点内部<strong>主动</strong>往流里推任意数据。这靠 <code class="inline">get_stream_writer()</code>（在 <code class="inline">langgraph.config</code>）实现，它返回一个 <code class="inline">StreamWriter</code>（类型定义在 <code class="inline">types.py:147</code>： <code class="inline">StreamWriter = Callable[[Any], None]</code>）。</p>
     <p>典型用途：进度条、中间产物、或者接入<strong>非 LangChain 原生模型</strong>的流式输出（比如直接调 OpenAI SDK 的流式接口，在每个 chunk 上 <code class="inline">writer(chunk)</code>，外部用 <code class="inline">custom</code> 接收）。</p>
 
@@ -133,11 +134,11 @@
     writer({<span class="st">"progress"</span>: <span class="st">"处理完成"</span>, <span class="st">"intermediate"</span>: result})
     <span class="kw">return</span> {<span class="st">"answer"</span>: final}</span>
 
-<span class="cmt"># 接收端：用 stream_mode="custom" 拿到 writer 推的数据</span>
+<span class="cmt"># 接收端：用 stream_mode="custom" 拿到 writer 推的数据（实测 v2 输出）</span>
 <span class="kw">for</span> chunk <span class="kw">in</span> graph.<span class="fn">stream</span>(inputs, stream_mode=<span class="st">"custom"</span>, version=<span class="st">"v2"</span>):
     <span class="kw">if</span> chunk[<span class="st">"type"</span>] == <span class="st">"custom"</span>:
         print(chunk[<span class="st">"data"</span>])   <span class="cmt"># {"progress": "开始处理..."}</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">StreamWriter</code> 源码注释明确："Always injected into nodes if requested as a keyword argument, but it's a no-op when not using stream_mode='custom'"。也就是说，除了 <code class="inline">get_stream_writer()</code>，你也可以直接在节点签名里声明形参 <code class="inline">writer: StreamWriter</code> 让框架注入（见 <code class="inline">graph/_node.py</code> 的节点 Protocol）。但注意：没开 <code class="inline">custom</code> 模式时，writer 是空操作，推了也收不到。</div>
+    <div class="annotation"><b>注入与空操作各占一半：</b> <code class="inline">StreamWriter</code> 源码注释明确："Always injected into nodes if requested as a keyword argument, but it's a no-op when not using stream_mode='custom'"。也就是说，除了 <code class="inline">get_stream_writer()</code>，你也可以直接在节点签名里声明形参 <code class="inline">writer: StreamWriter</code> 让框架注入（见 <code class="inline">graph/_node.py</code> 的节点 Protocol）。但注意：没开 <code class="inline">custom</code> 模式时，writer 是空操作（实测推了不报错、流里也收不到）。还有一点：writer 推的数据<strong>不走通道、不进状态</strong>，只是路过流——想持久化自定义进度，得自己在节点里写 checkpointer 或状态字段。</div>
 
     <div class="callout warn">
       <b class="tag">Python &lt; 3.11 的异步坑</b>
@@ -146,7 +147,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.6</span>version="v2":统一的 StreamPart 结构</h2>
+    <h2><span class="num">11.6</span>version="v2"：统一的 StreamPart 结构</h2>
     <p>这是容易忽略但很重要的一点。<code class="inline">stream()</code> 的 <code class="inline">version</code> 参数（见 <code class="inline">pregel/main.py:2670</code>）默认是 <code class="inline">"v1"</code>，此时不同 stream_mode 返回的 chunk 形状不一——裸 dict、二元组混着来，你得按模式分别解析。<code class="inline">version="v2"</code> 之后，所有 chunk 统一成 <code class="inline">StreamPart</code> 结构：<code class="inline">{"type": ..., "ns": ..., "data": ...}</code>，不再需要分情况处理。</p>
 
     <div class="figure">
@@ -158,7 +159,7 @@
         <text class="lbl" x="540" y="30" text-anchor="middle" fill="var(--brand-3)">version="v2"</text>
 
         <rect class="node" x="40" y="50" width="280" height="50" rx="8"></rect>
-        <text class="lbl sm code" x="180" y="80" text-anchor="middle">{节点名： 更新}  （裸 dict）</text>
+        <text class="lbl sm code" x="180" y="80" text-anchor="middle">{节点名: 更新}  （裸 dict）</text>
         <rect class="node" x="40" y="115" width="280" height="50" rx="8"></rect>
         <text class="lbl sm code" x="180" y="145" text-anchor="middle">（chunk, metadata）  （二元组）</text>
         <rect class="node" x="40" y="180" width="280" height="50" rx="8"></rect>
@@ -169,7 +170,7 @@
         <text class="lbl" x="540" y="80" text-anchor="middle" font-weight="bold" fill="var(--brand)">StreamPart 统一结构</text>
         <text class="lbl sm code" x="540" y="115" text-anchor="middle">{"type": "updates",</text>
         <text class="lbl sm code" x="540" y="135" text-anchor="middle"> "ns": (...),</text>
-        <text class="lbl sm code" x="540" y="155" text-anchor="middle"> "data": {节点名： 更新}}</text>
+        <text class="lbl sm code" x="540" y="155" text-anchor="middle"> "data": {节点名: 更新}}</text>
         <text class="lbl sm code" x="540" y="190" text-anchor="middle">{"type": "messages",</text>
         <text class="lbl sm code" x="540" y="210" text-anchor="middle"> "ns": (...), "data": (chunk, meta)}</text>
         <text class="lbl sm" x="540" y="255" text-anchor="middle" fill="var(--brand-3)">永远 type + ns + data，统一解析</text>
@@ -179,15 +180,15 @@
       <div class="fig-cap">图 11.1：v1 各模式返回形状不一（裸 dict / 二元组 / 任意），v2 统一成 <code class="inline">{type, ns, data}</code>。生产代码建议直接用 v2。</div>
     </div>
 
-    <div class="code-title">v2:组合多种 mode，统一解析</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 传 list 一次组合多种 mode;v2 下每个 part 都有 type 字段</span>
+    <div class="code-title">v2：组合多种 mode，统一解析</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 传 list 一次组合多种 mode；v2 下每个 part 都有 type 字段</span>
 <span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(
     inputs, config,
     stream_mode=[<span class="st">"values"</span>, <span class="st">"updates"</span>, <span class="st">"messages"</span>, <span class="st">"custom"</span>],
     version=<span class="st">"v2"</span>,
 ):
     <span class="kw">if</span> part[<span class="st">"type"</span>] == <span class="st">"updates"</span>:
-        <span class="cmt"># part["data"] 是 {节点名： 更新}</span>
+        <span class="cmt"># part["data"] 是 {节点名: 更新}</span>
         ...
     <span class="kw">elif</span> part[<span class="st">"type"</span>] == <span class="st">"messages"</span>:
         msg, metadata = part[<span class="st">"data"</span>]
@@ -195,14 +196,14 @@
     <span class="kw">elif</span> part[<span class="st">"type"</span>] == <span class="st">"custom"</span>:
         <span class="cmt"># part["data"] 是节点 writer 推的任意数据</span>
         ...</pre>
-    <div class="annotation"><b>读懂这段：</b> 组合多种 mode 时，传一个 <code class="inline">list</code> 给 <code class="inline">stream_mode</code>。源码 docstring 说明：组合模式下，v1 会输出 <code class="inline">(mode, data)</code> 元组，v2 则每个 part 自带 <code class="inline">type</code> 字段——这就是 v2 的价值：你用一个 <code class="inline">if part["type"] == ...</code> 分发就能处理所有模式，代码更干净。<code class="inline">ns</code> 是命名空间元组，标明事件来自哪个（子）图，配合 <code class="inline">subgraphs=True</code> 用于区分多层图的事件来源。</div>
+    <div class="annotation"><b>v2 的价值就在这：</b> 组合多种 mode 时，传一个 <code class="inline">list</code> 给 <code class="inline">stream_mode</code>。源码 docstring 说明（main.py:2696）：组合模式下，v1 会输出 <code class="inline">(mode, data)</code> 元组（实测确认：单模式 custom 时是裸数据 <code class="inline">{'p': 1}</code>，组合时变成 <code class="inline">('custom', {'p': 1})</code>），v2 则每个 part 自带 <code class="inline">type</code> 字段——这就是 v2 的价值：你用一个 <code class="inline">if part["type"] == ...</code> 分发就能处理所有模式，代码更干净。<code class="inline">ns</code> 是命名空间元组，标明事件来自哪个（子）图，配合 <code class="inline">subgraphs=True</code> 用于区分多层图的事件来源。每种模式的 v2 结构在 <code class="inline">types.py</code> 里都有对应的 TypedDict（ValuesStreamPart、UpdatesStreamPart、MessagesStreamPart…），要查字段直接看那里。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.7</span>subgraphs:要不要看子图内部</h2>
+    <h2><span class="num">11.7</span>subgraphs：要不要看子图内部</h2>
     <p>前面提到 <code class="inline">subgraphs</code> 参数（默认 <code class="inline">False</code>）。它的作用是：是否把<strong>子图内部</strong>的事件也输出出来。源码 docstring（<code class="inline">main.py:2713</code>）明确： <code class="inline">subgraphs=True</code> 时，事件会带 <code class="inline">namespace</code> 标明来源路径，形如 <code class="inline">("parent_node:&lt;task_id&gt;", "child_node:&lt;task_id&gt;")</code>。</p>
 
-    <div class="code-title">subgraphs=True:拿子图（如 create_react_agent）内部的 token</div>
+    <div class="code-title">subgraphs=True：拿子图（如 create_react_agent）内部的 token</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 假设外层图里有个节点是 create_react_agent 构建的子图</span>
 <span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(
     inputs, config,
@@ -213,30 +214,85 @@
     <span class="kw">if</span> part[<span class="st">"type"</span>] == <span class="st">"messages"</span>:
         msg, metadata = part[<span class="st">"data"</span>]
         <span class="cmt"># part["ns"] 标明这段 token 来自哪一层子图</span>
-        <span class="cmt"># 例如 () 表示外层图， ("worker:abc",) 表示 worker 子图内</span>
+        <span class="cmt"># 实测：() 表示外层图， ("sub:94dde711-...",) 表示 sub 子图内</span>
         print(part[<span class="st">"ns"</span>], msg.content, end=<span class="st">""</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">create_react_agent</code> 返回的是一个 <code class="inline">CompiledStateGraph</code>，作为节点嵌进外层图时它就是个子图。不开 <code class="inline">subgraphs=True</code>，<code class="inline">messages</code> 流会在子图边界「断掉」——你能看到子图节点的 <code class="inline">updates</code>，但看不到它内部 LLM 的逐 token 输出。多 agent 场景下这是个必踩的坑。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t117 d117">
+        <title id="t117">subgraphs=True 与 False：子图边界上的事件过滤</title>
+        <desc id="d117">subgraphs=False 时子图内 LLM 的逐 token 事件在边界被丢弃，但消息仍随节点返回整条 emit 一次；subgraphs=True 时逐 token 事件带 ns 元组流出边界</desc>
+        <defs><marker id="arr117" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+
+        <!-- 左：subgraphs=False -->
+        <text class="lbl sm" x="215" y="24" text-anchor="middle" font-weight="bold">subgraphs=False（默认）</text>
+        <rect class="node core" x="40" y="40" width="350" height="180" rx="10"></rect>
+        <text class="lbl" x="215" y="64" text-anchor="middle" font-weight="bold" fill="var(--brand)">外层图</text>
+
+        <rect class="node" x="90" y="90" width="120" height="90" rx="8"></rect>
+        <text class="lbl" x="150" y="118" text-anchor="middle">sub（子图）</text>
+        <rect class="node" x="110" y="132" width="80" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="150" y="153" text-anchor="middle">LLM 调用</text>
+
+        <text class="lbl sm code" x="290" y="105" text-anchor="middle" fill="var(--brand-3)">token 事件×</text>
+        <text class="lbl sm" x="290" y="124" text-anchor="middle" fill="var(--brand-3)">_messages.py:145 丢弃</text>
+        <text class="lbl sm code" x="290" y="168" text-anchor="middle">on_chain_end:223</text>
+        <text class="lbl sm" x="290" y="187" text-anchor="middle">消息整条 emit 一次</text>
+
+        <line class="edge" x1="150" y1="90" x2="150" y2="70" marker-end="url(#arr117)"></line>
+        <path class="edge" d="M390 130 Q 420 130 428 130" fill="none" stroke="var(--brand-3)" stroke-width="1.8" marker-end="url(#arr117)" stroke-dasharray="5 3"></path>
+
+        <text class="lbl sm code" x="215" y="250" text-anchor="middle">for chunk in stream(..., subgraphs=False):</text>
+        <text class="lbl sm code" x="215" y="272" text-anchor="middle">chunk = (AIMessage('CHILD TOKENS'), meta)</text>
+        <text class="lbl sm" x="215" y="292" text-anchor="middle" fill="var(--fg-muted)">1 个事件，等到节点跑完才出现</text>
+
+        <!-- 分隔 -->
+        <line x1="435" y1="20" x2="435" y2="290" stroke="var(--fg-muted)" stroke-width="1" stroke-dasharray="4 4" opacity="0.5"></line>
+
+        <!-- 右：subgraphs=True -->
+        <text class="lbl sm" x="650" y="24" text-anchor="middle" font-weight="bold">subgraphs=True</text>
+        <rect class="node core" x="475" y="40" width="350" height="180" rx="10"></rect>
+        <text class="lbl" x="650" y="64" text-anchor="middle" font-weight="bold" fill="var(--brand)">外层图</text>
+
+        <rect class="node" x="525" y="90" width="120" height="90" rx="8"></rect>
+        <text class="lbl" x="585" y="118" text-anchor="middle">sub（子图）</text>
+        <rect class="node" x="545" y="132" width="80" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="585" y="153" text-anchor="middle">LLM 调用</text>
+
+        <text class="lbl sm code" x="725" y="105" text-anchor="middle">token 事件带 ns 流出</text>
+        <text class="lbl sm" x="725" y="124" text-anchor="middle" fill="var(--fg-muted)">逐 token，实时</text>
+
+        <path class="edge" d="M825 130 Q 835 130 838 130" fill="none" stroke="var(--brand-3)" stroke-width="1.8" marker-end="url(#arr117)"></path>
+
+        <text class="lbl sm code" x="650" y="250" text-anchor="middle">chunk[0] = ('sub:94dde711-...',)</text>
+        <text class="lbl sm code" x="650" y="272" text-anchor="middle">chunk[1] = (AIMessageChunk('CHILD'), meta)</text>
+        <text class="lbl sm" x="650" y="292" text-anchor="middle" fill="var(--brand-3)">3 个事件，边跑边到，ns 标来源</text>
+      </svg>
+      <div class="fig-cap">图 11.2：子图边界上的事件过滤。False 时逐 token 事件被 _messages.py:145 丢弃，消息走 on_chain_end 路径整条补发——前端「卡住后整段蹦出」；True 时逐 token 事件实时流出，v1 下 chunk 外层多包一层 ns 元组。</div>
+    </div>
+
+    <div class="annotation"><b>子图就是这样断流的：</b> <code class="inline">create_react_agent</code> 返回的是一个 <code class="inline">CompiledStateGraph</code>，作为节点嵌进外层图时它就是个子图。不开 <code class="inline">subgraphs=True</code>，<code class="inline">messages</code> 流会在子图边界「断掉」——逐 token 事件被丢，但完整消息会在节点返回时整条补发（§11.4 callout 的实测）。注意 v1 下的形状变化：默认时 chunk 是 <code class="inline">(message, metadata)</code>；<code class="inline">subgraphs=True</code> 后外层多包一层 <code class="inline">(ns, (message, metadata))</code>（图 11.2 右侧）——解析代码要跟着改。多 agent 场景下这是个必踩的坑。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.8</span>tags 与 nostream:精细控制哪些 LLM 调用入流</h2>
+    <h2><span class="num">11.8</span>tags 与 nostream：精细控制哪些 LLM 调用入流</h2>
     <p>有时你不希望某次 LLM 调用出现在 <code class="inline">messages</code> 流里——比如内部的结构化输出、路由判断，这些中间步骤不需要暴露给前端。LangGraph 用一个特殊 tag 解决：给模型加 <code class="inline">tags=["nostream"]</code>，该次调用会<strong>照常执行，但不产生 messages 流事件</strong>。</p>
 
-    <div class="code-title">tags=["nostream"]:让某次 LLM 调用不出现在流里</div>
+    <div class="code-title">tags=["nostream"]：让某次 LLM 调用不出现在流里</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 路由用的 LLM 调用，不需要让用户看到它的 token</span>
 router_llm = model.bind(tags=[<span class="st">"nostream"</span>])
 decision = router_llm.invoke([...])   <span class="cmt"># 照常执行，但 messages 流里看不到它</span>
 
 <span class="cmt"># 源码依据：constants.py:24  TAG_NOSTREAM = sys.intern("nostream")</span>
-<span class="cmt"># pregel/_tools.py:111  if tags and TAG_NOSTREAM in tags: return None  (不 emit)</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 源码里 <code class="inline">TAG_NOSTREAM</code>（在 <code class="inline">constants.py</code>）就是字符串 <code class="inline">"nostream"</code>。<code class="inline">pregel/_tools.py</code> 的处理逻辑明确：如果某次调用的 tags 里含 <code class="inline">nostream</code>，它返回 <code class="inline">None</code>（即不 emit 到 messages 流）——注释原文是 "caller explicitly opted out"。这是精细控制流式可见性的标准手段。</div>
+<span class="cmt"># _messages.py:141  if metadata and (not tags or TAG_NOSTREAM not in tags):  (守卫)</span>
+<span class="cmt">#   —— tags 含 nostream 时条件不成立，本次调用不注册进 metadata，token 全部不 emit</span></pre>
+    <div class="annotation"><b>挡的是「所有人」：</b> 源码里 <code class="inline">TAG_NOSTREAM</code>（在 <code class="inline">constants.py</code>）就是字符串 <code class="inline">"nostream"</code>。messages 处理器在 <code class="inline">on_chat_model_start</code> 就检查它（_messages.py:141）：tags 含 <code class="inline">nostream</code> 的调用根本不注册，后续 token 事件全被挡住——同一道守卫也存在于工具流处理器 <code class="inline">_tools.py:110</code>，注释原文是 "caller explicitly opted out"。注意对称性：§11.7 的 <code class="inline">subgraphs=False</code> 挡的是「子图边界外的观众」，这里挡的是「所有人」——调用照常执行，只是从流里消失。这是精细控制流式可见性的标准手段。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.9</span>stream_events(v3):事件驱动的统一入口</h2>
+    <h2><span class="num">11.9</span>stream_events(v3)：事件驱动的统一入口</h2>
     <p>除了 <code class="inline">stream()</code>，LangGraph 还提供 <code class="inline">stream_events()</code>（见 <code class="inline">pregel/main.py:3638</code>），它支持 <code class="inline">version: Literal["v1","v2","v3"]</code>。其中 <code class="inline">v1/v2</code> 兼容 LangChain 的 <code class="inline">Runnable.stream_events</code>（输出 <code class="inline">StreamEvent</code> dict）；<code class="inline">v3</code> 是较新的实验性 API，返回一个 <code class="inline">GraphRunStream</code> 对象，调用方通过迭代它的 typed projection 驱动——不开后台线程。</p>
 
-    <div class="code-title">stream_events(version="v3"):可拿 output/interrupted/interrupts</div>
+    <div class="code-title">stream_events(version="v3")：可拿 output/interrupted/interrupts</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># v3 是事件驱动的统一入口，尤其适合配合 interrupt 用</span>
 run = graph.<span class="fn">stream_events</span>(inputs, config=config, version=<span class="st">"v3"</span>)
 
@@ -251,7 +307,7 @@ final = run.output          <span class="cmt"># 最终输出</span>
     ...   <span class="cmt"># 按 part 的类型处理</span></pre>
     <div class="callout warn">
       <b class="tag">v3 是实验性的</b>
-      源码 docstring 明确标注： <code class="inline">version="v3"</code> 的 API is experimental and may change。如果你要长期稳定的生产代码，目前更稳妥的是 <code class="inline">stream(..., version="v2")</code>。<code class="inline">stream_events(v3)</code> 的优势在于和 interrupt 配合时能直接拿到 <code class="inline">run.interrupts</code>——这是第 06 章人机协同里恢复流程的入口。
+      源码 docstring 明确标注： <code class="inline">version="v3"</code> 的 API is experimental and may change。如果你要长期稳定的生产代码，目前更稳妥的是 <code class="inline">stream(..., version="v2")</code>。<code class="inline">stream_events(v3)</code> 的优势在于和 interrupt 配合时能直接拿到 <code class="inline">run.interrupts</code>——这是第 06 章人机协同里恢复流程的入口。另外 docstring 有一条兼容性警告：v3 运行里的节点再嵌 v1 的 <code class="inline">stream(stream_mode="messages")</code> 会拿不到逐 token 事件（只有最终消息），内层也要用 v3 或显式调 <code class="inline">model.stream()</code>。
     </div>
   </section>
 
@@ -266,12 +322,12 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
     print(part)   <span class="cmt"># 什么都不输出！for 循环一次都不进，也不报错</span>
 
 <span class="cmt"># 原因：checkpoints 事件的 emit 被 `if self._checkpointer_put_after_previous is not None` 守卫</span>
-<span class="cmt"># (见 _loop.py:632)。无 checkpointer 时该字段为 None,emit 被短路 → 静默产出 0 个事件。</span>
+<span class="cmt"># (见 _loop.py:632)。无 checkpointer 时该字段为 None，emit 被短路 → 静默产出 0 个事件。</span>
 <span class="cmt"># 注意：tasks 模式不受此影响(emit 在 _loop.py:674 无守卫)，没有 checkpointer 也照常输出；</span>
 <span class="cmt"># debug 模式 = checkpoints + tasks，无 checkpointer 时仍会输出 task 事件，只是少了 checkpoint 事件。</span>
 <span class="cmt"># 修复：想看 checkpoint 事件就 compile 时传入 checkpointer；只想看任务流用 tasks 即可，不必配 checkpointer。</span>
 graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">compile</span>(checkpointer=InMemorySaver())</pre>
-    <div class="annotation"><b>读懂这段：</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。「需 checkpointer」的只有 <code class="inline">checkpoints</code> 模式：无 checkpointer 时它<strong>静默产出 0 个事件</strong>，而不是抛异常。源码依据是 <code class="inline">_loop.py:632</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫——无 checkpointer 时该字段为 <code class="inline">None</code>，emit 被短路。但别误伤 <code class="inline">tasks</code>：它的 emit 没有这道守卫，有没有 checkpointer 都正常工作。排查时一旦发现 <code class="inline">checkpoints</code> 流「空跑」，先查图有没有 <code class="inline">checkpointer</code>，再看 stream_mode（tasks 的 emit 位置：<code class="inline">_loop.py:674</code>）。</div>
+    <div class="annotation"><b>不报错、不输出，最隐蔽：</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。「需 checkpointer」的只有 <code class="inline">checkpoints</code> 模式：无 checkpointer 时它<strong>静默产出 0 个事件</strong>，而不是抛异常。源码依据是 <code class="inline">_loop.py:632</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫——无 checkpointer 时该字段为 <code class="inline">None</code>，emit 被短路。但别误伤 <code class="inline">tasks</code>：它的 emit 没有这道守卫，有没有 checkpointer 都正常工作（实测同一张无 checkpointer 的图：checkpoints 模式 0 个事件，tasks 模式 2 个）。排查时一旦发现 <code class="inline">checkpoints</code> 流「空跑」，先查图有没有 <code class="inline">checkpointer</code>，再看 stream_mode（tasks 的 emit 位置：<code class="inline">_loop.py:674</code>）。</div>
 
     <div class="code-title">② custom 模式收不到数据——writer 在异步 + Python &lt; 3.11 下拿不到 runtime</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Python 3.10 + 异步运行，节点里调 get_stream_writer()</span>
@@ -283,10 +339,10 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
 <span class="cmt">#   RuntimeError: Called get_config outside of a runnable context</span>
 
 <span class="cmt"># 原因：get_stream_writer() -> get_config() -> 从 contextvar 取 runtime。</span>
-<span class="cmt"># Python < 3.11 的 asyncio 不传播 contextvar(get_stream_writer docstring 明确警告),</span>
+<span class="cmt"># Python < 3.11 的 asyncio 不传播 contextvar(get_stream_writer docstring 明确警告)，</span>
 <span class="cmt"># 于是取不到 runnable config。同步运行不受影响。</span>
 <span class="cmt"># 修复：升级到 Python ≥ 3.11(见 §11.5 callout)，或在同步上下文里运行。</span></pre>
-    <div class="annotation"><b>读懂这段：</b> §11.5 的 callout 已点出 Python &lt; 3.11 的异步坑，这里补上<strong>具体症状</strong>：不是静默 no-op，而是 <code class="inline">get_stream_writer()</code> 内部调用 <code class="inline">get_config()</code> 时，因 contextvar 没传播而取不到 runnable config，抛 <code class="inline">RuntimeError: Called get_config outside of a runnable context</code>（<code class="inline">config.py:29</code>）。同步运行 + 任意 Python 版本都正常——这进一步说明生产环境锁定 Python ≥ 3.11 的必要性。</div>
+    <div class="annotation"><b>症状比 callout 里更进一步：</b> §11.5 的 callout 已点出 Python &lt; 3.11 的异步坑，这里补上<strong>具体症状</strong>：不是静默 no-op，而是 <code class="inline">get_stream_writer()</code> 内部调用 <code class="inline">get_config()</code> 时，因 contextvar 没传播而取不到 runnable config，抛 <code class="inline">RuntimeError: Called get_config outside of a runnable context</code>（<code class="inline">config.py:29</code>）。同步运行 + 任意 Python 版本都正常——这进一步说明生产环境锁定 Python ≥ 3.11 的必要性。</div>
 
     <div class="code-title">③ 子图内部的 LLM token 拿不到——忘了 subgraphs=True</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 外层图里嵌了 create_react_agent 作为子图节点</span>
@@ -296,12 +352,12 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
 ):
     ...   <span class="cmt"># 只看到外层图的 updates，子图内 LLM 的逐 token 全部缺失——但不报错</span>
 
-<span class="cmt"># 原因：messages 的事件源是 _tools.py 的处理器，它在 `subgraphs=False` 时</span>
-<span class="cmt"># 对子图内的调用直接 `return None`(_tools.py:117: if not self.subgraphs and len(ns) > 0 ...)。</span>
+<span class="cmt"># 原因：messages 的事件源是 StreamMessagesHandler，它在 `subgraphs=False` 时</span>
+<span class="cmt"># 对子图内的 LLM 调用直接 `return`(_messages.py:145: if not self.subgraphs and len(ns) > 0 ...)。</span>
 <span class="cmt"># 修复：显式传 subgraphs=True，并用 part["ns"] 区分事件来自哪一层子图(见 §11.7)。</span>
 <span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(inputs, config, stream_mode=<span class="st">"messages"</span>, subgraphs=<span class="kw">True</span>, version=<span class="st">"v2"</span>):
     ...</pre>
-    <div class="annotation"><b>读懂这段：</b> 这是 §11.4 / §11.7 都强调过的高频坑，这里收口为一条可对照的诊断步骤：<strong>messages 流「断」在子图边界、且无任何报错</strong>时，检查是否漏传 <code class="inline">subgraphs=True</code>。源码依据是 <code class="inline">_tools.py:117</code>——当 <code class="inline">subgraphs=False</code> 且事件来自非父级子图（<code class="inline">len(ns) &gt; 0 and ns != self.parent_ns</code>）时，处理器返回 <code class="inline">None</code>，token 不 emit。三个坑的共同特征是「静默失败」：没有异常、没有日志，只是流里缺东西——这是 streaming 调试时最该建立的肌肉记忆。</div>
+    <div class="annotation"><b>收口成一条诊断步骤：</b> 这是 §11.4 / §11.7 都强调过的高频坑，这里收口为一条可对照的诊断步骤：<strong>子图 token「卡住后整段蹦出」、且无任何报错</strong>时，检查是否漏传 <code class="inline">subgraphs=True</code>。messages 的源码依据是 <code class="inline">_messages.py:145</code>——当 <code class="inline">subgraphs=False</code> 且事件来自子图内部（<code class="inline">len(ns) &gt; 0 and ns != self.parent_ns</code>）时，逐 token 事件直接丢弃；同一道过滤也存在于工具流处理器 <code class="inline">_tools.py:117</code>。三个坑的共同特征是「静默失败」：没有异常、没有日志，只是流里缺东西（或者晚到）——这是 streaming 调试时最该建立的肌肉记忆。</div>
   </section>
 
   <section class="block">
@@ -311,12 +367,33 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
       <tr><td>前端逐字显示 LLM 回答</td><td><code class="inline">stream_mode="messages"</code> + <code class="inline">version="v2"</code>；嵌套子图加 <code class="inline">subgraphs=True</code></td></tr>
       <tr><td>展示「Agent 正在做什么」的进度</td><td><code class="inline">stream_mode="updates"</code>，按节点名展示</td></tr>
       <tr><td>自定义进度条 / 中间产物</td><td><code class="inline">stream_mode="custom"</code> + 节点内 <code class="inline">get_stream_writer()</code></td></tr>
+      <tr><td>工具执行的开始/结束/部分输出</td><td><code class="inline">stream_mode="tools"</code>（未列入 Literal 的新模式）+ <code class="inline">ToolRuntime.emit_output_delta()</code></td></tr>
       <tr><td>同时要状态增量 + token + 自定义</td><td><code class="inline">stream_mode=["updates","messages","custom"]</code> + <code class="inline">version="v2"</code></td></tr>
       <tr><td>调试图执行 / 排查问题</td><td><code class="inline">stream_mode="debug"</code>（= checkpoints + tasks）</td></tr>
       <tr><td>配合 interrupt 做人机协同</td><td><code class="inline">stream_events(version="v3")</code> 拿 <code class="inline">run.interrupts</code></td></tr>
       <tr><td>隐藏内部 LLM 调用</td><td>给该模型 <code class="inline">bind(tags=["nostream"])</code></td></tr>
     </table>
-    <p>概括：<strong>生产用 <code class="inline">stream(version="v2")</code> 拿统一结构，<code class="inline">messages</code> 显示给用户、<code class="inline">updates</code> 显示给日志、<code class="inline">custom</code> 做自定义进度</strong>。子图场景别忘了 <code class="inline">subgraphs=True</code>，Python 环境 ≥ 3.11。这是把 Agent 从「黑盒等待」变成「透明实时」的关键一层。</p>
+    <p>概括：<strong>生产用 <code class="inline">stream(version="v2")</code> 拿统一结构，<code class="inline">messages</code> 显示给用户、<code class="inline">updates</code> 显示给日志、<code class="inline">custom</code> 做自定义进度</strong>。子图场景别忘了 <code class="inline">subgraphs=True</code>，Python 环境 ≥ 3.11。排查流里「缺东西」时，先按 §11.10 的三个症状对号入座——三个坑都是静默失败，靠异常是查不出来的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.12</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · <code class="inline">stream_mode="updates"</code>、不带 <code class="inline">version</code> 参数，同一个节点完成的时刻，收到的 chunk 是什么形状？改成 <code class="inline">version="v2"</code> 之后呢？如果再同时传 <code class="inline">stream_mode=["updates","custom"]</code>（仍然 v1），形状又变了吗？</summary>
+      <div class="a">三个形状：① v1 单模式：裸 dict <code class="inline">{节点名: 更新}</code>，没有 type/ns 元信息；② v2：统一 part <code class="inline">{"type": "updates", "ns": (), "data": {节点名: 更新}}</code>；③ v1 组合模式：每个 chunk 变成 <code class="inline">(mode, data)</code> 二元组，如 <code class="inline">("updates", {"n": {...}})</code>——实测确认，custom 数据也包成 <code class="inline">("custom", {...})</code>。也就是说 v1 下「单模式裸数据、组合模式加元组前缀」两套解析逻辑并存；v2 把两种情况统一成同一种 part 结构。这正是 11.6 建议「生产直接用 v2」的原因：解析代码只写一遍。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · 外层图的节点嵌了一个 <code class="inline">create_react_agent</code> 子图。前端同事报告：「用户等待时一片空白，然后完整回答突然整段出现」。你还没看代码，说出最可能的原因和它背后的机制；再看一条：如果前端偶尔能看到子图内 LLM 的逐字输出，又说明什么？</summary>
+      <div class="a">最可能：外层 stream 用了 <code class="inline">stream_mode="messages"</code> 但没传 <code class="inline">subgraphs=True</code>。机制是子图边界过滤——子图内 LLM 的逐 token 事件在 StreamMessagesHandler 的 namespace 检查处被丢弃（_messages.py:145，事件来自子图内部 <code class="inline">len(ns) &gt; 0</code>），而节点返回时消息经 on_chain_end 路径整条 emit 一次（_messages.py:223），所以是「长时间空白 + 整段蹦出」而不是「完全没有」。如果前端偶尔能看到子图内逐字输出，说明某些请求走了 subgraphs=True 的调用路径（比如不同端点、不同版本的前端代码用了不同 stream 配置），要查的是配置不一致，不是流机制本身。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 没配 checkpointer 的图上，<code class="inline">stream_mode="checkpoints"</code> 和 <code class="inline">stream_mode="tasks"</code> 各输出几个事件？换成 <code class="inline">stream_mode="debug"</code> 呢？这三个行为差异的源码依据是什么？</summary>
+      <div class="a">checkpoints：0 个事件——emit 被 <code class="inline">_loop.py:632</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫，无 checkpointer 时该字段为 None，emit 被短路，且不报错。tasks：正常输出（实测 2 个事件）——它的 emit 在 <code class="inline">_loop.py:674</code>，无守卫。debug：仍输出 task 事件（checkpoint + task_result 等子类型里少了 checkpoint 类）——因为 debug 本质是两种事件的合集，checkpoints 部分被同一道守卫挡住，tasks 部分照发。排查口诀：checkpoints 流「空跑」先查 checkpointer，tasks 流空跑再查图的边和节点（tasks 事件是每个 task 开始/结束触发的，图没跑起来自然没有）。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · 你想让「路由判断」的 LLM 调用对用户隐藏，但公司另一个团队在同一张图上做调试工具，需要看到所有 LLM 调用的 token。<code class="inline">tags=["nostream"]</code> 方案能满足两边吗？为什么？如果不行，给出替代思路。</summary>
+      <div class="a">满足不了。nostream 是全局开关：_messages.py:141 的守卫在 on_chat_model_start 就不注册该调用，任何观众（包括 stream_events 和调试工具）都收不到它的 token——它挡的是「所有人」，不是「某些观众」。这与 subgraphs=False 形成对比：后者挡的是「子图边界外的观众」，挂着 parent_ns 例外（子图自己 stream 自己的子图时仍能看到）。替代思路：不用 nostream，给路由模型打自定义 tag（如 <code class="inline">tags=["internal"]</code>），token 照常进流，接收端按 metadata 里的 tags 过滤——前端丢掉 internal 事件，调试工具全收。把「可见性决策」从生产端挪到消费端，两边就不打架了。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 节点里 <code class="inline">writer({"progress": 0.5})</code> 推了进度，但接收端用的是 <code class="inline">stream_mode="updates"</code>。会报错吗？进度数据去哪了？如果产品要求「进度条断线重连后还能恢复到 0.5」，custom 模式还够用吗？</summary>
+      <div class="a">不报错——这是静默 no-op：StreamWriter 的注释写明 "it's a no-op when not using stream_mode='custom'"（types.py:147），数据既不进流也不进通道。换成 stream_mode="custom" 才能收到。至于断线重连恢复：不够用。custom 数据是「路过」的——writer 推的东西不写通道、不进 checkpoint，只活在当次 stream 迭代里，连接断了数据就没了。要恢复进度得把进度写进图状态（如 Annotated 的 progress 字段），靠 checkpointer 持久化，重连后从 get_state() 或 values 流拿。一句话：custom 管「实时推送」，状态 + checkpointer 管「可恢复」，两者不是竞争关系，进度条场景通常两个都要。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

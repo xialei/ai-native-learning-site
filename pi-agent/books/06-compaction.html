@@ -35,13 +35,23 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 上下文压缩 Compaction</div>
-    <h1>上下文压缩 Compaction：把历史「压成摘要」</h1>
-    <div class="subtitle">第 5 章我们看到「最近一次 compaction 会被调到最前」。本章展开压缩的全过程：何时触发、如何选切割点、如何让模型生成结构化摘要、以及上一个 <code class="inline">compaction</code> 条目如何被新摘要<strong>增量更新</strong>。</div>
+    <h1>上下文压缩：摘要、切割点，与一次压缩如何接替上一次</h1>
+    <div class="subtitle">何时触发？token 用量怎么估——provider 报过的 usage 在历史被改写之后还算数吗？切割点怎么选才不把对话拦腰截断？摘要怎么生成、失败怎么恢复？这四问串起本章。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>先用一段话讲清楚</h2>
-    <p>Compaction = <strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。压缩成功后的后续请求里，模型通常只看到「摘要 + 最近细节」，而不是无限增长的完整转写——但压缩关闭、未触发或失败时，请求仍带完整历史。</p>
+    <h2><span class="num">6.1</span>历史太长，丢什么、留什么</h2>
+    <p>Compaction 的定义一句话：<strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。压缩成功后的后续请求里，模型通常只看到「摘要 + 最近细节」，而不是无限增长的完整转写——但压缩关闭、未触发或失败时，请求仍带完整历史。要把这件事做对，得回答四个问题：</p>
+    <ul>
+      <li><strong>何时触发？</strong>token 数怎么数？provider 报过的 usage 在上下文被改写之后还算数吗？</li>
+      <li><strong>切割点怎么选？</strong>压掉多少历史、留多少尾巴，切在哪才不把一条对话从中间截断？</li>
+      <li><strong>摘要怎么生成？</strong>全量重写还是增量合并？压缩失败的恢复流程（溢出重试）又怎么和压缩配合？</li>
+      <li><strong>压缩产物怎么回到上下文？</strong>摘要条目、系统提示存档、文件清单——各自怎么投影回 LLM 面前的消息？</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">答案地图</b>
+      触发在 6.2（shouldCompact 的两笔预算）与 6.4（usage 优先 + 投影估算）；切点在 6.3（findProjectedCutPoint）；摘要与恢复在 6.5/6.5b；产物回上下文在 6.6–6.8。先把结论放在前面：<strong>压缩不是「删历史」，而是在 append-only 会话树上追加一条 compaction 条目——原始历史仍在盘上，模型面前只剩「摘要 + 尾巴」，而切割点选在投影（而不是原始转写）上，才能把 context_edit 改动过的上下文算对。</strong>
+    </div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t6 d6">
         <title id="t6">Compaction 流程</title>
@@ -58,7 +68,7 @@
 
         <rect class="node core" x="220" y="120" width="170" height="60" rx="8"></rect>
         <text class="lbl" x="305" y="144" text-anchor="middle">2. 找切割点</text>
-        <text class="lbl sm" x="305" y="162" text-anchor="middle">findCutPoint(keepRecentTokens)</text>
+        <text class="lbl sm" x="305" y="162" text-anchor="middle">findProjectedCutPoint(keepRecentTokens)</text>
 
         <rect class="node core" x="440" y="120" width="170" height="60" rx="8"></rect>
         <text class="lbl" x="525" y="144" text-anchor="middle">3. 模型生成摘要</text>
@@ -145,7 +155,7 @@
           <div id="cp-out"></div>
         </div>
       </div>
-      <div class="fig-cap" style="margin-top:8px">虚化=将被摘要的部分，绿框=保留的尾巴（retainedTail），橙框=新写入的 compaction 条目。<code class="inline">findCutPoint</code> 从新到旧累加到 keepRecentTokens 再回退到安全切点。</div>
+      <div class="fig-cap" style="margin-top:8px">虚化=将被摘要的部分，绿框=保留的尾巴（retainedTail），橙框=新写入的 compaction 条目。<code class="inline">findProjectedCutPoint</code> 从新到旧累加到 keepRecentTokens 再回退到安全切点。</div>
     </div>
   </section>
 
@@ -169,35 +179,63 @@
   <span class="kw">if</span> (!settings.enabled) <span class="kw">return false</span>;
   <span class="kw">return</span> contextTokens &gt; contextWindow - settings.reserveTokens;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 思路是「别等到窗口满才动，留出 <code class="inline">reserveTokens</code> 给这次摘要本身」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。</div>
+    <div class="annotation">思路是「别等到窗口满才动，留出 <code class="inline">reserveTokens</code> 给这次摘要本身」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。<code class="inline">reserveTokens</code> 还影响摘要输出上限（按模型最大输出 token 封顶），不只是触发线。</div>
     <p>生产侧（coding-agent 的 <code class="inline">settings-manager.ts</code>）在这两个旋钮之上又加了一层解析：<code class="inline">compaction.modelOverrides</code> 允许按 <code class="inline">"provider/modelId"</code> 精确覆盖 <code class="inline">reserveTokens</code>/<code class="inline">keepRecentTokens</code>。动机很实际——一个 1M 窗口的模型与一个 32K 窗口的模型，合身的预留预算差了一个量级，全局一份默认值必然顾此失彼。解析顺序是<strong>模型覆盖 → 普通设置 → 内置默认</strong>，两个字段各自独立回退；<code class="inline">AgentSession</code> 在每次触发检查、手动 <code class="inline">/compact</code>、溢出恢复时都按<strong>当前模型</strong>调 <code class="inline">getCompactionSettings(model)</code> 拿生效值，换模型后下次检查就用新预算（进行中的那次压缩仍用开工时捕获的设置）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>切割点：该压掉多少</h2>
-    <p><code class="inline">findCutPoint</code> 从新到旧累加每条消息的估计 token，直到凑足 <code class="inline">keepRecentTokens</code>，再回退到一个「安全切点」（合法切点包括 user/assistant/bashExecution/custom 消息、branchSummary/compactionSummary 消息，以及独立的 <code class="inline">branch_summary</code> 条目），避免从一条工具结果（toolResult）中间切开。coding-agent 侧的实现（<code class="inline">core/compaction/compaction.ts</code>）里，选点这一步有一处精细的回退语义：</p>
-    <div class="code-title">packages/coding-agent/src/core/compaction/compaction.ts — findCutPoint 选点（要点）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">findCutPoint</span>(entries, startIndex, endIndex, keepRecentTokens): <span class="cl">CutPointResult</span> {
-  <span class="kw">const</span> cutPoints = <span class="fn">findValidCutPoints</span>(entries, startIndex, endIndex);
-  <span class="cmt">// findValidCutPoints：合法切点 = message 的若干角色（user/assistant/bashExecution/custom/</span>
-  <span class="cmt">//   branchSummary/compactionSummary）+ 独立的 branch_summary 条目；</span>
-  <span class="cmt">//   toolResult 不行（不能从"工具结果"切断对话）。</span>
-  <span class="kw">let</span> accumulatedTokens = <span class="nu">0</span>, cutIndex = cutPoints[<span class="nu">0</span>];
-  <span class="kw">for</span> (<span class="kw">let</span> i = endIndex - <span class="nu">1</span>; i &gt;= startIndex; i--) {   <span class="cmt">// 从新到旧累加</span>
-    <span class="cmt">// ...累加 estimateTokens，一旦 ≥ keepRecentTokens：</span>
-    <span class="cmt">// 选离当前消息最近的合法切点；若结尾的工具结果自己就超预算，</span>
-    <span class="cmt">// 取不到 ≥ i 的切点时回退到<strong>最后一个</strong>合法切点（前面那条 assistant 调用）</span>
-    cutIndex = cutPoints.<span class="fn">find</span>((c) =&gt; c &gt;= i) ?? cutPoints[cutPoints.length - <span class="nu">1</span>];
-    <span class="kw">break</span>;
+    <h2><span class="num">6.3</span>切割点：在投影上选，不在原始转写上选</h2>
+    <p>第 5 章讲过：发给模型的历史不是原始转写，而是经过 context_edit 与 compaction 投影后的消息序列。切割点自然也要选在投影上——coding-agent 的实现已经从旧的 <code class="inline">findCutPoint(entries)</code> 换成 <code class="inline">findProjectedCutPoint(entries: ProjectedSessionEntry[])</code>，选点规则与旧版一致（合法切点 = user/assistant/bashExecution/custom 消息 + 独立 branch_summary 条目，toolResult 不行），但多了一条针对「恢复省略」的后缀规则：</p>
+    <div class="code-title">packages/coding-agent/src/core/compaction/compaction.ts — findProjectedCutPoint（摘录，行号 824 起；注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">findProjectedCutPoint</span>(
+  entries: ProjectedSessionEntry[], startIndex, endIndex, keepRecentTokens,
+): <span class="cl">CutPointResult</span> {
+  <span class="kw">const</span> cutPoints: number[] = [];
+  <span class="kw">for</span> (<span class="kw">let</span> i = startIndex; i &lt; endIndex; i++) {
+    <span class="kw">const</span> entry = entries[i];
+    <span class="cmt">// 合法切点：message 的若干角色（user/assistant/bashExecution/custom/…）+</span>
+    <span class="cmt">// 独立的 branch_summary 条目；toolResult 不行，compaction 条目本身也不是</span>
+    <span class="kw">if</span> (entry.sourceEntry.type !== <span class="st">"compaction"</span> &amp;&amp; entry.messages.some(isCutPointMessage))
+      cutPoints.push(i);
   }
+
+  <span class="kw">let</span> accumulatedTokens = <span class="nu">0</span>, exceededBudget = false;
+  <span class="kw">let</span> cutIndex = cutPoints[<span class="nu">0</span>];
+  <span class="kw">for</span> (<span class="kw">let</span> i = endIndex - <span class="nu">1</span>; i &gt;= startIndex; i--) {   <span class="cmt">// 从新到旧累加</span>
+    <span class="kw">const</span> messageTokens = entries[i].messages.reduce((sum, m) =&gt; sum + estimateTokens(m), <span class="nu">0</span>);
+    <span class="kw">if</span> (messageTokens === <span class="nu">0</span>) <span class="kw">continue</span>;
+    accumulatedTokens += messageTokens;
+    <span class="kw">if</span> (accumulatedTokens &gt;= keepRecentTokens) {
+      exceededBudget = true;
+      <span class="cmt">// 凑满预算的位置往回找最近合法切点；找不到就回退到最后一个（commit 8bdcd4498 的旧语义）</span>
+      cutIndex = cutPoints.<span class="fn">find</span>((c) =&gt; c &gt;= i) ?? cutPoints[cutPoints.length - <span class="nu">1</span>];
+      <span class="kw">break</span>;
+    }
+  }
+
+  <span class="cmt">// 恢复省略的后缀规则：切割点之后若恰好是一段「上下文里看不见的后缀」——</span>
+  <span class="cmt">// 溢出恢复写下的省略 context_edit 把那次失败的 assistant 尝试整段藏掉了——</span>
+  <span class="cmt">// 切点就再往前进一格。任意元数据（如纯记账条目）不得移动切点，</span>
+  <span class="cmt">// 外部替换型编辑也会挡住推进（被省略的 assistant 回答的是改前输入，压进摘要会失配）</span>
+  <span class="kw">const</span> suffix = entries.slice(cutIndex + <span class="nu">1</span>, endIndex);
+  <span class="kw">const</span> isIntrinsicallyVisible = (e) =&gt;
+    e.sourceEntry.type !== <span class="st">"context_edit"</span> &amp;&amp; sessionEntryToContextMessages(e.sourceEntry).length &gt; <span class="nu">0</span>;
+  <span class="kw">const</span> isOmitted = (e) =&gt; isIntrinsicallyVisible(e) &amp;&amp; e.messages.length === <span class="nu">0</span>;
+  <span class="cmt">// 本可进上下文，却被省略编辑藏空</span>
+  <span class="kw">const</span> isRecoveryOmissionSuffix =
+    exceededBudget &amp;&amp; !hasExternalReplacement &amp;&amp;
+    suffix.some((e) =&gt; e.sourceEntry.type === <span class="st">"message"</span> &amp;&amp; e.sourceEntry.message.role === <span class="st">"assistant"</span> &amp;&amp; isOmitted(e)) &amp;&amp;
+    suffix.every((e) =&gt; e.sourceEntry.type !== <span class="st">"compaction"</span> &amp;&amp; (!isIntrinsicallyVisible(e) || isOmitted(e)));
+  <span class="kw">if</span> (isRecoveryOmissionSuffix) cutIndex++;
+
   <span class="kw">return</span> { firstKeptEntryIndex: cutIndex, turnStartIndex, isSplitTurn };
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个<strong>精细的细节</strong>。其一，切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>——此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的 turn 也有上下文，这是「压掉一半对话」时仍不丢语义的关键。其二，<code class="inline">?? cutPoints[cutPoints.length - 1]</code> 这个回退改过一次（commit 8bdcd4498）：变量初值本来就是 <code class="inline">cutPoints[0]</code>（从头保留），旧代码里若「凑满预算的位置」找不到「≥ 它」的合法切点，循环什么都不选，<code class="inline">cutIndex</code> 就停在初值上——等价于这次什么都不压。触发场景是<strong>结尾一堆工具结果自己就超过了 <code class="inline">keepRecentTokens</code></strong>：此时回退到<strong>最新的</strong>安全切点（<code class="inline">cutPoints[length - 1]</code>），保住它们前面那条 assistant 工具调用作为边界，让更旧的历史得以在下一轮请求前被压掉。两个方向都是「别让压缩空转」：要么压得动，要么别白跑。</div>
+    <div class="annotation">三个精细的细节。其一，切割点若落在「正在进行的 turn 中间」会标记 <code class="inline">isSplitTurn</code>——此时 Pi 会把该 turn 的<strong>前缀单独再摘要一次</strong>（<code class="inline">generateTurnPrefixSummary</code>），保证被切开的 turn 也有上下文；<code class="inline">?? cutPoints[cutPoints.length - 1]</code> 的回退语义（结尾一堆工具结果自己超预算时退到最后一个安全切点，别让压缩空转）沿袭自旧实现。其二，<strong>messages 为 0 ≠ 天然不可见</strong>：compaction 条目在 index &gt; 0 时投影为空（5.4 的规则），但那不算「省略后缀」；只有「本可进上下文、却被 context_edit 藏空」的条目才计入。其三，外部替换型编辑会挡住推进——被省略的 assistant 尝试回答的是<strong>改前</strong>的输入，若把它连同输入一起压进摘要，摘要与后续请求就对不上了。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>token 估算：先靠 provider usage，后靠字符启发</h2>
-    <p>估算「现在用了多少 token」是触发与切点的前提。Pi 的聪明之处：<strong>优先用最近一次 assistant 消息里 provider 报告的 usage（精确）</strong>，只对它之后的尾巴用字符启发式估算：</p>
+    <h2><span class="num">6.4</span>token 估算：先靠 provider usage，失效后靠投影重算</h2>
+    <p>估算「现在用了多少 token」是触发与切点的前提。基础规则：<strong>优先用最近一次 assistant 消息里 provider 报告的 usage（精确）</strong>，只对它之后的尾巴用字符启发式估算：</p>
     <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — 估算与启发式</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">estimateContextTokens</span>(messages): <span class="cl">ContextUsageEstimate</span> {
   <span class="kw">const</span> usageInfo = <span class="fn">getLastAssistantUsageInfo</span>(messages);  <span class="cmt">// 最近一次有 usage 的 assistant</span>
@@ -209,7 +247,29 @@
   <span class="kw">return</span> { tokens: usageTokens + trailingTokens, usageTokens, trailingTokens, ... };
 }
 <span class="cmt">// 触发判定的 contextTokens 就来自这里</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 用 provider 的真实 usage <strong>而不是</strong>整段重算，省时又准（provider 会报告 prompt/eval 的精确 token，含 cache）。只有「usage 之后新增的部分」才走 <code class="inline">chars/4</code> 的启发式。这是工程上的务实取舍。</div>
+    <div class="annotation">用 provider 的真实 usage <strong>而不是</strong>整段重算，省时又准（provider 会报告 prompt/eval 的精确 token，含 cache）。只有「usage 之后新增的部分」才走 <code class="inline">chars/4</code> 的启发式。</div>
+    <p>但 usage 有一个盲区：它报告的是<strong>那次请求时</strong>的上下文。如果那之后有人写入了 context_edit（省略或替换历史）或新的 compaction，旧 usage 对应的内容已经被改写，数字就过期了。coding-agent 为此在投影层加了一道失效判定：</p>
+    <div class="code-title">packages/coding-agent/src/core/compaction/compaction.ts — estimateProjectedContextTokens（行号 249 起，要点）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">estimateProjectedContextTokens</span>(
+  projection: SessionProjection, branchEntries: SessionEntry[],
+): ContextUsageEstimate {
+  <span class="kw">const</span> estimate = estimateContextTokens(projection.messages);
+  <span class="kw">if</span> (estimate.lastUsageIndex !== null) {
+    <span class="cmt">// 找到 usage 落在哪个投影条目上，再看该条目之后</span>
+    <span class="cmt">// 是否还有 context_edit / compaction 写入</span>
+    <span class="kw">if</span> (usageEntryIndex &gt; latestInvalidatingEntryIndex) <span class="kw">return</span> estimate;  <span class="cmt">// usage 仍有效</span>
+  }
+  <span class="cmt">// usage 已失效（或有 usage 但有改写）：放弃 usage，对整条投影逐条重估</span>
+  <span class="kw">let</span> tokens = currentSystem ? estimateTokens(currentSystem) : <span class="nu">0</span>;
+  <span class="kw">for</span> (<span class="kw">const</span> message <span class="kw">of</span> projection.messages) {
+    <span class="kw">if</span> (message.role !== <span class="st">"system"</span>) tokens += estimateTokens(message);
+  }
+  <span class="kw">return</span> { tokens, usageTokens: <span class="nu">0</span>, trailingTokens: tokens, lastUsageIndex: null };
+}</pre>
+    <div class="callout info">
+      <b class="tag">谁在用它</b>
+      <code class="inline">prepareCompaction</code> 用它重算 <code class="inline">tokensBefore</code>（写进新 CompactionEntry 的数字必须反映「实际被替换的上下文」，包括被改写过的部分）；<code class="inline">AgentSession._checkCompaction</code> 在会话里存在 context_edit 时用它替代直接读 usage；每轮间隙的 <code class="inline">shouldCompact</code> 预检也走它。一句话：凡是有「改写历史」动作的会话，token 账本都以投影为准。
+    </div>
   </section>
 
   <section class="block">
@@ -225,39 +285,75 @@
   { systemPrompt: <span class="cl">SUMMARIZATION_SYSTEM_PROMPT</span>, messages: summarizationMessages },
   <span class="fn">createSummaryRequestOptions</span>(completionOptions, context),
   context);</pre>
-    <div class="annotation"><b>读懂这段：</b> 摘要 prompt 的格式（<code class="inline">SUMMARIZATION_PROMPT</code>）很讲究：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context</code>——这几乎就是「让我能无缝接手」的充分信息集。它把「压缩」变成了「结构化交接班」。<strong>摘要走的是独立请求：默认的 request 边界是 <code class="inline">completeSimpleWithRetries(models, model, aiContext, options, retry, callbacks, context)</code>（7 参），它内部用 <code class="inline">createSummaryRequestOptions</code> 强制 <code class="inline">{ ...options, signal, telemetryContext, cacheRetention: "none", sessionId: options.sessionId ?? uuidv7() }</code>——<code class="inline">sessionId</code> 若调用方未传才生成新 <code class="inline">uuidv7()</code>，<code class="inline">cacheRetention</code> 恒为 <code class="inline">"none"</code> 不写缓存</strong>，让摘要彻底脱离主对话的缓存；摘要请求不传 <code class="inline">toolChoice</code>，<code class="inline">completionOptions</code> 只含 <code class="inline">{ maxTokens[, reasoning] }</code>。</div>
+    <div class="annotation">摘要 prompt 的格式（<code class="inline">SUMMARIZATION_PROMPT</code>）很讲究：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context</code>——这几乎就是「让我能无缝接手」的充分信息集。它把「压缩」变成了「结构化交接班」。<strong>摘要走的是独立请求：默认的 request 边界是 <code class="inline">completeSimpleWithRetries(models, model, aiContext, options, retry, callbacks, context)</code>（7 参），它内部用 <code class="inline">createSummaryRequestOptions</code> 强制 <code class="inline">{ ...options, signal, telemetryContext, cacheRetention: "none", sessionId: options.sessionId ?? uuidv7() }</code>——<code class="inline">sessionId</code> 若调用方未传才生成新 <code class="inline">uuidv7()</code>，<code class="inline">cacheRetention</code> 恒为 <code class="inline">"none"</code> 不写缓存</strong>，让摘要彻底脱离主对话的缓存；摘要请求不传 <code class="inline">toolChoice</code>，<code class="inline">completionOptions</code> 只含 <code class="inline">{ maxTokens[, reasoning] }</code>。增量合并的底稿在切分 turn 时取 <code class="inline">previousSummary ?? "No prior history."</code>——旧摘要直接作为下一轮的底稿，压缩因此是<strong>递归的</strong>：新摘要 = 旧摘要 + 新增消息的合并。</div>
+    <p><strong>retain-none 压缩</strong>是 v0.87 里新出现的一档：<code class="inline">appendCompaction</code> 的 <code class="inline">firstKeptEntryId</code> 参数从必填的 <code class="inline">string</code> 放宽为 <code class="inline">string | null</code>。传 <code class="inline">null</code> 时，条目把自己的 ID 记成保留边界——压缩后模型面前的历史<strong>只剩摘要，尾巴为零</strong>：</p>
+    <div class="code-title">coding-agent/src/core/session-manager.ts — appendCompaction（节选，行号约 1258；注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export</span> <span class="fn">appendCompaction</span>&lt;T = unknown&gt;(
+  summary: string,
+  firstKeptEntryId: string | null,    <span class="cmt">// ← v0.87 起允许 null</span>
+  tokensBefore: number, details?, fromHook?, usage?,
+): string {
+  <span class="kw">const</span> systemMessage = getCurrentSystemMessage(<span class="kw">this</span>.<span class="fn">buildSessionProjection</span>().messages);
+  <span class="kw">const</span> id = generateId(<span class="kw">this</span>.byId);
+  <span class="kw">const</span> entry: CompactionEntry&lt;T&gt; = {
+    type: <span class="st">"compaction"</span>, id, parentId: <span class="kw">this</span>.leafId, timestamp, summary,
+    firstKeptEntryId: firstKeptEntryId ?? id,   <span class="cmt">// null → 保留边界记自己：什么都不留</span>
+    tokensBefore, details, usage, fromHook,
+    ...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: ... } } : {}),
+  };
+  <span class="kw">this</span>._appendEntry(entry);
+  <span class="kw">return</span> entry.id;
+}</pre>
+    <div class="annotation">retain-none 的用途在重复压缩：下一次压缩的摘要范围从上一条 compaction 的 <code class="inline">firstKeptEntryId</code> 起算，若上一条什么都不留（边界 = 它自己），那么<strong>上一轮侥幸留下的消息也会被并进这次摘要</strong>，而不是被静默跳过。同时 <code class="inline">tokensBefore</code> 在写入前会按「重建后的、改写过的投影」重新计算——数字反映的是真正被替换的上下文。被省略的原始条目仍留在盘上，但不再影响切点选择、摘要、检查点与 token 估算。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.6</span>写入 compaction 条目</h2>
-    <p>摘要生成后，连同保留的尾巴与「文件操作」细节一起，作为一条 <code class="inline">compaction</code> 条目追加进会话：</p>
-    <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — compact 的产出</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">CompactResult</span> {
-  summary: <span class="cl">string</span>;            <span class="cmt">// 摘要文本（含文件操作清单）</span>
-  tokensBefore: <span class="cl">number</span>;        <span class="cmt">// 压缩前估计 token（记档用）</span>
-  usage?: <span class="cl">Usage</span>;               <span class="cmt">// 生成摘要的 LLM 用量</span>
-  retainedTail: <span class="cl">AgentMessage</span>[]; <span class="cmt">// 保留的最近消息</span>
-  details?: <span class="cl">T</span>;                 <span class="cmt">// 例如 readFiles / modifiedFiles</span>
-}
-<span class="cmt">// compact() 最后：</span>
-<span class="kw">const</span> { readFiles, modifiedFiles } = <span class="fn">computeFileLists</span>(fileOps);
-summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles);  <span class="cmt">// 把碰过哪些文件写进摘要</span>
-<span class="kw">return</span> ok({ summary, tokensBefore, usage: summaryUsage, retainedTail,
-             details: { readFiles, modifiedFiles } });</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">retainedTail</code> 直接存在 compaction 条目上——所以第 5 章的 <code class="inline">sessionEntryToContextMessages</code> 能「<code class="inline">[摘要假消息, ...retainedTail]</code>」地展开它。而 <code class="inline">details</code> 记录了「这段历史读过/改过哪些文件」，让后续上下文（或你自研时）能推断文件依赖而无需重扫。</div>
-    <p>coding-agent 的 <code class="inline">appendCompaction</code> 还往 compaction 条目上多存了一样东西——<strong>压缩那一刻的完整系统提示</strong>：</p>
+    <h2><span class="num">6.5b</span>溢出恢复：先省略失败尝试，再压缩重试</h2>
+    <p>上下文压满通常不是发生在「写文档写到一半」，而是 provider 直接报 context-overflow 错误，或 <code class="inline">stopReason: "length"</code> 提前截断。pi 允许这两种情况挑起<strong>一次</strong>「压缩 + 重试」的恢复。恢复的关键改动：失败的那次 assistant 尝试不再只是从内存里剥掉，而是<strong>持久化地省略</strong>——为它写下 <code class="inline">replacement: null</code> 的 context_edit：</p>
+    <div class="code-title">coding-agent/src/core/agent-session.ts — _omitRecoveryAttempt（行号 1015 起；注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private</span> <span class="fn">_omitRecoveryAttempt</span>(message: AssistantMessage, toolResults: AgentMessage[] = []): void {
+  <span class="kw">const</span> targets = [message, ...toolResults];
+  <span class="kw">const</span> targetIds = targets.map((t) =&gt; <span class="kw">this</span>._findPersistedMessageEntryId(t));
+  <span class="cmt">// 找不到对应条目且消息还在 agent state 里 → 投影消息没有源条目，直接报错</span>
+  <span class="kw">if</span> (unresolvedProjectedTarget) {
+    <span class="kw">throw new</span> Error(<span class="st">"Cannot persist recovery omission because a projected message has no source entry"</span>);
+  }
+  <span class="kw">for</span> (<span class="kw">const</span> targetId <span class="kw">of</span> targetIds) {
+    <span class="kw">if</span> (!targetId) <span class="kw">continue</span>;
+    <span class="kw">const</span> editId = <span class="kw">this</span>.sessionManager.appendContextEdit(targetId, <span class="kw">null</span>);  <span class="cmt">// null = 从模型上下文省略</span>
+    <span class="kw">this</span>._emit({ type: <span class="st">"entry_appended"</span>, entry });
+  }
+  <span class="kw">this</span>._refreshFinalizedContext();   <span class="cmt">// 用新投影刷新 agent.state.messages 与条目索引</span>
+}</pre>
+    <div class="code-title">恢复的完整时序（docs/compaction.md 原文复述）</div>
+    <pre class="code"><span class="lang-tag">text</span>persist final assistant response   <span class="cmt">① 失败尝试先照常落盘</span>
+→ extension/public turn_end        <span class="cmt">② 生命周期事件一个不少</span>
+→ extension/public agent_end
+→ append context_edit omissions    <span class="cmt">③ 再为失败尝试写省略编辑</span>
+→ session_before_compact → append compaction   <span class="cmt">④ 然后才压缩</span>
+→ start the retry as a fresh run   <span class="cmt">⑤ 重试作为全新 run 启动</span></pre>
+    <div class="callout info">
+      <b class="tag">为什么先落盘再省略</b>
+      顺序反过来行不行？不行。若先省略再发事件，扩展和 UI 看到的是「这次回复从未存在」；而 raw 转写、导出、计费统计、历史搜索都还能翻到被省略的尝试——省略只改模型上下文，不改历史。若恢复压缩失败或被取消，省略编辑保留、不追加压缩、不排内部重试；排队中的 steering/follow-up 照常走原有规则，<code class="inline">agent_before_settle</code> 看到的是修复后的投影。这也解释了 6.3 的后缀规则：切点后那段「上下文不可见的省略后缀」必须一起进摘要，否则恢复后模型面前的历史会凭空少一块。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.6</span>写入 compaction 条目：顺手存档系统提示</h2>
+    <p>摘要生成后，连同保留的尾巴与「文件操作」细节一起，作为一条 <code class="inline">compaction</code> 条目追加进会话。产物本身（<code class="inline">CompactResult</code>：summary / tokensBefore / usage / retainedTail / details）与第 5 章讲的展开方式（<code class="inline">[摘要假消息, ...retainedTail]</code>）不变；coding-agent 侧多存的一样东西——<strong>压缩那一刻的完整系统提示</strong>——现在从投影里取：</p>
     <div class="code-title">coding-agent/src/core/session-manager.ts — 压缩检查点（节选，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// CompactionEntry 上新增的字段：边界处的完整 prompt 与工具声明状态</span>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// CompactionEntry 上的字段：边界处的完整 prompt 与工具声明状态</span>
 <span class="cmt">/** Complete prompt and tool state at this compaction boundary. */</span>
 systemMessage?: <span class="cl">SystemMessage</span>;
 
-<span class="cmt">// appendCompaction 写入时快照当前生效的系统消息</span>
-<span class="kw">const</span> systemMessage = <span class="fn">getCurrentSystemMessage</span>(<span class="kw">this</span>.<span class="fn">buildSessionContext</span>().messages);
+<span class="cmt">// appendCompaction 写入时快照「投影后」当前生效的系统消息</span>
+<span class="cmt">// （投影已应用 context_edit —— 若 prompt 被编辑过，存档的是编辑后的版本）</span>
+<span class="kw">const</span> systemMessage = <span class="fn">getCurrentSystemMessage</span>(<span class="kw">this</span>.<span class="fn">buildSessionProjection</span>().messages);
 <span class="kw">const</span> entry: <span class="cl">CompactionEntry</span>&lt;T&gt; = {
   type: <span class="st">"compaction"</span>, summary, firstKeptEntryId, tokensBefore, details, usage, fromHook,
   ...(systemMessage ? { systemMessage: { ...systemMessage } } : {}),
 };</pre>
-    <div class="annotation"><b>读懂这段：</b> 系统提示不再是「永远在头顶的一条固定消息」，而是随对话演化、可被中途替换的状态（<a href="10-ai-layer.html">第 10 章</a>）。这带来一个压缩特有的问题：压缩会把旧消息丢掉，如果那条记录「系统提示是什么」的 system 消息恰好落在被丢掉的部分，压缩后模型就失去了 prompt。所以压缩条目把边界处的 system 消息<strong>整体存档</strong>，重放时展开成「<code class="inline">[系统消息, 摘要消息]</code>」两条：</div>
+    <div class="annotation">系统提示不再是「永远在头顶的一条固定消息」，而是随对话演化、可被中途替换的状态（<a href="10-ai-layer.html">第 10 章</a>）。这带来一个压缩特有的问题：压缩会把旧消息丢掉，如果那条记录「系统提示是什么」的 system 消息恰好落在被丢掉的部分，压缩后模型就失去了 prompt。所以压缩条目把边界处的 system 消息<strong>整体存档</strong>，重放时展开成「<code class="inline">[系统消息, 摘要消息]</code>」两条：</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// sessionEntryToContextMessages 的 compaction 分支</span>
 <span class="kw">if</span> (entry.type === <span class="st">"compaction"</span>) {
   <span class="kw">const</span> summary = <span class="fn">createCompactionSummaryMessage</span>(entry.summary, entry.tokensBefore, entry.timestamp);
@@ -269,12 +365,12 @@ systemMessage?: <span class="cl">SystemMessage</span>;
   contextEntries.push(entry);
 }</pre>
     <div class="callout">
-      <strong>配套的取舍：</strong>压缩收集待摘要消息时也跳过 system 角色（<code class="inline">getMessageFromEntryForCompaction</code> 里有一句注释「System messages are prompt state, not conversation」）——系统提示不参与摘要。另外切分 turn 时，拆成「历史摘要 + turn 前缀摘要」两段再合并，历史那段的种子文本现在取 <code class="inline">previousSummary ?? "No prior history."</code>——即上一轮的旧摘要直接作为增量更新的底稿，而不是每次都从「无历史」开始。压缩在 coding-agent 里因此是<strong>递归的</strong>：新摘要 = 旧摘要 + 新增消息的合并。
+      <strong>配套的取舍：</strong>压缩收集待摘要消息时也跳过 system 角色（<code class="inline">getMessageFromEntryForCompaction</code> 里有一句注释「System messages are prompt state, not conversation」）——系统提示不参与摘要。另外切分 turn 时，拆成「历史摘要 + turn 前缀摘要」两段再合并，历史那段的种子文本取 <code class="inline">previousSummary ?? "No prior history."</code>——上一轮的旧摘要直接作为增量更新的底稿，而不是每次都从「无历史」开始。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.7</span>在上下文里呈现：摘要假消息</h2>
+    <h2><span class="num">6.7</span>摘要回到上下文：一条包着 &lt;summary&gt; 标签的假消息</h2>
     <p>落到 LLM 面前，摘要被包成一段 user 消息（来自 <code class="inline">messages.ts</code>）：</p>
     <div class="code-title">packages/agent/src/harness/messages.ts — 摘要消息的包装</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">COMPACTION_SUMMARY_PREFIX</span> =
@@ -287,11 +383,11 @@ systemMessage?: <span class="cl">SystemMessage</span>;
   <span class="kw">return</span> { role: <span class="st">"user"</span>,
            content: [{ type: <span class="st">"text"</span>, text: <span class="cl">COMPACTION_SUMMARY_PREFIX</span> + m.summary + <span class="cl">COMPACTION_SUMMARY_SUFFIX</span> }],
            timestamp: m.timestamp };</pre>
-    <div class="annotation"><b>读懂这段：</b> 摘要对模型来说是「一个来自系统的大量历史说明」，塞进显式的 <code class="inline">&lt;summary&gt;</code> 标签，让模型明确区分「这是历史压缩」与「这是本轮对话」。<code class="inline">branchSummary</code>（第 7 章 navigation）用同样的手法。</div>
+    <div class="annotation">摘要对模型来说是「一个来自系统的大量历史说明」，塞进显式的 <code class="inline">&lt;summary&gt;</code> 标签，让模型明确区分「这是历史压缩」与「这是本轮对话」。<code class="inline">branchSummary</code>（第 7 章 navigation）用同样的手法。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.8</span>分支摘要：navigation 时把「被离开的分支」压成一条</h2>
+    <h2><span class="num">6.8</span>分支摘要：navigation 时给被离开的分支留张便条</h2>
     <p>6.1–6.7 讲的是「上下文压缩」——同一条主线上的历史被压成摘要。但还有另一种摘要：当你 <strong>navigate 切到另一条分支</strong>（第 7 章 navigation）时，那条<strong>被离开的旧分支</strong>不该凭空消失，而会被压成<strong>一条 <code class="inline">branch_summary</code> 条目</strong>留作路标。这件事由 <code class="inline">branch-summarization.ts</code> 负责，分三步：</p>
     <div class="code-title">harness/compaction/branch-summarization.ts — 分支摘要三步</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// ① 收集要摘要的 entries：从旧叶子 oldLeafId 回溯到「与目标分支的最近公共祖先」</span>
@@ -317,15 +413,21 @@ systemMessage?: <span class="cl">SystemMessage</span>;
 <span class="kw">const</span> { readFiles, modifiedFiles } = <span class="fn">computeFileLists</span>(fileOps);
 summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles);  <span class="cmt">// 末尾追加文件清单</span></pre>
     <p>关键是 <strong>BRANCH_SUMMARY_PROMPT 的格式与 compaction 摘要同构</strong>——都是结构化「交接班」：<code class="inline">## Goal / ## Constraints &amp; Preferences / ## Progress(Done/In Progress/Blocked) / ## Key Decisions / ## Next Steps</code>（比 compaction 少一节 <code class="inline">## Critical Context</code>）。所以分支摘要不是「自由文本」，而是一份让模型回到这条分支时能无缝接手的清单。它生成的摘要前面会加一段 <code class="inline">BRANCH_SUMMARY_PREAMBLE</code>（说明「用户刚才探索了另一条分支」），末尾再用 <code class="inline">formatFileOperations</code> 追加「读过/改过哪些文件」的清单——这部分与 §6.6 的 compaction 摘要复用同一套 <code class="inline">computeFileLists</code> / <code class="inline">formatFileOperations</code> 工具。</p>
-    <div class="annotation"><b>读懂这段：</b> 别把分支摘要和上下文压缩混为一谈——compaction 是「主线太长压一压」，branch summary 是「离开分支前留张便条」。两者<strong>共用同款结构化 prompt、同一套文件清单工具、同一个请求边界 <code class="inline">completeSimpleWithRetries</code> + <code class="inline">createSummaryRequestOptions</code>（同样 <code class="inline">cacheRetention:"none"</code> + <code class="inline">sessionId: options.sessionId ?? uuidv7()</code>）</strong>，只是触发时机与产物条目类型（<code class="inline">compaction</code> vs <code class="inline">branch_summary</code>）不同。6.7 的「摘要假消息」对二者一视同仁，都包成 <code class="inline">&lt;summary&gt;</code> 塞进上下文。</div>
+    <div class="annotation">别把分支摘要和上下文压缩混为一谈——compaction 是「主线太长压一压」，branch summary 是「离开分支前留张便条」。两者<strong>共用同款结构化 prompt、同一套文件清单工具、同一个请求边界 <code class="inline">completeSimpleWithRetries</code> + <code class="inline">createSummaryRequestOptions</code>（同样 <code class="inline">cacheRetention:"none"</code> + <code class="inline">sessionId: options.sessionId ?? uuidv7()</code>）</strong>，只是触发时机与产物条目类型（<code class="inline">compaction</code> vs <code class="inline">branch_summary</code>）不同。6.7 的「摘要假消息」对二者一视同仁，都包成 <code class="inline">&lt;summary&gt;</code> 塞进上下文。</div>
     <div class="annotation"><b>设计取舍：</b> 不保留文件内容、只留清单，是 token 预算的精算——内容大概率会在后续 turn 被重新读，而「动过哪些文件」这种元信息一旦丢失就要重头猜。压缩的本质不是「少说话」，而是「留下以后还能用的索引」。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.9</span>对自研与使用的启示</h2>
+    <h2><span class="num">6.9</span>收尾：四个答案</h2>
+    <ul>
+      <li><strong>何时触发？</strong>token 涨过「窗口 − 预留」即触发；预算可按模型覆盖。usage 是主账本，但 context_edit/compaction 写在它之后时数字作废，改由 <code class="inline">estimateProjectedContextTokens</code> 按投影重算。</li>
+      <li><strong>切割点怎么选？</strong><code class="inline">findProjectedCutPoint</code> 从新到旧累加到 keepRecentTokens，回退到安全切点（不切工具结果、不切 compaction 条目）；「恢复省略」形成的上下文不可见后缀会连带推进切点，外部替换编辑则挡住推进。</li>
+      <li><strong>摘要怎么生成、失败怎么恢复？</strong>结构化交接班 prompt + 旧摘要作底稿的增量合并；retain-none 压缩（<code class="inline">firstKeptEntryId: null</code>）让重复压缩把上轮尾巴也并进来。溢出恢复按时序「先落盘 → 再省略 → 再压缩 → 全新 run 重试」，只给一次机会。</li>
+      <li><strong>产物怎么回上下文？</strong>compaction 条目存档系统提示、展开成「prompt + 摘要」两条；摘要包 <code class="inline">&lt;summary&gt;</code> 标签；文件清单作为元上下文写进摘要正文。</li>
+    </ul>
     <div class="callout warn">
       <b class="tag">要点</b>
-      <strong>① token 预算两笔账</strong>：reserveTokens（给这次摘要留空间）+ keepRecentTokens（保留多少细节）。<strong>② 切割要尊重对话边界</strong>：别从工具结果中间切。<strong>③ 增量更新旧摘要</strong>，别每次全量重写（省 token 且更连贯）。<strong>④ 摘要里带上文件清单等"元上下文"</strong>，比纯文本可控得多。
+      <strong>token 预算是两笔账</strong>：reserveTokens（给这次摘要留空间）+ keepRecentTokens（保留多少细节）。<strong>切割要尊重对话边界</strong>，别从工具结果中间切。<strong>增量更新旧摘要</strong>，别每次全量重写（省 token 且更连贯）。<strong>摘要里带上文件清单等"元上下文"</strong>，比纯文本可控得多。
     </div>
   </section>
 
@@ -336,7 +438,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 </div>
 
 <footer>
-  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>
@@ -344,7 +446,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
  * 压缩四步动画 — §6.1
  * 复刻 compaction.ts 的语义：
  *   shouldCompact: contextTokens > contextWindow - reserveTokens
- *   findCutPoint:  从新到旧累加 token 直到 keepRecentTokens，回退到安全切点
+ *   findProjectedCutPoint:  从新到旧累加 token 直到 keepRecentTokens，回退到安全切点
  *                  （不能从 toolResult 中间切；这里简化为「回退到最近的 user」）
  *   压缩产出：messagesToSummarize → summary；retainedTail 保留
  * ============================================================ */
@@ -359,7 +461,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
   let msgs = [];
   let seq = 0;
   let compacted = false; // 是否已压缩（避免重复）
-  let scanIdx = -1; // findCutPoint 扫描高亮（-1=无）
+  let scanIdx = -1; // findProjectedCutPoint 扫描高亮（-1=无）
 
   const roles = [
     { role: "user", tk: 22 },
@@ -376,7 +478,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
     return totalTokens() > THRESHOLD;
   }
 
-  // findCutPoint：从新到旧累加，直到 >= keepRecent，记录该位置，
+  // findProjectedCutPoint：从新到旧累加，直到 >= keepRecent，记录该位置，
   // 再回退到「安全切点」（这里：该位置之前最近的 user/assistant，且不能是 toolResult）。
   // 返回 { cutIndex, tail } —— cutIndex 之前的(含)被摘要，之后是 retainedTail。
   function findCutPoint() {
@@ -409,7 +511,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
     out.innerHTML = "";
     log(`<b>① 触发</b>：${totalTokens()} tokens > ${THRESHOLD}（窗口${WINDOW}−预留${RESERVE}）`);
 
-    // ② findCutPoint 动画：从新到旧逐条累加
+    // ② findProjectedCutPoint 动画：从新到旧逐条累加
     const { cutIndex, tailStart } = findCutPoint();
     let acc = 0;
     const tkList = [];
@@ -420,7 +522,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
       if (k < tkList.length) {
         scanIdx = tkList[k].i;
         render();
-        log(`② findCutPoint：累加到 ${msgs[scanIdx].role} m${msgs[scanIdx].id.slice(1)}，累计 ${tkList[k].acc} ≥ ${KEEP_RECENT}`, "acc");
+        log(`② findProjectedCutPoint：累加到 ${msgs[scanIdx].role} m${msgs[scanIdx].id.slice(1)}，累计 ${tkList[k].acc} ≥ ${KEEP_RECENT}`, "acc");
         k++; setTimeout(animateScan, 420);
       } else {
         scanIdx = -1;

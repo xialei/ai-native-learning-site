@@ -34,19 +34,88 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 01 核心概念</div>
     <h1>核心概念</h1>
-    <div class="subtitle">LangGraph 把 agent 当作「状态机 + 图」来编程——掌握 State、Node、Edge、Reducer、Channel、Compile 这六块，你就掌握了它的全部心智模型。</div>
+    <div class="subtitle">先看一个用「链」写到第三轮就散架的 agent 场景，把它的三个症状拆成四个工程问题，再看 LangGraph 用哪六个概念逐一回答——每个概念都配可运行代码和源码出处。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">1.1</span>为什么是图，而不是链</h2>
-    <p>如果你用过 LangChain 的链（LCEL），你会发现链是「一条线」——数据从前往后流，中间拼接若干步。而真实的 agent 往往需要<strong>循环</strong>（思考-行动-观察）、<strong>分支</strong>（根据结果决定下一步）、<strong>记忆</strong>（跨多轮保留上下文）。LangGraph 的设计起点就是：与其把 agent 写成一条越来越长的 prompt 链，不如把它显式建模成一张有状态的有向图。</p>
-    <p>这一页先把六个核心概念过一遍，每个都配一句话定义、一段可运行代码、以及它「在图里扮演什么角色」。理解了这六块，后面所有章节都是在它们之上做组合。</p>
-    <div class="callout info"><b class="tag">提示</b> LangGraph 的本质是<strong>「把 agent 当作状态机/图来编程」</strong>。链是线性的、无状态的、一次性把 prompt 拼死；而图是结构化的、有共享状态的、可以在节点之间循环和分支的。状态（State）是图的「内存」，节点（Node）是「计算单元」，边（Edge）是「控制流」，Reducer 决定「状态怎么合并」。一旦你用这四个词去描述一个 agent，它就不再是一团模糊的 prompt，而是一个可以被画出、被调试、被复用的程序。</div>
+    <h2><span class="num">1.1</span>开场：一条链写到第三轮，散架了</h2>
+    <p>你要做一个客服助手。第一版需求很简单：用户发来问题 → 查订单（调一次订单接口）→ 把查询结果拼进 prompt → 输出回复。用 LangChain 的链（LCEL）写，半小时就上线了——链就是「一条线」：数据从前往后流，每一步的输出接下一步的输入。</p>
+    <p>然后需求开始加码，三个症状接连出现：</p>
+    <ul>
+      <li><strong>循环</strong>：模型看完订单数据，经常说「我还得再查一次物流」。要查几轮，事先没人知道——而链的步骤数是拼的时候就写死的。你只能在某个环节里塞一个 <code class="inline">while</code> 循环，于是「流程长什么样」从链的结构里掉进了某个函数体内，再也画不出来。</li>
+      <li><strong>并行</strong>：产品说订单查询和物流查询没有依赖，可以同时发。链的第 N 步只有一个上游、一个下游，汇合点在哪、等谁做完，框架不管——你只能自己开 <code class="inline">ThreadPoolExecutor</code>，把并发管理手写在业务代码里。</li>
+      <li><strong>停顿</strong>：查完订单，想先暂停下来问用户「要不要继续查物流？」，等人确认再继续。进程一停，函数栈里的局部变量全没了；服务重启后，该从哪一行接着跑？</li>
+    </ul>
+    <div class="callout info"><b class="tag">根源</b> 三个症状指向同一个缺口：链这个抽象里，<strong>没有一个地方放着「目前查到了什么」（状态）</strong>，<strong>没有一种写法能说「下一步去哪由数据决定」（控制流）</strong>，<strong>没有一种机制能把执行进度存下来、换个进程再捡起来（可恢复）</strong>。循环、并行、停顿不是三个需求，是同一个缺口的三个切面。</div>
+    <p>LangGraph 的全部 API，就是在回答一个问题：<strong>如果把 agent 写成一张有状态的图——节点是步骤，边是走向，每个节点读写同一份状态——上面三件事是不是就有着落了？</strong>这一章先建立回答这个问题需要的心智模型，后面所有章节都是在这套模型上做加法。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 960 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="c11t c11d">
+        <title id="c11t">链与图的表达力对比</title>
+        <desc id="c11d">左侧一条线性链：START、查订单、拼 prompt、END，步骤固定；右侧一张图：agent 节点与 tools 节点循环，条件边决定去 END 还是继续循环。</desc>
+        <defs>
+          <marker id="ar11a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <!-- 左半：链 -->
+        <text class="lbl" x="240" y="30" text-anchor="middle">链（LCEL）：一条线</text>
+        <ellipse class="node" cx="60" cy="150" rx="32" ry="22"></ellipse>
+        <text class="lbl sm" x="60" y="154" text-anchor="middle">START</text>
+        <rect class="node" x="130" y="126" width="120" height="48" rx="8"></rect>
+        <text class="lbl" x="190" y="147" text-anchor="middle">查订单</text>
+        <text class="lbl sm" x="195" y="163" text-anchor="middle">调一次接口</text>
+        <rect class="node" x="290" y="126" width="110" height="48" rx="8"></rect>
+        <text class="lbl" x="345" y="154" text-anchor="middle">拼 prompt</text>
+        <ellipse class="node" cx="448" cy="150" rx="26" ry="20"></ellipse>
+        <text class="lbl sm" x="448" y="154" text-anchor="middle">END</text>
+        <line class="edge" x1="92" y1="150" x2="128" y2="150" marker-end="url(#ar11a)"></line>
+        <line class="edge" x1="250" y1="150" x2="288" y2="150" marker-end="url(#ar11a)"></line>
+        <line class="edge" x1="400" y1="150" x2="420" y2="150" marker-end="url(#ar11a)"></line>
+        <text class="lbl sm" x="240" y="225" text-anchor="middle">步骤和顺序在拼的时候就写死</text>
+        <text class="lbl sm" x="240" y="247" text-anchor="middle">循环？并行？中途暂停？链上没有位置放它们</text>
+
+        <!-- 分隔线 -->
+        <line class="st" x1="480" y1="20" x2="480" y2="300" stroke-dasharray="5 4"></line>
+
+        <!-- 右半：图 -->
+        <text class="lbl" x="730" y="30" text-anchor="middle">图（LangGraph）：循环 + 分支</text>
+        <rect class="node core" x="560" y="100" width="170" height="54" rx="8"></rect>
+        <text class="lbl" x="645" y="122" text-anchor="middle">agent 节点</text>
+        <text class="lbl sm" x="645" y="140" text-anchor="middle">调 LLM：还查吗？</text>
+        <rect class="node acc" x="810" y="100" width="120" height="54" rx="8"></rect>
+        <text class="lbl" x="870" y="122" text-anchor="middle">tools 节点</text>
+        <text class="lbl sm" x="870" y="140" text-anchor="middle">执行工具</text>
+        <ellipse class="node" cx="645" cy="250" rx="28" ry="20"></ellipse>
+        <text class="lbl sm" x="645" y="254" text-anchor="middle">END</text>
+        <line class="edge" x1="730" y1="118" x2="808" y2="118" marker-end="url(#ar11a)"></line>
+        <text class="lbl sm code" x="769" y="110" text-anchor="middle">有 tool_calls</text>
+        <line class="edge" x1="810" y1="142" x2="732" y2="142" stroke-dasharray="5 3" marker-end="url(#ar11a)"></line>
+        <text class="lbl sm" x="771" y="170" text-anchor="middle">结果回填，再想一轮</text>
+        <line class="edge" x1="645" y1="154" x2="645" y2="226" marker-end="url(#ar11a)"></line>
+        <text class="lbl sm" x="700" y="196" text-anchor="middle">没 tool_calls 了</text>
+        <text class="lbl sm" x="720" y="296" text-anchor="middle">走向是数据，循环是图的一部分</text>
+      </svg>
+      <div class="fig-cap">图 1.1：同一类任务，两种抽象。左：链的步骤拼完就固定，循环和分支没有落脚点；右：图把「要不要再来一轮」表达成一条条件边，循环本身就是图结构。</div>
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.2</span>总览：四大件如何协作</h2>
-    <p>在看每个概念的细节前，先用一张图理解 State / Node / Edge / Reducer 的关系。节点从状态里<strong>读</strong>数据，做完计算后返回一个<strong>状态更新</strong>（partial state）；这个更新不是直接覆盖，而是交给对应字段的 Reducer 去<strong>合并</strong>；合并完的新状态再由 Edge 决定流向下一个节点。</p>
+    <h2><span class="num">1.2</span>把困境拆开：四个问题，六个概念</h2>
+    <p>1.1 的三个症状，翻译成工程问题是这样四个。注意它们的排列顺序——不是 API 文档的目录顺序，而是你动手时会依次撞上的顺序：</p>
+    <table class="tbl">
+      <thead>
+        <tr><th>#</th><th>问题</th><th>LangGraph 的部件</th><th>本节</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>①</td><td>「目前查到了什么」放在哪，节点之间怎么共享？</td><td><strong>State</strong>：一份所有节点都能读写的结构化数据</td><td>1.3</td></tr>
+        <tr><td>②</td><td>每一步的计算怎么写？和共享状态是什么关系？</td><td><strong>Node</strong>：一个读状态、返回「更新」的普通函数</td><td>1.4</td></tr>
+        <tr><td>③</td><td>下一步去哪？怎么表达循环和分支？</td><td><strong>Edge</strong>：固定走向（普通边）+ 看状态决定（条件边）</td><td>1.5</td></tr>
+        <tr><td>④</td><td>几个节点同时写一个字段，谁赢？还是该合并？</td><td><strong>Reducer</strong>：写在字段注解上的合并规则</td><td>1.6</td></tr>
+      </tbody>
+    </table>
+    <p>Reducer 那一问的答案，最终要落到一层底层抽象上：<strong>Channel</strong>（1.7）——State 的每个字段在运行时其实是一个「盒子」，reducer 就是盒子的更新规则。最后，声明完的图怎么变成能跑的程序，由 <strong>Compile</strong>（1.8）回答。最后，声明完的图怎么变成能跑的程序，由 <strong>Compile</strong>（1.8）回答。</p>
+
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ov-tid ov-did">
         <title id="ov-tid">State/Node/Edge/Reducer 协作关系</title>
@@ -56,74 +125,56 @@
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
           </marker>
         </defs>
-        <!-- 中央 State -->
         <rect class="node core" x="340" y="30" width="220" height="56" rx="8"></rect>
         <text class="lbl" x="450" y="52" text-anchor="middle">State（共享状态）</text>
         <text class="lbl sm" x="450" y="70" text-anchor="middle">messages / count / ...</text>
-
-        <!-- 节点 A -->
         <rect class="node" x="40" y="160" width="170" height="52" rx="8"></rect>
         <text class="lbl" x="125" y="182" text-anchor="middle">节点 A</text>
         <text class="lbl sm" x="125" y="200" text-anchor="middle">读 state → 计算 → 返回更新</text>
-
-        <!-- 节点 B -->
         <rect class="node" x="690" y="160" width="170" height="52" rx="8"></rect>
         <text class="lbl" x="775" y="182" text-anchor="middle">节点 B</text>
         <text class="lbl sm" x="775" y="200" text-anchor="middle">读 state → 计算 → 返回更新</text>
-
-        <!-- Reducer -->
         <rect class="node acc" x="370" y="270" width="160" height="52" rx="8"></rect>
         <text class="lbl" x="450" y="292" text-anchor="middle">Reducer</text>
         <text class="lbl sm" x="450" y="310" text-anchor="middle">合并更新（非覆盖）</text>
-
-        <!-- State -> A / B (读取) -->
         <line class="edge" x1="380" y1="86" x2="180" y2="158"></line>
         <line class="edge" x1="520" y1="86" x2="720" y2="158"></line>
         <text class="lbl sm" x="250" y="120">读取</text>
-        <text class="lbl sm" x="620" y="120">读取</text>
-
-        <!-- A/B -> Reducer (更新) -->
+        <text class="lbl sm" x="620" y="110">读取</text>
         <line class="edge acc" x1="180" y1="212" x2="380" y2="270"></line>
         <line class="edge acc" x1="720" y1="212" x2="520" y2="270"></line>
         <text class="lbl sm" x="230" y="248">更新</text>
         <text class="lbl sm" x="640" y="248">更新</text>
-
-        <!-- Reducer -> State (写回) -->
         <line class="edge core" x1="450" y1="270" x2="450" y2="88"></line>
         <text class="lbl sm" x="460" y="180">写回</text>
-
-        <!-- Edge: A -> B -->
         <path class="edge" d="M 210 186 Q 450 140 690 186" fill="none"></path>
         <text class="lbl sm" x="450" y="140" text-anchor="middle">Edge: A → B</text>
       </svg>
-      <div class="fig-cap">图 1.2：State 在中央，节点读写都经过它；更新经 Reducer 合并后写回，边把控制流从 A 传到 B。</div>
+      <div class="fig-cap">图 1.2：四个部件怎么咬合。节点之间不直接传数据，都经过 State 中转；更新由 Reducer 合并后写回；Edge 决定控制流往哪走。</div>
     </div>
-    <p>关键点：节点之间<strong>不直接传数据</strong>，而是都通过 State 中转。这就是为什么 LangGraph 能支持循环、并行、断点恢复——因为状态是显式的、可持久化的，而不是藏在某个函数调用栈里的局部变量。</p>
+    <p>读这张图先记住一条：<strong>节点之间不直接传数据</strong>。A 的结果不是作为函数参数传给 B 的，而是先落进 State，B 再从 State 里读。为什么非要绕这一道？因为只有状态是「图以外、函数以外」的显式数据，循环才能在任意一步停下来、停下来的状态才能存盘、存了盘才能换个进程接着跑——这些正是 1.1 三个症状的解药。状态藏在函数调用栈里的话，以上全部免谈。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.3</span>State（状态）：图的共享数据结构</h2>
-    <p><strong>一句话定义：</strong>State 是图的共享数据结构，通常用 <code class="inline">TypedDict</code> 定义，所有节点都读写它。</p>
-    <p>State 是 LangGraph 的「主内存」。每个节点拿到的输入就是当前 State 的一个快照，节点做完事后返回的更新会被合并回 State。用 <code class="inline">TypedDict</code> 是因为它既能给编辑器/类型检查器提示字段类型，又能在运行时像普通 dict 一样使用——不需要写 dataclass 或 pydantic 模型（当然你也<strong>可以</strong>用它们，LangGraph 都支持）。</p>
-    <div class="code-title">代码来源说明 — State 的两种典型字段：带 reducer 的 messages、普通字段 count。</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
-<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
-<span class="kw">from</span> langgraph.graph <span class="kw">import</span> add_messages
+    <h2><span class="num">1.3</span>State：数据放哪，节点怎么共享</h2>
+    <p><strong>一份所有节点共享的结构化数据。</strong>LangGraph 里你用一个 <code class="inline">TypedDict</code> 声明它（也可以用 Pydantic，第 3 章对比两者取舍）：每个字段就是一项「目前已知的信息」。执行时，每个节点拿到的输入是当前 State 的完整快照；节点做完事返回的更新，由框架合并回 State（<em>怎么合并</em>是 1.6 的事，这里先按下）。</p>
+    <div class="code-title">代码来源说明 — 最朴素的 State：两个普通字段，先不带任何注解。</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 
 
 <span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
-    <span class="cmt"># messages 用 add_messages 归约器：追加而非覆盖</span>
-    messages: Annotated[list, add_messages]
-    <span class="cmt"># count 是普通字段，默认行为是"最后写入者胜"(LastValue)</span>
+    <span class="cmt"># 对话历史：每一轮都要接着上一轮长，而不是被新消息顶掉</span>
+    messages: <span class="cl">list</span>
+    <span class="cmt"># 普通计数字段：每步直接给最新值</span>
     count: <span class="cl">int</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这里有两个字段，展示了 State 的两种典型用法。<code class="inline">messages</code> 加了 <code class="inline">Annotated[list, add_messages]</code>，意味着每次节点返回新消息时，它们会被<strong>追加</strong>到列表里（而不是替换整个列表）；<code class="inline">count</code> 没有任何注解，所以用默认的 <code class="inline">LastValue</code> 通道——后写覆盖先写。这是「状态合并语义」在最常见场景里的体现：聊天历史要累积、计数器要覆盖。</div>
-    <p><strong>在图中的角色：</strong>State 是数据的「单一事实来源（single source of truth）」。节点之间不直接传参，而是都通过 State 中转。这让图的执行可以被暂停、持久化、恢复——因为状态是显式可序列化的。</p>
+    <div class="annotation"><b>为什么用 TypedDict：</b> 它运行时就是一个普通 dict——零开销、编辑器和 mypy 都认识，后面还能通过 <code class="inline">Annotated</code> 在字段上挂合并规则（1.6）。注意这份定义此刻<strong>什么注解都没挂</strong>，这是故意的：<code class="inline">messages</code> 写成这样，第一轮对话之后历史就会丢——这颗雷 1.6 会当场引爆，现在先记住「字段 = 一份共享数据」就够了。</div>
+    <p><strong>在整张图里，State 扮演的是唯一事实来源（single source of truth）。</strong>节点不互相传参（见 1.2 的图），一切以 State 为准。这带来的直接回报：状态是显式的、可序列化的——所以图可以暂停后恢复、恢复时可以用存盘的状态。第 6 章（人机协同）和第 9 章（持久化）都站在这个设计上。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.4</span>Node（节点）：执行计算单元</h2>
-    <p><strong>一句话定义：</strong>Node 是一个普通函数 <code class="inline">def node(state) -&gt; partial_state</code>，接收当前状态，返回<strong>状态更新</strong>（不是全量状态）。</p>
-    <p>这是新手最容易踩的坑：节点返回的不是完整的新 State，而是<strong>只想修改的那几个字段的更新</strong>。比如 State 有 <code class="inline">messages</code> 和 <code class="inline">count</code> 两个字段，但你的节点只想追加一条消息，那就只返回 <code class="inline">{"messages": [...]}</code>，不用管 <code class="inline">count</code>。LangGraph 会把你的更新和现有 State 合并（怎么合并由 Reducer 决定）。</p>
+    <h2><span class="num">1.4</span>Node：每一步怎么写</h2>
+    <p><strong>答案朴素得可疑：一个普通 Python 函数。</strong>签名固定为「接收 State，返回一个 dict」。调 LLM、查数据库、执行工具，都在这个函数里做。</p>
+    <p>但有一个新手最容易踩的约定藏在返回值里：<strong>节点返回的不是完整的新 State，而是只想修改的那几个字段的更新。</strong>State 有 <code class="inline">messages</code> 和 <code class="inline">count</code> 两个字段，你的节点只想追加一条消息，就只返回 <code class="inline">{"messages": [...]}</code>，别管 <code class="inline">count</code>。</p>
     <div class="code-title">代码来源说明 — 一个最小的 chatbot 节点：读最后一条消息、返回一条 AIMessage。</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langchain_core.messages <span class="kw">import</span> <span class="cl">AIMessage</span>
 
@@ -134,17 +185,20 @@
     <span class="cmt"># 做计算：这里用固定回复示意，真实场景会调 LLM</span>
     reply = <span class="st">f"你说了：{last_user_msg.content}，我收到了。"</span>
     <span class="cmt"># 返回更新：只写想改的字段，不必返回全量 state</span>
-    <span class="cmt"># add_messages 会把这条 AIMessage 追加到 messages 列表</span>
     <span class="kw">return</span> {<span class="st">"messages"</span>: [<span class="cl">AIMessage</span>(content=reply)]}</pre>
-    <div class="annotation"><b>读懂这段：</b> 节点签名是 <code class="inline">State -&gt; Partial[State]</code>。返回值可以是 <code class="inline">dict</code>、也可以是 <code class="inline">Command</code> 对象（后者还能顺便控制跳转，后面控制流章节会讲）。节点还可以接收第二个参数 <code class="inline">config: RunnableConfig</code>，用来拿 <code class="inline">thread_id</code>、回调等运行时信息。注意这里只返回 <code class="inline">messages</code>——只改你关心的一两个字段，是 LangGraph 的核心约定。</div>
-    <p><strong>在图中的角色：</strong>Node 是「动词」，负责所有的计算——调 LLM、查数据库、执行工具、做判断。一个图里可以有任意多个节点，每个节点是一个独立的、可测试的、可重试的单元。</p>
+    <div class="annotation"><b>签名的准确读法：</b> <code class="inline">State -&gt; Partial[State]</code>——返回值是「更新请求」，不是新状态。框架拿到这个 dict 后，交给每个字段的合并规则去落地（1.6）。返回值也可以是 <code class="inline">Command</code> 对象（顺便控制下一跳，第 4 章会讲）。节点还能接收第二个参数 <code class="inline">config: RunnableConfig</code>，用来取 <code class="inline">thread_id</code>、回调等运行时信息。「只返回要改的字段」这个约定是节点可复用、可单测的前提：一个只依赖输入、只声明自己输出的函数，才好放进不同的图里跑。</div>
+    <p><strong>节点是图里的「动词」</strong>：调 LLM、查数据库、执行工具、做判断，全在节点里。一个节点就是一个可独立测试、可重试的单元——这个性质后面会被反复兑现（重试策略、超时控制、断点恢复都挂在节点这一层）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.5</span>Edge（边）：定义控制流</h2>
-    <p><strong>一句话定义：</strong>Edge 定义节点之间的控制流，分普通边（<code class="inline">add_edge</code>）和条件边（<code class="inline">add_conditional_edges</code>）。</p>
-    <p>普通边是「固定的下一步」：A 跑完一定去 B。条件边是「看情况」：A 跑完后，调用一个路由函数，根据当前 State 决定去哪个节点（或去 <code class="inline">END</code> 结束）。条件边是构建 ReAct 循环、多 agent 路由的核心——没有它，图就只能是一条直线。</p>
-    <div class="code-title">代码来源说明 — ReAct 骨架：普通边进 chatbot，条件边决定去 tools 还是 END,tools 回 chatbot 形成循环。</div>
+    <h2><span class="num">1.5</span>Edge：流程怎么走，循环怎么转</h2>
+    <p><strong>下一步去哪？</strong>LangGraph 的答案是「边」，分两种：</p>
+    <ul>
+      <li><strong>普通边</strong>（<code class="inline">add_edge</code>）：A 跑完一定去 B，写死的顺序。</li>
+      <li><strong>条件边</strong>（<code class="inline">add_conditional_edges</code>）：A 跑完后，调一个路由函数看当前 State，决定去哪个节点（或去 <code class="inline">END</code> 收工）。</li>
+    </ul>
+    <p>没有条件边，图就只能是一条直线——1.1 的三个症状一个都治不了。条件边是 agent「看起来在自主决策」的全部秘密：所谓决策，就是路由函数读了 State 之后返回一个「下一站的名字」。</p>
+    <div class="code-title">代码来源说明 — ReAct 骨架：普通边进 chatbot，条件边决定去 tools 还是 END，tools 回 chatbot 形成循环。</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.graph <span class="kw">import</span> <span class="cl">StateGraph</span>, START, END
 
 
@@ -156,13 +210,13 @@
         <span class="cmt"># AI 想调工具，就去 tools 节点</span>
         <span class="kw">return</span> <span class="st">"tools"</span>
     <span class="cmt"># 没有工具调用，直接结束</span>
-    <span class="kw">return</span> END
+    <span class="kw">return</span> <span class="cl">END</span>
 
 
 builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>)
 builder.<span class="fn">add_node</span>(<span class="st">"chatbot"</span>, chatbot)
-<span class="cmt"># some_tool_node 是个会执行 tool_calls、回填 ToolMessage 的节点。
-# 本页聚焦控制流，先把它的实现当成"黑盒"——见第 5 章(5.6)的 ToolNode</span>
+<span class="cmt"># some_tool_node 是个会执行 tool_calls、回填 ToolMessage 的节点。</span>
+<span class="cmt"># 本页聚焦控制流，先把它的实现当成"黑盒"——见第 5 章的 ToolNode</span>
 builder.<span class="fn">add_node</span>(<span class="st">"tools"</span>, some_tool_node)
 
 <span class="cmt"># 普通边：入口固定进 chatbot</span>
@@ -171,34 +225,15 @@ builder.<span class="fn">add_edge</span>(START, <span class="st">"chatbot"</span
 builder.<span class="fn">add_conditional_edges</span>(<span class="st">"chatbot"</span>, should_continue)
 <span class="cmt"># 普通边：tools 跑完回 chatbot(形成循环)</span>
 builder.<span class="fn">add_edge</span>(<span class="st">"tools"</span>, <span class="st">"chatbot"</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> 这段代码就是 ReAct agent 的骨架：chatbot 决定要不要调工具，要调就去 tools 节点，调完回 chatbot 继续推理，循环到不需要调工具为止。<code class="inline">START</code> 和 <code class="inline">END</code> 是 LangGraph 的两个保留字（实际值是 <code class="inline">"__start__"</code> 和 <code class="inline">"__end__"</code>），分别代表图的入口和出口。条件边返回的字符串就是「下一站的名字」，这是 agent 能「自主决策」的关键。</div>
-    <p><strong>在图中的角色：</strong>Edge 是「连线」，决定数据/控制流往哪走。普通边让图变成「流水线」，条件边让图变成「状态机」——能根据运行时状态动态选择路径，这是 agent 能「自主决策」的基础。</p>
+    <div class="annotation"><b>十几行，就是完整骨架：</b> 这就是 ReAct agent（第 5 章会从零搭一遍）：chatbot 决定要不要调工具，要调就去 tools，调完回 chatbot 继续推理，循环到不需要为止。<code class="inline">START</code> 和 <code class="inline">END</code> 是两个保留字（实际值是 <code class="inline">"__start__"</code> 和 <code class="inline">"__end__"</code>，源码 constants.py:30/28 里用 <code class="inline">sys.intern</code> 定义的），代表图的入口和出口。条件边返回的字符串就是「下一站节点名」——1.1 那个「查几轮不知道」的需求，到这里变成了一个返回字符串的普通函数。</div>
+    <p>再对照图 1.1 右半看一遍：那两条一正一反的箭头不是装饰，就是这段代码里的 <code class="inline">add_conditional_edges</code> 和 <code class="inline">add_edge</code>。<strong>循环不是控制流补丁，是图的一部分</strong>——这正是它能被持久化、被暂停的原因（每一步转移都是图结构上显式的一笔）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.6</span>Reducer（归约器）：状态合并方式</h2>
-    <p><strong>一句话定义：</strong>Reducer 用 <code class="inline">Annotated[type, reducer]</code> 指定某个字段的状态如何合并，签名是 <code class="inline">(old_value, new_value) -&gt; merged_value</code>。</p>
-    <p>这是 LangGraph 区别于普通函数调用的关键设计。考虑一个场景：两个节点并行执行，都往 <code class="inline">messages</code> 里写了新消息。如果没有 Reducer，后写的会覆盖先写的；有了 Reducer，框架知道该把它们<strong>合并</strong>起来。最常用的 Reducer 是 <code class="inline">add_messages</code>——它把新消息追加到旧列表里（而不是替换），并且如果新消息和某条旧消息 ID 相同，就替换那条（支持「编辑历史消息」）。</p>
-    <div class="code-title">代码来源说明 — add_messages 的合并行为：追加、同 ID 替换、支持 RemoveMessage 删除。</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
-<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
-<span class="kw">from</span> langgraph.graph <span class="kw">import</span> add_messages
-
-
-<span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
-    <span class="cmt"># add_messages： 追加新消息；同 ID 则替换；支持 RemoveMessage 删除</span>
-    messages: Annotated[list, add_messages]
-    <span class="cmt"># 自定义 reducer：用 operator.add 把列表拼起来</span>
-    <span class="cmt"># steps: Annotated[list, operator.add]</span>
-    <span class="cmt"># 没有注解的字段 -&gt; LastValue(后写覆盖)</span>
-
-
-<span class="cmt"># 看 add_messages 的合并行为：</span>
-<span class="cmt"># old = [HumanMessage("你好", id="1")]</span>
-<span class="cmt"># new = [AIMessage("你好啊", id="2")]</span>
-<span class="cmt"># 合并后 = [HumanMessage("你好", id="1"), AIMessage("你好啊", id="2")]</span>
-<span class="cmt"># 如果 new 里有 id="1" 的消息，它会替换 old 里那条，而不是追加</span></pre>
-    <div class="annotation"><b>读懂这段：</b> Reducer 的存在让「并行节点写同一字段」变得安全。默认的 <code class="inline">LastValue</code> 通道每一步只能接收一个值，如果同一 step 有两个节点同时写一个非 Reducer 字段，会直接报错（<code class="inline">InvalidUpdateError</code>）；而带 Reducer 的字段会把多个更新归约成一个。这也是为什么聊天历史必须用 <code class="inline">add_messages</code>——否则多轮对话的每条消息都会被下一条覆盖掉。</div>
+    <h2><span class="num">1.6</span>Reducer：两个节点同时写一个字段，怎么办</h2>
+    <p><strong>这也是最容易被低估的一问。</strong>1.4 说节点返回「更新」，那更新怎么落到 State 上？这个问题在两种场景下会爆：</p>
+    <p><strong>场景一：单节点顺序写。</strong>user 节点往 <code class="inline">messages</code> 写一条用户消息，bot 节点接着写一条回复。如果合并规则是「新值覆盖旧值」，第一轮的用户消息就被第二轮的回复顶掉了——多轮对话等于每轮失忆。<strong>场景需要一个能「追加」的字段。</strong></p>
+    <p><strong>场景二：并行写入。</strong>两个节点在同一步被并行执行，都往 <code class="inline">hello</code> 写值。没有合并规则的话，框架直接拒绝执行——下面这段代码可以原样跑一遍，亲手撞一次这个错：</p>
     <div class="code-title">最小复现：两个并行节点写同一字段，触发 InvalidUpdateError</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> <span class="cl">StateGraph</span>
@@ -206,7 +241,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"tools"</span>, <span 
 
 
 <span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
-    <span class="cmt"># hello 没有 reducer -&gt； 默认 LastValue，每步只能收一个值</span>
+    <span class="cmt"># hello 没有 reducer -&gt; 默认 LastValue，每步只收一个值</span>
     hello: <span class="cl">str</span>
 
 
@@ -224,20 +259,80 @@ builder.<span class="fn">add_edge</span>(<span class="st">"a"</span>, <span clas
 graph = builder.<span class="fn">compile</span>()
 
 graph.<span class="fn">invoke</span>({<span class="st">"hello"</span>: <span class="st">"there"</span>})
-<span class="cmt"># InvalidUpdateError: At key 'hello': Can receive only one value per step.
-#                Use an Annotated key to handle multiple values.</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">a</code> 跑完后同时把控制流交给 <code class="inline">b</code> 和 <code class="inline">c</code>（fan-out），它们在同一 step 都写了 <code class="inline">hello</code>。因为 <code class="inline">hello</code> 没挂 reducer，背后是 <code class="inline">LastValue</code> 通道，它每步只认一个值——两个写入撞在一起就报错。解法是给字段配 reducer（比如 <code class="inline">Annotated[str, lambda o, n: n]</code>，或干脆用一个能归约的类型）。这个「为什么需要 reducer」的故事，在 1.7 讲 Reducer 与 Channel 的关系时会再落到底层通道上。</div>
-    <p><strong>在图中的角色：</strong>Reducer 是「合并规则」，定义在 State 的类型注解上。它让状态更新变成可组合、可并行的操作，而不是粗暴的覆盖。理解 Reducer 是理解 LangGraph 并行执行和消息累积的前提。至于 reducer 函数最终是被谁调用、存在哪一层抽象里，留给下一节的 Channel。</p>
+<span class="cmt"># InvalidUpdateError: At key 'hello': Can receive only one value per step.</span>
+<span class="cmt">#                Use an Annotated key to handle multiple values.</span></pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="cr61t cr61d">
+        <title id="cr61t">并行写入撞车与 reducer 合并</title>
+        <desc id="cr61d">上半部分：节点 b 和 c 在同一 super-step 各写一个值，LastValue 盒子收到两个值，抛 InvalidUpdateError；下半部分：字段配了 reducer 后，两个值逐个喂给合并函数，结果正常写回。</desc>
+        <defs>
+          <marker id="ar11b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <text class="lbl" x="230" y="26" text-anchor="middle">没有 reducer：撞车</text>
+        <rect class="node" x="30" y="46" width="150" height="48" rx="8"></rect>
+        <text class="lbl sm" x="105" y="66" text-anchor="middle">节点 b</text>
+        <text class="lbl sm code" x="105" y="84" text-anchor="middle">写 "world"</text>
+        <rect class="node" x="30" y="130" width="150" height="48" rx="8"></rect>
+        <text class="lbl sm" x="105" y="150" text-anchor="middle">节点 c</text>
+        <text class="lbl sm code" x="105" y="168" text-anchor="middle">写 "world"</text>
+        <line class="edge acc" x1="182" y1="76" x2="368" y2="92" marker-end="url(#ar11b)"></line>
+        <line class="edge acc" x1="182" y1="150" x2="368" y2="112" marker-end="url(#ar11b)"></line>
+        <text class="lbl sm" x="272" y="128" text-anchor="middle">同一 super-step 的两个写入</text>
+        <rect class="node warn" x="370" y="60" width="240" height="84" rx="8"></rect>
+        <text class="lbl" x="490" y="88" text-anchor="middle">LastValue 盒子</text>
+        <text class="lbl sm" x="490" y="108" text-anchor="middle">update(["world", "world"])</text>
+        <text class="lbl sm code" x="490" y="128" text-anchor="middle">len(values) != 1 → raise</text>
+        <line class="edge" x1="612" y1="102" x2="648" y2="102" marker-end="url(#ar11b)"></line>
+        <text class="lbl code" x="700" y="96">InvalidUpdateError</text>
+        <line class="st" x1="20" y1="216" x2="880" y2="216" stroke-dasharray="5 4"></line>
+
+        <text class="lbl" x="230" y="240" text-anchor="middle">配了 reducer：合并</text>
+        <rect class="node" x="30" y="262" width="150" height="48" rx="8"></rect>
+        <text class="lbl sm" x="105" y="282" text-anchor="middle">节点 b、c</text>
+        <text class="lbl sm code" x="105" y="300" text-anchor="middle">并行各写 "world"</text>
+        <line class="edge acc" x1="182" y1="286" x2="368" y2="284" marker-end="url(#ar11b)"></line>
+        <text class="lbl sm" x="272" y="274" text-anchor="middle">两个写入</text>
+        <rect class="node acc" x="370" y="252" width="260" height="64" rx="8" fill="#d9ead3" stroke="#4a8a3f"></rect>
+        <text class="lbl" x="500" y="274" text-anchor="middle">BinaryOperatorAggregate 盒子</text>
+        <text class="lbl sm" x="500" y="292" text-anchor="middle">for value in values:</text>
+        <text class="lbl sm code" x="500" y="308" text-anchor="middle">value = operator(old, value)</text>
+      </svg>
+      <div class="fig-cap">图 1.6：同一份 State，两种下场。上：无 reducer 的字段被两个并行写入撞上，LastValue 盒子直接抛错；下：配了 reducer 的字段把两个写入逐个归约成一个结果。细节见 1.7 的源码。</div>
+    </div>
+    <p><strong>统一解法：给字段挂一个 Reducer</strong>——一个签名固定为 <code class="inline">(旧值, 新值) -&gt; 合并结果</code> 的函数，写在字段的 <code class="inline">Annotated</code> 注解上。它同时解决上面两个场景：单节点反复写时怎么累积（覆盖还是追加），以及多个并行写入怎么归约成一个确定结果。</p>
+    <div class="code-title">代码来源说明 — add_messages 的合并行为：追加、同 ID 替换、支持 RemoveMessage 删除。</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
+<span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
+<span class="kw">from</span> langgraph.graph <span class="kw">import</span> add_messages
+
+
+<span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
+    <span class="cmt"># add_messages： 追加新消息；同 ID 则替换；支持 RemoveMessage 删除</span>
+    messages: Annotated[<span class="cl">list</span>, add_messages]
+    <span class="cmt"># 自定义 reducer：用 operator.add 把列表拼起来</span>
+    <span class="cmt"># steps: Annotated[list, operator.add]</span>
+    <span class="cmt"># 没有注解的字段 -&gt; LastValue(后写覆盖)</span>
+
+
+<span class="cmt"># 看 add_messages 的合并行为：</span>
+<span class="cmt"># old = [HumanMessage("你好", id="1")]</span>
+<span class="cmt"># new = [AIMessage("你好啊", id="2")]</span>
+<span class="cmt"># 合并后 = [HumanMessage("你好", id="1"), AIMessage("你好啊", id="2")]</span>
+<span class="cmt"># 如果 new 里有 id="1" 的消息，它会替换 old 里那条，而不是追加</span></pre>
+    <div class="annotation"><b>1.3 埋的雷，在这里拆：</b> <code class="inline">messages: list</code> 改成 <code class="inline">Annotated[list, add_messages]</code>，一个注解，把「覆盖语义」换成了「追加语义」。这就是 Reducer 的全部形式：不是什么新 API，是字段注解上的一个二元函数。<strong>凡是要累积历史的字段，必须配 reducer；凡是「最新值即真相」的字段（计数器、当前路由），不配反而是对的。</strong>选择权在你，判断依据是字段的业务语义。</div>
+    <div class="callout warn"><b class="tag">建议实跑一次</b> 上面那个最小复现值得认真跑一遍：<code class="inline">InvalidUpdateError: Can receive only one value per step</code> 是 LangGraph 新手报错率第一名。它的根源、以及 reducer 函数到底被谁调用，下一节的 Channel 会落到底。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.7</span>Channel（通道）：底层状态存储抽象</h2>
-    <p><strong>一句话定义：</strong>Channel 是 State 每个字段在编译后对应的「存储盒子」——它规定了这个字段「怎么存、怎么更新、怎么持久化」。</p>
-    <p>你在 State 里写的 <code class="inline">messages</code>、<code class="inline">count</code> 这些字段，在编译时不会变成普通的 Python 变量，而是各自被包进一个 Channel 对象。前面 1.6 你写的 <code class="inline">Annotated[list, add_messages]</code> 注解，编译时就变成了一个 <strong>「带 reducer 的盒子」</strong>；没有注解的字段则变成 <strong>「只认最后一个值的盒子」</strong>。Channel 就是 Reducer 真正落脚的那一层——reducer 函数不是凭空被调用的，而是被盒子的 <code class="inline">update()</code> 方法调用的。</p>
+    <h2><span class="num">1.7</span>Channel：合并逻辑落在哪一层</h2>
+    <p><strong>1.6 说 reducer 决定合并——那 reducer 是被谁、在什么时刻调用的？</strong>答案藏在 State 每个字段背后的运行时结构里。你写的 <code class="inline">messages</code>、<code class="inline">count</code>，在编译时不会变成普通的 Python 变量，而是各自被包进一个 <strong>Channel（通道）</strong>对象——可以理解成「每个字段一个盒子」，盒子规定了这个字段怎么存、怎么收更新、怎么存盘。</p>
+    <p>对应关系是机械的：1.6 里你写的 <code class="inline">Annotated[list, add_messages]</code>，编译时变成一个「拿 reducer 合并多个写入」的盒子；没写注解的字段，变成一个「只认最后一个写入」的盒子。reducer 函数不是被框架凭空调用的——它是盒子 <code class="inline">update()</code> 方法里的一行代码。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ch-tid ch-did">
         <title id="ch-tid">State 字段到 Channel 的映射</title>
-        <desc id="ch-did">State 的两个字段分别映射到两种 Channel 盒子：messages 映射到 BinaryOperatorAggregate(add_messages),count 映射到 LastValue。</desc>
+        <desc id="ch-did">State 的两个字段分别映射到两种 Channel 盒子：messages 映射到 BinaryOperatorAggregate(add_messages)，count 映射到 LastValue。</desc>
         <defs>
           <marker id="arrow17" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
@@ -248,20 +343,17 @@ graph.<span class="fn">invoke</span>({<span class="st">"hello"</span>: <span cla
         <text class="lbl sm code" x="180" y="98" text-anchor="middle">messages: Annotated[...,</text>
         <text class="lbl sm code" x="180" y="115" text-anchor="middle">           add_messages]</text>
         <text class="lbl sm code" x="180" y="148" text-anchor="middle">count: int</text>
-
         <rect class="node acc" x="600" y="20" width="270" height="64" rx="8"></rect>
         <text class="lbl" x="735" y="44" text-anchor="middle">BinaryOperatorAggregate</text>
         <text class="lbl sm" x="735" y="64" text-anchor="middle">盒子：能合并多个更新 → 调 add_messages</text>
-
         <rect class="node acc" x="600" y="126" width="270" height="64" rx="8"></rect>
-        <text class="lbl" x="735" y="150" text-anchor="middle">LastValue</text>
-        <text class="lbl sm" x="735" y="170" text-anchor="middle">盒子：只存最后一个值，每步只收一个</text>
-
+        <text class="lbl" x="735" y="152" text-anchor="middle">LastValue</text>
+        <text class="lbl sm" x="735" y="172" text-anchor="middle">盒子：只存最后一个值，每步只收一个</text>
         <path class="edge acc" d="M300 92 C 430 92, 470 52, 598 52" fill="none" stroke-width="1.6" marker-end="url(#arrow17)"></path>
         <path class="edge acc" d="M300 148 C 430 148, 470 158, 598 158" fill="none" stroke-width="1.6" marker-end="url(#arrow17)"></path>
         <text class="lbl sm" x="440" y="72" text-anchor="middle">编译时自动推断</text>
       </svg>
-      <div class="fig-cap">图 1.7：State 字段 → Channel 盒子。带 reducer 的注解变成能合并的盒子，普通字段变成只存最后一个值的盒子。推断逻辑在 state.py:1850 的 _get_channel，无注解字段走 state.py:1871 的 LastValue fallback。</div>
+      <div class="fig-cap">图 1.7：State 字段 → Channel 盒子。带 reducer 注解的字段变成能合并的盒子，普通字段变成只存最后一个值的盒子。推断逻辑在 state.py:1850 的 _get_channel，无注解字段走 state.py:1871 的 LastValue 兜底。</div>
     </div>
     <p>盒子的种类由<strong>有没有 reducer 注解</strong>决定，框架在编译时自动推断，你不用手写：</p>
     <table class="tbl">
@@ -269,39 +361,75 @@ graph.<span class="fn">invoke</span>({<span class="st">"hello"</span>: <span cla
         <tr><th>字段写法</th><th>编译后的 Channel</th><th>盒子的「更新规则」</th></tr>
       </thead>
       <tbody>
-        <tr><td><code class="inline">messages: Annotated[list, add_messages]</code></td><td><code class="inline">BinaryOperatorAggregate(add_messages)</code></td><td>把所有写入用 reducer 逐个合并（追加 / 同 ID 替换）</td></tr>
+        <tr><td><code class="inline">messages: Annotated[list, add_messages]</code></td><td><code class="inline">BinaryOperatorAggregate(add_messages)</code></td><td>把所有写入用 reducer 逐个归并（追加 / 同 ID 替换）</td></tr>
         <tr><td><code class="inline">count: int</code>（无注解）</td><td><code class="inline">LastValue(int)</code></td><td>只保留最后一个值；<strong>同一 step 收到 2 个值就报错</strong></td></tr>
-        <tr><td><code class="inline">x: Annotated[int, EphemeralValue(int)]</code></td><td><code class="inline">EphemeralValue</code></td><td>值只存活一个 super-step：写入它的那步 checkpoint 里有它，下一个 super-step 一开始就被清空（临时值）</td></tr>
+        <tr><td><code class="inline">x: Annotated[int, EphemeralValue(int)]</code></td><td><code class="inline">EphemeralValue</code></td><td>临时值：写入后只对紧接着的下一个 super-step 可读，随后自动清空（图入口的 START 通道就是它，state.py:1354）</td></tr>
       </tbody>
     </table>
-    <p>每个 Channel 对外都暴露三个核心方法：<code class="inline">get()</code>（读当前值）、<code class="inline">update(values)</code>（收一批写入、合并进盒子）、<code class="inline">checkpoint()</code>（把当前值序列化存盘）。自己写自定义 Channel 时，抽象基类 <code class="inline">BaseChannel</code> 强制要求实现 <code class="inline">get()</code>/<code class="inline">update()</code>/<code class="inline">from_checkpoint()</code> 三者（<code class="inline">checkpoint()</code> 有默认实现）。Pregel 引擎在每个 super-step 结束时，统一调所有盒子的 <code class="inline">update()</code>，这就是 Reducer 真正被调用的时刻。</p>
-    <div class="code-title">代码来源说明 — LastValue.update 的「每步只收一个」逻辑（last_value.py:56，错误信息见 last_value.py:61）。</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LastValue</span>(<span class="cl">BaseChannel</span>):
-    <span class="cmt"># 源码 last_value.py:56 —— 这就是 1.6 那个 InvalidUpdateError 的发源地</span>
-    <span class="kw">def</span> <span class="fn">update</span>(<span class="kw">self</span>, values: <span class="cl">Sequence</span>[<span class="cl">Value</span>]) -&gt; <span class="cl">bool</span>:
-        <span class="kw">if</span> <span class="fn">len</span>(values) == <span class="nu">0</span>:
-            <span class="kw">return</span> <span class="kw">False</span>
-        <span class="kw">if</span> <span class="fn">len</span>(values) != <span class="nu">1</span>:                      <span class="cmt"># 同一步收了多个值</span>
-            <span class="kw">raise</span> <span class="cl">InvalidUpdateError</span>(            <span class="cmt"># ← 1.6 报的就是这个错</span>
-                <span class="st">f"At key '</span>{<span class="kw">self</span>.key}<span class="st">': Can receive only one value per step."</span>
-            )
-        <span class="kw">self</span>.value = values[-<span class="nu">1</span>]              <span class="cmt"># 只留最后一个，这就是"后写覆盖"</span>
-        <span class="kw">return</span> <span class="kw">True</span>
+    <p>每个 Channel 对外暴露三个核心方法：<code class="inline">get()</code>（读当前值）、<code class="inline">update(values)</code>（收一批写入、合并进盒子）、<code class="inline">checkpoint()</code>（把当前值序列化存盘）。自己写自定义 Channel 时，抽象基类 <code class="inline">BaseChannel</code> 强制实现 <code class="inline">get()</code>/<code class="inline">update()</code>/<code class="inline">from_checkpoint()</code> 三者（<code class="inline">checkpoint()</code> 有默认实现）。Pregel 引擎在每个 super-step 结束时，统一调所有盒子的 <code class="inline">update()</code>——这就是 reducer 真正被执行的时刻。</p>
+    <div class="code-title">代码来源说明 — LastValue.update 的「每步只收一个」逻辑（last_value.py:56 起摘录，报错文案在 last_value.py:64）。</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># langgraph/channels/last_value.py:56 —— 1.6 那个 InvalidUpdateError 的发源地</span>
+<span class="kw">def</span> <span class="fn">update</span>(<span class="kw">self</span>, values: <span class="cl">Sequence</span>[<span class="cl">Value</span>]) -&gt; <span class="cl">bool</span>:
+    <span class="kw">if</span> <span class="fn">len</span>(values) == <span class="nu">0</span>:
+        <span class="kw">return</span> <span class="kw">False</span>
+    <span class="kw">if</span> <span class="fn">len</span>(values) != <span class="nu">1</span>:                    <span class="cmt"># 同一个 super-step 收到多个写入</span>
+        msg = create_error_message(
+            message=<span class="st">f"At key '</span>{<span class="kw">self</span>.key}<span class="st">': Can receive only one value per step. Use an Annotated key to handle multiple values."</span>,
+            error_code=ErrorCode.INVALID_CONCURRENT_GRAPH_UPDATE,
+        )
+        <span class="kw">raise</span> <span class="cl">InvalidUpdateError</span>(msg)       <span class="cmt"># ← 1.6 报的就是这个错</span>
 
-<span class="cmt"># 对比 BinaryOperatorAggregate.update(binop.py:123)——</span>
-<span class="cmt"># 它不报错，而是把多个值逐个喂给 operator(self.value, value):</span>
-<span class="cmt">#   for value in values:</span>
-<span class="cmt">#       self.value = self.operator(self.value, value)   # operator 就是你的 reducer (binop.py:143)</span>
-<span class="cmt"># 所以 add_messages 能"追加"，而不是被覆盖——区别全在这个盒子里。</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 1.6 节那个 <code class="inline">InvalidUpdateError</code> 的根，就在 <code class="inline">LastValue.update</code> 这 4 行里：<code class="inline">b</code>、<code class="inline">c</code> 两个并行节点都写了 <code class="inline">hello</code>，Pregel 把 <code class="inline">["world", "world"]</code> 两个值塞进 <code class="inline">hello</code> 的 LastValue 盒子，<code class="inline">len(values) != 1</code> 直接抛错。而 <code class="inline">BinaryOperatorAggregate</code> 走的是 <code class="inline">for</code> 循环逐个合并，所以它天生能吃多个并行写入。结论：<strong>reducer 注解不是装饰，它决定了你字段的盒子是「会报错」还是「会合并」</strong>。这是 Channel 抽象最值得你记住的一行代码。</div>
-    <div class="callout warn"><b class="tag">要不要手写 Channel</b> 99% 的场景<strong>不用</strong>。你只要会写 <code class="inline">Annotated[type, reducer]</code>，框架就自动给你装上 <code class="inline">BinaryOperatorAggregate</code>；不写就默认 <code class="inline">LastValue</code>（源码 state.py:1871 的 fallback 分支）。只有当你需要一种内置盒子没有的状态语义（只读、自动过期、跨线程共享、增量流式），才去继承 <code class="inline">BaseChannel</code> 自己实现 <code class="inline">get/update/checkpoint</code> 三个方法——第 9 章的 <code class="inline">DeltaChannel</code>（增量流式）就是这种「自定义盒子」的例子。</div>
-    <p><strong>在图中的角色：</strong>Channel 是「存储引擎」，藏在 State 背后。它是 Reducer 的载体——你在 State 注解里写的每一条合并规则，最终都落到某个 Channel 盒子的 <code class="inline">update()</code> 里执行。日常把它当作「实现细节」忽略完全没问题，但当你看到 <code class="inline">InvalidUpdateError</code> 或想理解「为什么流式能拿到增量」时，记住：答案在盒子这一层。</p>
+    <span class="kw">self</span>.value = values[-<span class="nu">1</span>]                <span class="cmt"># 只留最后一个，这就是「后写覆盖」</span>
+    <span class="kw">return</span> <span class="kw">True</span></pre>
+    <div class="code-title">对比 — BinaryOperatorAggregate.update 的归约循环（binop.py:123 起摘录，reducer 调用在 binop.py:143）。</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># langgraph/channels/binop.py:123 —— 它不报错，把多个写入逐个归约：</span>
+<span class="kw">def</span> <span class="fn">update</span>(<span class="kw">self</span>, values: <span class="cl">Sequence</span>[<span class="cl">Value</span>]) -&gt; <span class="cl">bool</span>:
+    <span class="kw">if</span> <span class="kw">not</span> values:
+        <span class="kw">return</span> <span class="kw">False</span>
+    <span class="kw">if</span> <span class="kw">self</span>.value <span class="kw">is</span> <span class="cl">MISSING</span>:
+        <span class="kw">self</span>.value = values[<span class="nu">0</span>]              <span class="cmt"># 第一个写入直接播种</span>
+        values = values[<span class="nu">1</span>:]
+    <span class="kw">for</span> value <span class="kw">in</span> values:                    <span class="cmt"># 剩下的逐个喂给合并函数</span>
+        <span class="kw">self</span>.value = <span class="kw">self</span>.operator(<span class="kw">self</span>.value, value)  <span class="cmt"># (binop.py:143)</span>
+    <span class="kw">return</span> <span class="kw">True</span></pre>
+    <div class="annotation"><b>报错的根：</b> 1.6 那个 <code class="inline">InvalidUpdateError</code>，根就在 <code class="inline">LastValue.update</code> 的 <code class="inline">len(values) != 1</code> 分支里：b、c 两个并行节点都写了 <code class="inline">hello</code>，Pregel 在每个 super-step 结束时把 <code class="inline">["world", "world"]</code> 两个值送进 hello 的 LastValue 盒子（触发点在 pregel/_algo.py:319 的 <code class="inline">channels[chan].update(vals)</code>），直接抛错。而 <code class="inline">BinaryOperatorAggregate</code> 先用第一个写入播种，再把剩下的逐个喂给 <code class="inline">operator</code>——也就是你的 reducer——天生能吃多个并行写入。结论：<strong>reducer 注解不是类型装饰，它决定你字段的盒子是「遇到并行写入就报错」还是「把并行写入合并起来」。</strong></div>
+    <div class="callout warn"><b class="tag">要不要手写 Channel</b> 99% 的场景不用。会写 <code class="inline">Annotated[type, reducer]</code>，框架就自动配 BinaryOperatorAggregate；不写就默认 LastValue（state.py:1871 的 fallback 分支）。只有当内置盒子给不了你要的状态语义（只读、自动过期、跨线程共享、增量流式），才去继承 BaseChannel 实现 get/update/checkpoint——第 9 章的 DeltaChannel（增量流式）就是这种自定义盒子的实例。</div>
+    <p>日常开发可以完全忽略这一层，把它当实现细节；但有两类时刻它必须被想起来：<strong>遇到 InvalidUpdateError 想知道为什么</strong>，以及<strong>想知道流式输出为什么能拿到增量</strong>——两个答案都在盒子里。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.8</span>Compile（编译）：StateGraph → Runnable</h2>
-    <p><strong>一句话定义：</strong><code class="inline">compile()</code> 把 <code class="inline">StateGraph</code>（构建器）变成 <code class="inline">CompiledStateGraph</code>（一个 Runnable），之后可以 <code class="inline">invoke</code> / <code class="inline">stream</code> / <code class="inline">batch</code>。</p>
-    <p><code class="inline">StateGraph</code> 是一个<strong>构建器（builder）</strong>——你往里 add_node、add_edge，它只是把结构存起来，不能直接运行。调用 <code class="inline">compile()</code> 后，它会校验图（有没有入口、有没有孤立节点）、把每个 State 字段转成 Channel、把节点和边转成执行计划，最终产出一个 <code class="inline">CompiledStateGraph</code>。这个编译后的对象实现了 LangChain 的 <code class="inline">Runnable</code> 接口，所以它和 LCEL 链一样可以 <code class="inline">invoke</code>、<code class="inline">stream</code>、<code class="inline">batch</code>、<code class="inline">ainvoke</code>。</p>
+    <h2><span class="num">1.8</span>Compile：从声明到能跑的程序</h2>
+    <p><strong>最后一个问题：节点、边、字段都声明完了，什么时候真正跑起来？为什么 builder 不能直接 invoke？</strong>因为 <code class="inline">StateGraph</code> 只是一个构建器（builder）——add_node、add_edge 只是把结构存进内存，此时连图的合法性都没检查过。调用 <code class="inline">compile()</code> 后它才变成可执行的 <code class="inline">CompiledStateGraph</code>。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="cp18t cp18d">
+        <title id="cp18t">compile() 三步</title>
+        <desc id="cp18d">StateGraph 构建器经 compile() 做三件事：校验图结构、把 State 字段转成 Channel、把节点和边编译成 Pregel 执行计划，产出可 invoke/stream/batch 的 CompiledStateGraph。</desc>
+        <defs>
+          <marker id="ar11c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="20" y="80" width="210" height="100" rx="10"></rect>
+        <text class="lbl" x="125" y="112" text-anchor="middle">StateGraph（builder）</text>
+        <text class="lbl sm" x="125" y="136" text-anchor="middle">add_node / add_edge</text>
+        <text class="lbl sm" x="125" y="156" text-anchor="middle">只是存结构，不能跑</text>
+        <line class="edge" x1="230" y1="130" x2="308" y2="130" marker-end="url(#ar11c)"></line>
+        <text class="lbl code" x="269" y="118" text-anchor="middle">compile()</text>
+        <rect class="node core" x="310" y="40" width="260" height="180" rx="10"></rect>
+        <text class="lbl" x="440" y="66" text-anchor="middle">编译三步</text>
+        <text class="lbl sm" x="440" y="94" text-anchor="middle">① 校验：入口？悬空节点？</text>
+        <text class="lbl sm" x="440" y="122" text-anchor="middle">② State 字段 → Channel 盒子</text>
+        <text class="lbl sm" x="440" y="150" text-anchor="middle">③ 节点+边 → Pregel 执行计划</text>
+        <text class="lbl sm" x="440" y="180" text-anchor="middle">（声明式 → 命令式）</text>
+        <line class="edge" x1="570" y1="130" x2="648" y2="130" marker-end="url(#ar11c)"></line>
+        <rect class="node acc" x="650" y="60" width="230" height="140" rx="10"></rect>
+        <text class="lbl" x="765" y="90" text-anchor="middle">CompiledStateGraph</text>
+        <text class="lbl sm" x="765" y="116" text-anchor="middle">一个 Runnable：</text>
+        <text class="lbl sm code" x="765" y="138" text-anchor="middle">invoke / stream / batch</text>
+        <text class="lbl sm code" x="765" y="164" text-anchor="middle">+ checkpointer + thread_id</text>
+      </svg>
+      <div class="fig-cap">图 1.8：compile() 的三步。构建和执行分离——同一个 builder 可以用不同 checkpointer 编译出多个运行实例。</div>
+    </div>
     <div class="code-title">代码来源说明 — 编译带 checkpointer 的图，invoke / stream / batch 用法与 LCEL 一致。</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.graph <span class="kw">import</span> <span class="cl">StateGraph</span>, START, END
 <span class="kw">from</span> langgraph.checkpoint.memory <span class="kw">import</span> <span class="cl">InMemorySaver</span>
@@ -337,33 +465,32 @@ result2 = graph.<span class="fn">invoke</span>(
     [{<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"t1"</span>}}, {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"t2"</span>}}],
 ):
     <span class="kw">pass</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">compile()</code> 还能接收 <code class="inline">interrupt_before</code> / <code class="inline">interrupt_after</code>（在指定节点前后暂停，用于人机协同）、<code class="inline">store</code>（长期记忆）、<code class="inline">debug</code> 等参数。这里只要记住：<strong>构建和执行是分离的</strong>——你先构建图结构，编译后得到一个可复用的、可持久化的执行单元。同一个 thread_id 多次 invoke 会接续状态，这是 checkpointer 带来的「短期记忆」。</div>
-    <p><strong>在图中的角色：</strong>Compile 是「从设计图到可运行程序」的那一步。它做了三件事：校验图结构、把声明式的节点/边/状态编译成命令式的执行计划（Pregel 引擎）、把结果包装成标准 Runnable。这一步让 LangGraph 既能保持声明式的简洁，又能拥有运行时的性能和可控性。</p>
+    <div class="annotation"><b>compile() 还能接什么：</b> <code class="inline">interrupt_before</code> / <code class="inline">interrupt_after</code>（在指定节点前后暂停，人机协同用）、<code class="inline">store</code>（长期记忆）、<code class="inline">debug</code> 等参数。这里记住主线就够：<strong>构建和执行是分开的</strong>——先声明图结构，编译后得到可复用、可持久化的执行单元；同一个 thread_id 多次 invoke 会接续状态，那是 checkpointer 的功劳，第 9 章展开。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">1.9</span>六概念速查表</h2>
     <table class="tbl">
       <thead>
-        <tr><th>概念</th><th>是什么</th><th>怎么用</th><th>类比</th></tr>
+        <tr><th>概念</th><th>回答的问题</th><th>怎么用</th><th>类比</th></tr>
       </thead>
       <tbody>
-        <tr><td><code class="inline">State</code></td><td>共享数据结构</td><td><code class="inline">TypedDict</code> 定义字段</td><td>程序的「内存」</td></tr>
-        <tr><td><code class="inline">Node</code></td><td>计算单元</td><td><code class="inline">def node(state) -&gt; dict</code></td><td>函数/步骤</td></tr>
-        <tr><td><code class="inline">Edge</code></td><td>控制流</td><td><code class="inline">add_edge</code> / <code class="inline">add_conditional_edges</code></td><td>if-else / goto</td></tr>
-        <tr><td><code class="inline">Reducer</code></td><td>状态合并规则</td><td><code class="inline">Annotated[type, reducer]</code></td><td><code class="inline">=</code> vs <code class="inline">+=</code></td></tr>
-        <tr><td><code class="inline">Channel</code></td><td>底层存储抽象</td><td>自动推断（高级可自定义）</td><td>数据库引擎</td></tr>
-        <tr><td><code class="inline">Compile</code></td><td>构建器 → Runnable</td><td><code class="inline">builder.compile()</code></td><td>编译/打包</td></tr>
+        <tr><td><code class="inline">State</code></td><td>数据放哪、怎么共享</td><td><code class="inline">TypedDict</code> 定义字段</td><td>程序的内存</td></tr>
+        <tr><td><code class="inline">Node</code></td><td>每步做什么</td><td><code class="inline">def node(state) -&gt; dict</code></td><td>函数/步骤</td></tr>
+        <tr><td><code class="inline">Edge</code></td><td>下一步去哪</td><td><code class="inline">add_edge</code> / <code class="inline">add_conditional_edges</code></td><td>if-else / goto</td></tr>
+        <tr><td><code class="inline">Reducer</code></td><td>并行写入怎么合并</td><td><code class="inline">Annotated[type, reducer]</code></td><td><code class="inline">=</code> vs <code class="inline">+=</code></td></tr>
+        <tr><td><code class="inline">Channel</code></td><td>合并逻辑的载体</td><td>自动推断（高级可自定义）</td><td>数据库引擎</td></tr>
+        <tr><td><code class="inline">Compile</code></td><td>怎么跑起来</td><td><code class="inline">builder.compile()</code></td><td>编译/打包</td></tr>
       </tbody>
     </table>
-    <div class="callout warn"><b class="tag">为什么是这六个</b> 这六个概念覆盖了「定义数据 → 定义计算 → 定义流转 → 定义合并 → 底层存储 → 产出可执行物」的完整链条。前四个（State/Node/Edge/Reducer）是你<strong>每天都在用</strong>的；Channel 是<strong>偶尔需要</strong>的底层；Compile 是<strong>每次都要调</strong>但通常只用默认参数的。掌握它们之后，后面所有的章节（多 agent、人机协同、持久化）都只是在这六块上做加法。</div>
+    <div class="callout warn"><b class="tag">使用频率分层</b> 前四个（State/Node/Edge/Reducer）每天都在写；Channel 是偶尔要下钻的底层；Compile 每次都调但通常只用默认参数。后面所有章节——多 agent、人机协同、持久化——都只是在这六块上做组合，不再引入新概念。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">1.10</span>新手常犯的错误</h2>
-    <p>正确用法讲了这么多，但真正让人记住一个概念的，往往是<strong>踩过的坑</strong>。下面三个是这一章的六个概念里最高频的误区，每条都对应一个已经讲过的机制——复习时对照着看，比只背「正确写法」更牢。</p>
+    <p>正确用法讲了这么多，但真正让人记住一个概念的，往往是<strong>踩过的坑</strong>。下面三个是这一章的六个概念里最高频的误区，每条都对应一个已经讲过的机制——复习时对照着看，比只背「正确写法」记得牢。</p>
 
-    <h3>① 节点返回全量 state，而不是 partial state</h3>
+    <h3>节点返回全量 state，而不是 partial state</h3>
     <p>1.4 强调节点返回的是<strong>只想修改的那几个字段的更新</strong>，不是完整的新 State。新手常把整个 state 拷出来改完再 <code class="inline">return state</code>——多数时候能跑，但它埋了两个雷：一是和 reducer 语义打架（<code class="inline">add_messages</code> 想追加，你却把完整列表当「更新」传回去，行为变得不可预期）；二是抹掉了「只关心一两个字段」这个让节点可复用、可测试的核心约定。</p>
     <div class="code-title">反面 vs 正面：节点该返回什么</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ 反面：拷出全量 state 再返回</span>
@@ -374,14 +501,34 @@ result2 = graph.<span class="fn">invoke</span>(
 <span class="cmt"># ✓ 正面：只返回想改的字段</span>
 <span class="kw">def</span> <span class="fn">chatbot</span>(state: <span class="cl">State</span>) -&gt; <span class="cl">dict</span>:
     <span class="kw">return</span> {<span class="st">"messages"</span>: [<span class="cl">AIMessage</span>(content=<span class="st">"hi"</span>)]}</pre>
-    <div class="annotation"><b>读懂这段：</b>第二版只返回 <code class="inline">{"messages": [...]}</code>，把「怎么合并」交给 1.6 的 reducer。<code class="inline">add_messages</code> 会把它追加进历史，而不是被当成一份完整的新列表。记住签名是 <code class="inline">State -&gt; Partial[State]</code>，不是 <code class="inline">State -&gt; State</code>。</div>
+    <div class="annotation"><b>正面写法对在哪：</b>它只返回 <code class="inline">{"messages": [...]}</code>，把「怎么合并」交给 1.6 的 reducer。<code class="inline">add_messages</code> 会把它追加进历史，而不是当成一份完整的新列表。记住签名是 <code class="inline">State -&gt; Partial[State]</code>，不是 <code class="inline">State -&gt; State</code>。</div>
 
-    <h3>② 忘了给 messages 加 add_messages，历史被覆盖</h3>
-    <p>这是 1.6 反复出现的主题：<code class="inline">messages</code> 不挂 reducer 就走默认 <code class="inline">LastValue</code>，后写覆盖先写，多轮对话里每条消息都被下一条顶掉。因为这条坑足够典型，第 3 章（3.2）专门用了一段可运行代码展示「历史丢失」的全过程和修法——这里不重复，只记住一条：<strong>凡是要累积历史的字段，必须配 reducer。</strong></p>
+    <h3>忘了给 messages 配 add_messages，历史被覆盖</h3>
+    <p>这是 1.6 反复出现的主题：messages 不挂 reducer 就走默认 LastValue，后写覆盖先写，多轮对话里每条消息都被下一条顶掉。因为这条坑足够典型，第 3 章（3.2）专门用了一段可运行代码展示「历史丢失」的全过程和修法——这里不重复，只记一条：<strong>凡是要累积历史的字段，必须配 reducer。</strong></p>
 
-    <h3>③ fan-out 写同一字段，撞出 InvalidUpdateError</h3>
-    <p>1.6 的最小复现已经看过：<code class="inline">LastValue</code> 通道每步只认一个值，两个并行节点写同一个无 reducer 的字段就报 <code class="inline">InvalidUpdateError</code>。这其实和 ② 是同一枚硬币的两面——<strong>reducer 的两大职责：决定单次写入怎么累积（覆盖 vs 追加），以及让多个并发写入能归约成一个确定结果。</strong>遇到这个报错，别去「减少并行」，而是给字段配 reducer。</p>
-    <div class="callout warn"><b class="tag">根源</b> 这三条的共同根源都是<strong>把「状态更新」当成了「状态覆盖」</strong>。LangGraph 的心智模型里，节点返回的是<strong>更新请求</strong>，怎么落地由 reducer 决定——一旦你开始问「这个字段该用哪种合并语义」，你就从「写普通函数」切换到了「设计状态机」。</div>
+    <h3>fan-out 写同一字段，撞出 InvalidUpdateError</h3>
+    <p>1.6 的最小复现已经看过：LastValue 通道每步只认一个值，两个并行节点写同一个无 reducer 的字段就报错。它和上一条其实是同一枚硬币的两面——<strong>reducer 的两大职责：决定单次写入怎么累积（覆盖 vs 追加），以及让多个并发写入能归约成一个确定结果。</strong>遇到这个报错，别去「减少并行」，给字段配 reducer。</p>
+    <div class="callout warn"><b class="tag">根源</b> 这三条的共同根源是<strong>把「状态更新」当成了「状态覆盖」</strong>。LangGraph 的心智模型里，节点返回的是<strong>更新请求</strong>，怎么落地由 reducer 决定——一旦你开始问「这个字段该用哪种合并语义」，你就从「写普通函数」切换到了「设计状态机」。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.11</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。这些题检验的是因果和取舍，不是术语复述。</p>
+    <details class="q"><summary><b>Q1</b> · 两个并行节点分别返回 <code class="inline">{"count": 1}</code> 和 <code class="inline">{"count": 2}</code>，State 里 <code class="inline">count: int</code> 没有任何注解。运行会发生什么？要让它不报错，有哪两类改法，语义差别是什么？</summary>
+      <div class="a">抛 <code class="inline">InvalidUpdateError: At key 'count': Can receive only one value per step</code>——LastValue 盒子每个 super-step 只收一个写入。改法一：挂归并型 reducer，如 <code class="inline">Annotated[int, operator.add]</code>，两个写入被加成 3，语义是「都算数」；改法二：挂挑选型 reducer，如取 <code class="inline">max</code>，语义是「只要赢家」。选择依据是业务含义：计数累积用前者，状态竞争（谁最新用谁）用后者。报错的根源不是「并行」，是无 reducer 的字段遇到了多个写入。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · 节点里写 <code class="inline">state["messages"].append(reply)</code> 然后 <code class="inline">return state</code>，多数时候能跑。说出它坏在哪，以及正确写法。</summary>
+      <div class="a">两个问题：一是全量 state 被当作「更新」重新提交，messages 挂了 <code class="inline">add_messages</code> 时，完整历史被当成新一轮写入去归并——行为取决于 reducer 实现，通常造成消息重复或顺序错乱；二是抹掉了 partial-update 约定，节点被迫了解全图字段，不可复用。正确写法：只返回 <code class="inline">{"messages": [reply]}</code>，原地 append 也别做（那是把可变共享当更新机制）。本质：节点返回的是「更新请求」，不是「新状态」。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 图恢复执行时，为什么框架选择「从头重跑节点」，而不是「从暂停的那一行继续」？这个设计逼着你在写节点时遵守什么纪律？</summary>
+      <div class="a">暂停时函数栈帧和局部变量已经随进程消失，框架拥有的只有 checkpoint 里的<strong>图状态</strong>（各 channel 的值）；「从第 N 行继续」需要持久化全部局部变量，跨进程做不到。唯一可靠的恢复点是「以图状态为输入重跑一遍函数」——函数开头总能从图状态重建一切。纪律：<strong>interrupt 之前不能放不可重复的副作用</strong>（发邮件、扣款要放在恢复拿到答案之后）。第 6 章会把恢复重跑的代价展开成几条明确的纪律。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · <code class="inline">StateGraph</code> 和 <code class="inline">CompiledStateGraph</code> 的分工是什么？同一个 builder 编译两次（配不同的 checkpointer），得到的是什么关系？</summary>
+      <div class="a">前者是构建器：只存结构（节点、边、状态 schema），不能跑；compile() 时校验图（入口、悬空节点）、把字段转成 channel、生成 Pregel 执行计划，产出实现 Runnable 接口的可执行图。编译两次得到两个<strong>共享同一份结构、运行配置互相独立</strong>的实例——比如一个带 InMemorySaver 用于测试、一个带 SqliteSaver 用于生产，结构不用重写。这就是「构建/执行分离」买到的复用。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 判断题：State 里 <code class="inline">current_route: str</code> 记录「本步决定走哪条分支」，只有一个节点会写它。该字段需不需要 reducer？<code class="inline">retrieved_docs: list</code> 呢？</summary>
+      <div class="a">current_route 不需要——它是「最新值即正确值」的单写者字段，默认 LastValue（后写覆盖）恰好正确；随手挂个 operator.add 反而会越加越长。retrieved_docs 需要看写入模式：单节点逐步追加，不配也能工作（每步一个写入、覆盖为「新列表」），但配 <code class="inline">operator.add</code> 语义更准（多次写入累积）；若有两个节点并行检索再汇总，则必须配，否则直接撞 InvalidUpdateError。判断标准只有一条：<strong>字段的业务语义要求「覆盖」还是「累积」。</strong></div>
+    </details>
   </section>
 
   <div class="arrow-nav"><a class="dim" href="index.html">← 返回首页</a><a href="02-first-graph.html">第一个图 →</a></div>

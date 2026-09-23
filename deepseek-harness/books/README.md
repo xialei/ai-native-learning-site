@@ -2,7 +2,7 @@
 
 一套**纯静态、自包含**的 HTML 学习站点，用于系统学习 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）的 agent 运行时实现，并为**自制 Harness** 提供路线图。无需任何构建工具，双击 `index.html` 即可浏览。
 
-> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.6-alpha.2**（HEAD `ddefc45fbc`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
+> 参考源码：`/Users/lei.xia/workspace/github/deepseek-harness`，版本锚点 **dsh-v0.1.7-alpha.2**（HEAD `00102833df`）。每个页面标注的 `packages/...` 路径均为该仓库的真实文件。
 
 ## 如何浏览
 

@@ -36,11 +36,11 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 PagedAttention &amp; KV cache</div>
     <h1>PagedAttention &amp; KV cache：vLLM 吞吐量高的根源</h1>
-    <div class="subtitle">vLLM 借鉴操作系统「分页」思想来管理注意力缓存，直接针对原生实现「显存浪费 + 内存碎片」两个问题。要自研引擎，这是最值得先搬过去的一个设计。</div>
+    <div class="subtitle">这一章借操作系统「分页」思想回答一串问题：<strong>每个请求的 KV 为什么这么占显存？怎么把浪费和碎片消掉？块从哪来、怎么发？kernel 拿到不连续的 KV 怎么读写？</strong>先立动机，再沿「消浪费 → 发块 → 读块」一路推进，末了拿 SGLang 的前缀索引结构对照一眼。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">3.1</span>问题：KV cache 为什么这么占显存</h2>
+    <h2><span class="num">3.1</span>KV cache 为什么这么占显存</h2>
     <p>Transformer 自回归每算一个新 token，都要把每个历史 token 的 <strong>K（key）和 V（value）</strong> 存起来，供后续注意力使用。这个缓存叫 <strong>KV cache</strong>，它随序列长度线性增长。</p>
     <p>对每个请求、每层、每个注意力头，KV cache 都要占一块显存。并发 N 个请求、序列都较长时，KV cache 会占掉大部分显存。旧版 naive 方案给每个请求<strong>一次性预留最大长度</strong>的连续显存，导致：</p>
     <ul>
@@ -82,10 +82,11 @@
       </div>
       <div class="fig-cap">图 3.1：PagedAttention 的核心动机——像操作系统管理内存页一样管理 KV cache。</div>
     </div>
+    <div class="annotation"><b>顺着问题往下走：</b>浪费和碎片怎么消 → 3.2 逻辑块与物理块解耦；物理块谁来发 → 3.3 BlockPool；调度器怎么申请新块的槽位 → 3.4 用代码看 allocate_slots；kernel 拿到不连续的块怎么读 → 3.5 block table。3.6 拿 SGLang 对照。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.2</span>核心思想：逻辑块 vs 物理块</h2>
+    <h2><span class="num">3.2</span>怎么消掉浪费和碎片：逻辑块 vs 物理块</h2>
     <p>关键是<strong>把「连续性」和「存储」解耦</strong>：</p>
     <ul>
       <li><strong>逻辑视图（序列自己看）</strong>：一个请求的 KV 是一串连续的 token，逻辑块编号 0,1,2,…。</li>
@@ -129,7 +130,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.4</span>用代码看｜KVCacheManager 如何分配槽位</h2>
+    <h2><span class="num">3.4</span>怎么申请新块：KVCacheManager 分配槽位</h2>
     <p>调度器决定「这个请求这步要追加多少新 token」后，会调用 <code class="inline">KVCacheManager.allocate_slots</code> 给请求腾出 KV 空间。签名很长，因为要兼顾前缀命中、投机采样 lookahead、跨 attention 组等；抓主干：<strong>为请求的这批新 token 找出可写的物理块</strong>。</p>
     <div class="code-title">vllm/v1/core/kv_cache_manager.py — allocate_slots（签名摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">allocate_slots</span>(self, request: <span class="cl">Request</span>,
@@ -141,8 +142,8 @@
     <span class="cmt"># 若返回 None：本轮 KV 不够，该请求先不调度（等别人释放）</span>
     <span class="cmt"># 若成功：为请求追加物理块引用，并把新块内容登记进前缀缓存</span>
     ...</pre>
-    <div class="annotation"><b>读懂这段：</b>对分配器来说，<code class="inline">None</code> 是它唯一的拒绝表达——不抛异常、不部分分配：要么给出完整的一批可写块引用并把新块登记进前缀缓存，要么什么都不给。至于收到 <code class="inline">None</code> 的一方（调度器）怎么决策，是另一个组件的事，见<a href="04-scheduler.html">第 4.3 节</a>。</div>
-    <p>为什么偏偏是「返回 <code class="inline">None</code>」这个不起眼的设计值得停下来看一眼？拿几种同样能表达「不够了」的替代方案对比一下，就看出好处了：</p>
+    <div class="annotation"><b>对分配器来说，<code class="inline">None</code> 是它唯一的拒绝表达</b>——不抛异常、不部分分配：要么给出完整的一批可写块引用并把新块登记进前缀缓存，要么什么都不给。至于收到 <code class="inline">None</code> 的一方（调度器）怎么决策，是另一个组件的事，见<a href="04-scheduler.html">第 4.3 节</a>。</div>
+    <p>为什么偏偏是「返回 <code class="inline">None</code>」这个不起眼的设计值得多看一眼？拿几种同样能表达「不够了」的替代方案对比一下，就看出好处了：</p>
     <ul>
       <li><strong>分配器一直塞、塞到 OOM</strong>：错误发生得太晚——CUDA OOM 是进程级灾难，没有任何降级空间，代价是整条 forward 作废甚至整个引擎重启，而不是「一个请求晚几步被调度」。背压的全部意义就是把「不够」拦在可控的时机。</li>
       <li><strong>分配器直接抢别人的块</strong>：抢占要动 waiting 队列、退还 token 预算、给受害者记状态——这些全是调度器的私有账本。分配器越权意味着换个调度策略（FCFS ↔ PRIORITY）就得改分配器，两层从此互相咬死。</li>
@@ -217,7 +218,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.5</span>Attention 侧：kernel 需要知道 block table</h2>
+    <h2><span class="num">3.5</span>不连续的 KV 怎么读：kernel 需要知道 block table</h2>
     <p>因为 KV 在物理上不连续，标准的 FlashAttention 不能直接用。vLLM 的注意力 kernel 接收 <strong>block table</strong>，在 kernel 内通过索引拿到每个逻辑块对应的物理偏移。这个「分页的 flash attention」就是 <strong>PagedAttention</strong> 名字的来源。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 180" xmlns="http://www.w3.org/2000/svg">
@@ -244,7 +245,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.6</span>小结与自研启示</h2>
+    <h2><span class="num">3.6</span>SGLang 的前缀索引与自研启示</h2>
+    <p>回到 3.1 摆出的问题，vLLM 的答案是「逻辑/物理解耦 → BlockPool 预分配 → allocate_slots 发号 → block table 寻址」。前缀缓存的完整机制在第 8 章讲过——「这段 KV 已经算过」怎么被发现，两边的数据结构选择不同：</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
       <tr><td>分页 KV</td><td>BlockPool + block table</td><td>先做固定连续 KV，理解了再用分页（第二版）</td></tr>
@@ -252,6 +254,18 @@
       <tr><td>前缀缓存</td><td>块内容哈希 + BlockHashToBlockMap</td><td>先跳过；这是吞吐优化，不是正确性要求</td></tr>
       <tr><td>kernel</td><td>v1/attention/backends</td><td>先用 torch 原生 attention 跑通，再换优化 kernel</td></tr>
     </table>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      分页本身两边一致（固定大小的块、引用计数、块共享），前缀索引的数据结构两边分道：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>数据结构</td><td>块内容哈希表：<code class="inline">BlockHashToBlockMap</code>（<code class="inline">vllm/v1/core/block_pool.py</code>）</td><td>基数树 RadixCache：公共前缀共享节点，节点挂 KV 槽位下标（<code class="inline">python/sglang/srt/mem_cache/radix_cache.py</code>）</td></tr>
+        <tr><td>查询方式</td><td>算块哈希 → 查表，O(1)</td><td><code class="inline">match_prefix</code> 从根往下走，对出最长公共前缀</td></tr>
+        <tr><td>问的粒度</td><td>「这一块在不在」——按完整块</td><td>「这条序列能对到哪」——树上直接长出多请求的分叉形状</td></tr>
+        <tr><td>可扩展性</td><td>哈希表就到此为止</td><td>分层缓存 HiCache（KV 淘到主机内存）直接建在这棵树上</td></tr>
+      </table>
+      哈希买查得快，树买「看得见序列的形状」。详见 <a href="../../sglang/books/03-radix-cache.html">深入浅出SGLang · 03 RadixCache</a>。
+    </div>
     <div class="callout warn">
       <b class="tag">下一步</b>
       KV 只回答「块从哪来」。谁决定「这批 KV 该属于哪些请求、每步跑哪些请求」？这就是<a href="04-scheduler.html">第 4 章：调度器</a>。
@@ -265,7 +279,7 @@
 </div>
 
 <footer>
-  深入浅出vLLM · 03 PagedAttention &amp; KV cache · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 03 PagedAttention &amp; KV cache · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

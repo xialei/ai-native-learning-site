@@ -41,7 +41,7 @@
   <section class="block">
     <h2><span class="num">5.1</span>图复用：为什么 decode 第二步起不用重建图</h2>
     <p>每个 ubatch 的图拓扑只由「形状参数」决定——token 数、序列数、输入种类。参数不变，图就不变，于是 llama.cpp 缓存上一张图，先问一句「还能用吗」：</p>
-    <div class="code-title">src/llama-context.cpp:1350-1394 — process_ubatch 的图复用（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1398-1442 — process_ubatch 的图复用（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * res = <span class="fn">get_gf_res_prev</span>();   <span class="cmt">// 双 arena 之一：按「本批有无输出」二选一</span>
 <span class="kw">auto</span> * gf  = res-&gt;<span class="fn">get_gf</span>();
 
@@ -107,14 +107,14 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     res &amp;= (kq_mask-&gt;ne[<span class="nu">3</span>] == n_stream);
     <span class="kw">return</span> res;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 复用不是「跳过计算」，是「跳过 CPU 上的建图 + 分配」这两个 CPU 密集步骤，GPU 计算照跑。注意 decode 单 token 场景下形状几乎恒定（n_tokens=1、n_kv 渐增——n_kv 变了 mask 形状就变，所以窗口涨的时候还是要重建；这正是 KV padding 到 256 对齐的动机之一：让 n_kv 阶梯状跳变，多数步复用成立）。计数器 <code class="inline">n_reused</code> 会在 llama_perf 里报告为「graphs reused」。两个后续演进值得留意：① <code class="inline">gf_res_prev</code> 已从单个缓冲扩成 <code class="inline">array&lt;..., 2&gt;</code>——「有输出」和「无输出」的批各占一个 arena，头文件注释明说是为了让 CUDA Graph 的缓存键区分开（MTP draft 场景下两种批交替出现，#28549）；② 复用条件里多了 <code class="inline">gf_res_prev_active == res</code>——只有「本次刚建/刚用过」的 arena 才可复用，防止切换 arena 后误重用另一边的过期图。图复用的守卫随特性加一层套一层，这正是「跳过 CPU 工作」这类优化必然的复杂化路径。</div>
+    <div class="annotation">先说清楚复用到底省了什么：不是「跳过计算」，是「跳过 CPU 上的建图 + 分配」这两个 CPU 密集步骤，GPU 计算照跑。注意 decode 单 token 场景下形状几乎恒定（n_tokens=1、n_kv 渐增——n_kv 变了 mask 形状就变，所以窗口涨的时候还是要重建；这正是 KV padding 到 256 对齐的动机之一：让 n_kv 阶梯状跳变，多数步复用成立）。计数器 <code class="inline">n_reused</code> 会在 llama_perf 里报告为「graphs reused」。两个后续演进值得留意：一是 <code class="inline">gf_res_prev</code> 已从单个缓冲扩成 <code class="inline">array&lt;..., 2&gt;</code>——「有输出」和「无输出」的批各占一个 arena，头文件注释明说是为了让 CUDA Graph 的缓存键区分开（MTP draft 场景下两种批交替出现，#28549）；二是复用条件里多了 <code class="inline">gf_res_prev_active == res</code>——只有「本次刚建/刚用过」的 arena 才可复用，防止切换 arena 后误重用另一边的过期图。图复用的守卫随特性加一层套一层，这正是「跳过 CPU 工作」这类优化必然的复杂化路径。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.2</span>sched_reserve：三次 reserve 的启动仪式</h2>
     <p>启动时 llama.cpp 会用「最坏情况」图把计算缓冲一次性预留到位，推理期间 galloc 只在其中做原地分配。reserve 序列是 pp → tg → pp 三次：</p>
-    <div class="code-title">src/llama-context.cpp:626-686 — 三次 reserve（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 先用 pp（prompt processing）图预留 —— 缓冲只分配一次</span>
+    <div class="code-title">src/llama-context.cpp:661-729 — 三次 reserve（摘录，注释为译注）</div>
+    <pre class="code"><span class="cmt">// 先用 pp（prompt processing）图预留 —— 缓冲只分配一次</span>
 {
     <span class="kw">auto</span> * gf = <span class="fn">graph_reserve</span>(n_tokens, n_seqs, n_outputs_pp, mctx.get(), ...);
     <span class="kw">if</span> (!gf) {
@@ -127,6 +127,8 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     }
     n_splits_pp = <span class="fn">ggml_backend_sched_get_n_splits</span>(sched.get());
     n_nodes_pp  = <span class="fn">ggml_graph_n_nodes</span>(gf);
+    <span class="cmt">// #26625 起还顺带记录两组计数（此处略）：</span>
+    <span class="cmt">// n_inputs_pp / n_input_tensors_pp —— 图输入对象数与输入张量数</span>
 }
 
 <span class="cmt">// 再用 tg（token generation，bs=1）图 —— 只为拿到 splits/nodes 计数</span>
@@ -135,6 +137,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     ...
     n_splits_tg = <span class="fn">ggml_backend_sched_get_n_splits</span>(sched.get());
     n_nodes_tg  = <span class="fn">ggml_graph_n_nodes</span>(gf);
+    <span class="cmt">// n_inputs_tg / n_input_tensors_tg 同理</span>
 }
 
 <span class="cmt">// 最后再用 pp 图 reserve 一遍 —— 避免 ggml-alloc 在推理期间重新分配</span>
@@ -151,7 +154,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     };
     ...
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 启动日志里的两行输出「compute buffer size = xxx MiB」「graph nodes = N (with bs=512), M (with bs=1)」就是这里打出来的。三次 reserve 的逻辑：① pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；② 跑一遍 tg 图测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；③ 再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 与 KIMI_LINEAR 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长，这个特例清单还在随新架构缓慢加长。</div>
+    <div class="annotation">启动日志里的「compute buffer size = xxx MiB」「graph (pp bs=512, tg bs=1): nodes = …, splits = …, input objects = …, input tensors = …」就是这里打出来的（#26625 之前日志是分开的两行「graph nodes = …」「graph splits = …」，现在合并成一行还顺带报了图输入计数）。三次 reserve 各有任务：第一遍 pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；第二遍跑一遍 tg 图，测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；第三遍再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 与 KIMI_LINEAR 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长，这个特例清单还在随新架构缓慢加长。</div>
   </section>
 
   <section class="block">
@@ -210,7 +213,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     <div class="code-title">ggml/src/ggml-backend.cpp:1297 — pass 5：切图找拷贝点（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// pass 5: split graph, find tensors that need to be copied</span>
 <span class="cmt">// 沿节点序扫描，后端归属一变就切一刀；跨越切点的张量在 sched 里插 copy op</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 各遍的分工：pass 1 锚定「数据在哪，算就在哪」；pass 2 把 GPU 节点成片扩张（注释里那句很关键——<strong>CPU 是最低优先级，只有权重在 CPU 上、或图里 GPU 段之间没有 CPU 空隙时才会用到</strong>，这避免了无谓的 CPU/GPU 往返）；pass 3 把同缓冲类型的节点升级到更高优先级后端（BLAS 和 CPU 可以共用 host 内存缓冲类型）；pass 4 给前三遍没覆盖到的 src 收尾——view 跟随 view_src、孤立 src 跟随消费它的 dst，<strong>目的是少插拷贝</strong>；pass 5 才真正沿节点序切图、标出跨切点张量。前三遍决定「谁在哪个后端」，后两遍决定「在哪里切开、切开后补哪些拷贝」——切点之间的边界就是拷贝点，两张图之间的张量会在 sched 里插 copy op。第 2 章讲过的按层切分（i_gpu_start）就是这套机制在模型加载期的静态版本。</div>
+    <div class="annotation">五遍扫描的分工：pass 1 锚定「数据在哪，算就在哪」；pass 2 把 GPU 节点成片扩张（注释里那句很关键——<strong>CPU 是最低优先级，只有权重在 CPU 上、或图里 GPU 段之间没有 CPU 空隙时才会用到</strong>，这避免了无谓的 CPU/GPU 往返）；pass 3 把同缓冲类型的节点升级到更高优先级后端（BLAS 和 CPU 可以共用 host 内存缓冲类型）；pass 4 给前三遍没覆盖到的 src 收尾——view 跟随 view_src、孤立 src 跟随消费它的 dst，<strong>目的是少插拷贝</strong>；pass 5 才真正沿节点序切图、标出跨切点张量。概括一下：前三遍决定「谁在哪个后端」，后两遍决定「在哪里切开、切开后补哪些拷贝」——切点之间的边界就是拷贝点，两张图之间的张量会在 sched 里插 copy op。第 2 章讲过的按层切分（i_gpu_start）就是这套机制在模型加载期的静态版本。</div>
   </section>
 
   <section class="block">
@@ -254,17 +257,12 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     self.attn_backend.<span class="fn">prepare_for_replay</span>(batch)
     g.<span class="fn">replay</span>()
     <span class="kw">return</span> self.buffer.logits[: batch.size]</pre>
-    <div class="annotation"><b>对照读：</b> 两种「图」解决的问题不同：llama.cpp 的 can_reuse 省的是<strong>建图 + 分配</strong>（CPU 上的张量拓扑搭建），CUDA Graph 省的是<strong>kernel launch</strong>（每秒上万次小提交的驱动开销）。FreeToken 能录整张图的前提是形状完全静态：bs 用 <code class="inline">padded_size</code> 补齐到候选档位、GDN 槽位经由 copy_from 写入、每档捕捉前先跑一遍热身 forward 把 offload cache 烘热——源码注释说得很直白：「Resetting here forces CUDA graph capture to replay cold-cache expert copies」，所以 reset 只能放在<strong>捕捉之后</strong>，为下一档复位。代价是一段可观捕捉时间和一块固定池显存——消费级卡上 max_bs=160 的候选要录 20+ 张。llama.cpp 走的是另一极：图每次可变、灵活但 CPU 开销大。第 13 章会把这个对照收进自研清单。</div>
+    <div class="annotation">容易混淆的是两种「图」解决的问题不同：llama.cpp 的 can_reuse 省的是<strong>建图 + 分配</strong>（CPU 上的张量拓扑搭建），CUDA Graph 省的是<strong>kernel launch</strong>（每秒上万次小提交的驱动开销）。FreeToken 能录整张图的前提是形状完全静态：bs 用 <code class="inline">padded_size</code> 补齐到候选档位、GDN 槽位经由 copy_from 写入、每档捕捉前先跑一遍热身 forward 把 offload cache 烘热——源码注释说得很直白：「Resetting here forces CUDA graph capture to replay cold-cache expert copies」，所以 reset 只能放在<strong>捕捉之后</strong>，为下一档复位。代价是一段可观捕捉时间和一块固定池显存——消费级卡上 max_bs=160 的候选要录 20+ 张。llama.cpp 走的是另一极：图每次可变、灵活但 CPU 开销大。第 13 章会把这个对照收进自研清单。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.5</span>小结</h2>
-    <ul>
-      <li>图拓扑由 ubatch 形状参数唯一决定 → can_reuse 逐输入类校验，decode 常态复用。</li>
-      <li>sched_reserve 用 pp→tg→pp 三次 reserve 一次性预留计算缓冲；个别架构最坏情况不是 bs 最大时。</li>
-      <li>split_graph 五遍扫描：预分配锚定 → GPU 成片扩张（CPU 只兜底）→ 同缓冲类型升级 → 从 dst/view_src 补剩余 src → 切图找拷贝点。</li>
-      <li>FreeToken 用 CUDA Graph 换掉另一类开销（launch），前提是把一切形状焊死成候选档位。</li>
-    </ul>
+    <p>本章的三件事可以串成一句话：让 GPU 少等 CPU。图拓扑由 ubatch 形状参数唯一决定，can_reuse 逐输入类校验后 decode 常态复用；sched_reserve 用 pp→tg→pp 三次 reserve 把计算缓冲一次性预留到位（个别架构的最坏情况不是 bs 最大时）；split_graph 五遍扫描完成「谁在哪个后端」与「在哪里切开、补哪些拷贝」。FreeToken 走得更远——用 CUDA Graph 换掉另一类开销（launch），前提是把一切形状焊死成候选档位。</p>
     <p>图的节点为什么能落在不同设备上？下一章讲多设备切分。<a href="06-multi-device.html">第 6 章：多设备</a>。</p>
   </section>
 
@@ -275,7 +273,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

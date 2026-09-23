@@ -37,12 +37,12 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 Megatron 张量并行</div>
     <h1>张量并行：一层权重怎么切给多张卡</h1>
-    <div class="subtitle">TP 是 Megatron 的起点（2019 年那篇论文的核心贡献）。核心结论只有一句话：attention/MLP 的两个矩阵乘，一个按列切、一个按行切，就能让通信从每层 4 次降到 2 次。这一章从代码看这两个算子怎么写、通信怎么与计算重叠。</div>
+    <div class="subtitle">把 Y = XA 切给多卡，怎么切才能让通信最少？通信代码写在哪，才能让模型作者无感？dgrad 与 wgrad 的通信怎么跟计算重叠？激活还能不能省？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">3.1</span>一分钟版本</h2>
-    <p>线性层 <code class="inline">Y = XA</code>，把 A 切成两半有两种切法，通信代价完全不同：</p>
+    <h2><span class="num">3.1</span>一层权重的切分问题</h2>
+    <p>TP 是 Megatron 的起点（2019 年那篇论文的核心贡献），问题也朴素：线性层 <code class="inline">Y = XA</code>，把 A 切成两半，怎么切才能让通信最少？切法只有两种，通信代价完全不同：</p>
     <ul>
       <li><strong>列并行</strong>（A = [A₁, A₂] 按列切）：每个卡拿自己的 Aᵢ 算 Yᵢ = XAᵢ——<strong>不需要通信就能算</strong>，只是输出比完整 Y 窄。把结果拼起来（all-gather）或留给下一个行并行层（免通信）即可。</li>
       <li><strong>行并行</strong>（A 按行切，X 也按列切）：每个卡算部分和，<strong>必须 all-reduce</strong> 才能得到完整 Y。</li>
@@ -50,12 +50,13 @@
     <p>transformer 的 FFN 是两个连续矩阵乘：把第一个（h→4h）<strong>按列切</strong>、第二个（4h→h）<strong>按行切</strong>，则两层的输出天然就是「切开的」——中间不需要任何通信，只在最后做一次 all-reduce。<strong>每个 transformer 层通信 2 次，而不是朴素做法的 4 次</strong>，这是 Megatron 论文的核心观察。注意力按头切同理：多头天然可分。</p>
     <div class="callout info">
       <b class="tag">命名</b>
-      Megatron 把这两次通信抽象为共轭算子 <code class="inline">f</code> 与 <code class="inline">g</code>：f = 前向恒等/反向 all-reduce；g = 前向 all-reduce/反向恒等。所有 TP 算子的前后向通信都挂在这对共轭算子上。
+      Megatron 把这两次通信抽象为共轭算子 <code class="inline">f</code> 与 <code class="inline">g</code>：f = 前向恒等/反向 all-reduce；g = 前向 all-reduce/反向恒等。这一对名字后面反复出现，值得现在记住：所有 TP 算子的前后向通信都挂在它们身上。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.2</span>用代码看｜Column 与 Row 并行线性层</h2>
+    <h2><span class="num">3.2</span>Column 与 Row 并行线性层</h2>
+    <p>两种切法在代码里对应两个类，是 TP 的两块基石：</p>
     <div class="code-title">megatron/core/tensor_parallel/layers.py — 两个基石算子（docstring 摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ColumnParallelLinear</span>(torch.nn.Module):
     <span class="st">"""Linear layer with column parallelism.
@@ -71,7 +72,7 @@
     its first dimension and X along its second dimension.
     A = transpose([A_1 .. A_p])  X = [X_1, ..., X_p]"""</span>
     <span class="cmt"># input_is_parallel: 输入已是各卡分片（接在列并行后）→ 免切分直接算</span></pre>
-    <div class="annotation"><b>读懂这对算子：</b>Column 并行切 A 的列 → 每卡输出是 Y 的一段特征维；Row 并行切 A 的行、同时要求 X 也按特征切 → 每卡输出是完整 Y 的<strong>部分和</strong>，需要 all-reduce。<strong>两者相接处不需要通信</strong>（列并行的输出本来就是行并行想要的输入分片）——这就是「MLP 两次 GEMM 只通信一次」的实现基础。配置里 <code class="inline">gather_output=False</code> + <code class="inline">input_is_parallel=True</code> 就是在声明「保持分片不落地」。</div>
+    <div class="annotation"><b>重点看两者相接处：</b>Column 并行切 A 的列 → 每卡输出是 Y 的一段特征维；Row 并行切 A 的行、同时要求 X 也按特征切 → 每卡输出是完整 Y 的<strong>部分和</strong>，需要 all-reduce。而<strong>两者相接处不需要通信</strong>——列并行的输出本来就是行并行想要的输入分片，这就是「MLP 两次 GEMM 只通信一次」的实现基础。配置里 <code class="inline">gather_output=False</code> + <code class="inline">input_is_parallel=True</code> 就是在声明「保持分片不落地」。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
@@ -132,8 +133,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.3</span>用代码看｜通信是 autograd 的一部分</h2>
-    <p>TP 最精妙的设计：<strong>通信写在 autograd.Function 里</strong>，前向反向自动取共轭操作，用户层完全无感：</p>
+    <h2><span class="num">3.3</span>通信是 autograd 的一部分</h2>
+    <p>切法有了，还有个工程问题：通信代码写在哪？让模型作者在每个层间手动调 all-reduce 显然不现实。Megatron 的做法是把通信写在 autograd.Function 里——前向反向自动取共轭操作，用户层完全无感：</p>
     <div class="code-title">megatron/core/tensor_parallel/mappings.py — f/g 共轭算子（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">_CopyToModelParallelRegion</span>(torch.autograd.Function):
     <span class="st">"""f 算子：前向恒等（复制），反向 all-reduce"""</span>
@@ -167,12 +168,12 @@ output_parallel = F.embedding(masked_input, weight)
     output_parallel[input_mask, :] = <span class="nu">0.0</span>   <span class="cmt"># 查不到的位置清零</span>
 <span class="cmt"># 最后 all-reduce：每个位置只有一张卡有值，求和即还原</span>
 output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output_parallel, group=self.tp_group)</pre>
-    <div class="annotation"><b>逐行读：</b>每个卡只存词表的一段（vocab_start/end_index 由 rank 算出）。所有卡对所有 token 都查表——查不到的填 0，然后一次 all-reduce。看起来浪费，但换来了「无需路由、无需动态通信」的静态实现。all-reduce 的量 = embedding 输出大小，与词表切法无关。输出层 <code class="inline">output_layer</code>（词表投影）同构：logits 按词表分段，cross-entropy 有对应的并行实现（<code class="inline">core/tensor_parallel/cross_entropy.py</code>）避免把完整 logits all-gather 出来。</div>
+    <div class="annotation"><b>这段的做法乍看很浪费：</b>每个卡只存词表的一段（vocab_start/end_index 由 rank 算出）。所有卡对所有 token 都查表——查不到的填 0，然后一次 all-reduce。但换来的是「无需路由、无需动态通信」的静态实现。all-reduce 的量 = embedding 输出大小，与词表切法无关。输出层 <code class="inline">output_layer</code>（词表投影）同构：logits 按词表分段，cross-entropy 有对应的并行实现（<code class="inline">core/tensor_parallel/cross_entropy.py</code>）避免把完整 logits all-gather 出来。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.4</span>通信与计算的重叠：一行 CUDA 环境变量</h2>
-    <p>LinearWithGradAccumulationAndAsyncCommunication 的 backward 是 TP 性能的心脏——dgrad 的 all-reduce 与 wgrad 的 GEMM 重叠执行：</p>
+    <p>前向通信说完了，反向还有一笔：dgrad 的 all-reduce 是 blocking 的吗？LinearWithGradAccumulationAndAsyncCommunication 的 backward 是 TP 性能的关键路径——dgrad 的 all-reduce 与 wgrad 的 GEMM 重叠执行：</p>
     <div class="code-title">megatron/core/tensor_parallel/layers.py — backward（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> ctx.allreduce_dgrad:
     <span class="cmt"># 异步 all-reduce：不等结果，直接排下一个计算</span>
@@ -182,14 +183,14 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
 <span class="kw">if</span> ctx.gradient_accumulation_fusion:
     <span class="cmt"># wgrad 直接累加进 fp32 main_grad 缓冲（fused kernel），不产生 .grad</span>
     fused_weight_gradient_mlp_cuda.<span class="fn">wgrad_gemm_accum_fp32</span>(total_input, grad_output, weight.main_grad)</pre>
-    <div class="annotation"><b>两行代码两篇论文：</b>
-    ① <strong>allreduce_dgrad</strong>：dgrad all-reduce 发出去后不等待，继续算 wgrad——通信躲在计算后面。这要求 NCCL 的通信 stream 与计算 stream 正确排队，Megatron 文档明确要求启动时设 <code class="inline">CUDA_DEVICE_MAX_CONNECTIONS=1</code>，否则 kernel 调度乱序、结果错误。这是「一个环境变量决定正确性」的著名坑。
-    ② <strong>gradient_accumulation_fusion</strong>：wgrad 不写到 <code class="inline">param.grad</code>，而是融合进参数旁边那块 fp32 的 <code class="inline">main_grad</code> 缓冲——省一次梯度存储，也避免了 fp16 累加误差。main_grad 机制在第 7 章还会出现（Megatron DDP 与 ZeRO 的共同底座）。</div>
+    <div class="annotation"><b>这十几行里有两个值得单独立传的机制：</b>
+    <strong>allreduce_dgrad</strong>：dgrad all-reduce 发出去后不等待，继续算 wgrad——通信躲在计算后面。这要求 NCCL 的通信 stream 与计算 stream 正确排队，Megatron 文档明确要求启动时设 <code class="inline">CUDA_DEVICE_MAX_CONNECTIONS=1</code>，否则 kernel 调度乱序、结果错误。这是「一个环境变量决定正确性」的著名坑。
+    <strong>gradient_accumulation_fusion</strong>：wgrad 不写到 <code class="inline">param.grad</code>，而是融合进参数旁边那块 fp32 的 <code class="inline">main_grad</code> 缓冲——省一次梯度存储，也避免了 fp16 累加误差。main_grad 机制在第 7 章还会出现（Megatron DDP 与 ZeRO 的共同底座）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.5</span>Sequence Parallel：把 TP 的激活也切了</h2>
-    <p>纯 TP 下，LayerNorm/Dropout 的激活每个卡仍是<strong>完整序列</strong>的副本。序列并行（SP）把它们沿序列维切开，代价是 TP 通信的形态变化：</p>
+    <p>梯度省完了，激活还剩一笔账：纯 TP 下，LayerNorm/Dropout 的激活每个卡仍是<strong>完整序列</strong>的副本。序列并行（SP）把它们沿序列维切开，代价是 TP 通信的形态变化：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t33 d33">
         <title id="t33">TP 通信 vs TP+SP 通信</title>
@@ -234,6 +235,7 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
 
   <section class="block">
     <h2><span class="num">3.6</span>小结 + 自研启示</h2>
+    <p>回望这一章：两种切法通信代价差一倍——列并行前向免通信、行并行前向要 all-reduce，列-行配对后每层只通信 2 次；通信写进 autograd.Function（f/g 共轭算子），模型代码与普通 Linear 无异；反向靠 allreduce_dgrad 异步重叠、gradient_accumulation_fusion 直写 main_grad，激活则交给 SP 换通信原语。算子速查：</p>
     <table class="tbl">
       <tr><th>算子</th><th>切法</th><th>前向通信</th><th>反向通信</th></tr>
       <tr><td>ColumnParallelLinear</td><td>权重按列切</td><td>无（gather_output=False 时）</td><td>all-reduce dgrad（可重叠）</td></tr>
@@ -243,7 +245,7 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>
-      TP 的可复用资产是三样：<strong>① f/g 共轭算子（通信进 autograd）；② 列-行配对消除中间通信；③ 初始化一致性（同层权重各卡必须按完整矩阵初始化，_initialize_affine_weight_cpu 先在 CPU 造全量再切）</strong>。第三点最容易踩坑：直接在分片上随机初始化，各卡的有效权重与单卡不等价，模型训不出来还查不出原因。
+      TP 的可复用资产是三样：<strong>f/g 共轭算子（通信进 autograd）；列-行配对消除中间通信；初始化一致性（同层权重各卡必须按完整矩阵初始化，_initialize_affine_weight_cpu 先在 CPU 造全量再切）</strong>。第三样最容易踩坑：直接在分片上随机初始化，各卡的有效权重与单卡不等价，模型训不出来还查不出原因。
     </div>
   </section>
 
@@ -254,7 +256,7 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 03 Megatron TP · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 03 Megatron TP · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

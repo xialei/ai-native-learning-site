@@ -59,7 +59,7 @@
     <span class="cmt">// 2) 读版本号；高 16 位为 0 说明字节序与主机不符</span>
     <span class="cmt">// 3) 读 n_tensors、n_kv，再逐个读键值对与张量信息</span>
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 版本检查里有一个容易忽略的细节——<code class="inline">(ctx-&gt;version &amp; 0x0000FFFF) == 0</code> 用于探测大小端不匹配（大端机器读出的版本号会位移到高位）。GGUF 的设计目标是<strong>单文件、自描述、可 mmap</strong>：元数据都读进内存（很小），张量数据不拷贝，靠文件偏移直接映射。</div>
+    <div class="annotation">版本检查里藏着一个容易忽略的细节——<code class="inline">(ctx-&gt;version &amp; 0x0000FFFF) == 0</code> 用于探测大小端不匹配（大端机器读出的版本号会位移到高位）。GGUF 的设计目标是<strong>单文件、自描述、可 mmap</strong>：元数据都读进内存（很小），张量数据不拷贝，靠文件偏移直接映射。</div>
     <p>关键元数据键（常量定义在 <code class="inline">ggml/include/gguf.h</code>）包括 <code class="inline">general.alignment</code> 等；模型架构名、quant version 等由 llama 层按字符串约定读取。张量信息表的每项记录了名字、维度、类型和对齐后的数据偏移——这就是 mmap 直读的索引。</p>
   </section>
 
@@ -102,7 +102,7 @@
     }
     <span class="cmt">// resolve AUTO on systems without mmap support (e.g. iGPUs)</span>
     <span class="kw">if</span> (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) { ... <span class="cmt">// 同样退回 OFF</span> }</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个 AUTO 都会「按能力降级」：设备不支持 mmap 就关 mmap，iGPU 这类设备直接把 lazy 模式关掉。这是 on-device 引擎的典型写法——<strong>默认值必须是「探测后的最优」而不是「理论最优」</strong>。</div>
+    <div class="annotation">两个 AUTO 都会「按能力降级」：设备不支持 mmap 就关 mmap，iGPU 这类设备直接把 lazy 模式关掉。这是 on-device 引擎的典型写法——<strong>默认值必须是「探测后的最优」而不是「理论最优」</strong>。</div>
     <div class="annotation"><b>进化痕迹（2026-09）：</b> mmap 的边界条件还在被补。#28993 修的是「GGUF 嵌在别的文件里」的场景：<code class="inline">gguf_init_from_file_ptr</code> 支持从 FILE* 当前位置读一个嵌入 GGUF，但旧版对齐计算以文件头为基准——嵌入偏移不是 32 的倍数时，mmap 出来的张量数据整体错位且不报错（静默坏数据比崩溃可怕）。新版对齐基准改成 GGUF 起始位置，且 loader 侧对不满足 CPU 对齐（32 字节）的嵌入 GGUF 直接报错拒绝（llama-model-loader.cpp 现在有一段专门的校验）。同一批次 #29014 还给张量加载加了 <code class="inline">TENSOR_SKIP</code> 跳过标记：MTP 张量被融合进别的张量、不需要独立加载时（qwen35moe），<code class="inline">create_tensor_gate_up_exps</code> 可以整个跳过专家矩阵的创建。启示：mmap 直读的「零拷贝」建立在<strong>地址对齐的硬前提</strong>上——FTW 格式把对齐做成第一约束（第 11 章），llama.cpp 是被嵌入场景倒逼补上的。</div>
   </section>
 
@@ -146,8 +146,7 @@ pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };
     pimpl-&gt;dev_layer[il] = get_layer_buft_list(il);
 }
 pimpl-&gt;dev_output = get_layer_buft_list(n_layer_all);</pre>
-    <div class="annotation"><b>读懂这段：</b>
-      ① n_gpu_layers() 返回「要放 GPU 的层数」（用户指定则用之，否则全部）；② i_gpu_start 是 GPU 起始层号——层数从后往前数，因为推理时层是串行走的，把<strong>尾部层</strong>放 GPU 同样生效；③ 多卡时按 free memory 加权切，不是平均切——24GB+8GB 的组合，24GB 卡分到 3/4 的层；④ 输入层（embedding）永远留 CPU，注释写明「offload 收益极小」。</div>
+    <div class="annotation">几处细节展开说。n_gpu_layers() 返回「要放 GPU 的层数」，用户指定则用之，否则全部；i_gpu_start 是 GPU 起始层号——层数从后往前数，因为推理时层是串行走的，把<strong>尾部层</strong>放 GPU 同样生效。多卡时按 free memory 加权切，不是平均切：24GB+8GB 的组合，24GB 卡分到 3/4 的层。还有一条写死的规则——输入层（embedding）永远留 CPU，注释写明「offload 收益极小」。</div>
     <div class="callout warn">
       <b class="tag">坑</b>
       这套「按 free memory 比例切层」是<strong>静态</strong>的：加载时定死。推理过程中 KV cache 增长挤压显存时，它不会重新分配。这就是为什么后面章节（06）还要讲 fit-params——先在 CPU 上模拟整个内存规划，确认装得下再真的加载。
@@ -176,18 +175,12 @@ Layout on disk:
     &lt;dir&gt;/freetoken_weight.json        # 索引: tensors[] + shards[] + meta
     &lt;dir&gt;/freetoken-00000.ftw          # 字节区，按 ≤ 8 GiB 切 shard
 """</span></pre>
-    <div class="annotation"><b>读懂这段：</b> GGUF/safetensors 是「通用可交换」优先；FTW 是「磁盘→host bank 一次 DMA 到位」优先。所有张量 4096 对齐后，<code class="inline">O_DIRECT</code> 多线程 preadv 可以把 NVMe 顺序带宽打满，绕过 page cache。这条线在第 11 章展开（expert bank 装载流程）。</div>
+    <div class="annotation">GGUF/safetensors 是「通用可交换」优先；FTW 是「磁盘→host bank 一次 DMA 到位」优先。所有张量 4096 对齐后，<code class="inline">O_DIRECT</code> 多线程 preadv 可以把 NVMe 顺序带宽打满，绕过 page cache。这条线在第 11 章展开（expert bank 装载流程）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">2.6</span>小结</h2>
-    <ul>
-      <li>GGUF = 魔数/版本 + KV 元数据 + 对齐张量表；单文件、可 mmap、自描述。</li>
-      <li>量化位宽谱系：Q4_0（2）→ Q4_K_M（15）→ IQ2_XS（20）→ TQ1_0（36）→ MXFP4_MOE（38）→ NVFP4（39）。</li>
-      <li>mmap 让「加载」变成「建立映射」；load_mode AUTO 按设备能力降级。</li>
-      <li>n_gpu_layers 按 free memory 比例静态切层，输入层恒留 CPU。</li>
-      <li>FreeToken 的 FTW 是同一个问题的另一种答案：放弃交换性，换取 O_DIRECT 直读。</li>
-    </ul>
+    <p>加载这一章其实就一条主线：怎么让权重以最少的拷贝、最合适的精度落进这台机器。GGUF 用「魔数/版本 + KV 元数据 + 对齐张量表」做成单文件、自描述、可 mmap 的容器；量化位宽从 Q4_0（2）到 NVFP4（39）排成一条谱系，日常取 Q4_K_M 这个折中点。mmap 把「加载」变成「建立映射」，load_mode AUTO 按设备能力降级；n_gpu_layers 按 free memory 比例静态切层，输入层恒留 CPU。FreeToken 的 FTW 是同一个问题的另一种答案：放弃交换性，换取 O_DIRECT 直读。</p>
     <p>权重进内存/显存之后，下一个问题是：<strong>一次 decode 到底发生了什么</strong> → <a href="03-decode-loop.html">第 3 章：decode 循环</a>。</p>
   </section>
 
@@ -198,7 +191,7 @@ Layout on disk:
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 02 GGUF与模型加载 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 02 GGUF与模型加载 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

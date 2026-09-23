@@ -34,51 +34,62 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 第一个图</div>
     <h1>第一个图：从 add_node 到 invoke</h1>
-    <div class="subtitle">用三步法搭出一张可运行的 StateGraph——注册节点、连边、编译——看清状态如何在节点之间流转。整张图只有两个节点、三条边，却浓缩了 LangGraph 建图的核心套路。</div>
+    <div class="subtitle">第 1 章给出了六个概念，但没回答「一动手到底先干什么」。这一章用一张 x+1 再 ×2 的小图把「builder → compile → invoke」管线走通，顺路回答三个问题：为什么要分三步、一个节点执行时状态怎么流、编译前后各能做什么。整张图只有两个节点、三条边，却浓缩了建图的全部套路。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">2.1</span>三步法总览</h2>
-    <p>无论图多复杂，用 <code class="inline">StateGraph</code> 建图永远遵循同一个节奏：</p>
-    <ol>
-      <li><strong>add_node（注册节点）</strong>：把一个个 Python 函数登记到图里，给它们起个名字。节点函数的职责是「读当前状态、返回状态更新」。</li>
-      <li><strong>add_edge（连接边）</strong>：用 <code class="inline">START</code>、节点名、<code class="inline">END</code> 这些「地址」连出有向边，告诉框架执行完谁该轮到谁。</li>
-      <li><strong>compile（编译）</strong>：把 builder 转成一个实现了 Runnable 接口、可以 <code class="inline">invoke</code> / <code class="inline">stream</code> 的可运行图。</li>
-    </ol>
-    <p>为什么是这三步、而不是一个声明式的大配置？因为 LangGraph 刻意把「定义结构」和「执行结构」分开：<code class="inline">StateGraph</code> 只是个<strong>建造者（builder）</strong>，本身不能跑；只有 <code class="inline">compile()</code> 之后才生成可执行的 <code class="inline">CompiledStateGraph</code>。这样分开有两个好处：一是编译时能做一次完整的图校验（有没有入口、有没有悬空节点），二是同一个 builder 可以用不同 checkpointer / store 编译出多个运行实例，复用结构、隔离运行。</p>
-
+    <h2><span class="num">2.1</span>开场：三个 API 就够了吗？为什么要分三步</h2>
+    <p>第 1 章结束时你已经知道建图要用 <code class="inline">add_node</code>、<code class="inline">add_edge</code>、<code class="inline">compile</code>。但动手前值得先问一句：<strong>为什么是三步？为什么不能一个函数把图配完？</strong></p>
+    <p>把三个症状反过来推就明白了。假设 LangGraph 真提供 <code class="inline">run_my_graph(nodes=[...], edges=[...])</code> 一把梭：</p>
+    <ul>
+      <li>参数列表里怎么表达「图必须从哪开始」？入口信息得混进 edges 参数。</li>
+      <li>节点多了以后，出错时怎么知道是「结构写错了」还是「节点跑挂了」？没有一道把结构整体校验一遍的关卡。</li>
+      <li>同一套结构想配两套运行配置（比如测试用内存快照、生产用 SQLite 快照），只能整个函数调两遍。</li>
+    </ul>
+    <p>LangGraph 的三步法正是对着这三件事设计的：<strong>add_node/add_edge 只管「搭结构」</strong>——它是个建造者（builder），本身不能跑；<strong>compile() 一道关做整体校验</strong>（有没有入口、边指向的节点存不存在），校验过了才生成可执行的 <code class="inline">CompiledStateGraph</code>；<strong>invoke 是执行</strong>，只存在于编译产物上。同一个 builder 用不同 checkpointer 编译两次、得到两个共享结构但运行配置独立的实例——第 1 章 Q4 留的那道题，这里动手验证。</p>
     <div class="figure">
-      <svg class="svg-box" viewBox="0 0 880 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
-        <title id="t21">第一个图结构</title>
-        <desc id="d21">START → step1（加1） → step2（乘2） → END</desc>
+      <svg class="svg-box" viewBox="0 0 900 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21a d21a">
+        <title id="t21a">builder → compile → invoke 三段管线</title>
+        <desc id="d21a">StateGraph builder 阶段做 add_node 和 add_edge 存结构；compile 阶段做校验并装配 Pregel 执行计划，产出 CompiledStateGraph；invoke 阶段把输入 x=1 沿 START-step1-step2-END 执行，输出 x=4。</desc>
         <defs>
-          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <marker id="ar21a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
           </marker>
         </defs>
-        <rect class="node" x="20" y="48" width="120" height="54" rx="8"></rect>
-        <text class="lbl" x="80" y="72" text-anchor="middle">START</text>
-        <text class="lbl sm" x="80" y="88" text-anchor="middle">虚拟入口</text>
-        <rect class="node core" x="220" y="48" width="180" height="54" rx="8"></rect>
-        <text class="lbl" x="310" y="72" text-anchor="middle">step1</text>
-        <text class="lbl sm" x="310" y="88" text-anchor="middle">x = x + 1</text>
-        <rect class="node core" x="480" y="48" width="180" height="54" rx="8"></rect>
-        <text class="lbl" x="570" y="72" text-anchor="middle">step2</text>
-        <text class="lbl sm" x="570" y="88" text-anchor="middle">x = x * 2</text>
-        <rect class="node" x="720" y="48" width="120" height="54" rx="8"></rect>
-        <text class="lbl" x="780" y="72" text-anchor="middle">END</text>
-        <text class="lbl sm" x="780" y="88" text-anchor="middle">终止</text>
-        <line class="edge" x1="140" y1="75" x2="218" y2="75" marker-end="url(#arrow)"></line>
-        <line class="edge" x1="400" y1="75" x2="478" y2="75" marker-end="url(#arrow)"></line>
-        <line class="edge" x1="660" y1="75" x2="718" y2="75" marker-end="url(#arrow)"></line>
+        <rect class="node" x="20" y="30" width="200" height="100" rx="10"></rect>
+        <text class="lbl" x="120" y="56" text-anchor="middle">① 建造：StateGraph</text>
+        <text class="lbl sm" x="120" y="80" text-anchor="middle">add_node 登记函数</text>
+        <text class="lbl sm" x="120" y="98" text-anchor="middle">add_edge 连出走向</text>
+        <text class="lbl sm code" x="120" y="116" text-anchor="middle">只存结构，不能 invoke</text>
+        <line class="edge" x1="220" y1="80" x2="328" y2="80" marker-end="url(#ar21a)"></line>
+        <text class="lbl code" x="274" y="70" text-anchor="middle">compile()</text>
+        <rect class="node core" x="330" y="30" width="230" height="100" rx="10"></rect>
+        <text class="lbl" x="445" y="54" text-anchor="middle">② 校验 + 装配</text>
+        <text class="lbl sm" x="445" y="78" text-anchor="middle">有入口？悬空节点？重名？</text>
+        <text class="lbl sm" x="445" y="98" text-anchor="middle">State 字段 → Channel 盒子</text>
+        <text class="lbl sm code" x="445" y="116" text-anchor="middle">生成 Pregel 执行计划</text>
+        <rect class="node acc" x="330" y="168" width="230" height="72" rx="10"></rect>
+        <text class="lbl" x="445" y="194" text-anchor="middle">CompiledStateGraph</text>
+        <text class="lbl sm" x="445" y="216" text-anchor="middle">invoke / stream / batch</text>
+        <text class="lbl sm code" x="445" y="234" text-anchor="middle">+ checkpointer 挂载点</text>
+        <line class="edge" x1="445" y1="130" x2="445" y2="166" marker-end="url(#ar21a)"></line>
+        <line class="edge" x1="560" y1="80" x2="638" y2="80" marker-end="url(#ar21a)"></line>
+        <rect class="node" x="640" y="30" width="240" height="100" rx="10"></rect>
+        <text class="lbl" x="775" y="54" text-anchor="middle">③ 执行：invoke</text>
+        <text class="lbl sm code" x="775" y="80" text-anchor="middle">{"x": 1}</text>
+        <text class="lbl sm" x="775" y="100" text-anchor="middle">START → step1 → step2 → END</text>
+        <text class="lbl sm code" x="775" y="120" text-anchor="middle">输出 {'x': 4}</text>
+        <path class="edge" d="M 560 180 C 620 160, 640 120, 680 92" fill="none" stroke-dasharray="4 3" marker-end="url(#ar21a)"></path>
+        <text class="lbl sm" x="600" y="130" text-anchor="middle">同一结构可再编译</text>
       </svg>
-      <div class="fig-cap">图 2.1：本章要搭的图。输入 <code class="inline">{"x": 1}</code>，经 +1 再 *2，最终 <code class="inline">{"x": 4}</code>。</div>
+      <div class="fig-cap">图 2.1：三个阶段各管一件事。结构与执行分离——builder 校验前只是数据，compile 一道关做完校验和装配，invoke 只属于编译产物。</div>
     </div>
+    <p>无论图多复杂，节奏永远不变：<strong>add_node 注册节点 → add_edge 连边 → compile 封口</strong>。本章就按这条时间线走，每一步都对照源码看它到底做了什么。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">2.2</span>第一步：add_node 注册节点</h2>
-    <p><code class="inline">add_node</code> 把一个函数登记成图里的节点。它的真实签名（摘自源码 <code class="inline">langgraph/graph/state.py</code>）是：</p>
+    <p><strong>建图的第一问：我的每个步骤怎么登记进图？</strong><code class="inline">add_node</code> 把一个函数登记成节点。它的真实签名（摘自源码 <code class="inline">langgraph/graph/state.py</code>）是：</p>
     <div class="code-title">langgraph/graph/state.py — add_node 签名（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">add_node</span>(
     <span class="kw">self</span>,
@@ -95,7 +106,7 @@
     timeout: <span class="cl">float</span> | <span class="cl">timedelta</span> | <span class="cl">TimeoutPolicy</span> | <span class="kw">None</span> = <span class="kw">None</span>,
     trace_policy: <span class="cl">TracePolicy</span> | <span class="kw">None</span> = <span class="kw">None</span>,
 ) -> <span class="cl">Self</span>:  <span class="cmt"># 返回 self，支持链式调用</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 日常用得最多的就是前两个参数。两种写法等价：要么直接传函数（框架取它的 <code class="inline">__name__</code> 当节点名），要么显式给个名字字符串再加函数。源码 docstring 里的真实示例就是前一种——直接 <code class="inline">add_node(my_node)</code>。</div>
+    <div class="annotation"><b>常用的只有前两个：</b> 日常用得最多的就是前两个参数。两种写法等价：要么直接传函数（框架取它的 <code class="inline">__name__</code> 当节点名），要么显式给个名字字符串再加函数。源码 docstring 里的真实示例就是前一种——直接 <code class="inline">add_node(my_node)</code>。其余参数（retry_policy、timeout、cache_policy……）先全部无视，它们是后面章节的伏笔：重试和超时在第 5 章的 agent 里露面，缓存策略要等图跑慢了才用得上。</div>
 
     <div class="code-title">源码 add_node docstring 的真实示例</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -104,7 +115,7 @@
 <span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
     x: <span class="cl">int</span>
 
-<span class="kw">def</span> <span class="fn">my_node</span>(state: <span class="cl">State</span>) -> <span class="cl">State</span>:
+<span class="kw">def</span> <span class="fn">my_node</span>(state: <span class="cl">State</span>) -&gt; <span class="cl">State</span>:
     <span class="kw">return</span> {<span class="st">"x"</span>: state[<span class="st">"x"</span>] + <span class="nu">1</span>}
 
 builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>)
@@ -113,27 +124,27 @@ builder.add_node(my_node)  <span class="cmt"># 节点名自动取函数名 "my_n
 
     <div class="callout info">
       <b class="tag">护栏</b>
-      源码里有一道护栏：<code class="inline">add_node</code> 会拒绝把节点命名为 <code class="inline">START</code> 或 <code class="inline">END</code>（报 <code class="inline">Node `...` is reserved</code>），也不允许名字里含保留分隔符。这两个名字是图的「虚拟地址」，只能用在 <code class="inline">add_edge</code> 里指代入口和出口，不能当成普通节点。
+      源码里有一道护栏：<code class="inline">add_node</code> 会拒绝把节点命名为 <code class="inline">START</code> 或 <code class="inline">END</code>（报 <code class="inline">Node `...` is reserved</code>，state.py:805），也不允许名字里含保留分隔符。这两个名字是图的「虚拟地址」，只能用在 <code class="inline">add_edge</code> 里指代入口和出口，不能当成普通节点。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.3</span>第二步：add_edge 连接边，START 与 END</h2>
-    <p>节点注册好之后，它们之间还互不相干。<code class="inline">add_edge</code> 负责连出有向边，决定执行顺序。签名很简洁：</p>
+    <h2><span class="num">2.3</span>第二步：add_edge 连边——图从哪开始、到哪结束</h2>
+    <p><strong>节点登记完还是一座座孤岛：谁先跑、跑完轮到谁？</strong><code class="inline">add_edge</code> 用有向边回答。签名很简洁：</p>
     <div class="code-title">langgraph/graph/state.py — add_edge 签名</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">add_edge</span>(<span class="kw">self</span>, start_key: <span class="cl">str</span> | <span class="cl">list</span>[<span class="cl">str</span>], end_key: <span class="cl">str</span>) -> <span class="cl">Self</span>:
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">add_edge</span>(<span class="kw">self</span>, start_key: <span class="cl">str</span> | <span class="cl">list</span>[<span class="cl">str</span>], end_key: <span class="cl">str</span>) -&gt; <span class="cl">Self</span>:
     ...</pre>
-    <p><code class="inline">start_key</code> 传一个节点名（或一组节点名，表示「等这组全都完成再继续」），<code class="inline">end_key</code> 传一个目标。这里有两个特殊「地址」贯穿始终：</p>
+    <p><code class="inline">start_key</code> 传一个节点名（或一组节点名，表示「等这组全都完成再继续」，第 4 章 4.2 的 join 语义），<code class="inline">end_key</code> 传一个目标。这里有两个特殊「地址」贯穿始终：</p>
     <div class="code-title">langgraph/constants.py — START / END 常量</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.graph <span class="kw">import</span> START, END
 <span class="cmt"># 源码 constants.py 里：START = "__start__", END = "__end__"</span></pre>
     <ul>
-      <li><strong>START</strong> 是虚拟入口：它不是一个真正的节点，而是「图的起点」这个概念。<code class="inline">add_edge(START, "step1")</code> 等价于说「图启动后第一个执行 step1」。源码里它还有个便利别名 <code class="inline">set_entry_point("step1")</code>，内部就是调 <code class="inline">add_edge(START, ...)</code>。</li>
-      <li><strong>END</strong> 是终止：一旦某条边把控制权交给 <code class="inline">END</code>，图就停止执行。<code class="inline">add_edge("step2", END)</code> 表示「step2 跑完就结束」。同样有别名 <code class="inline">set_finish_point("step2")</code>。</li>
+      <li><strong>START</strong> 是虚拟入口：它不是一个真正的节点，而是「图的起点」这个概念。<code class="inline">add_edge(START, "step1")</code> 等价于说「图启动后第一个执行 step1」。源码里它还有个便利别名 <code class="inline">set_entry_point("step1")</code>（state.py:1079，内部就是 <code class="inline">return self.add_edge(START, key)</code>）。</li>
+      <li><strong>END</strong> 是终止：一旦某条边把控制权交给 <code class="inline">END</code>，图就停止执行。<code class="inline">add_edge("step2", END)</code> 表示「step2 跑完就结束」。同样有别名 <code class="inline">set_finish_point("step2")</code>（state.py:1116）。</li>
     </ul>
     <div class="callout warn">
       <b class="tag">方向约束</b>
-      源码对这两个常量有明确约束：<code class="inline">END</code> 不能作为边的起点（<code class="inline">END cannot be a start node</code>），<code class="inline">START</code> 不能作为边的终点（<code class="inline">START cannot be an end node</code>）——方向是单向的，入口只能出、终点只能进。编译时还会校验「图必须至少有一条从 <code class="inline">START</code> 出发的边」，否则报 <code class="inline">Graph must have an entrypoint</code>。
+      源码对这两个常量有明确约束：<code class="inline">END</code> 不能作为边的起点（<code class="inline">END cannot be a start node</code>，state.py:953），<code class="inline">START</code> 不能作为边的终点（<code class="inline">START cannot be an end node</code>，state.py:955）——方向是单向的，入口只能出、终点只能进。编译时还会校验「图必须至少有一条从 <code class="inline">START</code> 出发的边」，否则报 <code class="inline">Graph must have an entrypoint</code>（state.py:1144）。
     </div>
     <div class="code-title">最小复现：忘了从 START 接出边，compile 时就报错</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 只注册了节点、连了 step1 -&gt; step2，却没接 START</span>
@@ -142,9 +153,9 @@ builder.add_node(<span class="st">"step2"</span>, step2)
 builder.add_edge(<span class="st">"step1"</span>, <span class="st">"step2"</span>)
 
 builder.compile()
-<span class="cmt"># ValueError: Graph must have an entrypoint:
-#             add at least one edge from START to another node</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这条校验在 <code class="inline">compile()</code> 时触发，不是 <code class="inline">add_edge</code> 时——所以你会等到编译才看到报错。解法就是补一条 <code class="inline">add_edge(START, "step1")</code>。新手常以为「注册了节点图就能跑」，但 <code class="inline">START</code> 是唯一的入口，没有从它出发的边，框架不知道第一个该执行谁。</div>
+<span class="cmt"># ValueError: Graph must have an entrypoint:</span>
+<span class="cmt">#             add at least one edge from START to another node</span></pre>
+    <div class="annotation"><b>报错为什么来得这么晚：</b> 这条校验在 <code class="inline">compile()</code> 里触发（compile 内部调 state.py:1129 的 <code class="inline">validate()</code>），不是 <code class="inline">add_edge</code> 时——所以你会等到编译才看到报错。解法就是补一条 <code class="inline">add_edge(START, "step1")</code>。新手常以为「注册了节点图就能跑」，但 <code class="inline">START</code> 是唯一的入口，没有从它出发的边，框架不知道第一个该执行谁。</div>
     <div class="code-title">三条边串成一条线</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 三条边串成一条线：入口 → step1 → step2 → 终止</span>
 builder.add_edge(START, <span class="st">"step1"</span>)
@@ -153,8 +164,8 @@ builder.add_edge(<span class="st">"step2"</span>, END)</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.4</span>第三步：compile 编译为可运行图</h2>
-    <p><code class="inline">StateGraph</code> 只是建造者，不能直接跑。调 <code class="inline">compile()</code> 才会做图校验、把节点和边装配成一个 <code class="inline">CompiledStateGraph</code>——它实现了 Runnable 接口，因而有 <code class="inline">invoke</code> / <code class="inline">stream</code> / <code class="inline">ainvoke</code> / <code class="inline">astream</code> / <code class="inline">batch</code> 等方法。签名（同样摘自源码）：</p>
+    <h2><span class="num">2.4</span>第三步：compile——从结构到可运行对象</h2>
+    <p><strong>结构搭完了，为什么不能直接跑？compile() 到底做了什么？</strong>第 1 章图 1.8 画过三步（校验、字段转 Channel、装配 Pregel 计划），这一节落到 API 层面。签名（同样摘自源码）：</p>
     <div class="code-title">langgraph/graph/state.py — compile 签名（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">compile</span>(
     <span class="kw">self</span>,
@@ -165,13 +176,13 @@ builder.add_edge(<span class="st">"step2"</span>, END)</pre>
     interrupt_after: <span class="cl">list</span>[<span class="cl">str</span>] | <span class="kw">None</span> = <span class="kw">None</span>,
     debug: <span class="cl">bool</span> = <span class="kw">False</span>,
     name: <span class="cl">str</span> | <span class="kw">None</span> = <span class="kw">None</span>,
-) -> <span class="cl">CompiledStateGraph</span>:</pre>
-    <div class="annotation"><b>读懂这段：</b> 本章先把可选项全空着，得到一张最朴素的图。<code class="inline">checkpointer</code> / <code class="inline">store</code> / <code class="inline">interrupt</code> 这些参数会在第 06、09 章用到——它们正是把图从「一次性计算」升级成「可暂停、可记忆、可恢复」的关键，而你现在看到的 <code class="inline">compile</code> 就是它们统一的挂载点。</div>
+) -&gt; <span class="cl">CompiledStateGraph</span>:</pre>
+    <div class="annotation"><b>本章全部用默认值：</b> 先把可选项全空着，得到一张最朴素的图。<code class="inline">checkpointer</code> / <code class="inline">store</code> / <code class="inline">interrupt</code> 这些参数会在第 06、09 章用到——它们正是把图从「一次性计算」升级成「可暂停、可记忆、可恢复」的关键，而你现在看到的 <code class="inline">compile</code> 就是它们统一的挂载点。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.5</span>完整可运行示例</h2>
-    <p>把三步合起来，就是一张能跑的图。这个例子扩展自源码 <code class="inline">add_node</code> docstring 里的真实示例——原来只有一个节点（<code class="inline">x + 1</code>），这里加到两个节点，串成一条流水线：</p>
+    <h2><span class="num">2.5</span>invoke 时状态怎么流：一张图看懂 super-step</h2>
+    <p>三步齐了，把整张图跑起来。这个例子扩展自源码 <code class="inline">add_node</code> docstring 里的真实示例——原来只有一个节点（<code class="inline">x + 1</code>），这里加到两个节点，串成一条流水线：</p>
     <div class="code-title">第一个完整图 — 三步法 + invoke</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> START, END, StateGraph
@@ -180,12 +191,12 @@ builder.add_edge(<span class="st">"step2"</span>, END)</pre>
 <span class="kw">class</span> <span class="cl">State</span>(<span class="cl">TypedDict</span>):
     x: <span class="cl">int</span>
 
-<span class="cmt"># 2. 定义节点：签名是 (state) -> 部分更新</span>
+<span class="cmt"># 2. 定义节点：签名是 (state) -&gt; 部分更新</span>
 <span class="cmt">#    返回的 dict 会与当前状态合并(默认覆盖同名键)</span>
-<span class="kw">def</span> <span class="fn">step1</span>(state: <span class="cl">State</span>) -> <span class="cl">dict</span>:
+<span class="kw">def</span> <span class="fn">step1</span>(state: <span class="cl">State</span>) -&gt; <span class="cl">dict</span>:
     <span class="kw">return</span> {<span class="st">"x"</span>: state[<span class="st">"x"</span>] + <span class="nu">1</span>}   <span class="cmt"># 加 1</span>
 
-<span class="kw">def</span> <span class="fn">step2</span>(state: <span class="cl">State</span>) -> <span class="cl">dict</span>:
+<span class="kw">def</span> <span class="fn">step2</span>(state: <span class="cl">State</span>) -&gt; <span class="cl">dict</span>:
     <span class="kw">return</span> {<span class="st">"x"</span>: state[<span class="st">"x"</span>] * <span class="nu">2</span>}   <span class="cmt"># 乘 2</span>
 
 <span class="cmt"># 3. 三步法建图</span>
@@ -197,50 +208,71 @@ builder.add_edge(<span class="st">"step1"</span>, <span class="st">"step2"</span
 builder.add_edge(<span class="st">"step2"</span>, END)     <span class="cmt"># step2 → 终止</span>
 
 <span class="cmt"># 4. 编译为可运行图</span>
-graph = builder.compile()
+graph = builder.<span class="fn">compile</span>()
 
 <span class="cmt"># 5. 执行：1 → (+1) = 2 → (*2) = 4</span>
-print(graph.invoke({<span class="st">"x"</span>: <span class="nu">1</span>}))
+<span class="fn">print</span>(graph.<span class="fn">invoke</span>({<span class="st">"x"</span>: <span class="nu">1</span>}))
 <span class="cmt"># {'x': 4}</span></pre>
-    <div class="annotation"><b>执行过程：</b> 你给 <code class="inline">invoke</code> 的 <code class="inline">{"x": 1}</code> 作为初始状态从 <code class="inline">START</code> 进入；框架把它喂给 <code class="inline">step1</code>，<code class="inline">step1</code> 返回 <code class="inline">{"x": 2}</code>，与状态合并后 <code class="inline">x</code> 变成 2；接着按边走到 <code class="inline">step2</code>，它读到 <code class="inline">x=2</code>、返回 <code class="inline">{"x": 4}</code>，合并后 <code class="inline">x</code> 变成 4；再到 <code class="inline">END</code>，图停止，最终状态 <code class="inline">{"x": 4}</code> 作为结果返回。</div>
 
     <div class="figure">
-      <svg class="svg-box" viewBox="0 0 880 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t25 d25">
-        <title id="t25">执行时的状态流转</title>
-        <desc id="d25">输入 x=1 流过 step1、step2，输出 x=4</desc>
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t25a d25a">
+        <title id="t25a">super-step 视角的状态流转</title>
+        <desc id="d25a">三个 super-step：第 0 步输入 x=1 写入 x 通道；第 1 步执行 step1 读 x=1 写回 x=2；第 2 步执行 step2 读 x=2 写回 x=4；随后无任务可触发，到 END 结束。每个 super-step 都是「先并行执行节点、再统一合并写入」。</desc>
         <defs>
-          <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <marker id="ar21b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
           </marker>
         </defs>
-        <rect class="node" x="20" y="48" width="120" height="54" rx="8"></rect>
-        <text class="lbl" x="80" y="72" text-anchor="middle">START</text>
-        <text class="lbl sm code" x="80" y="88" text-anchor="middle">输入 x=1</text>
-        <rect class="node core" x="220" y="48" width="180" height="54" rx="8"></rect>
-        <text class="lbl" x="310" y="72" text-anchor="middle">step1</text>
-        <text class="lbl sm code" x="310" y="88" text-anchor="middle">x = 1+1 → 2</text>
-        <rect class="node core" x="480" y="48" width="180" height="54" rx="8"></rect>
-        <text class="lbl" x="570" y="72" text-anchor="middle">step2</text>
-        <text class="lbl sm code" x="570" y="88" text-anchor="middle">x = 2*2 → 4</text>
-        <rect class="node" x="720" y="48" width="120" height="54" rx="8"></rect>
-        <text class="lbl" x="780" y="72" text-anchor="middle">END</text>
-        <text class="lbl sm code" x="780" y="88" text-anchor="middle">输出 x=4</text>
-        <line class="edge" x1="140" y1="75" x2="218" y2="75" marker-end="url(#arrow2)"></line>
-        <line class="edge" x1="400" y1="75" x2="478" y2="75" marker-end="url(#arrow2)"></line>
-        <line class="edge" x1="660" y1="75" x2="718" y2="75" marker-end="url(#arrow2)"></line>
+        <text class="lbl" x="70" y="30" text-anchor="middle">super-step 0</text>
+        <text class="lbl" x="330" y="30" text-anchor="middle">super-step 1</text>
+        <text class="lbl" x="590" y="30" text-anchor="middle">super-step 2</text>
+        <text class="lbl" x="820" y="30" text-anchor="middle">结束</text>
+        <line class="st" x1="200" y1="20" x2="200" y2="230" stroke-dasharray="5 4"></line>
+        <line class="st" x1="460" y1="20" x2="460" y2="230" stroke-dasharray="5 4"></line>
+        <line class="st" x1="720" y1="20" x2="720" y2="230" stroke-dasharray="5 4"></line>
+        <rect class="node" x="30" y="52" width="140" height="52" rx="8"></rect>
+        <text class="lbl sm" x="100" y="72" text-anchor="middle">输入合并</text>
+        <text class="lbl sm code" x="100" y="90" text-anchor="middle">x 通道 ← 1</text>
+        <rect class="node core" x="250" y="52" width="150" height="52" rx="8"></rect>
+        <text class="lbl" x="325" y="72" text-anchor="middle">step1</text>
+        <text class="lbl sm" x="325" y="90" text-anchor="middle">读 x=1</text>
+        <text class="lbl sm code" x="325" y="106" text-anchor="middle">返回 {"x": 2}</text>
+        <rect class="node core" x="510" y="52" width="150" height="52" rx="8"></rect>
+        <text class="lbl" x="585" y="72" text-anchor="middle">step2</text>
+        <text class="lbl sm" x="585" y="90" text-anchor="middle">读 x=2</text>
+        <text class="lbl sm code" x="585" y="106" text-anchor="middle">返回 {"x": 4}</text>
+        <rect class="node acc" x="770" y="52" width="110" height="52" rx="8"></rect>
+        <text class="lbl sm" x="825" y="74" text-anchor="middle">无任务可触发</text>
+        <text class="lbl sm" x="825" y="90" text-anchor="middle">执行 END</text>
+        <text class="lbl sm code" x="825" y="106" text-anchor="middle">输出 {'x': 4}</text>
+        <line class="edge" x1="170" y1="78" x2="248" y2="78" marker-end="url(#ar21b)"></line>
+        <line class="edge" x1="400" y1="78" x2="508" y2="78" marker-end="url(#ar21b)"></line>
+        <line class="edge" x1="660" y1="78" x2="768" y2="78" marker-end="url(#ar21b)"></line>
+        <line class="st" x1="30" y1="130" x2="880" y2="130" stroke-dasharray="4 4"></line>
+        <text class="lbl sm" x="450" y="152" text-anchor="middle">x 通道的值随 super-step 演化</text>
+        <text class="lbl" x="70" y="160" text-anchor="middle">x 通道</text>
+        <rect class="node" x="30" y="172" width="140" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="100" y="193" text-anchor="middle">1</text>
+        <rect class="node" x="250" y="172" width="150" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="325" y="193" text-anchor="middle">1 → 2（合并后）</text>
+        <rect class="node" x="510" y="172" width="150" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="585" y="193" text-anchor="middle">2 → 4（合并后）</text>
+        <rect class="node" x="770" y="172" width="110" height="34" rx="6"></rect>
+        <text class="lbl sm code" x="825" y="193" text-anchor="middle">4</text>
+        <text class="lbl sm" x="450" y="230" text-anchor="middle">每个 super-step：节点并行跑 → 写入统一按 reducer 合并 → 触发下一批节点</text>
       </svg>
-      <div class="fig-cap">图 2.2：执行时的状态流转。每个节点读全量状态、返回部分更新，框架负责合并。</div>
+      <div class="fig-cap">图 2.2：super-step 视角的状态流转。一次 invoke 不是「逐函数调用」，而是若干 super-step：每步先执行当步的所有节点（本例每步一个），步末把写入统一合并进通道（触发点 pregel/_algo.py:319），再由更新后的通道触发下一步的节点。</div>
     </div>
 
     <div class="callout info">
       <b class="tag">契约</b>
-      每个节点的签名是 <code class="inline">def node(state: State) -> dict</code>——<strong>读全量状态、返回部分更新</strong>。返回的 dict 不必包含所有键，框架只会拿你返回的那些键去更新状态。默认行为是「覆盖」（源码里对应 <code class="inline">LastValue</code> 通道）：新值直接顶掉旧值。但「覆盖」不是唯一的合并策略——你可以用 <code class="inline">Annotated[list, add_messages]</code> 给某个键指定 <strong>reducer</strong>，让该键做「追加」而非「覆盖」。这正是聊天历史能越积越长的原理，第 03 章专门展开。
+      每个节点的签名是 <code class="inline">def node(state: State) -&gt; dict</code>——<strong>读全量状态、返回部分更新</strong>。返回的 dict 不必包含所有键，框架只会拿你返回的那些键去更新状态。默认行为是「覆盖」（源码里对应 <code class="inline">LastValue</code> 通道）：新值直接顶掉旧值。但「覆盖」不是唯一的合并策略——你可以用 <code class="inline">Annotated[list, add_messages]</code> 给某个键指定 <strong>reducer</strong>，让该键做「追加」而非「覆盖」。这正是聊天历史能越积越长的原理，第 03 章专门展开。
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">2.6</span>方法链：三步可以串成一句</h2>
-    <p>留意源码签名末尾的 <code class="inline">-> Self</code>：<code class="inline">add_node</code> 和 <code class="inline">add_edge</code> 都返回 builder 自身，因此可以链式调用。整张图可以用一个表达式写完：</p>
+    <p>留意源码签名末尾的 <code class="inline">-&gt; Self</code>：<code class="inline">add_node</code> 和 <code class="inline">add_edge</code> 都返回 builder 自身，因此可以链式调用。整张图可以用一个表达式写完：</p>
     <div class="code-title">链式调用建图</div>
     <pre class="code"><span class="lang-tag">python</span>graph = (
     <span class="cl">StateGraph</span>(<span class="cl">State</span>)
@@ -251,8 +283,8 @@ print(graph.invoke({<span class="st">"x"</span>: <span class="nu">1</span>}))
     .add_edge(<span class="st">"step2"</span>, END)
     .compile()   <span class="cmt"># compile 是链的终点，返回 CompiledStateGraph</span>
 )
-print(graph.invoke({<span class="st">"x"</span>: <span class="nu">1</span>}))   <span class="cmt"># {'x': 4}</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 链的最后一个环节是 <code class="inline">compile()</code>——它返回的不再是 builder（<code class="inline">Self</code>），而是 <code class="inline">CompiledStateGraph</code>。所以 <code class="inline">compile</code> 是建图链的终点：编译产物上根本没有 <code class="inline">add_node</code>（调了直接 <code class="inline">AttributeError</code>）；而如果你拿着 builder 的引用在 compile 之后又调 <code class="inline">builder.add_node(...)</code>，源码只会打一条警告（"Adding a node to a graph that has already been compiled…"）——改动静默不生效，已编译的图不变。两种情形都指向同一件事：「建造」与「执行」分离，链式调用把结构搭完，<code class="inline">compile</code> 封口并产出可运行对象。</div>
+<span class="fn">print</span>(graph.invoke({<span class="st">"x"</span>: <span class="nu">1</span>}))   <span class="cmt"># {'x': 4}</span></pre>
+    <div class="annotation"><b>链的终点是 compile：</b> 最后一个环节 <code class="inline">compile()</code>——它返回的不再是 builder（<code class="inline">Self</code>），而是 <code class="inline">CompiledStateGraph</code>。所以 <code class="inline">compile</code> 是建图链的终点：编译产物上根本没有 <code class="inline">add_node</code>（调了直接 <code class="inline">AttributeError</code>）；而如果你拿着 builder 的引用在 compile 之后又调 <code class="inline">builder.add_node(...)</code>，源码只会打一条警告（"Adding a node to a graph that has already been compiled…"，state.py:790）——改动静默不生效，已编译的图不变。两种情形都指向同一件事：「建造」与「执行」分离，链式调用把结构搭完，<code class="inline">compile</code> 封口并产出可运行对象。</div>
   </section>
 
   <section class="block">
@@ -260,11 +292,11 @@ print(graph.invoke({<span class="st">"x"</span>: <span class="nu">1</span>}))   
     <p>编译后的图自带一个「自省」方法 <code class="inline">get_graph()</code>，它返回一个可绘制的 <code class="inline">Graph</code> 对象（来自 <code class="inline">langchain_core</code>）。这个对象能直接导出 mermaid 文本，也能遍历节点——对调试和文档化很有用：</p>
     <div class="code-title">图自省</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 导出 mermaid 文本(可直接粘进任意 mermaid 渲染器)</span>
-print(graph.get_graph().draw_mermaid())
+<span class="fn">print</span>(graph.get_graph().draw_mermaid())
 
 <span class="cmt"># 遍历图里的节点(.nodes 是 dict，键就是节点名)</span>
 <span class="kw">for</span> name <span class="kw">in</span> graph.get_graph().nodes:
-    print(name)
+    <span class="fn">print</span>(name)
 <span class="cmt"># 输出大致是：</span>
 <span class="cmt"># __start__</span>
 <span class="cmt"># step1</span>
@@ -282,7 +314,7 @@ print(graph.get_graph().draw_mermaid())
     <h2><span class="num">2.8</span>新手常犯的错误</h2>
     <p>这一章只有三步，但三步里最容易绊倒新手的恰恰是「忘了第三步」和「重名」。下面两个坑都源自本仓库源码，踩过一次就再也不会犯。</p>
 
-    <h3>① 对着 builder 直接 invoke，忘了 compile()</h3>
+    <h3>对着 builder 直接 invoke，忘了 compile()</h3>
     <p>2.1 反复强调 <code class="inline">StateGraph</code> 只是建造者、本身不能跑，但新手写顺手了很容易拿着 <code class="inline">builder</code> 就 <code class="inline">invoke</code>。源码里 <code class="inline">invoke</code> / <code class="inline">stream</code> 这些方法只挂在<strong>编译后</strong>的 <code class="inline">CompiledStateGraph</code> 上，builder 上根本没有——于是你拿到的不是图的结果，而是一个 <code class="inline">AttributeError</code>。</p>
     <div class="code-title">反面 vs 正面：builder 不能 invoke，编译后才能</div>
     <pre class="code"><span class="lang-tag">python</span>builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>)
@@ -297,16 +329,36 @@ builder.<span class="fn">invoke</span>({<span class="st">"x"</span>: <span class
 <span class="cmt"># ✓ 先 compile 再 invoke</span>
 graph = builder.<span class="fn">compile</span>()
 <span class="fn">print</span>(graph.<span class="fn">invoke</span>({<span class="st">"x"</span>: <span class="nu">1</span>}))   <span class="cmt"># {'x': 2}</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 报错信息本身就是一条线索——它说 <code class="inline">StateGraph</code> 「没有 invoke 属性」，而不是「参数错误」。这提醒你：执行能力是 <code class="inline">compile()</code> 赋予的。<code class="inline">compile</code> 返回的 <code class="inline">CompiledStateGraph</code> 才实现了 Runnable 接口。</div>
+    <div class="annotation"><b>读报错：</b> 报错信息本身就是一条线索——它说 <code class="inline">StateGraph</code> 「没有 invoke 属性」，而不是「参数错误」。这提醒你：执行能力是 <code class="inline">compile()</code> 赋予的。<code class="inline">compile</code> 返回的 <code class="inline">CompiledStateGraph</code> 才实现了 Runnable 接口。</div>
 
-    <h3>② 两次 add_node 用了同一个名字</h3>
-    <p>另一个高频坑：复制粘贴节点时没改名字，或者用 <code class="inline">add_node(my_node)</code> 这种「函数名即节点名」的写法时，两个不同函数恰好 <code class="inline">__name__</code> 相同。源码在 <code class="inline">add_node</code> 里会先查重，撞名就直接报错，不会悄悄覆盖。</p>
+    <h3>两次 add_node 用了同一个名字</h3>
+    <p>另一个高频坑：复制粘贴节点时没改名字，或者用 <code class="inline">add_node(my_node)</code> 这种「函数名即节点名」的写法时，两个不同函数恰好 <code class="inline">__name__</code> 相同。源码在 <code class="inline">add_node</code> 里会先查重（state.py:803），撞名就直接报错，不会悄悄覆盖。</p>
     <div class="code-title">最小复现：同名节点报 ValueError</div>
     <pre class="code"><span class="lang-tag">python</span>builder.add_node(<span class="st">"step1"</span>, step1)
 builder.add_node(<span class="st">"step1"</span>, step2)   <span class="cmt"># 名字撞了</span>
 <span class="cmt"># ValueError: Node `step1` already present.</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这条护栏是好事——LangGraph 不允许同名节点，避免了「后注册的悄悄顶掉先注册的」这种难查的 bug。遇到这个报错，要么改名字，要么确认你是不是真的想注册两次（若是，给它们不同的名字）。</div>
+    <div class="annotation"><b>这条护栏是好事：</b> LangGraph 不允许同名节点，避免了「后注册的悄悄顶掉先注册的」这种难查的 bug。遇到这个报错，要么改名字，要么确认你是不是真的想注册两次（若是，给它们不同的名字）。</div>
     <div class="callout warn"><b class="tag">共同点</b> 这两个坑的共同点是<strong>把「建造」和「执行」混在了一起</strong>。第一个是拿建造者当执行物用，第二个是以为建造阶段会「覆盖」而非「拒重名」。记住 2.1 的那条主线——<code class="inline">StateGraph</code> 搭结构、<code class="inline">compile()</code> 封口并产出可运行对象——这两个坑就都不会踩。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.9</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · 三步法里，哪一步做了「有没有入口」的校验？为什么这个检查放在那一步，而不是在 <code class="inline">add_edge</code> 时就做？</summary>
+      <div class="a">在 compile() 里（内部调 state.py:1129 的 validate()）。放在编译时有两个理由：入口合法性取决于「全部边拼完之后」的整体——你在 add_edge 阶段随时可能补上 START 边，逐边报错会误伤中间状态；同理悬空节点、未知目标这类「结构级」错误都只在结构封口时才能定论。代价是报错时机后移：编译前一切静默，所以写完图要立刻 compile 一次当作「类型检查」。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · <code class="inline">graph.invoke({"x": 1})</code> 的返回值 <code class="inline">{'x': 4}</code> 是哪一层的数据？如果 step1、step2 都返回 <code class="inline">{"x": ...}</code>，它们的返回值是直接拼成结果，还是经过别的路径？</summary>
+      <div class="a">返回值是各通道（channel）的最终值组成的 dict，不是把节点返回值直接拼接。每个节点的返回只是「写入请求」：step1 写 x=2 进 x 通道，step2 读到 2、写回 4，END 前最后读取通道现值得到 4。合并动作发生在每个 super-step 末尾（pregel/_algo.py:319 的 update）。这就是为什么返回值永远完整、而节点永远只返回部分更新——中间的翻译层是通道 + reducer。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 同一个 builder，第一次 <code class="inline">compile(checkpointer=A)</code>，第二次 <code class="inline">compile(checkpointer=B)</code>。第二次编译后，第一次编译出的图还能正常 invoke 吗？builder 上之后再 add_node 会怎样？</summary>
+      <div class="a">还能。compile 是读取 builder 的结构生成新实例，不消耗它，两个产物互相独立（各自的 checkpointer、各自的通道实例）。之后再 add_node：源码只发警告"Adding a node to a graph that has already been compiled"（state.py:790），改动不生效于任何已编译产物——既不进第一个也不进第二个，除非再 compile 一次。警惕点：这是警告不是异常，漏看的话「明明加了节点怎么不跑」。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · 为什么 <code class="inline">add_node("START", ...)</code> 会报错？「START 不是节点」和「START 不能当边终点」这两条约束分别在拦什么？</summary>
+      <div class="a">state.py:805 的保留名护栏拒绝注册 START/END。两条约束各管一头：START 不是节点（它是编译时补造的 EphemeralValue 入口通道 + 触发器的虚拟源，state.py:1354），把它当普通节点注册会跟入口机制撞车；「START 不能当边终点」拦的是「别的节点执行完回到起点」——入口在图语义里只出不进，写 add_edge("a", START) 会得到 ValueError。END 同理只能进不能出。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 图 2.2 里，一次 invoke 被切成了三个 super-step。如果 step1 和 step2 没有边相连、而是都被 START 直接触发（add_edge(START, "step1"); add_edge(START, "step2")），执行会变成什么样？</summary>
+      <div class="a">step1 和 step2 会落进同一个 super-step 并行执行：它们同时读到 x=1，各自返回写入。x 是无 reducer 字段，两个写入撞进 LastValue 通道就抛 InvalidUpdateError（第 1 章 1.6 的最小复现）。这个例子说明 super-step 的边界由「通道更新触发哪些节点」决定：同批触发的节点并行、共享同一次合并窗口——想顺序执行就把它们用边串起来，想并行就共享触发源，并给被写的字段配 reducer。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

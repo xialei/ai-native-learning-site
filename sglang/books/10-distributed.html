@@ -200,7 +200,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     )
     target_rank = req.bootstrap_room % <span class="fn">len</span>(self.workers)
     <span class="fn">sock_send</span>(self.workers[target_rank], req)</pre>
-    <div class="annotation"><b>读懂这段：</b> bootstrap room 是 PD 分离部署里 prefill 实例与 decode 实例约定的「会面房间号」（第 12 章展开）。断言文案本身说明了约束：不要绕过 router 直接给 prefill/decode 实例发请求——房间号是 router 分配的，绕过它房间号对不上。</div>
+    <div class="annotation"><b>会面房间号：</b> bootstrap room 是 PD 分离部署里 prefill 实例与 decode 实例约定的「会面房间号」（第 12 章展开）。断言文案本身说明了约束：不要绕过 router 直接给 prefill/decode 实例发请求——房间号是 router 分配的，绕过它房间号对不上。</div>
 
     <div class="callout info">
       <b class="tag">困惑点</b>
@@ -253,7 +253,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     )
     ...  <span class="cmt"># 非编译态：pymscclpp → symmetric memory pynccl → flashinfer →</span>
     <span class="cmt"># _resolve_outplace_all_reduce_method，逐个排除后落到 torch 默认</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 单卡短路和 CPU 短路写在最前面，都是为了让常见情形不付检查成本。custom allreduce 只在「消息够小 + 链路够好」时才赢，所以判定函数被压成一个布尔量提前算出来。</div>
+    <div class="annotation"><b>短路在前，昂贵检查在后：</b> 单卡短路和 CPU 短路写在最前面，都是为了让常见情形不付检查成本。custom allreduce 只在「消息够小 + 链路够好」时才赢，所以判定函数被压成一个布尔量提前算出来。</div>
     <div class="annotation"><b>这不是二选一，是六路选择：</b> 早先读这段容易得到「custom allreduce 还是 NCCL」的二元印象，现在的实际路径是：平台专用通信器（hpu / xpu / npu）→ 编译态分支 → <code class="inline">pymscclpp</code> → symmetric-memory 的 pynccl → flashinfer allreduce → <code class="inline">_resolve_outplace_all_reduce_method</code> → torch 默认。<strong>其中编译态那一段最值得注意</strong>：源码注释写得很清楚，按字节大小和链路选路的逻辑（<code class="inline">_pick_algo</code> / <code class="inline">should_mscclpp_allreduce</code>）在编译态下会 guard 到符号化的 token 维度上，<strong>每换一个 shape 就要重新编译一次</strong>，所以整段判断被推迟到运行时——统一发一个 <code class="inline">method="auto"</code> 的 opaque 自定义算子，由算子内部再决定。另外 symmetric-memory 的原地路径在编译态下被<strong>刻意绕开</strong>：它的裸 pynccl 调用不可追踪（fullgraph 下直接报错），而且原地语义塞不进 outplace 自定义算子的契约。</div>
 
     <p>custom allreduce 的适用条件写在 <code class="inline">should_custom_ar</code> 里，是个纯字节级的判断：</p>
@@ -283,7 +283,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
         <span class="kw">return</span> <span class="kw">False</span>
 
     <span class="kw">return</span> <span class="kw">False</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 决策三要素：<strong>消息字节大小</strong>（小消息走 custom allreduce，直接读对端注册的 IPC 缓冲区，一次往返完成；超过 max_size 落回 NCCL）、<strong>链路</strong>（要 NVLink 全互联或仅 2 卡，PCIe 上收益趋零）、<strong>对齐</strong>（16 字节倍数）。decode 阶段 batch 小、激活小，几乎每层都命中 custom allreduce——这是小 batch 延迟的重要来源之一。TP 的另一处集合通信在词表并行：<code class="inline">lm_head</code> 按列切分后各 rank 只有一段词表的 logits，需要 all_gather 拼回完整分布。</div>
+    <div class="annotation"><b>决策三要素：</b> <strong>消息字节大小</strong>（小消息走 custom allreduce，直接读对端注册的 IPC 缓冲区，一次往返完成；超过 max_size 落回 NCCL）、<strong>链路</strong>（要 NVLink 全互联或仅 2 卡，PCIe 上收益趋零）、<strong>对齐</strong>（16 字节倍数）。decode 阶段 batch 小、激活小，几乎每层都命中 custom allreduce——这是小 batch 延迟的重要来源之一。TP 的另一处集合通信在词表并行：<code class="inline">lm_head</code> 按列切分后各 rank 只有一段词表的 logits，需要 all_gather 拼回完整分布。</div>
     <div class="annotation"><b>HIP 分支是后加的：</b> 注意 <code class="inline">_is_hip</code> 出现了两次——一次是 NVIDIA 侧提前返回，一次是 AMD 侧单独判断。AMD 路径多出一个短路条件 <code class="inline">use_amd_deterministic_impl</code>：开了确定性实现就<strong>无条件放行</strong>，不再看链路和消息大小。这是个值得留意的形状——「确定性」在这里不是靠牺牲正确性换的，而是换了一条实现路径，代价（性能）由用户自己权衡，所以判断条件从「能不能快」变成了「用户要不要这个保证」。</div>
   </section>
 
@@ -311,7 +311,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     <span class="kw">if</span> local_tokens.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
         <span class="fn">memcpy</span>(local_tokens, global_tokens,
                <span class="nu">0</span>, local_start_pos, local_num_tokens, <span class="kw">True</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> 每层前向的模式就固定成三步：注意力各 rank 算各自的（无通信）→ <code class="inline">dp_gather</code> 汇总 → MoE 在全局 token 上计算 → <code class="inline">dp_scatter</code> 切回。CUDA Graph 要求形状固定，所以全局/本地缓冲区长度有 max/sum 两种填充模式（<code class="inline">get_dp_padding_mode</code>）。这套机制下每张卡仍然是一个完整的 Scheduler 进程，只是并行组划分变了：<code class="inline">attn_tp_size = tp_size // attn_dp_size // attn_cp_size</code>，注意力组与 MoE 组是同一批卡的不同切法。</div>
+    <div class="annotation"><b>每层前向的固定三步：</b> 注意力各 rank 算各自的（无通信）→ <code class="inline">dp_gather</code> 汇总 → MoE 在全局 token 上计算 → <code class="inline">dp_scatter</code> 切回。CUDA Graph 要求形状固定，所以全局/本地缓冲区长度有 max/sum 两种填充模式（<code class="inline">get_dp_padding_mode</code>）。这套机制下每张卡仍然是一个完整的 Scheduler 进程，只是并行组划分变了：<code class="inline">attn_tp_size = tp_size // attn_dp_size // attn_cp_size</code>，注意力组与 MoE 组是同一批卡的不同切法。</div>
     <div class="annotation"><b>布局约束常被误传：</b> 流传较广的说法是「只支持 <code class="inline">attn_tp_size == 1</code>、<code class="inline">tp_size == dp_size</code>」，但这只对了一部分。源码只断言 <code class="inline">tp_size % dp_size == 0</code>，此外 <code class="inline">tp_size % (dp_size * attn_cp_size) == 0</code>——并<strong>不要求</strong>两者相等。<code class="inline">attn_tp_size &gt; 1</code> 是一条活跃支持的路径：<code class="inline">layers/communicator.py</code> 与 <code class="inline">layers/logits_processor.py</code> 都有 <code class="inline">attn_tp_size &gt; 1</code> 的分支，还会为这种形状专门打一条提示日志（"DSA with TP mode is active… attention weights will be sharded across N ranks"）。<code class="inline">tp_size == dp_size</code> 这个约束只对 <strong>flashinfer MegaMoE</strong> 成立。<strong>「注意力 TP 与 DP 正交」才是这套设计的一般形态</strong>，tp8dp8 只是 <code class="inline">attn_tp_size=1</code> 的那个特例。锚点：断言 <code class="inline">parallel_hook.py:233</code>（CP 侧两条在 <code class="inline">:80, :83</code>）、分支 <code class="inline">layers/logits_processor.py:450</code>、提示日志 <code class="inline">arg_groups/model_hook.py:295</code>。</div>
   </section>
 
@@ -342,7 +342,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
             ...
             result, self.launch_event = self._pp_launch_batch(
                 mb_id, cur_batch, pp_proxy_tensors, ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 每个 microbatch 槽位独立维护自己的 running_batch / last_batch，相当于把第 2 章的事件循环复制了 N 份交错执行——stage 0 在算 mb_2 时，stage 1 在算 mb_1，流水线才能填满。<code class="inline">pp_async_batch_depth</code> 让最后一 stage 在 GPU 计算期间先处理上一个 microbatch 的结果，削掉尾部的 rank 空转。</div>
+    <div class="annotation"><b>循环复制了 N 份：</b> 每个 microbatch 槽位独立维护自己的 running_batch / last_batch，相当于把第 2 章的事件循环复制了 N 份交错执行——stage 0 在算 mb_2 时，stage 1 在算 mb_1，流水线才能填满。<code class="inline">pp_async_batch_depth</code> 让最后一 stage 在 GPU 计算期间先处理上一个 microbatch 的结果，削掉尾部的 rank 空转。</div>
 
     <h3>EP：专家怎么分、弹性扩缩怎么算</h3>
     <p>EP 把 MoE 的专家列表按 <code class="inline">moe_ep_size</code> 均分，每个 rank 持有一段专家；token 按路由结果发到持有目标专家的 rank。常规情况下「存储分片」和「运行时分片」是一回事，但弹性 EP（<code class="inline">ep_join_mode == "scale"</code>）把两者拆开——专家按<strong>初始规模</strong>落盘，运行时按<strong>当前规模</strong>计算归属，这样 EP 组扩容/缩容时不用重新分片权重：</p>
@@ -358,10 +358,10 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     self._expert_storage_rank = self.moe_ep_rank
 <span class="kw">assert</span> self._num_global_routed % storage_ep_size == <span class="nu">0</span>
 self._num_local_routed = self._num_global_routed // storage_ep_size</pre>
-    <div class="annotation"><b>读懂这段：</b> 弹性模式下，本 rank 的专家按「初始规模 + rank 偏移」从存储定位，而路由按当前运行规模算——两套编号并存，是支撑在线扩缩的代价。这也解释了 <code class="inline">_launch_scheduler_processes</code> 里那个条件：<code class="inline">use_dp_controller = dp_size &gt; 1 or ep_join_mode == "scale"</code>——弹性 EP 扩缩需要 controller 参与进程编排，不只是路由请求。</div>
+    <div class="annotation"><b>两套编号并存：</b> 弹性模式下，本 rank 的专家按「初始规模 + rank 偏移」从存储定位，而路由按当前运行规模算——两套编号并存，是支撑在线扩缩的代价。这也解释了 <code class="inline">_launch_scheduler_processes</code> 里那个条件：<code class="inline">use_dp_controller = dp_size &gt; 1 or ep_join_mode == "scale"</code>——弹性 EP 扩缩需要 controller 参与进程编排，不只是路由请求。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      最近两笔改动都指向同一个方向——把并行状态从「模块级全局变量」收拢到「显式的上下文对象」。<code class="inline">layers/dp_attention.py</code> 里那批模块级全局（本地 rank、缓冲区张量等）被整体拆除，读写改走 <code class="inline">get_parallel().override_permanently(...)</code>（<code class="inline">runtime_context.py:545</code>），注意力 rank 的推导也集中成 <code class="inline">derive_attention_ranks</code>（<code class="inline">runtime_context.py:262</code>）一处。代价是行号大范围漂移（本章几个锚点都因此后移），收益是并行组状态有了唯一的存取入口——对自研引擎是个可以抄的结构决策：全局变量省下的样板代码，迟早要在测试和 CUDA Graph 捕获的边界上还回来。另一笔是新增了 <code class="inline">_SHARED_EXPERTS_TP</code> 并行组（<code class="inline">distributed/parallel_state.py:2145</code>，<code class="inline">get_shared_experts_tp_group</code>，加入 <code class="inline">graph_capture</code> 的组元组）：共享专家（路由之外永远激活的那部分专家）单独成组做 TP 切分，与主 TP 组隔离，目前只对 Kimi-K3 类模型开启，且在 <code class="inline">parallel_hook.py</code> 里强制要求它整除 <code class="inline">tp_size</code>。MoE 的「共享专家怎么切」从此有了独立的自由度。
+      最近两笔改动都指向同一个方向——把并行状态从「模块级全局变量」收拢到「显式的上下文对象」。<code class="inline">layers/dp_attention.py</code> 里那批模块级全局（本地 rank、缓冲区张量等）被整体拆除，读写改走 <code class="inline">get_parallel().override_permanently(...)</code>（<code class="inline">runtime_context.py:448</code>），注意力 rank 的推导也集中成 <code class="inline">derive_attention_ranks</code>（<code class="inline">runtime_context.py:123</code>）一处。代价是行号大范围漂移（本章几个锚点都因此后移），收益是并行组状态有了唯一的存取入口——对自研引擎是个可以抄的结构决策：全局变量省下的样板代码，迟早要在测试和 CUDA Graph 捕获的边界上还回来。另一笔是新增了 <code class="inline">_SHARED_EXPERTS_TP</code> 并行组（<code class="inline">distributed/parallel_state.py:2179</code>，<code class="inline">get_shared_experts_tp_group</code>，加入 <code class="inline">graph_capture</code> 的组元组）：共享专家（路由之外永远激活的那部分专家）单独成组做 TP 切分，与主 TP 组隔离，目前只对 Kimi-K3 类模型开启，且在 <code class="inline">parallel_hook.py</code> 里强制要求它整除 <code class="inline">tp_size</code>。MoE 的「共享专家怎么切」从此有了独立的自由度。
     </div>
   </section>
 
@@ -380,7 +380,7 @@ self._num_local_routed = self._num_global_routed // storage_ep_size</pre>
 </div>
 
 <footer>
-  深入浅出SGLang · 10 分布式 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 10 分布式 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

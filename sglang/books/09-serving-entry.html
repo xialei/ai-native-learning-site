@@ -167,7 +167,7 @@
         )
     <span class="kw">else</span>:
         content = ret.message <span class="kw">or</span> <span class="st">"Flush cache failed.\n"</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 路由层不做业务，只做三件事：鉴权（<code class="inline">@auth_level</code>）、调用、包装响应。注意 flush 在有 running/waiting 请求时会拒绝执行——缓存清空请求和正在跑的请求之间存在一致性问题，调度器侧（第 4 章）会检查队列再动手。</div>
+    <div class="annotation"><b>薄路由：</b> 路由层不做业务，只做三件事：鉴权（<code class="inline">@auth_level</code>）、调用、包装响应。注意 flush 在有 running/waiting 请求时会拒绝执行——缓存清空请求和正在跑的请求之间存在一致性问题，调度器侧（第 4 章）会检查队列再动手。</div>
 
     <p><code class="inline">launch_server</code> 在起 HTTP 之前会做一次 warmup：等模型就绪、发一条 max_new_tokens=8 的真实生成请求，把 CUDA Graph、内核编译这些首次成本在「服务器就绪」之前消化掉：</p>
     <div class="code-title">python/sglang/srt/entrypoints/http_server.py — _execute_server_warmup（摘录，注释为译注）</div>
@@ -237,7 +237,7 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
     <span class="kw">return await</span> raw_request.app.state.openai_serving_chat.<span class="fn">handle_request</span>(
         request, raw_request
     )</pre>
-    <div class="annotation"><b>读懂这段：</b> 每个 /v1 端点对应一个 <code class="inline">OpenAIServing*</code> 对象，启动时统一挂到 <code class="inline">fast_api_app.state</code> 上，构造参数都是同一个 TokenizerManager 加 TemplateManager。适配层要干的活比「转格式」多得多。</div>
+    <div class="annotation"><b>不止转格式：</b> 每个 /v1 端点对应一个 <code class="inline">OpenAIServing*</code> 对象，启动时统一挂到 <code class="inline">fast_api_app.state</code> 上，构造参数都是同一个 TokenizerManager 加 TemplateManager。适配层要干的活比「转格式」多得多。</div>
 
     <p>第一件重活是 chat 模板。messages 数组要按模型自带的 Jinja 模板渲染成 prompt token 序列，tools 定义也要拼进模板。通用路径在 <code class="inline">_render_and_encode_chat_template</code>：</p>
     <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — chat 模板渲染（摘录，节选自 _render_and_encode_chat_template）</div>
@@ -250,7 +250,7 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
     **template_kwargs,
 )
 prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(rendered_prompt, **encode_kwargs)</pre>
-    <div class="annotation"><b>读懂这段：</b> 通用路径是「先渲染成文本、再 encode」两步，中间结果（<code class="inline">rendered_prompt</code> / <code class="inline">prompt_ids</code> / 反解码的 <code class="inline">decoded_prompt</code>）按 (chat_template, messages, tools, kwargs) 整体做 LRU 缓存（上限 128，仅多模态请求启用）——同一批图片重复请求时渲染和编码都省掉。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
+    <div class="annotation"><b>两步渲染，整体缓存：</b> 通用路径是「先渲染成文本、再 encode」两步，中间结果（<code class="inline">rendered_prompt</code> / <code class="inline">prompt_ids</code> / 反解码的 <code class="inline">decoded_prompt</code>）按 (chat_template, messages, tools, kwargs) 整体做 LRU 缓存（上限 128，仅多模态请求启用）——同一批图片重复请求时渲染和编码都省掉。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       这条路径上有过两次收敛。其一，渲染结果怎么交给引擎：可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是逐模型 <code class="inline">elif</code> 链（先 <code class="inline">kimi_k3</code> 再 <code class="inline">inkling</code>），后来抽成 <code class="inline">_engine_prompt()</code>，判断依据从模型名字符串换成能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>——<strong>每接一个特殊编码器就加一个 elif 是这类地方的典型退化路径</strong>，换成能力位之后新模型声明行为即可，这里不用动。其二，tokenize 本身：kimi_k3 一族仍走「<code class="inline">apply_chat_template(tokenize=True)</code> 一步出 id」的快路径（<code class="inline">_encode_messages</code> 内），通用模型走上面渲染+编码两步——一步出 id 少一次 tokenize 往返，但两步版能拿到中间文本做多模态缓存键，各取所需。如今两条路之间还插了一个自动仲裁：构造时跑一次 <code class="inline">_probe_prompt_text_round_trip</code>（serving_chat.py:374）——拿一条 <code class="inline">[{"role": "user", "content": "x"}]</code> 分别走「渲染成文本再 encode」和「直接 tokenize=True」，结果不同就标记 lossy，此后该 tokenizer 的请求直接走一步出 id。这是被 mistral_common 类 tokenizer 逼出来的：它们的控制 token（<code class="inline">[INST]</code>、<code class="inline">[AVAILABLE_TOOLS]</code>）没有文本形式，渲染成字符串会变成字面字母、再 encode 还会多出一个 BOS——模型看到的不再是框住工具块的控制 token，而是字面字符。探测失败（比如模板需要探测没给的 kwargs）时保守回到老的文本路径。
@@ -293,7 +293,7 @@ required_parsed_natively = glm_constraint
             thinking_mode=xgrammar_reasoning,
         )
         required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
-    <div class="annotation"><b>读懂这段：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生吐出，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
+    <div class="annotation"><b>glm47 走单独一条路：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生吐出，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
   </section>
 
   <section class="block">
@@ -315,7 +315,7 @@ required_parsed_natively = glm_constraint
 <span class="kw">else</span>:
     ret = self.loop.<span class="fn">run_until_complete</span>(generator.<span class="fn">__anext__</span>())
     <span class="kw">return</span> ret</pre>
-    <div class="annotation"><b>读懂这段：</b> 离线 Engine 把 asyncio 生成器包成同步生成器：内部跑自己的事件循环，逐块 run_until_complete。因为底层 API 与 HTTP 路径完全相同（同一个 generate_request 协程），离线压测得到的数据可以代表在线行为——这是「离线引擎优先」设计带来的直接好处。</div>
+    <div class="annotation"><b>同步包装，同一协程：</b> 离线 Engine 把 asyncio 生成器包成同步生成器：内部跑自己的事件循环，逐块 run_until_complete。因为底层 API 与 HTTP 路径完全相同（同一个 generate_request 协程），离线压测得到的数据可以代表在线行为——这是「离线引擎优先」设计带来的直接好处。</div>
 
     <p>进程编排入口是 <code class="inline">_launch_subprocesses</code>，开头几行值得细读——配置在发布给子进程前有一道「快照-恢复」保护：</p>
     <div class="code-title">python/sglang/srt/entrypoints/engine.py — _launch_subprocesses 开头（摘录，注释为译注）</div>
@@ -327,7 +327,7 @@ _set_envs_and_config(server_args)
 <span class="cmt"># snapshot/restore 保证启动失败时上下文回到发布前</span>
 context_before_publish = <span class="fn">snapshot_context</span>()
 <span class="fn">publish</span>(server_args, role=<span class="st">"tokenizer"</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">publish(role="tokenizer")</code> 之后，主进程内所有 <code class="inline">get_schedule()</code> 式的读取都有了着落。role 参数不只是元数据：每个角色有一张「允许读取哪些配置命名空间」的表（<code class="inline">ROLE_NAMESPACE_SETS</code>），<code class="inline">SGLANG_ROLE_NAMESPACES=enforce</code> 时表外的读取直接报错——这是把「哪类进程依赖哪些配置」显式写进了代码。</div>
+    <div class="annotation"><b>role 不只是元数据：</b> <code class="inline">publish(role="tokenizer")</code> 之后，主进程内所有 <code class="inline">get_schedule()</code> 式的读取都有了着落。每个角色有一张「允许读取哪些配置命名空间」的表（<code class="inline">ROLE_NAMESPACE_SETS</code>），<code class="inline">SGLANG_ROLE_NAMESPACES=enforce</code> 时表外的读取直接报错——这是把「哪类进程依赖哪些配置」显式写进了代码。</div>
     <div class="annotation"><b>这张表目前还很宽松，原因写在注释里：</b> 查表会发现，<code class="inline">scheduler</code>、<code class="inline">tokenizer</code>、<code class="inline">detokenizer</code>、<code class="inline">encoder</code> 等角色的值都是 <code class="inline">None</code>——<code class="inline">None</code> 的语义是<strong>整棵树都可以读</strong>，不是「什么都不能读」。真正被收窄的只有一个：<code class="inline">dp_controller</code>，限定在 <code class="inline">{"exec", "parallel", "device", "disagg", "observability", "serving"}</code> 六个命名空间。<code class="inline">tokenizer</code> 那一项旁边留了一段注释解释为什么不收窄：做记录模式审计时只跑通了文本模型的几个端点，多模态处理器、LoRA / score 端点、disagg 角色、gRPC 桥都没覆盖到，「<strong>收窄需要把这些形态也审计完；写错的集合会让请求失败，而不是让测试失败</strong>」。所以这张表现在的实际作用是：框架就位、失败关闭（fail-closed）已经生效，但生产角色还没有一个真正被限制住。</div>
   </section>
 
@@ -349,7 +349,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
            load_format: A[str, Arg(help="...", choices=CHOICES)] = "auto"
            model_path: A[str, Arg(help="...", aliases=["--model"])]
     """</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 字段定义、CLI 注册、帮助文档三份信息合并成一处声明，加参数只改一个文件。这个文件本身也是配置演进的记录：代码里专门列出了哪些参数「必须手动注册」（废弃 flag 重定向、动态 choices），并按注释块分区（# Model and tokenizer、# LoRA……），新参数必须归入对应分区。</div>
+    <div class="annotation"><b>一处声明，三份产出：</b> 字段定义、CLI 注册、帮助文档三份信息合并成一处声明，加参数只改一个文件。这个文件本身也是配置演进的记录：代码里专门列出了哪些参数「必须手动注册」（废弃 flag 重定向、动态 choices），并按注释块分区（# Model and tokenizer、# LoRA……），新参数必须归入对应分区。</div>
 
     <p>配置的<strong>读取</strong>端不在 ServerArgs 上，而是发布到一组进程级全局对象。Scheduler、ModelRunner、Sampler 里的代码到处在调 <code class="inline">get_schedule().page_size</code>、<code class="inline">get_memory().disable_radix_cache</code> 这类语句：</p>
     <div class="code-title">python/sglang/srt/runtime_context.py — 配置命名空间的访问器（摘录，注释为译注）</div>
@@ -371,7 +371,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 
 <span class="kw">def</span> <span class="fn">get_spec</span>() -&gt; <span class="cl">_ConfigBag</span>:
     <span class="kw">return</span> _CONTEXT.<span class="fn">config_bag</span>(<span class="st">"spec"</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> 这是「全局配置包」方案：publish 时把 ServerArgs 投影成十几个命名空间包（device/model/exec/schedule/memory/spec/lora/mm/disagg/serving/observability），之后任何模块按需读取，不必把 server_args 一路穿进每个构造函数。代价是依赖被藏进了全局读取——所以仓库里配了 enforce 模式：SGLANG_ROLE_NAMESPACES=enforce 时，未在角色表里声明的读取会直接失败，用检查替代纪律。</div>
+    <div class="annotation"><b>全局包与其代价：</b> 这是「全局配置包」方案：publish 时把 ServerArgs 投影成十几个命名空间包（device/model/exec/schedule/memory/spec/lora/mm/disagg/serving/observability），之后任何模块按需读取，不必把 server_args 一路穿进每个构造函数。代价是依赖被藏进了全局读取——所以仓库里配了 enforce 模式：SGLANG_ROLE_NAMESPACES=enforce 时，未在角色表里声明的读取会直接失败，用检查替代纪律。</div>
 
     <div class="callout info">
       <b class="tag">演进</b>
@@ -383,7 +383,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
     <h2><span class="num">9.7</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      三个可迁移的决定：① <strong>离线 Engine 先行</strong>——先把 generate() 做对，HTTP 层只是它的一层皮，两边共用同一协程入口，压测和服务行为才不会分叉。② <strong>路由薄、适配层厚</strong>——路由只做参数解析和转发，chat 模板、tool call、reasoning 分离这类协议工作收敛到独立的 serving 对象；SGLang 的路由清单已经长到 80 多条，靠的就是每条路由都足够薄。③ <strong>配置可以全局读，但要把「谁读什么」写成表</strong>——全局包省掉了参数传递的机械劳动，角色-命名空间表让这种妥协保持可审计。下一步进入 <a href="10-distributed.html">第 10 章：分布式推理</a>。
+      最值得迁移的是三个决定。首先是<strong>离线 Engine 先行</strong>——先把 generate() 做对，HTTP 层只是它的一层皮，两边共用同一协程入口，压测和服务行为才不会分叉。其次是<strong>路由薄、适配层厚</strong>——路由只做参数解析和转发，chat 模板、tool call、reasoning 分离这类协议工作收敛到独立的 serving 对象；SGLang 的路由清单已经长到 80 多条，靠的就是每条路由都足够薄。最后是<strong>配置可以全局读，但要把「谁读什么」写成表</strong>——全局包省掉了参数传递的机械劳动，角色-命名空间表让这种妥协保持可审计。下一步进入 <a href="10-distributed.html">第 10 章：分布式推理</a>。
     </div>
   </section>
 
@@ -394,7 +394,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

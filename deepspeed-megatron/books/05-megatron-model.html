@@ -37,11 +37,16 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 模型与数据</div>
     <h1>模型与数据：张量怎么在 3D 并行下流动</h1>
-    <div class="subtitle">前两章讲了怎么切（TP/PP/DP），这一章看切完之后模型代码长什么样、数据怎么喂进去。重点三件事：模型代码如何对并行透明、混合精度如何包裹模型（Float16Module）、数据管线如何让 TP/PP/CP 组内拿同一批样本而 DP 组间不重叠、序列维如何切给 CP。</div>
+    <div class="subtitle">切完之后，模型代码长什么样、怎么做到对并行透明？混合精度的壳（Float16Module）包在哪层，fp32 master 权重归谁？数据管线怎么保证 TP/PP/CP 组内同批、DP 组间不重叠？序列维怎么切给 CP？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">5.1</span>TransformerLayer 的组装：并行透明的关键</h2>
+    <h2><span class="num">5.1</span>切完之后，代码长什么样</h2>
+    <p>前两章讲了怎么切（TP/PP/DP），这一章看切完之后的事。比如一个挺反直觉的现象：切完之后，模型代码里一行 <code class="inline">torch.distributed</code> 都没有——切分藏在哪？顺着这个问题往下，还有三件说不清就会在生产里踩坑的事：混合精度的壳包在哪层，fp32 master 权重归谁；数据管线怎么保证 TP/PP/CP 组内同批、DP 组间不重叠；序列维怎么切给 CP——因果注意力的载荷不均匀，直接等分是错的。先给两个锚点：<strong>并行透明靠「算子类即切分点」，数据规则靠一条公式——TP/PP 永远不进 batch 公式。</strong>下面逐个展开。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>TransformerLayer 的组装：并行透明的关键</h2>
     <p>模型代码完全不写 <code class="inline">torch.distributed</code>——切分发生在模块的<strong>构造函数里</strong>。看一个 transformer 层的拼装：</p>
     <div class="code-title">megatron/core/transformer/transformer_layer.py — 组装链（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">TransformerLayer</span>(BaseTransformerLayer):
@@ -63,7 +68,7 @@
             ),
         )
         <span class="cmt"># TP 切分写进算子的构造参数——模型代码零切分逻辑</span></pre>
-    <div class="annotation"><b>读懂组装链：</b>「切分写进构造参数」是 Megatron 模型代码干净的根本原因：<code class="inline">MLP</code> 的 fc1 用 <code class="inline">TELayerNormColumnParallelLinear</code>（LN+列并行融合算子），fc2 用 <code class="inline">TERowParallelLinear</code>——<strong>换 TP=1 时只需换算子类</strong>（非 TE 路径对应 <code class="inline">ColumnParallelLinear</code>/<code class="inline">RowParallelLinear</code>，并行度 1 时自动退化为普通 Linear）。层内还可以包 <code class="inline">checkpointed_forward</code>（配置 <code class="inline">--recompute-granularity full</code> 时），在第 10 章展开。</div>
+    <div class="annotation"><b>「切分写进构造参数」是 Megatron 模型代码干净的根本原因：</b><code class="inline">MLP</code> 的 fc1 用 <code class="inline">TELayerNormColumnParallelLinear</code>（LN+列并行融合算子），fc2 用 <code class="inline">TERowParallelLinear</code>——<strong>换 TP=1 时只需换算子类</strong>（非 TE 路径对应 <code class="inline">ColumnParallelLinear</code>/<code class="inline">RowParallelLinear</code>，并行度 1 时自动退化为普通 Linear）。层内还可以包 <code class="inline">checkpointed_forward</code>（配置 <code class="inline">--recompute-granularity full</code> 时），在第 10 章展开。</div>
 
     <h3>GPTModel.forward：3D 并行下的输入形态</h3>
     <div class="code-title">megatron/core/models/gpt/gpt_model.py — GPTModel.forward 签名（摘录）</div>
@@ -77,11 +82,12 @@
     packed_seq_params: <span class="cl">PackedSeqParams</span> = <span class="kw">None</span>,  <span class="cmt"># 变长序列打包（THD 格式）</span>
     ...,
 ):</pre>
-    <div class="annotation"><b>三个特殊参数：</b>① <code class="inline">decoder_input</code>——PP 非首阶段不需要 embedding 输出，直接以「上一阶段传来的激活」为输入（首阶段则先过 <code class="inline">embedding</code>）；② <code class="inline">packed_seq_params</code>——变长 packing 后的段边界信息，配合 FA2 的 varlen 路径；③ <code class="inline">inference_context</code>——推理时携带 KV cache 状态。训练主路径里它们多半为 None，但签名本身就是 3D 并行下的输入全景。</div>
+    <div class="annotation"><b>签名里有两个训练时用不上的参数，但它们正好暴露了并行结构：</b><code class="inline">decoder_input</code>——PP 非首阶段不需要 embedding 输出，直接以「上一阶段传来的激活」为输入（首阶段则先过 <code class="inline">embedding</code>）；<code class="inline">packed_seq_params</code>——变长 packing 后的段边界信息，配合 FA2 的 varlen 路径；还有 <code class="inline">inference_context</code>——推理时携带 KV cache 状态。训练主路径里它们多半为 None，但签名本身就是 3D 并行下的输入全景。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.2</span>混合精度包裹：Float16Module</h2>
+    <h2><span class="num">5.3</span>混合精度包裹：Float16Module</h2>
+    <p>下一个问题关于精度：权重、梯度、master 权重、loss scale，各属于哪一层？直觉上「模型用 fp16 训练」就是模型自己的事——但 Megatron 把它拆成了三处：cast 在模型外壳、master 权重在 optimizer、缩放也在 optimizer。边界划错了，自研时就会出现「两边都做一遍缩放」这类静默错误。看代码：</p>
     <div class="code-title">megatron/core/transformer/module.py — Float16Module（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Float16Module</span>(torch.nn.Module):
     <span class="st">"""Wrap the module with fp16/bf16 conversion in forward pass"""</span>
@@ -96,8 +102,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.3</span>数据管线：组内同批、DP 间不重叠</h2>
-    <p>3D 并行下数据加载有两个特殊要求：① 同一 TP/PP/CP 组内各卡必须拿到<strong>同一批样本</strong>（它们在算同一个模型的同一段）；② 不同 DP 副本拿到<strong>不重叠的样本</strong>。Megatron 用 rank 算偏移：</p>
+    <h2><span class="num">5.4</span>数据管线：组内同批、DP 间不重叠</h2>
+    <p>并行组内各卡吃什么？3D 并行下数据加载有两个特殊要求：同一 TP/PP/CP 组内各卡必须拿到<strong>同一批样本</strong>（它们在算同一个模型的同一段）；不同 DP 副本拿到<strong>不重叠的样本</strong>。还有一条更隐蔽的：TP/PP 到底进不进 batch 公式？看代码怎么用 rank 算偏移：</p>
     <div class="code-title">megatron/training/data_samplers.py — MegatronPretrainingSampler.__iter__（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__iter__(self)</span>:
     batch = []
@@ -111,8 +117,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.4</span>CP 切序列：get_batch_on_this_cp_rank</h2>
-    <p>第 2 章 2.4 节讲过 PP 气泡；CP 的 zigzag 原理（因果注意力载荷是三角形，连续切会让首卡闲、尾卡忙）。这里看数据侧实现：</p>
+    <h2><span class="num">5.5</span>CP 切序列：get_batch_on_this_cp_rank</h2>
+    <p>最后一块拼图是 CP。CP 切的是序列而不是 batch，那切完之后每张卡手里的张量长什么样？因果注意力的载荷是三角形，连续切会让首卡闲、尾卡忙——所以 Megatron 用 zigzag 折返切法。这里看数据侧实现：</p>
     <div class="code-title">megatron/core/utils.py — get_batch_on_this_cp_rank（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_batch_on_this_cp_rank</span>(batch):
     cp_size = ...
@@ -123,11 +129,92 @@
                 batch[key] = <span class="fn">zigzag 分段</span>(val)
         <span class="cmt"># per-document：变体——文档边界重排后整段分配（document mask 配合）</span>
         <span class="cmt"># hybrid CP：另一变体——不同注意力后端配不同切法</span></pre>
-    <div class="annotation"><b>读代码要抓的两点：</b>① 切的是 <code class="inline">batch</code> 里每一个 key（tokens/position_ids/labels 必须同步切，错一个 key 就是 label 对不上的静默错误）；② zigzag 的实现是「第 i 段 + 第 cp_size·2−1−i 段」的配对，保证每卡两侧合计工作量相等。per-document 变体在文档数量多且长短不均时更优（避免跨文档 padding），hybrid CP 则服务于不同注意力后端的通信形态差异。哪个变体生效由配置选择，数据侧只负责按选定的方式切。</div>
+    <div class="annotation"><b>读代码要抓的两点：</b>切的是 <code class="inline">batch</code> 里每一个 key——tokens/position_ids/labels 必须同步切，错一个 key 就是 label 对不上的静默错误；zigzag 的实现则是「第 i 段 + 第 cp_size·2−1−i 段」的配对，保证每卡两侧合计工作量相等。per-document 变体在文档数量多且长短不均时更优（避免跨文档 padding），hybrid CP 则服务于不同注意力后端的通信形态差异。哪个变体生效由配置选择，数据侧只负责按选定的方式切。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t51 d51">
+        <title id="t51">一个 batch 在 3D 并行下的三条切分轴</title>
+        <desc id="d51">三条横向带：batch 维由 DP 切（卡间不重叠）；模型维由 TP/PP 切（同批样本复制进组，PP 阶段间传激活）；序列维由 CP 切（zigzag 首尾配对）。TP/PP 不进 batch 公式，CP 是第二种数据切分。</desc>
+        <defs>
+          <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl code" x="40" y="32" font-size="12">batch 维 · DP 切（每卡不同样本）</text>
+        <rect class="node" x="40" y="44" width="180" height="64" rx="8"></rect>
+        <text class="lbl" x="130" y="70" text-anchor="middle">全局 batch</text>
+        <text class="lbl code" x="130" y="92" text-anchor="middle">样本 0…7（8 条）</text>
+
+        <line class="edge" x1="220" y1="66" x2="300" y2="58"></line>
+        <line class="edge" x1="220" y1="86" x2="300" y2="100"></line>
+
+        <rect class="node core" x="302" y="34" width="200" height="46" rx="8"></rect>
+        <text class="lbl" x="402" y="56" text-anchor="middle">DP0 拿样本 0–3</text>
+        <text class="lbl sm" x="402" y="72" text-anchor="middle">micro_batch=4</text>
+        <rect class="node core" x="302" y="96" width="200" height="46" rx="8"></rect>
+        <text class="lbl" x="402" y="118" text-anchor="middle">DP1 拿样本 4–7</text>
+        <text class="lbl sm" x="402" y="134" text-anchor="middle">不重叠</text>
+
+        <rect class="node acc" x="560" y="44" width="330" height="64" rx="8"></rect>
+        <text class="lbl code" x="725" y="70" text-anchor="middle">global = micro × DP × grad_accum</text>
+        <text class="lbl sm" x="725" y="90" text-anchor="middle">TP/PP 不进这条公式；CP 加入后乘上 CP</text>
+
+        <line x1="40" y1="152" x2="900" y2="152" stroke="var(--fg-muted)" stroke-dasharray="4 5" stroke-width="1"></line>
+
+        <text class="lbl code" x="40" y="176" font-size="12">模型维 · TP/PP 切（同批样本复制进组，模型被切开）</text>
+        <rect class="node" x="40" y="188" width="180" height="64" rx="8"></rect>
+        <text class="lbl" x="130" y="214" text-anchor="middle">同一批样本</text>
+        <text class="lbl sm" x="130" y="236" text-anchor="middle">组内每卡一份（复制）</text>
+
+        <line class="edge" x1="220" y1="220" x2="300" y2="204"></line>
+        <line class="edge" x1="220" y1="220" x2="300" y2="252"></line>
+
+        <rect class="node core" x="302" y="182" width="250" height="46" rx="8"></rect>
+        <text class="lbl" x="427" y="204" text-anchor="middle">TP 组：各持半份权重</text>
+        <text class="lbl sm" x="427" y="220" text-anchor="middle">同一激活过两个半张量</text>
+        <rect class="node core" x="302" y="244" width="250" height="46" rx="8"></rect>
+        <text class="lbl" x="427" y="266" text-anchor="middle">PP：stage0 → 传激活 → stage1</text>
+        <text class="lbl sm" x="427" y="282" text-anchor="middle">stage1 以 decoder_input 为输入</text>
+
+        <rect class="node acc" x="610" y="188" width="280" height="102" rx="8"></rect>
+        <text class="lbl" x="750" y="214" text-anchor="middle">模型代码看不见这一切</text>
+        <text class="lbl sm" x="750" y="236" text-anchor="middle">切分藏在算子构造参数里</text>
+        <text class="lbl sm" x="750" y="256" text-anchor="middle">cast 在 Float16Module 壳</text>
+        <text class="lbl sm" x="750" y="276" text-anchor="middle">forward 只管算自己的那一份</text>
+
+        <line x1="40" y1="308" x2="900" y2="308" stroke="var(--fg-muted)" stroke-dasharray="4 5" stroke-width="1"></line>
+
+        <text class="lbl code" x="40" y="332" font-size="12">序列维 · CP 切（同批样本的序列对半折返）</text>
+        <rect class="node" x="40" y="344" width="180" height="64" rx="8"></rect>
+        <text class="lbl" x="130" y="370" text-anchor="middle">一条长序列</text>
+        <text class="lbl sm" x="130" y="392" text-anchor="middle">切成 2×CP 段</text>
+
+        <rect class="node core" x="260" y="338" width="52" height="34" rx="6"></rect>
+        <text class="lbl code" x="286" y="360" text-anchor="middle">s0</text>
+        <rect class="node core" x="316" y="338" width="52" height="34" rx="6"></rect>
+        <text class="lbl code" x="342" y="360" text-anchor="middle">s1</text>
+        <rect class="node core" x="372" y="338" width="52" height="34" rx="6"></rect>
+        <text class="lbl code" x="398" y="360" text-anchor="middle">s2</text>
+        <rect class="node core" x="428" y="338" width="52" height="34" rx="6"></rect>
+        <text class="lbl code" x="454" y="360" text-anchor="middle">s3</text>
+
+        <line class="edge" x1="220" y1="376" x2="258" y2="394"></line>
+        <rect class="node ok" x="302" y="382" width="220" height="36" rx="8"></rect>
+        <text class="lbl" x="412" y="405" text-anchor="middle">CP0：s0 + s3（首尾配对）</text>
+        <rect class="node ok" x="540" y="382" width="220" height="36" rx="8"></rect>
+        <text class="lbl" x="650" y="405" text-anchor="middle">CP1：s1 + s2</text>
+
+        <text class="lbl sm" x="700" y="394">因果注意力载荷是三角形，</text>
+        <text class="lbl sm" x="700" y="410">首尾配对让每卡合计工作量相等</text>
+      </svg>
+      <div class="fig-cap">图 5.1：一个 batch 的三条切分轴。batch 维归 DP（进 global batch 公式），模型维归 TP/PP（模型代码全程透明），序列维归 CP（zigzag 配对）。CP 本质上是第二种数据切分，所以它进 batch 公式；TP/PP 切的是模型，永远不进。</div>
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.5</span>小结 + 自研启示</h2>
+    <h2><span class="num">5.6</span>小结 + 自研启示</h2>
+    <p>本章的四个问题各有各的答案，但核心就两句：并行透明靠「算子类即切分点」——换并行度等于换构造参数，模型代码不动；精度边界拆成三处——cast 在 Float16Module 外壳，master 权重与缩放都在 optimizer，模型内部只存 params_dtype。数据侧的规则是一条公式——global batch = micro_batch × DP × grad_accum，TP/PP 永远不进这条公式；CP 切序列走 zigzag 配对，每卡拿「第 i 段 + 对称尾段」，tokens/position_ids/labels 三个 key 必须同步切。五个部件归拢成一张表：</p>
     <table class="tbl">
       <tr><th>部件</th><th>切分方式</th><th>关键机制</th></tr>
       <tr><td>TransformerLayer</td><td>TP 切分写进构造参数</td><td>build_module + submodules</td></tr>
@@ -149,7 +236,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 05 模型与数据 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673 · 所有引用代码路径以仓库最新为准
+  深入浅出 DeepSpeed · Megatron · 05 模型与数据 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

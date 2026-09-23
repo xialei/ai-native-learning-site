@@ -35,23 +35,24 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
     <h1>整体架构：没有「内核」的 Agent 运行时</h1>
-    <div class="subtitle">dsh 最反直觉的一点是它没有特权核心——LLM 适配器、会话存储、工具、甚至 Agent 循环本身，都是挂在同一个插件容器上的插件。这一章我们把整台机器拆开：先看插件框架 Cordis，再看一个进程如何被装配出来。</div>
+    <div class="subtitle">问题：没有内核的运行时，扩展性从哪来（①）？一台进程怎么被装配出来（②）？54 个目录想读懂一个能力从哪下手（③）？「新行为」该加在哪（④）？1.1 把问题摆出来，1.2–1.7 逐个作答，1.8 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">1.1</span>一分钟版本</h2>
+    <h2><span class="num">1.1</span>问题：四个层次的扩展性从哪来</h2>
+    <p>dsh 最反直觉的一点是它没有特权核心——LLM 适配器、会话存储、工具、甚至 Agent 循环本身，都是挂在同一个插件容器上的插件。那问题就来了：</p>
     <ul>
-      <li><code class="inline">dsh</code> = <strong>Cordis 插件框架</strong> + 一组<strong>插件</strong> + 一个<strong>装配器</strong>（profiles/bundles）。</li>
-      <li>Cordis 只提供三件事：服务仓库（<code class="inline">ctx.&lt;key&gt;</code>）、类型化事件总线、可逆副作用（<code class="inline">ctx.effect()</code>）。</li>
-      <li>每个产品能力都是一个插件，通过声明 <code class="inline">inject</code> 依赖别的服务、通过事件与别人通信，卸载时副作用自动回卷。</li>
-      <li>启动 = 按层叠加配置行：bundle（按序）→ profile patch → home patch → <code class="inline">--patch</code>，同 id 后写者整行替换。</li>
-      <li>想让 dsh 长出新能力？不是 fork 内核，而是「在别人旁边再挂一个插件」。</li>
+      <li>① <strong>扩展性靠什么机制保证</strong>——不 fork 内核的话，新能力从哪个口进来？</li>
+      <li>② <strong>一台进程怎么被装配出来</strong>——54 个目录、六个形态（web/headless/sdk/acp…），启动时谁先谁后、配置怎么叠加？</li>
+      <li>③ <strong>想读懂一个能力从哪下手</strong>——<code class="inline">packages/</code> 有自己的组织语法吗？</li>
+      <li>④ <strong>「新行为」该加在哪</strong>——事件？工具？会话日志？有没有判别法？</li>
     </ul>
+    <p>四问对应四节：① Cordis 的五个核心想法（1.2–1.3）；② profiles 与 bundles 的装配顺序（1.4–1.5）；③ 事件域坐标系（1.6）；④ 能力缝三角色模型（1.7）。</p>
     <div class="annotation"><b>为什么这样设计</b>：Agent 运行时的需求变化极快（新工具、新模型、新沙箱、新 UI），fork 内核的扩展方式会让每次升级都变成合并冲突。把「机制」全部下沉到插件框架，「策略」全部放到插件里，升级就变成重新装配。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.2</span>Cordis：五个核心想法</h2>
+    <h2><span class="num">1.2</span>① Cordis：五个核心想法</h2>
     <p>Cordis 是 vendor 进仓库的插件框架（<code class="inline">docs/cordis-primer.md</code>），它把插件系统压缩成五个想法：</p>
     <table class="tbl">
       <tr><th>想法</th><th>含义</th><th>dsh 里的例子</th></tr>
@@ -128,7 +129,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.4</span>Profiles 与 bundles：一个进程的装配过程</h2>
+    <h2><span class="num">1.4</span>② Profiles 与 bundles：一个进程的装配过程</h2>
     <p>dsh 所有形态都从同一个 CLI 启动（<code class="inline">apps/cli/package.json</code> 中 <code class="inline">"bin": {"dsh": "lib/bin.js"}</code>），差别只在 <code class="inline">--profile</code>：</p>
     <table class="tbl">
       <tr><th>命令</th><th>用途</th><th>在 dsh-base 之上追加</th></tr>
@@ -188,7 +189,7 @@
     <pre class="code"><span class="fn">dsh</span> --profile web --dump-config</pre>
     <div class="annotation"><b>审计入口</b>：打印出的任何一行都可以被你自己的 patch 替换。排查「我的配置为什么没生效」时，第一件事就是 dump-config 看该行的最终 config 是谁写的。</div>
 
-    <p>v0.1.6 补上了装配面的最后一块拼图：插件不用手编 YAML 也能管。<code class="inline">packages/boot/plugin-manager</code> 提供 <code class="inline">plugin_manager</code> 工具（六个 action：<code class="inline">list_plugins / list_bundles / set_plugin / set_bundle / install_bundle / remove_bundle</code>）与 Web 侧栏的 Plugins 页；<code class="inline">dsh &lt;name&gt;</code> 命令行简写也落在同一条命令族里——CLI 把首个非选项、且不等于 <code class="inline">plugin</code> 的位置参数展开成 <code class="inline">--profile &lt;name&gt;</code>（apps/cli/src/args.ts:186-189），所以 <code class="inline">dsh myprofile</code> 等价于 <code class="inline">dsh --profile myprofile</code>，而 <code class="inline">dsh plugin …</code> 保留给插件管理子命令。工具侧每一步都要求 danger-full-access 或本次调用的审批（理由串自带 <code class="inline">Profile changes persist across sessions; installed Host code runs outside the workspace sandbox</code>）——安装的 Host 代码<strong>在进程内、工作区沙箱之外</strong>运行，这是它必须过审批的原因。变更写入 profile 自己的 <code class="inline">cordis.patch.yml</code>（行级 disabled 覆盖）与 <code class="inline">package.json</code> 的 <code class="inline">dsh.profile.bundles</code> 列表；一次只允许一个变更（profile 写锁串行化），失败或取消的安装会把 <code class="inline">package.json</code> 与 <code class="inline">pnpm-lock.yaml</code> 快照回滚（index.ts:57 的 <code class="inline">RESTORED_FILES</code>），一批 protected modules（plugin-manager 自己、loader、include、webserver、hmr 等 16 个模块，index.ts:44）禁止被停用——管理面不能拔掉自己的电源。</p>
+    <p>v0.1.6 补上了装配面的最后一块拼图：插件不用手编 YAML 也能管。<code class="inline">packages/boot/plugin-manager</code> 提供 <code class="inline">plugin_manager</code> 工具（六个 action：<code class="inline">list_plugins / list_bundles / set_plugin / set_bundle / install_bundle / remove_bundle</code>）与 Web 侧栏的 Plugins 页；<code class="inline">dsh &lt;name&gt;</code> 命令行简写也落在同一条命令族里——CLI 把首个非选项、且不等于 <code class="inline">plugin</code> 的位置参数展开成 <code class="inline">--profile &lt;name&gt;</code>（apps/cli/src/args.ts:201-204），所以 <code class="inline">dsh myprofile</code> 等价于 <code class="inline">dsh --profile myprofile</code>，而 <code class="inline">dsh plugin …</code> 保留给插件管理子命令。工具侧每一步都要求 danger-full-access 或本次调用的审批（理由串自带 <code class="inline">Profile changes persist across sessions; installed Host code runs outside the workspace sandbox</code>）——安装的 Host 代码<strong>在进程内、工作区沙箱之外</strong>运行，这是它必须过审批的原因。变更写入 profile 自己的 <code class="inline">cordis.patch.yml</code>（行级 disabled 覆盖）与 <code class="inline">package.json</code> 的 <code class="inline">dsh.profile.bundles</code> 列表；一次只允许一个变更（profile 写锁串行化），失败或取消的安装会把 <code class="inline">package.json</code> 与 <code class="inline">pnpm-lock.yaml</code> 快照回滚（index.ts:72 的 <code class="inline">RESTORED_FILES</code>），一批 protected modules（plugin-manager 自己、loader、include、webserver、hmr 等 16 个模块，index.ts:59）禁止被停用——管理面不能拔掉自己的电源。</p>
   </section>
 
   <section class="block">
@@ -217,7 +218,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.6</span>三种事件域：扩展点坐标系</h2>
+    <h2><span class="num">1.6</span>③ 三种事件域：扩展点坐标系</h2>
     <p>改任何东西之前，先决定事件落在哪个域（<code class="inline">docs/architecture.md</code>）：</p>
     <table class="tbl">
       <tr><th>域</th><th>特征</th><th>何时用</th><th>例子</th></tr>
@@ -229,7 +230,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.7</span>能力缝：三角色模型</h2>
+    <h2><span class="num">1.7</span>④ 能力缝：三角色模型</h2>
     <p><strong>缝（seam）</strong>是带三个角色的可替换能力（<code class="inline">docs/architecture.md</code>）：</p>
     <ul>
       <li><strong>Service Definition</strong>：声明接口（类型与事件）；</li>
@@ -276,10 +277,14 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.8</span>对「自研 Harness」的第一个启示</h2>
+    <h2><span class="num">1.8</span>收尾：四个问题的答案与第一个启示</h2>
+    <div class="callout warn">
+      <b class="tag">答案回收</b>
+      ① 扩展性来自 Cordis 的三个机制——服务仓库（<code class="inline">ctx.&lt;key&gt;</code> 按键寻址）、类型化事件总线（五种派发模式，waterfall 是环绕中间件）、可逆副作用（卸载即回卷）；策略全在插件里，升级=重新装配。② 装配 = 按层叠加配置行：bundle（按 <code class="inline">dsh.profile.bundles</code> 声明序）→ profile patch → home patch → <code class="inline">--patch</code>，同 id 后写者整行替换；base 是一次 insert，行顺序不承载加载语义。③ 读懂一个能力：先找 ctx 键，再看 Service Definition / Provider / Consumer 三个角色（1.7 的缝）。④ 新行为去哪：需要重启后还在 → 会话事件；要拿 Agent 对象 → Agent 事件；只是接实现 → 能力事件，注册服务即可，全部不用动循环代码。
+    </div>
     <div class="callout warn">
       <b class="tag">要点</b>
-      自研 Harness 的 MVP 只需要两块：<strong>① 一个能从「模型回复 → 工具调用 → 结果回填」走通的循环；② 一个 append-only 的事件日志作为唯一事实源。</strong> Cordis 的服务仓库、事件域、能力缝是 dsh 为「可扩展性」付出的复杂度——先把最小可用的一版跑通，再决定要不要这么切。下一步进入 <a href="02-session-log.html">第 2 章：会话日志</a>。
+      自研 Harness 的 MVP 只需要两块：<strong>一个能从「模型回复 → 工具调用 → 结果回填」走通的循环；一个 append-only 的事件日志作为唯一事实源。</strong> Cordis 的服务仓库、事件域、能力缝是 dsh 为「可扩展性」付出的复杂度——先把最小可用的一版跑通，再决定要不要这么切。下一步进入 <a href="02-session-log.html">第 2 章：会话日志</a>。
     </div>
   </section>
 
@@ -290,7 +295,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 01 整体架构 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 01 整体架构 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

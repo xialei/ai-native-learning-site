@@ -38,24 +38,24 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 分布式 Checkpoint</div>
     <h1>分布式 Checkpoint：存的是分片，读回来还能变拓扑</h1>
-    <div class="subtitle">千亿模型的 checkpoint 是分片散落在几百张卡上的。麻烦在<strong>恢复</strong>：续训时并行度改了怎么办？微调时 DP 数量不同怎么办？两库的答案同构——把「物理布局」与「逻辑布局」分开存，加载时重分片（reshard）。Megatron 走得更远：定义了多种 reshardable 格式与异步保存。</div>
+    <div class="subtitle">并行度改了之后旧 checkpoint 还能读吗——「存的是分片」和「读回来变拓扑」之间的矛盾怎么解？保存的复杂度其实是几个独立问题？ShardedTensor 的坐标系怎么让任意 rank 找回自己要的那部分？异步保存期间训练崩溃，checkpoint 会坏吗？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">12.1</span>一分钟版本</h2>
+    <h2><span class="num">12.1</span>分片存下的，怎么变拓扑读回来</h2>
+    <p>千亿模型的 checkpoint 是分片散落在几百张卡上的。麻烦在<strong>恢复</strong>：续训时并行度改了怎么办？微调时 DP 数量不同怎么办？朴素做法（每卡存自己的分片 + 全局 metadata）在拓扑变化时对不上号——要么报错，要么静默错。拆开看，checkpoint 的复杂性常被低估成一个问题，实际是三个：<strong>存什么</strong>（模型/优化器/RNG/dataloader 状态）、<strong>怎么存</strong>（分片布局 + metadata，保存速度）、<strong>怎么读</strong>（变拓扑 reshard + 部分加载如仅权重供推理），两库的工程量大头都在后两个。而读这一问的答案先给一句：<strong>把「物理布局」与「逻辑布局」分开存，加载时按新拓扑重分片——保存慢一点没关系，永远能读才是底线。</strong></p>
+    <h3>一分钟版本</h3>
     <ul>
       <li><strong>朴素做法的坑</strong>：每卡存自己的分片 + 全局 metadata。加载时若并行度变了，各卡的「自己那份」对不上号——要么报错，要么静默错。</li>
       <li><strong>解决思路</strong>：存「每个张量的完整形状 + 分片位置描述」，加载时按新拓扑重新切。代价是加载时要跨卡读（reshard 本质是重新 all-gather/scatter）。</li>
       <li><strong>DeepSpeed</strong>：universal checkpoint——把 ZeRO 分片布局转成「每参数完整 + 优化器状态分片」的规范形式，任意 ZeRO stage/DP 数恢复。</li>
     </ul>
-    <div class="callout info">
-      <b class="tag">三个独立问题</b>
-      checkpoint 的复杂性常被低估成一个问题，实际是三个：① <strong>存什么</strong>（模型/优化器/RNG/dataloader 状态）；② <strong>怎么存</strong>（分片布局 + metadata，保存速度）；③ <strong>怎么读</strong>（变拓扑 reshard + 部分加载如仅权重供推理）。两库的工程量大头在②③。
-    </div>
   </section>
 
+
   <section class="block">
-    <h2><span class="num">12.2</span>用代码看｜Megatron 的 reshardable 格式</h2>
+    <h2><span class="num">12.2</span>Megatron 的 reshardable 格式</h2>
+    <p>变拓扑读回的关键，是让每个分片带「全局坐标」。Megatron 的格式家族：</p>
     <div class="code-title">megatron/core/dist_checkpointing/strategies/ — 格式家族（目录盘点，译注）</div>
     <pre class="code"><span class="lang-tag">text</span>megatron/core/dist_checkpointing/strategies/
 ├── base.py                    <span class="cmt"># ShardedTensor 抽象：每个分片带全局坐标</span>
@@ -63,7 +63,7 @@
 ├── fully_sharded_model_space.py  <span class="cmt"># 模型空间坐标系的分片</span>
 ├── fsdp_dtensor.py            <span class="cmt"># 与 torch FSDP DTensor 互通的格式</span>
 └── (zarr/torch 基础后端)</pre>
-    <div class="annotation"><b>ShardedTensor 的语义：</b>每个分片不只是裸 tensor，而是「tensor 的哪个部分」（global_offset + local_shape + global_shape）。保存时把各卡的分片都写盘、metadata 记录完整坐标系；加载时给定新拓扑，每个新 rank 按 ShardedTensor 描述反查「我要的张量部分散落在哪些旧分片里」，读盘后拼装。<code class="inline">checkpoint_fully_reshardable_formats</code>（第 7 章 DistributedOptimizer 的开关）决定优化器状态也走这套坐标——否则优化器状态只能按原 DP 数恢复。</div>
+    <div class="annotation"><b>ShardedTensor 的语义：</b>每个分片不只是裸 tensor，而是「tensor 的哪个部分」的描述（global_offset + local_shape + global_shape）。保存时把各卡的分片都写盘、metadata 记录完整坐标系；加载时给定新拓扑，每个新 rank 按 ShardedTensor 描述反查「我要的张量部分散落在哪些旧分片里」，读盘后拼装。<code class="inline">checkpoint_fully_reshardable_formats</code>（第 7 章 DistributedOptimizer 的开关）决定优化器状态也走这套坐标——否则优化器状态只能按原 DP 数恢复。</div>
 
     <div class="code-title">megatron/training/checkpointing.py — async save（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 保存也可以异步：先把数据准备好，IO 放后台，训练不停</span>
@@ -77,7 +77,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">12.3</span>用代码看｜DeepSpeed 的 universal checkpoint</h2>
+    <h2><span class="num">12.3</span>DeepSpeed 的 universal checkpoint</h2>
+    <p>同一个目标，DS 走的是「事后转换」路线——普通 checkpoint 先存、扩缩容前用脚本转成 universal 布局：</p>
     <div class="code-title">deepspeed/checkpoint/utils.py + ds_to_universal.py（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 转换脚本：把普通 ZeRO checkpoint 转成 universal 布局</span>
 <span class="cmt"># deepspeed --num_nodes 1 --num_gpus N ds_to_universal.py --input_ckpt ...</span>
@@ -87,11 +88,12 @@
 <span class="kw">def</span> <span class="fn">main</span>():
     <span class="cmt"># 读旧布局 → 重建全局视图 → 按目标 rank 数重切 → 写 universal 目录</span>
     ...</pre>
-    <div class="annotation"><b>读法：</b>DS 的 universal checkpoint 是<strong>事后转换</strong>（先有普通 checkpoint，再用脚本转成 universal），Megatron 是<strong>原生保存</strong>（训练时直接存 reshardable 格式）。功能等价，工作流不同：DS 用户在扩缩容前跑一次转换脚本；Megatron 用户配置开关常开。加载侧 DS 的 <code class="inline">load_checkpoint(..., load_module_strict=False)</code> 还支持部分加载（只取权重，供推理导出）。</div>
+    <div class="annotation"><b>读法：</b>DS 的 universal checkpoint 是<strong>事后转换</strong>——先有普通 checkpoint，再用脚本转成 universal；Megatron 则是<strong>原生保存</strong>，训练时直接存 reshardable 格式。功能等价，工作流不同：DS 用户在扩缩容前跑一次转换脚本，Megatron 用户配置开关常开。加载侧 DS 的 <code class="inline">load_checkpoint(..., load_module_strict=False)</code> 还支持部分加载（只取权重，供推理导出）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.4</span>存的不只是参数</h2>
+    <p>参数和优化器状态之外，还有几类「不存最难察觉」的 metadata：</p>
     <table class="tbl">
       <tr><th>内容</th><th>Megatron</th><th>DeepSpeed</th></tr>
       <tr><td>模型参数</td><td>ShardedTensor 分片 + metadata</td><td>fp16 全量/分片 + ZeRO 布局</td></tr>
@@ -104,13 +106,59 @@
       <b class="tag">RNG 与 consumed_samples</b>
       续训「无缝」的两个隐形条件：RNG 状态（不存则续训后 dropout 序列变了，loss 曲线在恢复点出现小跳变）与 consumed_samples（不存则数据从重头开始，重复样本扰动分布）。两者都是 metadata 级的小数据，漏了却最难察觉。
     </div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t121 d121">
+        <title id="t121">ShardedTensor 坐标：保存 4 卡、加载 2 卡的 reshard</title>
+        <desc id="d121">上行：保存时 DP=4，一个完整张量切成 4 段，每卡分片带 global_offset（0、1/4、2/4、3/4）+ local_shape + global_shape。下行：加载时 DP=2，每个新 rank 按坐标反查旧分片——rank0 读旧 rank0+rank1 两段，rank1 读旧 rank2+rank3 两段。metadata 记录坐标系，读盘后拼装。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="28" font-weight="bold">保存时 DP=4：每卡分片带全局坐标</text>
+        <rect class="node core" x="20" y="42" width="215" height="40" rx="5"></rect>
+        <text class="lbl sm" x="127" y="60" text-anchor="middle">rank0 分片</text>
+        <text class="lbl code" x="127" y="75" text-anchor="middle">offset=0</text>
+        <rect class="node core" x="237" y="42" width="215" height="40" rx="5"></rect>
+        <text class="lbl sm" x="344" y="60" text-anchor="middle">rank1 分片</text>
+        <text class="lbl code" x="344" y="75" text-anchor="middle">offset=1/4</text>
+        <rect class="node core" x="454" y="42" width="215" height="40" rx="5"></rect>
+        <text class="lbl sm" x="561" y="60" text-anchor="middle">rank2 分片</text>
+        <text class="lbl code" x="561" y="75" text-anchor="middle">offset=2/4</text>
+        <rect class="node core" x="671" y="42" width="215" height="40" rx="5"></rect>
+        <text class="lbl sm" x="778" y="60" text-anchor="middle">rank3 分片</text>
+        <text class="lbl code" x="778" y="75" text-anchor="middle">offset=3/4</text>
+
+        <text class="lbl sm" x="470" y="104" text-anchor="middle">metadata：global_shape + 每分片 (global_offset, local_shape) —— 与保存拓扑解耦</text>
+
+        <text class="lbl" x="20" y="146" font-weight="bold">加载时 DP=2：新 rank 按坐标反查要读哪些旧分片</text>
+        <rect class="node ok" x="60" y="176" width="380" height="46" rx="6"></rect>
+        <text class="lbl sm" x="250" y="196" text-anchor="middle">新 rank0（offset=0，占 1/2）</text>
+        <text class="lbl sm" x="250" y="212" text-anchor="middle">读旧 rank0 + rank1 两段 → 拼装</text>
+        <rect class="node ok" x="500" y="176" width="380" height="46" rx="6"></rect>
+        <text class="lbl sm" x="690" y="176" text-anchor="middle">新 rank1（offset=1/2，占 1/2）</text>
+        <text class="lbl sm" x="690" y="212" text-anchor="middle">读旧 rank2 + rank3 两段 → 拼装</text>
+
+        <line class="edge back" x1="250" y1="90" x2="250" y2="174"></line>
+        <line class="edge back" x1="344" y1="90" x2="330" y2="174"></line>
+        <line class="edge back" x1="561" y1="90" x2="620" y2="174"></line>
+        <line class="edge back" x1="778" y1="90" x2="690" y2="174"></line>
+
+        <text class="lbl sm" x="20" y="252" fill="#8f2d2d" font-weight="bold">reshard 本质是重新 all-gather/scatter：跨卡读，加载慢于原拓扑加载</text>
+        <text class="lbl sm" x="20" y="274">优化器状态若不走同一坐标系（fully_reshardable 开关关着），只能按原 DP 数恢复——第 7 章的开关在此汇合</text>
+      </svg>
+      <div class="fig-cap">图 12.1：4 卡存、2 卡读的 reshard 坐标反查。每个分片的 (global_offset, local_shape, global_shape) 三元组是变拓扑的关键——新 rank 用它算出「我的窗口覆盖哪些旧分片」。</div>
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.5</span>小结 + 自研启示</h2>
+    <p>本章的三个问题到这里都有了答案：存什么/怎么存/怎么读确实是三个独立问题，工程量大头在后两个；ShardedTensor 用 (global_offset, local_shape, global_shape) 描述每个分片，任意新 rank 靠 metadata 就能反查自己要读哪些旧分片（图 12.1）；DS 的 universal checkpoint 是事后转换、Megatron 是原生保存，功能等价、工作流不同；至于 RNG 和 consumed_samples 这两个隐形条件，它们都是 metadata 级的小数据，漏了却最难察觉。落到自研路径：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
-      自研 checkpoint 的最小正确路径：① 第一版就按「每参数完整张量 + 保存时 DP 无关」存（torch 的 state_dict 天然如此）——大不了保存慢，但<strong>永远能读</strong>；② 分片布局优化等真的遇到 IO 瓶颈再做；③ metadata 单独一个小 json（版本号、并行布局、参数形状表）——半年后你一定会感谢它。最容易错的三点：只存了模型没存 optimizer（续训 loss 跳变）、RNG 没存（续训曲线微抖）、保存目录名带 step 但进程崩溃留下半截文件（用原子改名）。
+      自研 checkpoint 的最小正确路径：第一版就按「每参数完整张量 + 保存时 DP 无关」存（torch 的 state_dict 天然如此）——大不了保存慢，但<strong>永远能读</strong>；分片布局优化等真的遇到 IO 瓶颈再做；metadata 单独一个小 json（版本号、并行布局、参数形状表）——半年后你一定会感谢它。最容易错的三点：只存了模型没存 optimizer（续训 loss 跳变）、RNG 没存（续训曲线微抖）、保存目录名带 step 但进程崩溃留下半截文件（用原子改名）。
     </div>
   </section>
 
@@ -121,7 +169,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 12 Checkpoint · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 12 Checkpoint · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 14 安全·本地模型·程序化集成</div>
     <h1>安全边界、本地模型与程序化集成</h1>
-    <div class="subtitle">这台「运行时」不光要跑得稳，还要<strong>敢在你不信任的地方跑、能在你没有网络时跑、能被你的代码当库调用</strong>。本章收拢三个「边界」话题：信任与沙箱（安全）、llama.cpp 本地模型接入（离线）、以及 SDK / RPC 的程序化嵌入（可编程）。它们共同回答了「一个能用的 Agent Runtime」的最后三个问题。</div>
+    <div class="subtitle">一个 Agent 敢在你不信任的目录里跑 Bash 吗——「信任」怎么表达、怎么继承、怎么并发安全？模型侧呢：断网/重隐私时本地模型怎么接进来，要为新机制写多少代码？程序侧呢：外部代码怎么把这套运行时当库调、当服务调？三条边界在源码里各有一个干净的收口，本章逐一看过。</div>
   </div>
 
   <div class="epigraph">
@@ -88,7 +88,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">14.2</span>沙箱边界：Bash 工具</h2>
+    <h2><span class="num">14.1b</span>沙箱边界：Bash 工具的四层纵深</h2>
     <p>信任是「要不要问」；真正的隔离发生在 <strong>Bash 工具这条沙箱边界</strong>上。回顾第 9 章我们已经建立的图景：权限确认挂在 <code class="inline">beforeToolCall</code> 钩子上（第 8 章），stdout 由 <code class="inline">output-guard</code> 串行接管（第 9 章 §9.6）。这里补上 bash 自身的<strong>执行边界</strong>——它接住 <code class="inline">AbortSignal</code> 并<strong>杀掉整个进程树</strong>。</p>
     <div class="code-title">tools/bash.ts · 中止即杀全树</div>
     <pre class="code"><code>exec: <span class="kw">async</span> (command, cwd, { onData, signal, <span class="kw">...</span> }) =&gt; {
@@ -108,7 +108,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">14.3</span>本地模型：把 llama.cpp 变成一个 Provider</h2>
+    <h2><span class="num">14.2</span>本地模型：把 llama.cpp 变成一个 Provider</h2>
     <p>没有网络、在意隐私时，你想在本地跑模型。Pi 用第 10 章那套「多 Provider 抽象」顺手就接上了 <code class="inline">llama.cpp</code>——<strong>它根本不需要为本地模型造新机制，只需要一个「把本地 llama 服务器翻译成 Model/Provider」的适配器</strong>。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t14 d14">
@@ -188,14 +188,14 @@
 models = catalog
   .<span class="fn">filter</span>((model) =&gt; <span class="fn">modelIsSelectable</span>(model, routerAutoload))   <span class="cmt">// loaded / sleeping /（autoload 时）未加载 preset</span>
   .<span class="fn">map</span>((model) =&gt; <span class="fn">toPiModel</span>(model, serverUrl));</code></pre>
-    <div class="annotation"><b>读懂这段：</b>「可选」分三档——<code class="inline">loaded</code>（已驻留内存）、<code class="inline">sleeping</code>（休眠、发请求时唤醒）、<code class="inline">unloaded</code> preset（连内存都没进，但若 llama.cpp router 开了 <code class="inline">models_autoload</code>，首次请求会自动加载它）。前两档无条件可选，第三档要 <code class="inline">routerAutoload</code> 为真——而这个标志是 <code class="inline">refreshModels</code> 时调 <code class="inline">LlamaClient.props()</code> 问 server 的 <code class="inline">/props</code> 接口拿来的。注意 <code class="inline">routerAutoloadEnabled</code> 会先看 catalog 里有没有未加载 preset，没有就直接短路返回 <code class="inline">false</code>，避免无谓的 <code class="inline">/props</code> 往返。</div>
+    <div class="annotation"><b>「可选」其实分三档：</b><code class="inline">loaded</code>（已驻留内存）、<code class="inline">sleeping</code>（休眠、发请求时唤醒）、<code class="inline">unloaded</code> preset（连内存都没进，但若 llama.cpp router 开了 <code class="inline">models_autoload</code>，首次请求会自动加载它）。前两档无条件可选，第三档要 <code class="inline">routerAutoload</code> 为真——而这个标志是 <code class="inline">refreshModels</code> 时调 <code class="inline">LlamaClient.props()</code> 问 server 的 <code class="inline">/props</code> 接口拿来的。注意 <code class="inline">routerAutoloadEnabled</code> 会先看 catalog 里有没有未加载 preset，没有就直接短路返回 <code class="inline">false</code>，避免无谓的 <code class="inline">/props</code> 往返。</div>
     <div class="callout">
       <strong>最大的启示：</strong>接入本地模型<strong>没有造任何新机制</strong>——只是把一个本地服务器“伪装”成既有的 OpenAI 兼容 Provider。这正是第 10 章「统一协议抽象」的全部回报：一个新 Provider 的成本被压到「写一个适配器」。而 <code class="inline">LlamaClient</code> 负责的 list/load/unload/download/props/SSE watch，才是本地场景特有的「模型管理」逻辑（内存里该驻留哪几个模型、要不要先下载、router 能不能按需 autoload）。你把 <code class="inline">/llama</code> 这套「本地路由 + 按需加载」的思想用到自己 Runtime 的本地模型支持上，能省不少弯路。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">14.4</span>程序化集成：SDK、RPC 与 JSON 事件流</h2>
+    <h2><span class="num">14.3</span>程序化集成：SDK、RPC 与 JSON 事件流</h2>
     <p>前面几章讲的是「人跟 Agent 交互」，这一节讲「<strong>你的程序</strong>跟 Agent 交互」——三种由浅入深的嵌入方式。</p>
 
     <h3>14.4.1 当库用：SDK</h3>
@@ -259,7 +259,7 @@ models = catalog
   </section>
 
   <section class="block">
-    <h2><span class="num">14.5</span>这一章收进你的 Runtime 清单</h2>
+    <h2><span class="num">14.4</span>收尾：三个边界的答案收进你的 Runtime 清单</h2>
     <table class="tbl">
       <thead><tr><th>能力</th><th>Pi 的做法（源码）</th><th>自制时的次序建议</th></tr></thead>
       <tbody>
@@ -271,6 +271,7 @@ models = catalog
         <tr><td>程序化嵌入</td><td>SDK / RPC / JSON event stream</td><td>内核稳定后加外壳</td></tr>
       </tbody>
     </table>
+    <p><strong>收尾——三个问题的答案：</strong>信任用三态值 + 就近祖先继承表达，加锁写、排序落盘保证并发与 diff 安全；放行与中止分别是 beforeToolCall 钩子和杀进程树，容器化是最后补的硬边界。本地模型零新机制——llama.cpp 被 toPiModel「伪装」成 openai-completions Provider，全部回报来自第 10 章的统一抽象；本地特有的只是 LlamaClient 的模型管理（驻留/下载/autoload）。程序化集成三档：SDK 同进程最深、RPC over JSONL 最稳通用、JSON event stream 偏观察——三者共享同一内核，只是外壳不同。</p>
     <p>至此，Pi 的「运行内核 + 安全边界 + 模型生态 + 集成外壳」四块拼图都齐了——这套多层设计，就是你后续持续吸收、贴合自己场景去改造的完整参考系。</p>
     <div class="arrow-nav">
       <a class="prev" href="12-build-own-runtime.html">← 上一章 · 自制 Runtime</a>
@@ -281,7 +282,7 @@ models = catalog
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 14 安全边界·本地模型·程序化集成 · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 14 安全边界·本地模型·程序化集成 · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

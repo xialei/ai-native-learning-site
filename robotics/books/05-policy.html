@@ -35,12 +35,21 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 策略动物园</div>
     <h1>策略动物园：从 ACT 到 Diffusion</h1>
-    <div class="subtitle">数据就位，现在轮到「学习」本身。lerobot 的 policies/ 目录下有二十余种策略，但它们都遵守同一个契约：输入观测 dict，输出动作。本章先读这个契约（PreTrainedPolicy），再深读两个经典——ACT（transformer 序列翻译）与 Diffusion Policy（迭代去噪），把「action chunk 从哪来、训练 loss 怎么算、推理时怎么消费」三件事彻底看清。</div>
+    <div class="subtitle">数据就位，现在轮到「学习」本身。lerobot 的 policies/ 目录下有二十余种策略，本章问下去：<strong>所有策略共用的契约是什么？ACT 怎么把模仿学习变成序列翻译？一次预测几十步动作，环境每步只吃一个，怎么消费？Diffusion Policy 与 ACT 的分野在哪？训练时策略、数据、处理器在哪组装？</strong>5.1 把问题摆出来，5.2–5.4 深读两个经典，5.5 看组装点，5.6 收尾。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">5.1</span>PreTrainedPolicy：所有策略的统一契约</h2>
-    <p>不管网络结构多花哨，每个策略都要回答同样三个问题：<strong>看到观测选什么动作</strong>（select_action）、<strong>预测一段动作</strong>（predict_action_chunk）、<strong>给一批数据算多大 loss</strong>（forward）。基类（src/lerobot/policies/pretrained.py:61）把它们钉死为抽象方法：</p>
+    <h2><span class="num">5.1</span>问题：二十种策略，凭什么能互换</h2>
+    <p>lerobot 的 policies/ 下躺着二十多个策略类，从 ACT 到 π0。它们凭什么能被同一个训练脚本、同一条部署链路消费？把问题拆开：</p>
+    <ul>
+      <li><strong>① 统一契约是什么？</strong>不管网络结构多花哨，每个策略要能回答哪三个问题——看到观测选什么动作、预测一段动作、给一批数据算多大 loss？</li>
+      <li><strong>② ACT 怎么把模仿学习变成序列翻译？</strong>观测是原文、未来 100 步动作是译文，网络结构怎么摆、loss 怎么算？</li>
+      <li><strong>③ chunk 怎么消费？</strong>一次预测 100 步、环境每步只吃一个——排队慢慢放，还是每步重推理做时序集成？</li>
+      <li><strong>④ Diffusion Policy 差在哪？</strong>同样是生成动作序列，「迭代去噪」和「transformer 直出」的取舍是什么？</li>
+      <li><strong>⑤ 训练入口在哪组装？</strong>策略、数据、处理器三者在哪个函数汇合，工厂怎么按名字实例化？</li>
+    </ul>
+    <div class="annotation"><b>五个问题，五节答案：</b>① 统一契约 → 就在本节；② ACT → 5.2；③ 两种消费模式 → 5.3；④ Diffusion → 5.4；⑤ 组装点 → 5.5。5.6 收尾。</div>
+    <p>先答 ①。不管网络结构多花哨，每个策略都要回答同样三个问题：<strong>看到观测选什么动作</strong>（select_action）、<strong>预测一段动作</strong>（predict_action_chunk）、<strong>给一批数据算多大 loss</strong>（forward）。基类（src/lerobot/policies/pretrained.py:61）把它们钉死为抽象方法：</p>
     <div class="code-title">src/lerobot/policies/pretrained.py:223 — 基类抽象接口（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PreTrainedPolicy</span>(nn.Module, HubMixin, abc.ABC):
     <span class="cmt">"""Base class for policy models."""</span>
@@ -59,13 +68,16 @@
         ...  <span class="cmt"># 部署：返回环境要执行的「单步」动作</span></pre>
     <div class="annotation"><b>读法：</b><code class="inline">forward</code> 服务训练循环，<code class="inline">select_action</code> 服务 30 Hz 的执行循环（第 3 章 record_loop 与第 11 章机器人跑 policy 都调它）。两者之间的桥就是 <strong>action chunk</strong>：predict_action_chunk 一次算出未来几十步动作，select_action 负责把这段动作「一点点放出去」——用队列缓存，或者做时序集成（5.3）。基类还提供 <code class="inline">from_pretrained</code>（safetensors 加载 + 强制 eval 模式）与 <code class="inline">drop_queued_actions</code>（中途换指令时强制丢弃缓存队列），这些细节在部署章（11）会再次出现。</div>
     <p>二十多个策略全部通过同一个工厂按名字实例化，且<strong>惰性导入</strong>——选哪个策略才 import 哪个重型依赖：</p>
-    <div class="code-title">src/lerobot/policies/factory.py:80 — 按名取类（节选）</div>
+    <div class="code-title">src/lerobot/policies/factory.py:55 — 按名取类（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_policy_class</span>(name: <span class="cl">str</span>) -&gt; type[PreTrainedPolicy]:
     <span class="cmt">"""Resolution is convention-based: the draccus-registered config class of `name`
     is looked up, its `configuration_*` module path is rewritten to `modeling_*`,
     and the `&lt;X&gt;Policy` class is imported from there. The modeling module is only
     imported at call time, keeping heavy optional dependencies lazy."""</span>
-    <span class="kw">return</span> _get_policy_cls_from_policy_name(name=name)</pre>
+    config_cls = PreTrainedConfig.<span class="fn">get_choice_class</span>(name)      <span class="cmt"># act → ActConfig</span>
+    cls_name = config_cls.__name__.<span class="fn">removesuffix</span>(<span class="cl">"Config"</span>) + <span class="cl">"Policy"</span>
+    module = <span class="fn">_import_sibling_policy_module</span>(config_cls, <span class="cl">"modeling"</span>)  <span class="cmt"># 惰性导入 modeling_act</span>
+    <span class="kw">return</span> <span class="fn">getattr</span>(module, cls_name)</pre>
     <p>当前动物园的概貌（policies/__init__.py 导出 + 各配置类论文出处）：</p>
     <table class="tbl">
       <tr><th>家族</th><th>策略</th><th>动作怎么生成</th><th>一句话定位</th></tr>
@@ -81,7 +93,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.2</span>ACT：把模仿学习变成序列翻译</h2>
+    <h2><span class="num">5.2</span>② ACT：把模仿学习变成序列翻译</h2>
     <p>ACT（Action Chunking Transformer）的直觉：与其每帧猜一个动作，不如把「一段演示」当成一次序列到序列的翻译——观测是原文，未来 100 步动作是译文。网络由三块组成：</p>
     <div class="code-title">src/lerobot/policies/act/modeling_act.py:260 — ACT 网络结构（结构注释 + 关键组件，节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ACT</span>(nn.Module):
@@ -128,7 +140,7 @@ actions = self.action_head(decoder_out.transpose(<span class="nu">0</span>, <spa
   </section>
 
   <section class="block">
-    <h2><span class="num">5.3</span>两种消费模式：action queue 与时序集成</h2>
+    <h2><span class="num">5.3</span>③ 两种消费模式：action queue 与时序集成</h2>
     <p>ACT 一次吐 100 步动作，但环境每步只接受一个。怎么放？lerobot 给了两种答案。默认是<strong>队列模式</strong>——预测一次，排队慢慢执行：</p>
     <div class="code-title">src/lerobot/policies/act/modeling_act.py:102 — select_action 的队列逻辑（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="meta">@torch.no_grad()</span>
@@ -209,7 +221,7 @@ actions = self.action_head(decoder_out.transpose(<span class="nu">0</span>, <spa
   </section>
 
   <section class="block">
-    <h2><span class="num">5.4</span>Diffusion Policy：把动作生成变成迭代去噪</h2>
+    <h2><span class="num">5.4</span>④ Diffusion Policy：把动作生成变成迭代去噪</h2>
     <p>ACT 对「同一观测多种做法」的处理靠 CVAE latent，Diffusion Policy 则干脆把「生成动作序列」建模成<strong>从纯噪声逐步去噪出一段轨迹</strong>。先用一句话建立直觉：训练时，拿一条真实轨迹，随机加一点噪声，让网络看着「加噪后的轨迹 + 噪声等级」预测<strong>当初加进去的那份噪声</strong>——练一万次后网络就学会了「怎样把噪声变成动作」；推理时反着来，从纯噪声出发，反复问网络「这里的噪声长什么样」并减掉，几十步后就「洗」出一段干净轨迹（这正是本节标题的「迭代去噪」）。模型本体是条件 1D U-Net（时间维做卷积，动作维度当通道），条件（状态 + 图像特征）拼成 <code class="inline">global_cond</code> 用 FiLM（特征级线性调制：用条件向量对网络每层的输出做逐通道的缩放与平移，是最常用的条件注入手法）注入。推理循环（modeling_diffusion.py:234）：</p>
     <div class="code-title">src/lerobot/policies/diffusion/modeling_diffusion.py:234 — conditional_sample（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">conditional_sample</span>(self, batch_size, global_cond=<span class="kw">None</span>, noise=<span class="kw">None</span>) -&gt; Tensor:
@@ -355,7 +367,7 @@ loss = F.mse_loss(pred, target, reduction=<span class="st">"none"</span>)</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.5</span>训练入口：策略、数据、处理器的组装点</h2>
+    <h2><span class="num">5.5</span>⑤ 训练入口：策略、数据、处理器的组装点</h2>
     <p>三条线在第 3 章见过的 <code class="inline">lerobot-train</code>（scripts/lerobot_train.py:385 的 <code class="inline">train(TrainPipelineConfig)</code>）汇合。组装逻辑藏在 factory 里：<code class="inline">make_policy</code> 按名字实例化策略 → 从数据集 metadata 拿 features 与 stats → 生成配套的 pre/post processor（归一化用 4.5 的 stats.json）：</p>
     <div class="code-title">组装顺序（factory.py + train.py 逻辑示意）</div>
     <pre class="code"><span class="lang-tag">python</span>policy = make_policy(
@@ -374,11 +386,12 @@ preprocessor, postprocessor = make_pre_post_processors(
   </section>
 
   <section class="block">
-    <h2><span class="num">5.6</span>本章小结</h2>
+    <h2><span class="num">5.6</span>收尾：一份契约，两种生成范式</h2>
+    <p>5.1 的五个问题，答案收拢：① 统一契约是 PreTrainedPolicy 的四抽象方法（reset / forward / predict_action_chunk / select_action），from_pretrained 强制 eval；② ACT 把示范当序列翻译，CVAE + transformer，L1+KL；③ chunk 的两种消费——队列模式开环执行、时序集成按 wᵢ=exp(-m·i) 加权；④ Diffusion 把生成变成迭代去噪，训练加噪预测噪声、推理 100 步洗出轨迹；⑤ 三条线在 lerobot-train 汇合，make_policy 按名字走工厂实例化。一张表带走：</p>
     <table class="tbl">
       <tr><th>概念</th><th>要点</th><th>源码锚点</th></tr>
       <tr><td>策略契约</td><td>reset / forward / predict_action_chunk / select_action 四抽象方法；from_pretrained 强制 eval</td><td>policies/pretrained.py:61,223,270,283,292</td></tr>
-      <tr><td>工厂</td><td>draccus 注册名 → config → modeling 模块惰性导入，第三方插件同机制</td><td>policies/factory.py:80</td></tr>
+      <tr><td>工厂</td><td>draccus 注册名 → config → modeling 模块惰性导入，第三方插件同机制</td><td>policies/factory.py:55,220</td></tr>
       <tr><td>ACT</td><td>CVAE（训练）+ transformer 序列翻译；L1+KL；n_decoder_layers=1 为复现原作 bug</td><td>act/modeling_act.py:42,260,462; configuration_act.py:111</td></tr>
       <tr><td>队列模式</td><td>chunk 入队逐步出队，执行期开环；reset/drop_queued_actions 清队列</td><td>act/modeling_act.py:102</td></tr>
       <tr><td>时序集成</td><td>每步推理，重叠预测按 wᵢ=exp(-m·i) 加权平均；n_action_steps 必须=1</td><td>act/modeling_act.py:169</td></tr>
@@ -398,7 +411,7 @@ preprocessor, postprocessor = make_pre_post_processors(
 </div>
 
 <footer>
-  深入浅出具身智能 · 05 策略动物园 · 基于 huggingface/lerobot（89236ea0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 05 策略动物园 · 基于 huggingface/lerobot（9a6bb610）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

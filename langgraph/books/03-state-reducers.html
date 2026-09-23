@@ -35,13 +35,15 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 状态·Reducer</div>
-    <h1>状态与 Reducer:图的「共享内存」如何合并</h1>
-    <div class="subtitle">LangGraph 的每个节点都只读写一份共享 State；决定「旧值 + 新值 → 最终值」的，正是 Reducer。理解它，就理解了 LangGraph 状态流转的全部秘密。</div>
+    <h1>状态与 Reducer:谁来决定「旧值 + 新值」等于什么</h1>
+    <div class="subtitle">第 1 章说节点返回「更新请求」、第 2 章看到更新被合并进 State——但「合并」这两个字一直被一笔带过。这一章把合并拆开：默认为什么是覆盖、覆盖在哪些场景会吃掉数据、怎么用一个注解换成你要的合并语义。读完你就有了回答「这个字段该不该配 reducer」的判断依据。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">3.1</span>State 是什么：节点间的共享黑板</h2>
-    <p>在 LangGraph 里，图不是一个「传参调用链」，而是一个「共享黑板」：所有节点都读取同一份 <strong>State</strong>，处理后返回一个 <strong>局部更新（Partial State）</strong>，框架再把这个更新合并进总 State。这种设计的好处是节点之间解耦——每个节点只关心自己要读什么、写什么，不需要知道上下游的返回结构。</p>
+    <h2><span class="num">3.1</span>开场：多轮对话第二轮就「失忆」</h2>
+    <p>先看一个马上会撞上的场景。按第 2 章的三步法搭一个最简单的多轮 chatbot：user 节点写用户消息，bot 节点写回复，边把它们串起来。跑第一轮没问题；第二轮一进来，你发现模型把第一轮说过的话全忘了——检查状态，<code class="inline">messages</code> 里只剩最后一条。</p>
+    <p>代码没有任何「删除」操作，消息去哪了？这就是本章要解决的第一个问题：<strong>节点返回的更新，落到 State 上时到底发生了什么。</strong>答案由每个字段的合并规则（Reducer）决定——而默认规则恰好是「覆盖」。本章从 State 长什么样、节点之间怎么共享它讲起（3.1）；然后拆开默认合并规则，看它在什么场景会吃掉数据（3.2）；再讲怎么用 Annotated 把「覆盖」换成「追加」「累加」，包括内置和自定义 reducer（3.3–3.6）；最后把合并逻辑放回整个执行流程，落到设计 reducer 的两条铁律上（3.8–3.9）。</p>
+    <p>在 LangGraph 里，图不是「传参调用链」，而是「共享黑板」：所有节点都读取同一份 <strong>State</strong>，处理后返回一个 <strong>局部更新（Partial State）</strong>，框架再把这个更新合并进总 State。这种设计让节点之间解耦——每个节点只关心自己要读什么、写什么，不需要知道上下游的返回结构。</p>
     <p>State 通常用一个 <code class="inline">TypedDict</code> 定义，也可以用 Pydantic 的 <code class="inline">BaseModel</code>。下面是最基本的例子：</p>
     <div class="code-title">最基础的 State —— 节点只返回要更新的字段子集，框架负责合并</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -67,7 +69,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"ask"</span>, END)
 graph = builder.<span class="fn">compile</span>()
 <span class="fn">print</span>(graph.<span class="fn">invoke</span>({<span class="st">"question"</span>: <span class="st">"什么是 LangGraph"</span>}))
 <span class="cmt"># {'question': '什么是 LangGraph', 'answer': '关于「什么是 LangGraph」的初步回答'}</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">ask_node</code> 只返回 <code class="inline">{"answer": ...}</code>，并不返回 <code class="inline">question</code>。框架把这个返回值与当前 State 合并：没有 reducer 时默认「覆盖」，于是 <code class="inline">answer</code> 被写入、<code class="inline">question</code> 保持不变。这就是「节点返回部分更新」的含义——你不必每次都返回全量 State。</div>
+    <div class="annotation"><b>部分更新的含义：</b><code class="inline">ask_node</code> 只返回 <code class="inline">{"answer": ...}</code>，并不返回 <code class="inline">question</code>。框架把这个返回值与当前 State 合并：没有 reducer 时默认「覆盖」，于是 <code class="inline">answer</code> 被写入、<code class="inline">question</code> 保持不变。这就是「节点返回部分更新」的含义——你不必每次都返回全量 State。</div>
     <p>你也可以用 Pydantic，这样字段会有校验和默认值：</p>
     <div class="code-title">Pydantic State —— 带校验和默认值，适合需要强约束的场景</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> pydantic <span class="kw">import</span> <span class="cl">BaseModel</span>
@@ -89,13 +91,47 @@ builder.<span class="fn">add_edge</span>(START, <span class="st">"ask"</span>)
 builder.<span class="fn">add_edge</span>(<span class="st">"ask"</span>, END)
 <span class="fn">print</span>(builder.<span class="fn">compile</span>().<span class="fn">invoke</span>({<span class="st">"question"</span>: <span class="st">"hi"</span>}))
 <span class="cmt"># {'question': 'hi', 'answer': '来自 Pydantic State 的回答'}</span></pre>
-    <div class="annotation"><b>读懂这段：</b>注意 <code class="inline">invoke</code> 返回的是普通 <code class="inline">dict</code>（即使 State 是 Pydantic 模型）。Pydantic 在这里的价值是<strong>入口校验</strong>：传入的字段类型不对会立刻报错，<code class="inline">answer</code> 带默认值 <code class="inline">""</code>，调用方没传也不会报错。适合字段较多、需要类型校验或嵌套结构的场景；但多数 agent 用 <code class="inline">TypedDict</code> 就够了。</div>
-    <div class="callout info"><b class="tag">提示</b> 为什么用 TypedDict？它是「带类型提示的字典」，运行时就是一个普通 <code class="inline">dict</code>，零开销、与 mypy/pyright 无缝配合，且能通过 <code class="inline">Annotated</code> 挂载 reducer。只有当你需要字段校验、默认值、嵌套模型时才上 Pydantic。</div>
+    <div class="annotation"><b>校验发生在入口：</b>注意 <code class="inline">invoke</code> 返回的是普通 <code class="inline">dict</code>（即使 State 是 Pydantic 模型）。Pydantic 在这里的价值是<strong>入口校验</strong>：传入的字段类型不对会立刻报错，<code class="inline">answer</code> 带默认值 <code class="inline">""</code>，调用方没传也不会报错。适合字段较多、需要类型校验或嵌套结构的场景；但多数 agent 用 <code class="inline">TypedDict</code> 就够了。</div>
+    <div class="callout info"><b class="tag">提示</b> 为什么用 TypedDict？它是「带类型提示的字典」，运行时就是一个普通 <code class="inline">dict</code>，零开销，mypy/pyright 都认得，且能通过 <code class="inline">Annotated</code> 挂载 reducer。只有当你需要字段校验、默认值、嵌套模型时才上 Pydantic。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.2</span>默认合并 = 覆盖：一个会咬人的坑</h2>
-    <p>关键问题来了：<strong>当一个 key 没有指定 reducer 时，新值如何与旧值合并？</strong> 答案是——<strong>直接覆盖</strong>。框架在源码里为没有 reducer 的字段创建的是一个 <code class="inline">LastValue</code> 通道，它的 <code class="inline">update</code> 逻辑就是 <code class="inline">self.value = values[-1]</code>：谁后写谁赢，旧值被丢弃。</p>
+    <p>关键问题来了：<strong>当一个 key 没有指定 reducer 时，新值如何与旧值合并？</strong> 答案是——<strong>直接覆盖</strong>。框架在源码里为没有 reducer 的字段创建的是一个 <code class="inline">LastValue</code> 通道，它的 <code class="inline">update</code> 逻辑就是 <code class="inline">self.value = values[-1]</code>（摘录见第 1 章 1.7，last_value.py:56）：谁后写谁赢，旧值被丢弃。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lv32t lv32d">
+        <title id="lv32t">LastValue 覆盖时序</title>
+        <desc id="lv32d">时间轴上两个节点先后写 messages 通道：user 节点写入用户消息后盒子值为[你好]；bot 节点写入 AI 回复，LastValue 直接替换整盒，用户消息消失。旁边对照配了 add_messages 的盒子：同样两次写入，值变成两条消息并排。</desc>
+        <defs>
+          <marker id="ar32" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <text class="lbl sm" x="70" y="30" text-anchor="middle">执行序</text>
+        <line class="st" x1="20" y1="40" x2="20" y2="220" stroke-dasharray="4 3"></line>
+        <line class="edge" x1="20" y1="120" x2="880" y2="120" marker-end="url(#ar32)"></line>
+        <text class="lbl sm" x="850" y="110" text-anchor="middle">时间</text>
+        <rect class="node" x="60" y="50" width="170" height="48" rx="8"></rect>
+        <text class="lbl sm" x="145" y="70" text-anchor="middle">user 节点</text>
+        <text class="lbl sm code" x="145" y="86" text-anchor="middle">写 [HumanMessage]</text>
+        <rect class="node" x="330" y="50" width="170" height="48" rx="8"></rect>
+        <text class="lbl sm" x="415" y="70" text-anchor="middle">bot 节点</text>
+        <text class="lbl sm code" x="415" y="86" text-anchor="middle">写 [AIMessage]</text>
+        <rect class="node warn" x="580" y="42" width="150" height="64" rx="8"></rect>
+        <text class="lbl sm" x="655" y="64" text-anchor="middle">messages 盒子</text>
+        <text class="lbl sm code" x="655" y="80" text-anchor="middle">[Human]→[AI]</text>
+        <text class="lbl sm code" x="655" y="96" text-anchor="middle">只剩 [AI]</text>
+        <text class="lbl sm code" x="770" y="80" text-anchor="middle">← 历史丢了</text>
+        <text class="lbl sm" x="415" y="150" text-anchor="middle">两次写入前后脚到同一个 LastValue</text>
+        <text class="lbl sm" x="415" y="168" text-anchor="middle">每次 update 都是「整盒替换」</text>
+        <text class="lbl sm" x="415" y="186" text-anchor="middle">先写的被后写的整个顶掉</text>
+        <rect class="node acc" x="580" y="150" width="150" height="64" rx="8"></rect>
+        <text class="lbl sm" x="655" y="172" text-anchor="middle">对照：配了 reducer</text>
+        <text class="lbl sm code" x="655" y="188" text-anchor="middle">[Human, AI] 都在</text>
+        <text class="lbl sm code" x="655" y="204" text-anchor="middle">逐条归约，不顶掉</text>
+      </svg>
+      <div class="fig-cap">图 3.2：LastValue 的覆盖时序。两次顺序写入各自触发一次 update，盒子每次整体替换为最新写入；配了 reducer 的盒子则把每次写入归约进历史。</div>
+    </div>
     <p>这在写「普通字段」时很合理（比如 <code class="inline">answer</code> 本来就该被新回答覆盖），但在处理 <strong>消息列表（messages）</strong> 时就是灾难：</p>
     <div class="code-title">陷阱：messages 没有指定 reducer，默认「覆盖」导致历史丢失</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -127,22 +163,22 @@ builder.<span class="fn">add_edge</span>(<span class="st">"bot"</span>, END)
 result = builder.<span class="fn">compile</span>().<span class="fn">invoke</span>({<span class="st">"messages"</span>: []})
 <span class="fn">print</span>(result[<span class="st">"messages"</span>])
 <span class="cmt"># [{'role': 'assistant', 'content': '你好呀'}]   ← 用户消息被覆盖丢了！</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">user_node</code> 写入了一条用户消息，紧接着 <code class="inline">bot_node</code> 返回 <code class="inline">{"messages": [AI回复]}</code>。由于 <code class="inline">messages</code> 没有 reducer，新值直接顶掉旧值——用户消息被丢弃。任何需要「累积历史」的场景都必须给这个字段配 reducer。</div>
+    <div class="annotation"><b>一条返回值顶掉全部历史：</b><code class="inline">user_node</code> 写入了一条用户消息，紧接着 <code class="inline">bot_node</code> 返回 <code class="inline">{"messages": [AI回复]}</code>。由于 <code class="inline">messages</code> 没有 reducer，新值直接顶掉旧值——用户消息被丢弃。任何需要「累积历史」的场景都必须给这个字段配 reducer。</div>
     <p>不仅如此，<code class="inline">LastValue</code> 还有一个更严格的限制：它<strong>每一步只能接收一个写入</strong>。如果你有多个并行节点（fan-out）同时往同一个没有 reducer 的 key 写，框架会直接抛出 <code class="inline">InvalidUpdateError</code>。源码里的报错信息写得很清楚：</p>
     <div class="code-title">LastValue 通道在并发写入时报错 —— fan-out 必须配 reducer</div>
     <pre class="code"><span class="lang-tag">text</span>At key 'messages': Can receive only one value per step.
 Use an Annotated key to handle multiple values.</pre>
-    <div class="annotation"><b>读懂这段：</b>这条报错点出了 reducer 的两大职责——一是决定单次写入如何累积（覆盖 vs 追加），二是让多个并发写入能被合并成一个确定结果。这就是为什么写 agent 几乎一定要给 <code class="inline">messages</code> 配 reducer。</div>
+    <div class="annotation"><b>报错的弦外之音：</b>这条报错点出了 reducer 的两大职责——一是决定单次写入如何累积（覆盖 vs 追加），二是让多个并发写入能被合并成一个确定结果。这就是为什么写 agent 几乎一定要给 <code class="inline">messages</code> 配 reducer。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.3</span>Annotated[type, reducer]:给字段挂上归约器</h2>
+    <h2><span class="num">3.3</span>Annotated[type, reducer]：给字段挂上归约器</h2>
     <p>解决上面的坑，只需要在类型注解里用 <code class="inline">Annotated</code> 挂一个 reducer 函数。语法是：</p>
     <div class="code-title">Annotated 挂载 reducer 的固定签名</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> <span class="cl">Annotated</span>
-<span class="cmt"># Annotated[类型， reducer函数]</span>
-<span class="cmt"># reducer 的签名固定为：(旧值， 新值) -&gt； 合并后的值</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">Annotated</code> 是 Python 标准库的类型工具，它把「额外元信息」挂在类型上而不改变运行时类型。LangGraph 在编译时检查 <code class="inline">Annotated</code> 的最后一个 metadata，若它是可调用的二元函数，就把该字段建成 <code class="inline">BinaryOperatorAggregate</code> 通道——每次更新时调用 <code class="inline">reducer(旧值, 新值)</code>。</div>
+<span class="cmt"># Annotated[类型, reducer函数]</span>
+<span class="cmt"># reducer 的签名固定为：(旧值, 新值) -&gt; 合并后的值</span></pre>
+    <div class="annotation"><b>框架怎么认出 reducer：</b><code class="inline">Annotated</code> 是 Python 标准库的类型工具，它把「额外元信息」挂在类型上而不改变运行时类型。LangGraph 在编译时检查 <code class="inline">Annotated</code> 的最后一个 metadata（state.py:1904 的 <code class="inline">_is_field_binop</code>），若它是「接收两个位置参数的可调用对象」，就把该字段建成 <code class="inline">BinaryOperatorAggregate</code> 通道——每次更新时调用 <code class="inline">reducer(旧值, 新值)</code>。</div>
     <p>给 <code class="inline">messages</code> 挂上合适的 reducer 后，上面的例子就能正常累积历史了。LangGraph 内置了一个专门处理消息的 reducer——<code class="inline">add_messages</code>，正是为这个场景而生。</p>
   </section>
 
@@ -189,7 +225,7 @@ result = builder.<span class="fn">compile</span>().<span class="fn">invoke</span
     <span class="fn">print</span>(<span class="fn">type</span>(m).__name__, <span class="st">":"</span>, m.content)
 <span class="cmt"># HumanMessage ： 你好</span>
 <span class="cmt"># AIMessage ： 你好呀，有什么可以帮你？     ← 历史完整保留了！</span></pre>
-    <div class="annotation"><b>读懂这段：</b>与 3.2 的陷阱相比，唯一的改动是 <code class="inline">messages: Annotated[list, add_messages]</code>。现在 <code class="inline">user_node</code> 写入的 <code class="inline">HumanMessage</code> 会被追加进历史，而不是被 <code class="inline">bot_node</code> 的返回覆盖。一个注解，就把「覆盖语义」切换成了「追加语义」。</div>
+    <div class="annotation"><b>一行注解，语义对调：</b>与 3.2 的陷阱相比，唯一的改动是 <code class="inline">messages: Annotated[list, add_messages]</code>。现在 <code class="inline">user_node</code> 写入的 <code class="inline">HumanMessage</code> 会被追加进历史，而不是被 <code class="inline">bot_node</code> 的返回覆盖。一个注解，就把「覆盖语义」切换成了「追加语义」。</div>
     <p>同 ID 替换的特性也很实用——比如流式输出时不断更新同一条 AI 消息：</p>
     <div class="code-title">同 ID 替换 —— 流式更新时同一条消息被原地刷新</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langchain_core.messages <span class="kw">import</span> <span class="cl">HumanMessage</span>, <span class="cl">AIMessage</span>
@@ -206,7 +242,39 @@ msgs3 = [<span class="cl">AIMessage</span>(content=<span class="st">"你好呀�
 <span class="fn">print</span>(<span class="fn">add_messages</span>(msgs1 + msgs2, msgs3))
 <span class="cmt"># [HumanMessage(content='你好', id='1'),</span>
 <span class="cmt">#  AIMessage(content='你好呀，很高兴认识你！', id='2')]   ← 第二条被原地更新</span></pre>
-    <div class="annotation"><b>读懂这段：</b>第二轮用 <code class="inline">id="2"</code> 再次写入，因为 ID 与历史中已有消息相同，<code class="inline">add_messages</code> 不会新增一条，而是把那条旧消息替换成新内容。这正是流式输出、工具调用修正、多步回溯等场景所需要的「原地更新」能力。</div>
+    <div class="annotation"><b>同 ID 就是「那条消息」：</b>第二轮用 <code class="inline">id="2"</code> 再次写入，因为 ID 与历史中已有消息相同，<code class="inline">add_messages</code> 不会新增一条，而是把那条旧消息替换成新内容。这正是流式输出、工具调用修正、多步回溯等场景所需要的「原地更新」能力。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="am34t am34d">
+        <title id="am34t">add_messages 的两条合并路径</title>
+        <desc id="am34d">新消息进来后先查 ID：ID 在历史中已存在则走替换路径，旧消息被新内容原地顶替；ID 不存在则走追加路径，挂到列表末尾。两条路径汇成同一份新历史。</desc>
+        <defs>
+          <marker id="ar34" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <rect class="node" x="30" y="90" width="150" height="50" rx="8"></rect>
+        <text class="lbl sm" x="105" y="112" text-anchor="middle">一批新消息</text>
+        <text class="lbl sm code" x="105" y="128" text-anchor="middle">带各自的 id</text>
+        <rect class="node acc" x="250" y="86" width="190" height="58" rx="8"></rect>
+        <text class="lbl sm" x="345" y="108" text-anchor="middle">逐条查历史</text>
+        <text class="lbl sm code" x="345" y="124" text-anchor="middle">这个 id 见过吗？</text>
+        <rect class="node core" x="560" y="30" width="300" height="60" rx="8"></rect>
+        <text class="lbl sm" x="720" y="52" text-anchor="middle">见过 → 原地替换</text>
+        <text class="lbl sm code" x="720" y="70" text-anchor="middle">msg(id=2) 内容换成新版</text>
+        <text class="lbl sm" x="720" y="84" text-anchor="middle">列表长度不变，流式刷新靠它</text>
+        <rect class="node core" x="560" y="140" width="300" height="60" rx="8"></rect>
+        <text class="lbl sm" x="720" y="162" text-anchor="middle">没见过 → 追加到末尾</text>
+        <text class="lbl sm code" x="720" y="180" text-anchor="middle">append 进历史</text>
+        <text class="lbl sm" x="720" y="188" text-anchor="middle">（无 id 的先自动补一个 uuid）</text>
+        <line class="edge" x1="180" y1="115" x2="248" y2="115" marker-end="url(#ar34)"></line>
+        <line class="edge core" x1="400" y1="100" x2="558" y2="62" marker-end="url(#ar34)"></line>
+        <text class="lbl sm code" x="470" y="70" text-anchor="middle">id 已存在</text>
+        <line class="edge core" x1="400" y1="130" x2="558" y2="172" marker-end="url(#ar34)"></line>
+        <text class="lbl sm code" x="470" y="164" text-anchor="middle">id 是新的</text>
+        <text class="lbl sm" x="450" y="222" text-anchor="middle">两条路径共用一个入口：这就是「追加」和「修正」统一成一个机制的原因</text>
+      </svg>
+      <div class="fig-cap">图 3.4：add_messages 按 ID 走两条合并路径——同 ID 原地替换（流式刷新、修正），新 ID 追加（append-only 历史）。一个机制同时服务两种场景。</div>
+    </div>
     <div class="callout info"><b class="tag">设计</b> 为什么按 ID 而不是简单 append？因为 agent 场景里消息不是「只增不改」的。流式生成要不断更新同一条 AI 消息的 content；工具调用出错可能要修正上一条；多步推理会回溯。按 ID 合并把「追加」和「更新」统一成同一个机制：ID 相同就更新，ID 不同就追加——比纯 <code class="inline">list + list</code> 灵活，又比全量覆盖安全。</div>
     <p><code class="inline">add_messages</code> 还支持用 <code class="inline">format="langchain-openai"</code> 参数把消息格式化成 OpenAI 兼容结构，用法是 <code class="inline">Annotated[list, add_messages(format="langchain-openai")]</code>（内部用了 <code class="inline">functools.partial</code> 柯里化）。</p>
   </section>
@@ -218,7 +286,7 @@ msgs3 = [<span class="cl">AIMessage</span>(content=<span class="st">"你好呀�
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 源码：langgraph/graph/message.py</span>
 <span class="kw">class</span> <span class="cl">MessagesState</span>(<span class="cl">TypedDict</span>):
     messages: <span class="cl">Annotated</span>[<span class="cl">list</span>[<span class="cl">AnyMessage</span>], add_messages]</pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">MessagesState</code> 没有任何特殊处理，就是把你每次都要写的那行 <code class="inline">Annotated[list, add_messages]</code> 封装好了。用它就不用自己写 <code class="inline">Annotated</code> 了，还能直接继承它来扩展更多字段：</div>
+    <div class="annotation"><b>没有任何魔法：</b><code class="inline">MessagesState</code> 没有任何特殊处理，就是把你每次都要写的那行 <code class="inline">Annotated[list, add_messages]</code> 封装好了。用它就不用自己写 <code class="inline">Annotated</code> 了，还能直接继承它来扩展更多字段：</div>
     <div class="code-title">直接用 / 继承 MessagesState —— 两种扩展方式</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langgraph.graph <span class="kw">import</span> <span class="cl">StateGraph</span>, START, END, <span class="cl">MessagesState</span>
 <span class="kw">from</span> langchain_core.messages <span class="kw">import</span> <span class="cl">HumanMessage</span>, <span class="cl">AIMessage</span>
@@ -242,7 +310,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"chat"</span>, END)
 <span class="kw">class</span> <span class="cl">AgentState</span>(<span class="cl">MessagesState</span>):
     <span class="cmt"># messages 字段从父类继承，已带 add_messages reducer</span>
     tool_call_count: <span class="cl">Annotated</span>[<span class="cl">int</span>, operator.add]  <span class="cmt"># 自定义累加字段</span></pre>
-    <div class="annotation"><b>读懂这段：</b>方式二继承 <code class="inline">MessagesState</code>，既保留了带 reducer 的 <code class="inline">messages</code>，又新增了一个用 <code class="inline">operator.add</code> 累加的 <code class="inline">tool_call_count</code>。这是自建 agent 时最常见的状态结构——消息历史 + 业务计数。</div>
+    <div class="annotation"><b>最常见的自建状态结构：</b>方式二继承 <code class="inline">MessagesState</code>，既保留了带 reducer 的 <code class="inline">messages</code>，又新增了一个用 <code class="inline">operator.add</code> 累加的 <code class="inline">tool_call_count</code>。这是自建 agent 时最常见的状态结构——消息历史 + 业务计数。</div>
     <div class="callout info"><b class="tag">提示</b> 本代码库里 <code class="inline">create_react_agent</code> 的内部状态 <code class="inline">AgentState</code>（位于 <code class="inline">libs/prebuilt/langgraph/prebuilt/chat_agent_executor.py</code>）就是同样的写法：<code class="inline">messages: Annotated[Sequence[BaseMessage], add_messages]</code>。你自建 agent 时照搬这个结构即可。</div>
   </section>
 
@@ -282,7 +350,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"step"</span>, END)  <
 result = builder.<span class="fn">compile</span>().<span class="fn">invoke</span>({<span class="st">"count"</span>: <span class="nu">0</span>, <span class="st">"steps"</span>: []})
 <span class="fn">print</span>(result)
 <span class="cmt"># {'count': 3, 'steps': ['step@count=0', 'step@count=1', 'step@count=2']}</span></pre>
-    <div class="annotation"><b>读懂这段：</b>每次 <code class="inline">step_node</code> 返回 <code class="inline">{"count": 1}</code>，但因为有 <code class="inline">operator.add</code>，这个 <code class="inline">1</code> 不是覆盖而是加到旧值上：0→1→2→3。同理 <code class="inline">steps</code> 每次返回单元素列表，被拼接成三元素列表。条件边根据 <code class="inline">count &lt; 3</code> 决定继续循环还是结束。</div>
+    <div class="annotation"><b>1 加三次等于 3，不是 1：</b>每次 <code class="inline">step_node</code> 返回 <code class="inline">{"count": 1}</code>，但因为有 <code class="inline">operator.add</code>，这个 <code class="inline">1</code> 不是覆盖而是加到旧值上：0→1→2→3。同理 <code class="inline">steps</code> 每次返回单元素列表，被拼接成三元素列表。条件边根据 <code class="inline">count &lt; 3</code> 决定继续循环还是结束。</div>
     <p>你也可以完全手写一个 reducer，实现更复杂的合并逻辑：</p>
     <div class="code-title">手写 reducer —— 用 " -> " 连接路径节点名</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> <span class="cl">Annotated</span>
@@ -322,7 +390,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"c"</span>, END)
 
 <span class="fn">print</span>(builder.<span class="fn">compile</span>().<span class="fn">invoke</span>({<span class="st">"path"</span>: <span class="st">""</span>}))
 <span class="cmt"># {'path': 'A -&gt; B -&gt; C'}</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">concat</code> 是个普通二元函数，符合 <code class="inline">(旧, 新) -&gt; 合并</code> 签名，所以能直接当 reducer 用。三个节点依次写入 <code class="inline">"A"</code>、<code class="inline">"B"</code>、<code class="inline">"C"</code>，reducer 把它们连成 <code class="inline">"A -&gt; B -&gt; C"</code>。任何纯函数合并逻辑都可以这样挂上去——去重、字典合并、最大值都行。</div>
+    <div class="annotation"><b>纯函数就能上岗：</b><code class="inline">concat</code> 是个普通二元函数，符合 <code class="inline">(旧, 新) -&gt; 合并</code> 签名，所以能直接当 reducer 用。三个节点依次写入 <code class="inline">"A"</code>、<code class="inline">"B"</code>、<code class="inline">"C"</code>，reducer 把它们连成 <code class="inline">"A -&gt; B -&gt; C"</code>。任何纯函数合并逻辑都可以这样挂上去——去重、字典合并、最大值都行。</div>
   </section>
 
   <section class="block">
@@ -342,7 +410,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"c"</span>, END)
         <tr><td><strong>operator.add</strong></td><td><code class="inline">[a, b]</code></td><td><code class="inline">[c, d]</code></td><td><code class="inline">[a, b, c, d]</code>（拼接）</td><td>收集多节点产出</td></tr>
       </tbody>
     </table>
-    <div class="annotation"><b>读懂这段：</b>三行带「默认并发写入」的报错是这里的关键——任何 fan-out（并行节点）写同一个字段，都必须有 reducer。其余行展示了同一对输入在不同 reducer 下得到完全不同的结果：覆盖、追加、替换、累加、拼接。选 reducer 就是选合并语义。</div>
+    <div class="annotation"><b>表格里真正要盯的一行：</b>三行带「默认并发写入」的报错是这里的关键——任何 fan-out（并行节点）写同一个字段，都必须有 reducer。其余行展示了同一对输入在不同 reducer 下得到完全不同的结果：覆盖、追加、替换、累加、拼接。选 reducer 就是选合并语义。</div>
 
     <p><strong>动态演示</strong>——同一份输入流，看三种 reducer 结果如何分叉（覆盖丢历史、add 会重复、add_messages 按 ID 替换）：</p>
     <div data-anim="reducer-compare"></div>
@@ -411,7 +479,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"c"</span>, END)
       </svg>
       <div class="fig-cap">图 3.8：状态合并全流程——节点返回更新后，有 reducer 走 BinaryOperatorAggregate 合并，无 reducer 走 LastValue 覆盖（并发写入则报错），最终写入新 State 并可被 checkpointer 持久化</div>
     </div>
-    <div class="annotation"><b>读懂这段：</b>这张图把「为什么 messages 必须配 reducer」讲透了——右侧黄色路径是默认覆盖，一旦 fan-out 并行写入就报错；左侧蓝色路径是带 reducer 的合并，天然支持多写入归约成单一结果。checkpointer 在「写入完成」后介入，把新 State 落盘。</div>
+    <div class="annotation"><b>两条路径，两个命运：</b>这张图把「为什么 messages 必须配 reducer」讲透了——右侧黄色路径是默认覆盖，一旦 fan-out 并行写入就报错；左侧蓝色路径是带 reducer 的合并，天然支持多写入归约成单一结果。checkpointer 在「写入完成」后介入，把新 State 落盘。</div>
   </section>
 
   <section class="block">
@@ -434,7 +502,7 @@ builder.<span class="fn">add_edge</span>(<span class="st">"c"</span>, END)
 
 <span class="cmt"># class BadState(TypedDict):</span>
 <span class="cmt">#     data: Annotated[list, bad_reducer]   # 不要用</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">bad_reducer</code> 踩了两个雷——<code class="inline">time.time()</code> 让每次重放结果不同（破坏确定性），<code class="inline">open("/dev/null")</code> 返回文件句柄无法被 JSON 序列化（checkpointer 落盘直接失败）。正确做法是：reducer 只做纯数据变换，需要「副作用」（读数据库、调 API）的逻辑放到节点函数里，节点把可序列化的结果交给 reducer 合并。这条边界是 LangGraph 状态管理的核心设计哲学——<strong>reducer 管合并，节点管计算</strong>。</div>
+    <div class="annotation"><b>两个雷，一条边界：</b><code class="inline">bad_reducer</code> 踩了两个雷——<code class="inline">time.time()</code> 让每次重放结果不同（破坏确定性），<code class="inline">open("/dev/null")</code> 返回文件句柄无法被 JSON 序列化（checkpointer 落盘直接失败）。正确做法是：reducer 只做纯数据变换，需要「副作用」（读数据库、调 API）的逻辑放到节点函数里，节点把可序列化的结果交给 reducer 合并。这条边界是 LangGraph 状态管理的核心设计哲学——<strong>reducer 管合并，节点管计算</strong>。</div>
   </section>
 
   <section class="block">
@@ -483,7 +551,27 @@ builder.<span class="fn">add_edge</span>(<span class="st">"c"</span>, END)
       </svg>
       <div class="fig-cap">图 3.10：Reducer 四要点——共享黑板 + 默认覆盖 + add_messages + 自定义二元函数</div>
     </div>
-    <p>记住这条主线：<strong>reducer 管合并，节点管计算</strong>。节点把可序列化的纯数据交给 reducer,reducer 用确定性的二元函数把它合并进 State,checkpointer 再把新 State 落盘——这就是 LangGraph 状态流转的全部秘密。后面第 04 章控制流、第 09 章持久化，都建立在这套机制之上。</p>
+    <p>记住这条主线：<strong>reducer 管合并，节点管计算</strong>。节点把可序列化的纯数据交给 reducer，reducer 用确定性的二元函数把它合并进 State，checkpointer 再把新 State 落盘。后面第 04 章控制流、第 09 章持久化，都建立在这套机制之上。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.11</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · 3.2 的陷阱里，bot 节点返回 <code class="inline">{"messages": [AI回复]}</code> 后历史只剩一条。如果 bot 节点改成返回 <code class="inline">{"messages": state["messages"] + [AI回复]}</code>（读出来拼好再整份写回），不配 reducer 能解决问题吗？会引入什么新风险？</summary>
+      <div class="a">顺序执行时能跑：每步只有一个写入，LastValue 收一个值，内容也确实是「旧历史+新消息」。但它把合并责任从框架挪回了业务代码，并在并行时刻翻车：一旦两个节点并行写 messages，两个「整份历史」撞进 LastValue 直接抛 InvalidUpdateError；即便配了 operator.add，两条「整份历史」会拼接出重复消息。正确做法仍是配 add_messages——节点只交「增量」，合并语义归字段。这也是第 1 章 Q2「更新请求而非新状态」约定的具体代价。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · <code class="inline">Annotated[list, add_messages]</code> 和 <code class="inline">Annotated[list, operator.add]</code> 都能累积，区别在哪？如果你要实现「流式刷新同一条 AI 消息」，哪个能用，哪个会出什么乱子？</summary>
+      <div class="a">add_messages 按 ID 合并：同 ID 替换、新 ID 追加，还能 RemoveMessage 删除；operator.add 是盲拼接：int 相加、list 连接，不认识 ID。流式刷新必须用 add_messages——每一步产出同 ID 的「半成品」消息，历史里那条被原地替换，长度不涨；用 operator.add 的话，每个 chunk 都会被拼进列表，历史里堆满重复的中间态，长度随流式步骤线性膨胀。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 为什么框架检查的是「Annotated 最后一个 metadata 是不是双位置参数的可调用对象」（_is_field_binop），而不是随便哪个参数位置？这排除了什么误挂？</summary>
+      <div class="a">约定取最后一个 metadata：这是「reducer 写在注解末位」的固定语法，检查两个位置参数是签名门槛——reducer 会在 update 循环里以 (旧值， 新值) 调用（binop.py:143），签名不符到运行时才炸，编译期先筛掉。它排除了两类误挂：把单参数函数（如 len）或带 keyword-only 参数的函数当 reducer——前者调用时参数个数对不上，后者不符合二元纯函数契约。EphemeralValue 这类 BaseChannel 实例走的是 _is_field_channel 分支（state.py:1850），不会进这条判定。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · Pydantic 版 State 在 invoke 返回的是普通 dict。为什么框架不返回模型实例？入口校验和「内部存储格式」是什么关系？</summary>
+      <div class="a">内部存储层是 channel 盒子，落盘走 checkpointer 的 JSON/msgpack 序列化——存的从来都是可序列化数据，不是对象引用。Pydantic 模型只在入口做一次校验/默认值填充，校验通过后拆成普通 dict 进通道；输出时同样组装回 dict。这样校验能力（入口严）和执行效率（内部无模型包装、可序列化、可恢复）互不妨碍。代价是节点内拿不到 Pydantic 的字段校验，那是入口的事。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 3.9 说 reducer 必须「确定性 + 可序列化」。reducer 之外，节点函数呢——节点里能不能调数据库？结合「reducer 管合并，节点管计算」这条边界说说理由。</summary>
+      <div class="a">节点可以调数据库/API，那是「计算」，本来就该在节点里；但节点返回给 reducer 合并的值必须可序列化。reducer 不行：它会被 checkpointer 的重放机制反复调用（时间旅行、断点恢复都靠重放写入记录），调外部服务既不确定也无法在恢复时复现。所以边界画在「副作用与纯函数」之间：副作用进节点，合并进 reducer；节点产出纯数据，reducer 只做纯变换。破坏这条线，恢复重放就是第一受害者。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

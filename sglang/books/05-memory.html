@@ -184,7 +184,7 @@ self.device = device
     )
 self.free_slots = <span class="fn">list</span>(<span class="fn">range</span>(<span class="nu">1</span>, self._alloc_size))
 self.req_generation = torch.<span class="fn">zeros</span>(self._alloc_size, dtype=torch.int64)</pre>
-    <div class="annotation"><b>读懂这段：</b> 两个细节。<strong>第一行是填充行</strong>：CUDA Graph 回放时，padding 出来的假请求 <code class="inline">req_pool_indices</code> 全是 0，让它们的读写都落在第 0 行，避免越界或污染真请求。<strong>free_slots 从 1 开始</strong>也是同一个原因。</div>
+    <div class="annotation"><b>两个细节：</b> <strong>第一行是填充行</strong>：CUDA Graph 回放时，padding 出来的假请求 <code class="inline">req_pool_indices</code> 全是 0，让它们的读写都落在第 0 行，避免越界或污染真请求。<strong>free_slots 从 1 开始</strong>也是同一个原因。</div>
     <p>分配行本身是个简化的空闲链表，但有三处细节值得看：</p>
     <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — alloc_rows（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_rows</span>(self, need_size: <span class="cl">int</span>) -&gt; Optional[<span class="cl">List</span>[<span class="cl">int</span>]]:
@@ -200,7 +200,7 @@ self.req_generation = torch.<span class="fn">zeros</span>(self._alloc_size, dtyp
     <span class="kw">if</span> self._on_alloc_rows <span class="kw">is not</span> <span class="kw">None</span>:
         self._on_alloc_rows(select_index)
     <span class="kw">return</span> select_index</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">free_slots[-0:]</code> 这个特判值得停下来看一眼：Python 里 <code class="inline">lst[-0:]</code> 等价于 <code class="inline">lst[0:]</code>，即整个列表——「分配 0 行」若不走这个分支会把所有空闲行都发出去。另外每次分配都会把该行的 <code class="inline">req_generation</code> 加一：行会被反复复用，重叠调度等异步路径里拿旧行号来写的人，可以凭代数判断自己是不是拿着过期引用。</div>
+    <div class="annotation"><b>一个特判值得停下来看一眼：</b> Python 里 <code class="inline">lst[-0:]</code> 等价于 <code class="inline">lst[0:]</code>，即整个列表——「分配 0 行」若不走 <code class="inline">free_slots[-0:]</code> 那个分支会把所有空闲行都发出去。另外每次分配都会把该行的 <code class="inline">req_generation</code> 加一：行会被反复复用，重叠调度等异步路径里拿旧行号来写的人，可以凭代数判断自己是不是拿着过期引用。</div>
   </section>
 
   <section class="block">
@@ -231,7 +231,7 @@ self.req_generation = torch.<span class="fn">zeros</span>(self._alloc_size, dtyp
             torch.<span class="fn">zeros</span>(v_shape, dtype=self.store_dtype, device=self.device)
             <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(self.layer_num)
         ]</pre>
-    <div class="annotation"><b>读懂这段：</b> NHD 是默认布局（行=槽位，方便 gather）；HND 把第一维换成页，服务按 kv-head 稀疏取页的后端（如 trtllm_mha）；<code class="inline">vectorized_5d</code> 是 ROCm AITER 专用的重排布局。文件头注释写明 HND 与 vectorized_5d 互斥、HND 优先——这是为不同 kernel 的访存模式留的口子，而不是统一的「更好布局」。</div>
+    <div class="annotation"><b>三种布局各有其人：</b> NHD 是默认布局（行=槽位，方便 gather）；HND 把第一维换成页，服务按 kv-head 稀疏取页的后端（如 trtllm_mha）；<code class="inline">vectorized_5d</code> 是 ROCm AITER 专用的重排布局。文件头注释写明 HND 与 vectorized_5d 互斥、HND 优先——这是为不同 kernel 的访存模式留的口子，而不是统一的「更好布局」。</div>
 
     <p>写入路径 <code class="inline">set_kv_buffer</code> 每个前向步、每层调一次，尾部按布局分派：</p>
     <div class="code-title">python/sglang/srt/mem_cache/memory_pool.py — set_kv_buffer 尾段（摘录，注释为译注）</div>
@@ -296,7 +296,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
         <span class="kw">return</span> <span class="kw">None</span>
     self.free_pages = self.free_pages[num_new_pages:]
     <span class="kw">return</span> out_indices</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang/kernels/ops/memory/allocator.py:116</code>）每个请求一个 program，把槽位计算拆成三段：<strong>① 填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>）；<strong>② 申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移）；<strong>③ 开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现留在调用方文件里（<code class="inline">mem_cache/allocator/paged.py:40</code>），两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
+    <div class="annotation"><b>一次 kernel 算完整个 batch：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang/kernels/ops/memory/allocator.py:116</code>）每个请求一个 program，把槽位计算拆成三段：先<strong>填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>），再<strong>申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移），最后<strong>开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现留在调用方文件里（<code class="inline">mem_cache/allocator/paged.py:40</code>），两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
 
     <p>decode 每步每请求至多消耗一页，kernel 更简单；释放则要把 token 槽位号折算回页号并去重：</p>
     <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_decode 与 free（摘录，注释为译注）</div>
@@ -327,7 +327,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
     ...
     reps = free_index[::ps]
     self.<span class="fn">free_page_ids</span>(reps <span class="cmt">//</span> ps)</pre>
-    <div class="annotation"><b>读懂这段：</b> 释放路径有三条，形状各不相同。<code class="inline">free</code> 是通用路径：<code class="inline">free_group</code> 为 <code class="inline">None</code> 时直接按页号归还（<code class="inline">//</code> 折算 + <code class="inline">torch.unique</code> 去重，因为尾页可能被多个请求写过）；否则只是把待释放索引攒进 <code class="inline">free_group</code>，延后合并。<code class="inline">free_segment</code> 是给「起点页对齐、页内 token 连续」这种规整形状走的快路径——<code class="inline">free_index[::page_size]</code> 直接就是每页一次，省掉 <code class="inline">torch.unique</code> 这个会同步设备的算子（NPU 后端的注释里明说了这一点）。<code class="inline">free_page_ids</code> 则是最底层的一条：调用方保证页号已去重，它连 <code class="inline">unique</code> 都不做。三条路最终都汇到 <code class="inline">_release_page_ids</code>。</div>
+    <div class="annotation"><b>释放路径有三条，形状各不相同：</b> <code class="inline">free</code> 是通用路径：<code class="inline">free_group</code> 为 <code class="inline">None</code> 时直接按页号归还（<code class="inline">//</code> 折算 + <code class="inline">torch.unique</code> 去重，因为尾页可能被多个请求写过）；否则只是把待释放索引攒进 <code class="inline">free_group</code>，延后合并。<code class="inline">free_segment</code> 是给「起点页对齐、页内 token 连续」这种规整形状走的快路径——<code class="inline">free_index[::page_size]</code> 直接就是每页一次，省掉 <code class="inline">torch.unique</code> 这个会同步设备的算子（NPU 后端的注释里明说了这一点）。<code class="inline">free_page_ids</code> 则是最底层的一条：调用方保证页号已去重，它连 <code class="inline">unique</code> 都不做。三条路最终都汇到 <code class="inline">_release_page_ids</code>。</div>
   </section>
 
   <section class="block">
@@ -361,7 +361,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
         )
 
     <span class="kw">return</span> <span class="fn">int</span>(rest_memory * (<span class="nu">1</span> &lt;&lt; <span class="nu">30</span>))  <span class="cmt"># 字节</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 三个要点。<strong>其一</strong>，权重先加载、再量显存，所以权重已经占掉的部分自动被计入——KV 池大小是「总量减去权重再减去余量」的残差。<strong>其二</strong>，<code class="inline">slack_gb</code> 按「启动时总量」的固定比例扣，而不是按当前空闲量扣，保证运行时余量不随权重变大而缩水。<strong>其三</strong>，配置得太小、权重就把预算吃光时，直接抛 ValueError 并给出可行的最小值，把「调 mem-fraction」这个用户动作变成一条可执行的错误信息。</div>
+    <div class="annotation"><b>三个要点：</b> <strong>其一</strong>，权重先加载、再量显存，所以权重已经占掉的部分自动被计入——KV 池大小是「总量减去权重再减去余量」的残差。<strong>其二</strong>，<code class="inline">slack_gb</code> 按「启动时总量」的固定比例扣，而不是按当前空闲量扣，保证运行时余量不随权重变大而缩水。<strong>其三</strong>，配置得太小、权重就把预算吃光时，直接抛 ValueError 并给出可行的最小值，把「调 mem-fraction」这个用户动作变成一条可执行的错误信息。</div>
     <div class="callout info">
       <b class="tag">困惑点</b>
       为什么先 <code class="inline">gc.collect()</code>？注释里写得很直白：weight loading 的中间张量此时可能还有引用，<code class="inline">empty_cache()</code> 对被引用的块无能为力；不先收集，测得的空闲显存偏小，KV 池可能被算小几个数量级，而显存其实闲着。这是启动路径上少见的「先 gc 再测量」写法，属于用 profiling 结果换稳定性的例子。
@@ -383,7 +383,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
 </div>
 
 <footer>
-  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

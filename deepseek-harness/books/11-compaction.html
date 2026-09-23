@@ -35,11 +35,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Compaction</div>
     <h1>Compaction：在 append-only 日志上「改历史」</h1>
-    <div class="subtitle">日志不可变，但上下文必须能缩。dsh 的答案不是删除，而是<strong>遮蔽</strong>：选一段表面范围，用一条摘要节点替换它的表面位置，原始事件原封不动地留在日志里。这一章看缝（CompactionEngine）、触发（pressure / context-overflow）、影子定价协议，以及缓存友好的摘要调用。</div>
+    <div class="subtitle">问题：日志不可变，上下文又必须能缩——不许删历史的前提下怎么腾空间？具体拆成四个——①缝怎么开（三种入口）②事务怎么编舞（锁、定价、替换、放锁）③什么时候触发（pressure / overflow / 图片配额）④摘要怎么调用才不砸缓存；11.1 摆问题，11.2–11.6 逐个作答，11.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">11.1</span>一分钟版本</h2>
+    <h2><span class="num">11.1</span>问题：append-only 日志上，上下文怎么缩</h2>
+    <p>会话日志只增不改（第 2 章的不变量），但上下文窗口是硬约束——总有一刻模型看到的表面要「变小」。删除历史违背不变量，截断日志破坏重放。dsh 的答案不是删除，而是<strong>遮蔽</strong>：选一段表面范围，用一条摘要节点替换它的表面位置，原始事件原封不动地留在日志里。这个答案展开来是四个问题：</p>
+    <p><strong>①缝怎么开</strong>——自动压缩、手动压缩、强制区域压缩是三种完全不同的入口，一个 <code class="inline">ctx.compaction</code> 契约怎么同时装下它们？</p>
+    <p><strong>②事务怎么编舞</strong>——压缩是「落锁→摘要→替换→放锁」的多步过程，步骤散在两个组件里，怎么靠持久事件串成原子事务、并发事务怎么互斥？</p>
+    <p><strong>③什么时候触发</strong>——步间压力检查、请求被供应商拒（上下文超限）、图片配额拒绝——三种死法三条恢复链，各自怎么接？</p>
+    <p><strong>④摘要怎么调用才不砸缓存</strong>——摘要是又一次模型调用，怎么让它复用前缀缓存而不是把 KV 缓存全部作废？</p>
+    <div class="callout info">
+      <b class="tag">速览答案</b>
+      ① 三个方法对应三种入口：<code class="inline">compactIfNeeded</code>（自动）、<code class="inline">compactNow</code>（手动、idle）、<code class="inline">compactRegion</code>（强制区域）。② 事务由持久事件串成：compaction/start（锁）→ compaction/summary（定价）→ <strong>紧跟的</strong> user/message（真正做表面替换）→ compaction/end（放锁）。③ 两个自动触发点：<code class="inline">agent/pre-step</code> 上按 pressure 检查；<code class="inline">agent/request-error</code> 上按 CONTEXT_WINDOW_EXCEEDED 做 overflow 恢复；图片配额失败由独立插件在同一个事件上按 IMAGE_OFFLOAD_REQUIRED 接管，摘要路径另有 compaction/summary-error 瀑布。④ 摘要调用是「重放对话 + 最后一条指令」——system/tools/消息前缀逐字复用，命中供应商的 warm prefix 缓存；标记 <code class="inline">purpose: 'compaction'</code>。
+    </div>
     <ul>
       <li><code class="inline">ctx.compaction</code> 是抽象缝（<code class="inline">CompactionEngine</code>），三个方法对应三种入口：<code class="inline">compactIfNeeded</code>（自动）、<code class="inline">compactNow</code>（手动、idle）、<code class="inline">compactRegion</code>（强制区域）。</li>
       <li>内置后端 compaction-basic：<code class="inline">thresholdRatio 0.8</code>（请求压力阈值）、<code class="inline">retainRatio 0.16</code>（逐字尾部保留）、<code class="inline">maxTokens 8192</code>（摘要生成上限）。</li>
@@ -50,8 +59,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.2</span>缝：三个方法三种入口</h2>
-    <div class="code-title">packages/compaction/compaction/src/index.ts:112 — CompactionEngine</div>
+    <h2><span class="num">11.2</span>① 缝：三个方法三种入口</h2>
+    <div class="code-title">packages/compaction/compaction/src/index.ts:119 — CompactionEngine</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export abstract class</span> <span class="cl">CompactionEngine</span> <span class="kw">extends</span> <span class="cl">Service</span> {
   <span class="cmt">/** 自动：pressure 用最近路由请求计量；context-overflow 可在阈值下强制有效缩减 */</span>
   <span class="kw">abstract</span> <span class="fn">compactIfNeeded</span>(
@@ -80,7 +89,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.3</span>事件编舞：锁、定价、替换、放锁</h2>
+    <h2><span class="num">11.3</span>② 事件编舞：锁、定价、替换、放锁</h2>
     <div class="code-title">packages/compaction/compaction/src/types.ts — SessionEventMap 合并（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * Marks the start of a compaction — log-only, holds the lock until
@@ -158,13 +167,13 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.4</span>触发：pressure 与 overflow 恢复</h2>
+    <h2><span class="num">11.4</span>③ 触发：pressure 与 overflow 恢复</h2>
     <p>先把两个触发点放进一个具体场景：一个深度会话逼近 20 万 token 的上下文窗口。假设当前路由请求计到 <strong>18 万 token</strong>（阈值 = 20 万 × 0.8 = 16 万，18 万已越过），此刻模型刚返回一轮 tool calls——下一个 step 开始前，挂在 <code class="inline">agent/pre-step</code> 上的压力监听器醒来，调 <code class="inline">compactIfNeeded(agent, 'pressure', signal)</code>。接下来发生的事（<code class="inline">packages/compaction/compaction-basic/src/index.ts</code> 的 <code class="inline">compactIfNeeded</code>）：</p>
     <ul>
       <li><strong>计量</strong>：<code class="inline">ctx.tokenMeter.measure(session)</code> 按最近一次路由请求的信封计 token（不是估算整段日志——只有模型真正看到的表面才算数）。</li>
-      <li><strong>查容量</strong>：<code class="inline">ctx.llm.resolveModelInfo(provider, model)</code> 拿到该模型的 contextWindow，乘 thresholdRatio 0.8 得出阈值 token 数。适配器没声明容量会直接抛 <code class="inline">TargetPressureConfigError</code>——压不压缩取决于一个配置事实，不能悄悄跳过。</li>
+      <li><strong>查容量</strong>：<code class="inline">ctx.llm.resolveModelInfo(provider, model)</code> 拿到该模型的 contextWindow，按 <code class="inline">resolveCompactSpec</code>（config.ts:153）算阈值——公式是三层：<code class="inline">messageBudget = contextWindow − reservedCompletionTokens</code>（路由请求自己要占的输出预留，取「envelope 配置 → 适配器默认 maxTokens → 0」链，index.ts:65），<code class="inline">pressureBudget = messageBudget − headroomTokens</code>（默认 65_536，config.ts:75），<code class="inline">threshold = floor(min(contextWindow × thresholdRatio, pressureBudget))</code>——窗口比例和「剩余预算」双封顶，预留吃光预算直接抛 <code class="inline">TargetPressureConfigError</code>。适配器没声明容量同样直接抛——压不压缩取决于一个配置事实，不能悄悄跳过。</li>
       <li><strong>先摘低垂果实</strong>：达标后先跑 model-free 的 tool-result 修剪（如果挂了 pruner），重新计量；很多会话修剪完就低于阈值了，一次模型调用都不用花。</li>
-      <li><strong>选范围</strong>：<code class="inline">selectCompactableRange(session, measurement, retainTokens)</code>（region.ts:118）从尾部向前累计节点 token，直到攒够 retainRatio 的<strong>逐字保留区</strong>（默认 16%——最近的对话原样留下，模型才不失去当前工作的细节），再从保留区边界向左回退，直到 <code class="inline">toolPairingBalancedBefore</code> 确认边界不劈开任何 assistant tool-call/result 对。</li>
+      <li><strong>选范围</strong>：<code class="inline">selectCompactableRange(session, measurement, retainTokens)</code>（region.ts:117）从尾部向前累计节点 token，直到攒够 retainRatio 的<strong>逐字保留区</strong>（默认 16%——最近的对话原样留下，模型才不失去当前工作的细节），再从保留区边界向左回退，直到 <code class="inline">toolPairingBalancedBefore</code> 确认边界不劈开任何 assistant tool-call/result 对。</li>
       <li><strong>压缩并复检</strong>：对选出的 [start, end] 跑 11.3 节的事务；成功后重新计量，仍超标就再来一轮（上限 compactionRetries），全打完还超标才抛错。</li>
     </ul>
     <p>第二个入口在 <code class="inline">agent/request-error</code> 上，对应另一种场景：会话没到 80% 阈值，但请求里有大量 tool-result 大块，供应商直接回了 400 上下文超限。两个监听器的关键差异都写在返回值语义里：</p>
@@ -206,7 +215,7 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
   </section>
 
   <section class="block">
-    <h2><span class="num">11.4b</span>第二条恢复链：image-offload 与 compaction/summary-error 瀑布</h2>
+    <h2><span class="num">11.4b</span>③ 第二条恢复链：image-offload 与 compaction/summary-error 瀑布</h2>
     <p>§11.4 的 overflow 恢复处理「上下文整体超限」，但多模态会话还有第三种死法：请求没超 token 预算，供应商却因为<strong>图片配额</strong>拒绝请求——路由抛 <code class="inline">IMAGE_OFFLOAD_REQUIRED</code>，错误里带着需要腾出的 <code class="inline">offloadImages</code> 数量。处理它的是另一个压缩缝插件 dsh-compaction-image-offload（<code class="inline">packages/compaction/compaction-image-offload/src/index.ts</code>，全文只有 41 行）：</p>
     <div class="code-title">packages/compaction/compaction-image-offload/src/index.ts — 两个监听器（全文）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">apply</span>(ctx: <span class="cl">Context</span>): <span class="kw">void</span> {
@@ -228,7 +237,7 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
   })
 }</pre>
     <div class="annotation"><b>与 §11.4 逐项对读</b>：① 同样挂在 <code class="inline">agent/request-error</code>，但筛的是不同错误码，所以两个插件可以共存——waterfall 语义天然支持「各认各的码」；② 同样返回 <code class="inline">{kind:'retry'}</code>，但注释刻意划清界线：这是<strong>持久表面修复</strong>（durable surface repair），不消耗 provider 重试预算、不记 retry 事件——第 7 章的重试退避完全感知不到它；③ 选图逻辑在 <code class="inline">offloadOldestImages</code>：按表面节点序找<strong>最旧的未 offload 输入图</strong>（只看 user/message 与 tool/result 节点，深度优先计数，嵌套 tool-result 一并数），凑够 count 就追加一条 <code class="inline">image/offload { targets: [{seq, imageIndexes}] }</code> 持久事件——改的是<strong>投影</strong>不是日志（第 2 章 §2.4：消息投影把占位文本呈现给模型，节点身份不变）。没有可选图时返回 false 放行 next()，错误照常上抛。</div>
-    <p>第二个监听器处理摘要路径上的同款失败，这就引出本节真正的新角色：<code class="inline">compaction/summary-error</code> 瀑布（声明在 <code class="inline">packages/compaction/compaction/src/index.ts:99</code>）。摘要调用也可能撞上图片配额——被压缩的输入里同样有图。摘要的重试循环在 <code class="inline">compaction-basic/src/region.ts</code>：</p>
+    <p>第二个监听器处理摘要路径上的同款失败，这就引出本节真正的新角色：<code class="inline">compaction/summary-error</code> 瀑布（声明在 <code class="inline">packages/compaction/compaction/src/index.ts:106</code>）。摘要调用也可能撞上图片配额——被压缩的输入里同样有图。摘要的重试循环在 <code class="inline">compaction-basic/src/region.ts</code>：</p>
     <div class="code-title">packages/compaction/compaction-basic/src/region.ts — summarize 重试循环（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">for</span> (;;) {
   signal?.<span class="fn">throwIfAborted</span>()
@@ -244,11 +253,11 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
       <span class="fn">validateSurfaceRegion</span>(agent.session, prepared.start, prepared.end))
   }
 }</pre>
-    <div class="annotation"><b>recover 是什么</b>：compaction-basic 在 <code class="inline">regionDependencies()</code>（index.ts:420）里把它绑成 <code class="inline">ctx.waterfall('compaction/summary-error', {session, sourceEventSeqs, error, signal?}, () =&gt; false)</code>——默认没人能恢复。返回 <code class="inline">true</code> 的含义是「有进展」：循环不抛错，而是重投影 + 重新计价后再试。image-offload 在这里返回 true 的效果和 §11.4 的 <code class="inline">{kind:'retry'}</code> 完全同构：都是「插件用一条持久事件修好了表面，请从头再来」。注意 payload 里带着 <code class="inline">sourceEventSeqs</code>（被选中的源事件，不是当前表面节点）——恢复插件看得见被遮蔽前的原始材料。至此压缩缝的恢复矩阵补齐：阈值内（pressure）/ 请求超限（overflow）/ 图片配额（offload，模型路径 + 摘要路径两条腿）。</div>
+    <div class="annotation"><b>recover 是什么</b>：compaction-basic 在 <code class="inline">regionDependencies()</code>（index.ts:438）里把它绑成 <code class="inline">ctx.waterfall('compaction/summary-error', {session, sourceEventSeqs, error, signal?}, () =&gt; false)</code>——默认没人能恢复。返回 <code class="inline">true</code> 的含义是「有进展」：循环不抛错，而是重投影 + 重新计价后再试。image-offload 在这里返回 true 的效果和 §11.4 的 <code class="inline">{kind:'retry'}</code> 完全同构：都是「插件用一条持久事件修好了表面，请从头再来」。注意 payload 里带着 <code class="inline">sourceEventSeqs</code>（被选中的源事件，不是当前表面节点）——恢复插件看得见被遮蔽前的原始材料。至此压缩缝的恢复矩阵补齐：阈值内（pressure）/ 请求超限（overflow）/ 图片配额（offload，模型路径 + 摘要路径两条腿）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.5</span>摘要调用：重放对话，命中 warm prefix</h2>
+    <h2><span class="num">11.5</span>④ 摘要调用：重放对话，命中 warm prefix</h2>
     <div class="code-title">packages/compaction/compaction-basic/src/summarizer.ts — 设计注释与指令（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * The summarization directive, delivered as the FINAL user message after the
@@ -290,9 +299,9 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
   </section>
 
   <section class="block">
-    <h2><span class="num">11.6</span>检查点来源：后端无关的识别标记</h2>
+    <h2><span class="num">11.6</span>④ 检查点来源：后端无关的识别标记</h2>
     <div class="code-title">packages/compaction/compaction/src/checkpoint.ts:19 — COMPACT_CHECKPOINT_MARKER</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> COMPACT_CHECKPOINT_MARKER = <span class="cl">Object</span>.<span class="fn">freeze</span>({ kind: <span class="st">'plugin'</span>, plugin: <span class="st">'compact'</span> } <span class="kw">as const</span>)
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> COMPACT_CHECKPOINT_MARKER = <span class="cl">Object</span>.<span class="fn">freeze</span>({ kind: <span class="st">'compact-checkpoint'</span> } <span class="kw">as const</span>)
 
 <span class="cmt">/** Message source carried by a concrete compaction checkpoint. */</span>
 <span class="kw">export type</span> <span class="cl">CompactionCheckpointSource</span> = <span class="kw">typeof</span> COMPACT_CHECKPOINT_MARKER &amp; {
@@ -300,17 +309,17 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
   <span class="kw">readonly</span> sourceCommandId?: <span class="cl">CommandId</span>
 }
 
-<span class="kw">export function</span> <span class="fn">isCompactCheckpointSource</span>(source: <span class="cl">MessageSource</span>): <span class="kw">boolean</span> {
-  <span class="kw">return</span> source.kind === <span class="st">'plugin'</span> &amp;&amp; source.plugin === COMPACT_CHECKPOINT_MARKER.plugin
+<span class="kw">export function</span> <span class="fn">isCompactCheckpointSource</span>(source: <span class="cl">MessageSource</span>): source <span class="kw">is</span> <span class="cl">CompactionCheckpointSource</span> {
+  <span class="kw">return</span> source.kind === <span class="st">'compact-checkpoint'</span>
 }</pre>
-    <div class="annotation"><b>为什么单拎一个文件</b>：注释说这个模块是「a pure type/value/predicate outlet (no cordis imports, no module augmentation) so client and wire programs can name the checkpoint source without loading the host plugin's Context merges」。识别一个消息是不是 compaction 检查点，不该强迫消费者加载整个宿主插件——第 8 章 RuntimeContextProjection 用 <code class="inline">source.plugin</code> 恢复快照归属是同一招：消息来源是持久、可折叠、后端无关的事实通道。</div>
+    <div class="annotation"><b>为什么单拎一个文件</b>：注释说这个模块是「a pure type/value/predicate outlet (no cordis imports, no module augmentation) so client and wire programs can name the checkpoint source without loading the host plugin's Context merges」。识别一个消息是不是 compaction 检查点，不该强迫消费者加载整个宿主插件——所以检查点不借 <code class="inline">plugin</code> 这类通用来源种类，而是有自己专属的 <code class="inline">compact-checkpoint</code> 种类，谓词顺手写成类型收窄（<code class="inline">source is CompactionCheckpointSource</code>），消费者拿到 compactionId 不用再断言一次。第 8 章 RuntimeContextProjection 的 <code class="inline">'runtime-context'</code> 专属来源是同一招：消息来源是持久、可折叠、后端无关的事实通道。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.7</span>要点</h2>
+    <h2><span class="num">11.7</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① 压缩 = 遮蔽不是删除：日志只增，表面用 replace 换成摘要节点；② 事务即事件编舞：start 持锁 → summary 定价 → 相邻 user/message 替换 → end 放锁，失败尝试也留在日志；③ 影子定价协议让纯消费者 O(1) 对账，启发式与路由定价各管折叠与决策；④ 摘要调用重放会话前缀命中 KV 缓存，purpose 隔离游标；⑤ 边界必须 tool-pairing balanced，永远不打断调用/结果配对；⑥ 三条恢复链共用「持久事件修表面 + 重试」模式：pressure（warn 不阻断）、overflow（replaceGeneration 守卫 + retry）、image-offload（offload 事件 + retry，摘要路径走 compaction/summary-error 瀑布）。下一步看多 agent 编排：<a href="12-orchestration.html">第 12 章：编排与多 Agent</a>。
+      <b class="tag">答案回收</b>
+      <strong>①缝怎么开</strong>——三个方法三种入口：compactIfNeeded（自动，pressure 双封顶阈值 + overflow 绕过阈值）、compactNow（手动，idle 经 runMaintenance，0 阈值语义）、compactRegion（强制区域，边界 tool-pairing balanced）；<strong>②事务怎么编舞</strong>——start 持锁 → summary 定价 → 相邻 user/message 替换 → end 放锁，失败尝试也留在日志；影子定价协议让纯消费者 O(1) 对账，启发式与路由定价各管折叠与决策；<strong>③什么时候触发</strong>——三条恢复链共用「持久事件修表面 + 重试」模式：pressure（warn 不阻断）、overflow（replaceGeneration 守卫 + retry）、image-offload（offload 事件 + retry，摘要路径走 compaction/summary-error 瀑布）；<strong>④摘要怎么不砸缓存</strong>——重放会话前缀命中 KV 缓存，指令是最后一条 user 消息，purpose 隔离游标，检查点来源是后端无关的 compact-checkpoint 标记。下一步看多 agent 编排：<a href="12-orchestration.html">第 12 章：编排与多 Agent</a>。
     </div>
   </section>
 
@@ -322,7 +331,7 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 11 Compaction · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 11 Compaction · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

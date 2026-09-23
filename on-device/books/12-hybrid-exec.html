@@ -47,7 +47,7 @@
 <span class="cmt"># Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :</span>
 <span class="cmt"># (cpu_bw - pcie_bw), i.e. fetching a pcie_bw / cpu_bw fraction of each decode</span>
 <span class="cmt"># step's misses -- both sides then finish together instead of one idling.</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 推导：设缺失量为 M，取 q 份走 PCIe、(1-q) 份走 CPU。PCIe 侧耗时 M·q/pcie_bw，CPU 侧耗时 M·(1-q)/cpu_bw。两边同时结束（重叠无等待）要求 M·q/pcie_bw = M·(1-q)/cpu_bw，解得 q = pcie_bw/cpu_bw。注意 CPU 侧公式里没有减 pcie_bw——减去的那部分出现在另一处（offload_cache.py:142 的 "fetched : cpu = pcie : cpu - pcie"），那是<strong>独立带宽</strong>下的近似；实测的重叠带宽（下一节）直接把争用效应测进去了，所以 engine 用的是简单的 pcie_bw/cpu_bw。<strong>同一策略两处推导、口径差一档</strong>——读代码时别把它们当成矛盾，它们对应「测什么」的两个版本。</div>
+    <div class="annotation">推导并不复杂：设缺失量为 M，取 q 份走 PCIe、(1-q) 份走 CPU。PCIe 侧耗时 M·q/pcie_bw，CPU 侧耗时 M·(1-q)/cpu_bw，两边同时结束（重叠无等待）要求 M·q/pcie_bw = M·(1-q)/cpu_bw，解得 q = pcie_bw/cpu_bw。注意 CPU 侧公式里没有减 pcie_bw——减去的那部分出现在另一处（offload_cache.py:142 的 "fetched : cpu = pcie : cpu - pcie"），那是<strong>独立带宽</strong>下的近似；实测的重叠带宽（下一节）直接把争用效应测进去了，所以 engine 用的是简单的 pcie_bw/cpu_bw。<strong>同一策略两处推导、口径差一档</strong>——读代码时别把它们当成矛盾，它们对应「测什么」的两个版本。</div>
     <p>这个 q 从哪来？不是默认值，是一台机器<strong>自己测自己</strong>：</p>
     <div class="code-title">python/freetoken/moe/bench_profile.py — 读取实测重叠带宽（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Preferred source is the *overlapped* pair (CPU MoE and PCIe gather measured</span>
@@ -88,7 +88,7 @@ contention ignores it entirely. Measuring the contended pair directly gives the 
 backend its bandwidth-matched fetch split: fetched : cpu-computed = pcie_ov : cpu_ov.
 """</span></pre>
     <p>判定与分流用这套 profile 的决策链（docs/cli.md:82、engine/engine.py:1594-1662）：moe_strategy=auto 时默认 offload；若 profile 判定 hybrid（CPU 带宽 &gt; 2× PCIe），再核对 CPU 执行器支持该激活函数、编译扩展没过期，都过了才升级 hybrid——<strong>每一步降级都有日志，绝不静默</strong>。分流比例 --moe-hybrid-max-fetch=-1（auto）读同一个 profile：没有 profile 就退回固定 cap=1（engine.py:761-767）。</p>
-    <div class="annotation"><b>读懂这段：</b> 这个设计把「调参」变成了「测量」。q* 没有公式可推导——不同主板、内存条数、PCIe 通道数的组合，谁也推不准，测一次就一劳永逸（profile 按 format+GPU 键控，换格式或换卡才重测）。<strong>自适应的本质是承认自己算不准</strong>，把不确定的部分交给测量。</div>
+    <div class="annotation">这个设计把「调参」变成了「测量」。q* 没有公式可推导——不同主板、内存条数、PCIe 通道数的组合，谁也推不准，测一次就一劳永逸（profile 按 format+GPU 键控，换格式或换卡才重测）。<strong>自适应的本质是承认自己算不准</strong>，把不确定的部分交给测量。</div>
     <div class="callout info">
       <b class="tag">一段代码的进化痕迹</b>
       整条 hybrid 升级链有一个前提：host 和 GPU 之间<strong>存在一条 PCIe</strong>。统一内存 GPU（DGX Spark 的 GB10、Jetson）把这个前提抽掉了——没有 host/device 边界，offload 家族的一切搬运都是同一块 DRAM 的两个名字互倒，实测每个请求多出约 130 秒的停顿（#369）。#445 的修法不是给 hybrid 打补丁，而是在决策链最前面加一个分岔：探测到统一内存且模型装得下，auto 直接选 fused（常驻专家），跳过整个 benchbw hybrid 判定——「CPU 带宽升级」在共享内存的机器上没有意义。<strong>带宽策略要跟着内存拓扑走</strong>：PCIe 存在时才有「两边」可协同。
@@ -115,7 +115,7 @@ cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU �
 <span class="kw">return</span> gpu_routed + cpu_routed</pre>
     <p>「每条路由恰好算一次」靠的是<strong>双向置零</strong>：GPU 侧把 CPU 负责的路由权重置 0（id clamp 到槽 0，乘出来是 0）；CPU 侧把 GPU 负责的路由 id 置 -1（C++ 内核跳过 id&lt;0）。两边都跑、各自只算自己那份、结果相加——没有 if 分支，全部是形状固定的张量操作，CUDA Graph 可捕获。</p>
     <p>cap 的语义（offload_cache.py:855-874 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:196-201）。</p>
-    <div class="annotation"><b>读懂这段：</b> 为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:325-326 注释明说 "Measurement knob"）。</div>
+    <div class="annotation">为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:325-326 注释明说 "Measurement knob"）。</div>
   </section>
 
   <section class="block">
@@ -176,7 +176,7 @@ cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU �
       </svg>
       <div class="fig-cap">图 12.1：门铃协议。三级退化路径：memop（默认）→ host-func（探测失败/超容量）→ watchdog 报错（卡死）。每级都是「功能正常但慢一档」，没有静默的错。</div>
     </div>
-    <div class="annotation"><b>读懂这段：</b> 三个历史教训都写在注释里，比机制本身更值钱：① <strong>回调延迟</strong>——每层 2 次回调 × 30-50µs，层数一多每步白丢几毫秒（源码按 75 层模型算出 ~6ms/步），门铃把「每层两次往返」变成「每步一次轮询」；② <strong>自旋内核骗了电源管理</strong>——GPU 利用率假 99%，笔记本的功耗调度看到「GPU 忙」就压 CPU 频率，解码反而更慢。memop 在 GPU 前端执行、不占 SM，利用率数字恢复诚实；③ <strong>watchdog 的三重确认</strong>（cpu_executor.py:607-617）——门铃 pending 跨 ≥10 秒、第一次见到时就 pending、期间 served 计数一动不动，三条同时成立才判死。两点采样会撞上正常的微秒级 pending 窗口，served 计数不变才是「协调者死了」的铁证。</div>
+    <div class="annotation">注释里留下的三个历史教训比机制本身更值钱。<strong>回调延迟</strong>：每层 2 次回调 × 30-50µs，层数一多每步白丢几毫秒（源码按 75 层模型算出 ~6ms/步），门铃把「每层两次往返」变成「每步一次轮询」。<strong>自旋内核骗了电源管理</strong>：GPU 利用率假 99%，笔记本的功耗调度看到「GPU 忙」就压 CPU 频率，解码反而更慢——memop 在 GPU 前端执行、不占 SM，利用率数字恢复诚实。<strong>watchdog 的三重确认</strong>（cpu_executor.py:607-617）：门铃 pending 跨 ≥10 秒、第一次见到时就 pending、期间 served 计数一动不动，三条同时成立才判死——两点采样会撞上正常的微秒级 pending 窗口，served 计数不变才是「协调者死了」的铁证。</div>
   </section>
 
   <section class="block">
@@ -209,7 +209,7 @@ next power of two (a 70GB bank would reserve 128GB)."""</span></pre>
 <span class="cmt"># DeepSeek-V4-Flash bs=1 decode: 12.85 -&gt; 15.65 tok/s, output bit-identical</span>
 <span class="cmt"># (tests/moe/test_dsfp4_prequant.py).</span>
 self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">and</span> device.type == <span class="st">"cuda"</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 15.65 对 12.85 是 22% 的提升，来源只是「别让每层的 decode 都在单线程标量循环上排队」（DSV4 有 43 层 MoE，每层省一次往返）。两个配套值得记：① <strong>位等价测试</strong>（tests/moe/test_dsfp4_prequant.py）——GPU 侧用与 GPU W4A8 路径 bit-identical 的 kernel，测试跑两种 round-trip 各一遍逐位断言相等，「数值相同」不是声称而是被测过的性质；② 改动标在代码里而非只在 changelog（注释里的 tok/s 数字），下一个读代码的人能直接看到这个分支为什么存在。</div>
+    <div class="annotation">15.65 对 12.85 是 22% 的提升，来源只是「别让每层的 decode 都在单线程标量循环上排队」（DSV4 有 43 层 MoE，每层省一次往返）。两个配套值得记：一是<strong>位等价测试</strong>（tests/moe/test_dsfp4_prequant.py）——GPU 侧用与 GPU W4A8 路径 bit-identical 的 kernel，测试跑两种 round-trip 各一遍逐位断言相等，「数值相同」不是声称而是被测过的性质；二是改动标在代码里而非只在 changelog（注释里的 tok/s 数字），下一个读代码的人能直接看到这个分支为什么存在。</div>
   </section>
 
   <section class="block">
@@ -232,15 +232,7 @@ self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">an
 
   <section class="block">
     <h2><span class="num">12.7</span>小结</h2>
-    <ul>
-      <li>q* = pcie_bw/cpu_bw：两边同时收工的分流比例；来自实测争用带宽（benchbw 重叠测量），不是公式推导。</li>
-      <li>hybrid decode 双向置零：GPU 权重置 0、CPU id 置 -1，每条路由恰好算一次，全设备端形状固定。</li>
-      <li>memop 门铃：write done=0 → write ready=1 → … → wait done；前端执行不占 SM，利用率数字诚实。</li>
-      <li>教训三连：回调 30-50µs×2/层太贵；自旋内核骗功耗调度反降频；watchdog 判死要三重确认。</li>
-      <li>host bank 的一切为带宽服务：物理核 pin、协调者独占核、精确尺寸 pinned、pin-after-fill。</li>
-      <li>GPU prequant 挪标量循环出临界路径：12.85 → 15.65 tok/s，位等价测试钉住正确性。</li>
-      <li>llama.cpp 的对照：切图接力不需要协议——复杂度差源于「CPU 是否要进 CUDA 流」。</li>
-    </ul>
+    <p>hybrid 的所有设计都从一个比例出发：q* = pcie_bw/cpu_bw，两边同时收工的分流比例——它来自 benchbw 的实测争用带宽，不是公式推导。decode 侧用双向置零保证每条路由恰好算一次（GPU 权重置 0、CPU id 置 -1），全设备端形状固定。CPU 工作怎么嵌进 GPU 流？memop 门铃：write done=0 → write ready=1 → … → wait done，前端执行不占 SM，利用率数字保持诚实。注释里的教训也值得带走：回调 30-50µs×2/层太贵；自旋内核骗功耗调度反降频；watchdog 判死要三重确认。host bank 的一切为带宽服务：物理核 pin、协调者独占核、精确尺寸 pinned、pin-after-fill；GPU prequant 把标量循环挪出临界路径，12.85 → 15.65 tok/s，位等价测试钉住正确性。llama.cpp 的对照是切图接力不需要协议——复杂度差源于「CPU 是否要进 CUDA 流」。</p>
     <p>两台机器、两条路线都拆完了。下一章把全部对照收拢成一张表，再给自研引擎画路线。<a href="13-build-own-engine.html">第 13 章：双引擎对照·自研</a>。</p>
   </section>
 
@@ -251,7 +243,7 @@ self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">an
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

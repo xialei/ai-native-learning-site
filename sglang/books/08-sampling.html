@@ -169,7 +169,7 @@
             <span class="kw">and</span> <span class="kw">not</span> sampling_info.need_min_p_sampling
         )
         ...  <span class="cmt"># 概率路径，见下</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 三个布尔标志（<code class="inline">is_all_greedy</code>、<code class="inline">need_top_*_sampling</code>）把 batch 里<strong>所有请求</strong>的参数归约成一个分支决策。只要有一个请求不是贪心，整个 batch 就走概率路径——贪心请求在概率路径里靠 <code class="inline">top_k=1</code> 的 renorm 得到等价结果。<br><br><b>两个同名函数要分清：</b><code class="inline">Sampler._preprocess_logits</code>（上面这个）只做「自定义 logit processor + NaN 清洗」两件事；真正施加 grammar 掩码的是 <code class="inline">ModelRunner._preprocess_logits</code>（<code class="inline">model_executor/model_runner.py</code>），它调用 <code class="inline">sampling_info.update_regex_vocab_mask()</code> + <code class="inline">apply_logits_bias()</code>。调用关系是 ModelRunner 先做、再进 <code class="inline">Sampler.forward</code>。两者同名但职责不重叠，读代码时按文件路径区分。<code class="inline">positions</code> 是后来加到签名里的：确定性采样要用它给每个位置算唯一 seed。</div>
+    <div class="annotation"><b>三个布尔标志：</b> <code class="inline">is_all_greedy</code>、<code class="inline">need_top_*_sampling</code> 把 batch 里<strong>所有请求</strong>的参数归约成一个分支决策。只要有一个请求不是贪心，整个 batch 就走概率路径——贪心请求在概率路径里靠 <code class="inline">top_k=1</code> 的 renorm 得到等价结果。<br><br><b>两个同名函数要分清：</b><code class="inline">Sampler._preprocess_logits</code>（上面这个）只做「自定义 logit processor + NaN 清洗」两件事；真正施加 grammar 掩码的是 <code class="inline">ModelRunner._preprocess_logits</code>（<code class="inline">model_executor/model_runner.py</code>），它调用 <code class="inline">sampling_info.update_regex_vocab_mask()</code> + <code class="inline">apply_logits_bias()</code>。调用关系是 ModelRunner 先做、再进 <code class="inline">Sampler.forward</code>。两者同名但职责不重叠，读代码时按文件路径区分。<code class="inline">positions</code> 是后来加到签名里的：确定性采样要用它给每个位置算唯一 seed。</div>
 
     <p>概率路径先做温度缩放和 softmax，再按需选择内核：<code class="inline">simple_sampling_case</code>（top_k/top_p/min_p 全默认）直接多项式采样；否则用 flashinfer 的融合内核：</p>
     <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 的 flashinfer 分支（摘录，注释为译注）</div>
@@ -198,7 +198,7 @@
         probs.contiguous(), sampling_info.top_ks, sampling_info.top_ps,
         filter_apply_order=<span class="st">"joint"</span>,
     )</pre>
-    <div class="annotation"><b>读懂这段：</b> 采样后端是可配的（<code class="inline">get_exec().kernel.sampling_backend</code>，CUDA 上默认 flashinfer，另有 pytorch/ascend）。min-p 没有融合内核，所以走「两次 renorm + 一次采样」的三步组合；top-k/top-p 用 joint 顺序的融合内核一次完成。这段代码里还留着一条演进痕迹：确定性推理（<code class="inline">enable_deterministic</code>）要求 logprob 一律取自 <code class="inline">log_softmax</code> 内核而不是 <code class="inline">log(softmax(x))</code>——两者在数学上等价，数值上有 ~1e-6 差异，足以破坏 prefill/decode 的逐位对齐，源码注释专门记录了这个坑。</div>
+    <div class="annotation"><b>采样后端是可配的：</b> <code class="inline">get_exec().kernel.sampling_backend</code>，CUDA 上默认 flashinfer，另有 pytorch/ascend。min-p 没有融合内核，所以走「两次 renorm + 一次采样」的三步组合；top-k/top-p 用 joint 顺序的融合内核一次完成。这段代码里还留着一条演进痕迹：确定性推理（<code class="inline">enable_deterministic</code>）要求 logprob 一律取自 <code class="inline">log_softmax</code> 内核而不是 <code class="inline">log(softmax(x))</code>——两者在数学上等价，数值上有 ~1e-6 差异，足以破坏 prefill/decode 的逐位对齐，源码注释专门记录了这个坑。</div>
 
     <p>细看签名会发现 <code class="inline">_sample_from_probs</code> 还返回第二个值 <code class="inline">sampling_mask_capture</code>：</p>
     <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 签名（摘录，注释为译注）</div>
@@ -223,7 +223,7 @@ masks = [<span class="kw">None</span>] * <span class="fn">len</span>(return_samp
     masks[batch_row] = row_ids       <span class="cmt"># 支撑集 token id 列表</span>
 logits_output.next_token_sampling_mask_idx = masks
 logits_output.next_token_sampling_logprobs = logprobs</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个问题逼着这段代码重写。① 每个 token 都要 GPU→CPU 同步拷一批 list，decode 阶段这是致命的；② 支撑集长度不设上限，top_p-only 采样的长尾能把元数据撑爆；③ 与 overlap 调度不兼容——CPU 侧的 list 处理挤不进 GPU 计算的时间窗。新实现改成固定容量的<strong>设备张量</strong>：</div>
+    <div class="annotation"><b>三个问题逼着这段代码重写：</b> 每个 token 都要 GPU→CPU 同步拷一批 list，decode 阶段这是致命的；支撑集长度不设上限，top_p-only 采样的长尾能把元数据撑爆；与 overlap 调度也不兼容——CPU 侧的 list 处理挤不进 GPU 计算的时间窗。新实现改成固定容量的<strong>设备张量</strong>：</div>
     <div class="code-title">python/sglang/srt/layers/sampler.py — _build_sampling_mask_output（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 状态码：支撑集算不出来 = INVALID，超过容量上限 = OVERFLOW</span>
 overflow = realized_lengths &gt; self.sampling_mask_max_tokens
@@ -247,7 +247,7 @@ packed_size = <span class="fn">min</span>(self.sampling_mask_max_tokens, weights
     token_ids=packed_token_ids, lengths=realized_lengths.<span class="fn">clamp</span>(max=packed_size),
     selected_logprobs=selected_logprobs, statuses=statuses,
 )</pre>
-    <div class="annotation"><b>读懂这段：</b> 新契约是一个定长 <code class="inline">SamplingMaskOutput</code>：<code class="inline">token_ids</code> 形状固定为 <code class="inline">[batch, sampling_mask_max_tokens]</code>，真实长度写在 <code class="inline">lengths</code> 里；超长就截断并标 <code class="inline">OVERFLOW</code>。请求准入也因此收紧——<code class="inline">Scheduler.handle_generate_request</code> 现在要求 <code class="inline">top_k=1</code>（贪心）或 <code class="inline">1 &lt; top_k &lt;= sampling_mask_max_tokens</code>，否则直接以 400 拒绝，不再等到采样时才发现要炸。组内的 <code class="inline">all_reduce(MAX)</code> 是让整个 TP/CP 组对状态码取最坏值——只要有 rank 溢出，全组一起 abort，避免各 rank 对请求生死判断不一致而挂死（第 12 章讲过 PD 分离下这个值还要经元数据缓冲传给 decode 侧，且 prefill / decode 两侧都要开 <code class="inline">SGLANG_ENABLE_DISAGG_SAMPLING_MASK</code>，默认关闭）。</div>
+    <div class="annotation"><b>新契约是一个定长 <code class="inline">SamplingMaskOutput</code>：</b> <code class="inline">token_ids</code> 形状固定为 <code class="inline">[batch, sampling_mask_max_tokens]</code>，真实长度写在 <code class="inline">lengths</code> 里；超长就截断并标 <code class="inline">OVERFLOW</code>。请求准入也因此收紧——<code class="inline">Scheduler.handle_generate_request</code> 现在要求 <code class="inline">top_k=1</code>（贪心）或 <code class="inline">1 &lt; top_k &lt;= sampling_mask_max_tokens</code>，否则直接以 400 拒绝，不再等到采样时才发现要炸。组内的 <code class="inline">all_reduce(MAX)</code> 是让整个 TP/CP 组对状态码取最坏值——只要有 rank 溢出，全组一起 abort，避免各 rank 对请求生死判断不一致而挂死（第 12 章讲过 PD 分离下这个值还要经元数据缓冲传给 decode 侧，且 prefill / decode 两侧都要开 <code class="inline">SGLANG_ENABLE_DISAGG_SAMPLING_MASK</code>，默认关闭）。</div>
     <div class="annotation"><b>拒绝路径也重构过：</b> 上面这段准入检查的形状变过一次。原来的写法是四处分散的「设错误 → <code class="inline">init_req_max_new_tokens</code> → 塞进队列」，让请求先走一遍正常流程再被 abort；现在统一收进 <code class="inline">Scheduler._reject_sampling_mask_request(req, error_msg)</code>，它只做三件事：记日志、<code class="inline">prepare_abort</code>（带 <code class="inline">HTTPStatus.BAD_REQUEST</code>）、<code class="inline">stream_output</code> 把错误送到客户端——<strong>模型一步都不跑</strong>。同时错误文案本身也细化了：原来只笼统说「需要有限 top_k」，现在明确告诉你期望是 <code class="inline">top_k=1</code>（贪心）或 <code class="inline">1 &lt; top_k &lt;= sampling_mask_max_tokens</code>，并把实际收到的 <code class="inline">top_k</code> 值打进消息，还提示可以调大 <code class="inline">--sampling-mask-max-tokens</code>。PD 分离那条也从「要求某个 max_tokens 环境变量大于 0」改成了直接点名要开的开关名。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
@@ -300,7 +300,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
         penaltylib.<span class="cl">BatchedRepetitionPenalizer</span>,
     },
 )</pre>
-    <div class="annotation"><b>读懂这段：</b> 惩罚器要跟着 batch 的增删同步状态（请求结束后从 batch 里 filter 掉，两个 batch 合并时要 merge 惩罚累积量），所以它挂在 <code class="inline">SamplingBatchInfo</code> 的生命周期上，而不是散在请求对象里。这是「batch 级状态收口」的又一次体现。</div>
+    <div class="annotation"><b>它挂在 batch 的生命周期上：</b> 惩罚器要跟着 batch 的增删同步状态（请求结束后从 batch 里 filter 掉，两个 batch 合并时要 merge 惩罚累积量），所以它挂在 <code class="inline">SamplingBatchInfo</code> 的生命周期上，而不是散在请求对象里。这是「batch 级状态收口」的又一次体现。</div>
   </section>
 
   <section class="block">
@@ -325,7 +325,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
             )
         <span class="kw">except</span> <span class="cl">TokenizerNotSupportedError</span> <span class="kw">as</span> e:
             ...</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个内置后端对应三种 FSM 实现：xgrammar 是默认（编译快、内核级的 token mask），outlines 最老牌（保留了 jump-forward 优化——FSM 确定走的字符序列直接跳过采样，见 <code class="inline">outlines_jump_forward.py</code> 与 <code class="inline">BaseGrammarObject.jump_and_retokenize</code>，这是早期「跳过确定性前缀」路线留下的接口），llguidance 支持最复杂的语法。编译是异步的：请求先进 <code class="inline">GrammarManager.grammar_queue</code>，FSM 编好之前不进调度。</div>
+    <div class="annotation"><b>三个内置后端对应三种 FSM 实现：</b> xgrammar 是默认（编译快、内核级的 token mask），outlines 最老牌（保留了 jump-forward 优化——FSM 确定走的字符序列直接跳过采样，见 <code class="inline">outlines_jump_forward.py</code> 与 <code class="inline">BaseGrammarObject.jump_and_retokenize</code>，这是早期「跳过确定性前缀」路线留下的接口），llguidance 支持最复杂的语法。编译是异步的：请求先进 <code class="inline">GrammarManager.grammar_queue</code>，FSM 编好之前不进调度。</div>
 
     <p>编译之前还有一道刚加上去的闸：<code class="inline">constrained/json_schema_validation.py</code>。有些 JSON Schema 关键字后端并不支持但也不报错——编译照常过，生成时才悄悄失效（比如 xgrammar 会无视 <code class="inline">contains</code>/<code class="inline">uniqueItems</code>/<code class="inline">multipleOf</code>）。这个模块在编译入口先扫一遍 schema（<code class="inline">validate_xgrammar_json_schema</code> / <code class="inline">validate_outlines_json_schema</code>，xgrammar_backend.py:349 与 outlines_backend.py:171 调用），碰到本后端保不住的关键字直接抛 <code class="inline">UnsupportedJSONSchemaFeature</code>，让请求在进入调度前就 400，而不是等用户拿到一份「不合法也没人告诉你」的输出。两个后端各自一张不支持清单，llguidance 没有——它语法覆盖最全，暂时不用这份体检。</p>
 
@@ -363,7 +363,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
     <span class="kw">if</span> self.grammar_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
         self.grammar_mask.<span class="fn">apply</span>(logits)                <span class="cmt"># 非法 token → -inf</span>
     self._apply_post_grammar_logits_transforms(logits)</pre>
-    <div class="annotation"><b>读懂这段：</b> 一个 batch 里可以混装「有 grammar」和「没 grammar」的请求：掩码按行填，没 grammar 的行保持初始的「全放行」。应用之后掩码立即释放——<code class="inline">ModelRunner._preprocess_logits</code> 末尾有一行 <code class="inline">sampling_info.grammar_mask = None</code>，源码注释写明：overlap 调度下 sampling_info 会被 delay_sample 闭包多持有一步，不释放就是稳定的显存泄漏。这是结构化输出 + 重叠调度交叉处的一个真实事故痕迹。</div>
+    <div class="annotation"><b>一个 batch 可以混装约束与放行：</b> 掩码按行填，没 grammar 的行保持初始的「全放行」。应用之后掩码立即释放——<code class="inline">ModelRunner._preprocess_logits</code> 末尾有一行 <code class="inline">sampling_info.grammar_mask = None</code>，源码注释写明：overlap 调度下 sampling_info 会被 delay_sample 闭包多持有一步，不释放就是稳定的显存泄漏。这是结构化输出 + 重叠调度交叉处的一个真实事故痕迹。</div>
   </section>
 
   <section class="block">
@@ -392,7 +392,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
         <span class="st">"qwen3_coder"</span>: <span class="cl">Qwen3CoderDetector</span>,
         ...  <span class="cmt"># 共 39 个模型条目，多个模型共享同一 detector 类</span>
     }</pre>
-    <div class="annotation"><b>读懂这段：</b> 39 个条目对应 35 个不同的 detector 类——同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
+    <div class="annotation"><b>39 个条目对应 35 个 detector 类：</b> 同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
     <div class="callout info">
       <b class="tag">为什么不在 Sampler 里做</b>
       采样器工作在 token id 空间，而工具调用的边界（比如 <code class="inline">&lt;tool_call&gt;</code> 标记、JSON 的完整闭合）是<strong>文本层</strong>的概念，和分词边界不对齐——一个标记可能被切成多个 token，半个 JSON 对象在 token 序列里无法判定合法性。所以解析只能等反分词之后按文本做，位置自然落在 <code class="inline">entrypoints/openai/serving_chat.py</code>（<code class="inline">FunctionCallParser</code> 在流式与非流式两个分支里分别构造）。代价是约束不「硬」：模型输出格式坏了，解析层只能尽力恢复或报错；要硬约束得靠 8.5 节的 grammar 路线。
@@ -403,7 +403,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
     <h2><span class="num">8.7</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      三条可落地的结论。<strong>① 贪心 argmax 路径从第一天就要有</strong>：它是最常用的服务形态，且实现只是一个 kernel，跳过 softmax 和采样内核的开销在大 batch 下很可观。<strong>② 逐请求参数先归约再进 kernel</strong>：像 <code class="inline">is_all_greedy</code> / <code class="inline">need_top_k_sampling</code> 这样的 batch 级布尔标志，把「逐请求分支」变成「一次分支决策」，这是保持 GPU 利用率的基本功。<strong>③ 约束分两层想清楚</strong>：token 级硬约束（grammar 位掩码，逐 token 生效，注意与重叠调度的内存生命周期交互）和文本级软约束（工具调用解析，放在 serving 层）。做 OpenAI 兼容 API 时，前者可以后补，后者迟早要补。下一步进入 <a href="09-serving-entry.html">第 9 章：服务入口</a>。
+      三条可落地的结论。<strong>贪心 argmax 路径从第一天就要有</strong>：它是最常用的服务形态，且实现只是一个 kernel，跳过 softmax 和采样内核的开销在大 batch 下很可观。<strong>逐请求参数先归约再进 kernel</strong>：像 <code class="inline">is_all_greedy</code> / <code class="inline">need_top_k_sampling</code> 这样的 batch 级布尔标志，把「逐请求分支」变成「一次分支决策」，这是保持 GPU 利用率的基本功。<strong>约束分两层想清楚</strong>：token 级硬约束（grammar 位掩码，逐 token 生效，注意与重叠调度的内存生命周期交互）和文本级软约束（工具调用解析，放在 serving 层）。做 OpenAI 兼容 API 时，前者可以后补，后者迟早要补。下一步进入 <a href="09-serving-entry.html">第 9 章：服务入口</a>。
     </div>
   </section>
 
@@ -414,7 +414,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
 </div>
 
 <footer>
-  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

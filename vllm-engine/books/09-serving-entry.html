@@ -36,12 +36,19 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 服务入口</div>
     <h1>服务入口：从离线 generate 到在线流式 API</h1>
-    <div class="subtitle">前几章都在讲「引擎内部」。这一章走到能被人调用的那一层：OpenAI 兼容的 HTTP API、异步引擎的 background loop，以及「API server 与引擎核心分离」的部署架构。</div>
+    <div class="subtitle">前几章都在讲「引擎内部」。这一章走到能被人调用的那一层，回答四个问题：客户端的 HTTP 请求怎么进来？引擎的输出怎么变成边生成边给的流？为什么 API server 和引擎核心要拆成两个进程？服务快不快怎么量？从 HTTP 路由一路讲到指标埋点，末了拿 SGLang 对照一眼。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">9.1</span>从离线到在线：LLM.generate vs 服务端</h2>
-    <p>先分清 vLLM 的<strong>两套完全不同</strong>的用法。离线 API <code class="inline">vllm/entrypoints/llm.py</code> 里的 <code class="inline">LLM.generate()</code> 是<strong>阻塞、一次性</strong>的——你给它一批 prompt，它算完再一次性把结果全部返回给你：</p>
+    <h2><span class="num">9.1</span>从离线脚本到在线服务，差在哪</h2>
+    <p>这一章要回答的问题有四个：</p>
+    <ul>
+      <li><strong>客户端的 HTTP 请求怎么进来</strong>——引擎不认识 HTTP，中间必然有一层翻译。→ 9.2 OpenAI 兼容路由。</li>
+      <li><strong>引擎的输出怎么变成「边生成边给」的流</strong>——客户端要的是第一个 token 越早越好，不是等整段生成完。→ 9.3 异步引擎、9.5 完整链路。</li>
+      <li><strong>为什么 API server 和引擎核心要拆成两个进程</strong>——以及这个拆分买到了什么。→ 9.4 分离部署。</li>
+      <li><strong>服务快不快怎么量</strong>——TTFT、ITL、吞吐，每个指标对应哪一章的机制。→ 9.6 可观测性。</li>
+    </ul>
+    <p>回答这四问之前，先分清一条界线：离线脚本和在线服务是两套完全不同的用法，离线 API <code class="inline">vllm/entrypoints/llm.py</code> 里的 <code class="inline">LLM.generate()</code> 是<strong>阻塞、一次性</strong>的——你给它一批 prompt，它算完再一次性把结果全部返回给你：</p>
     <ul>
       <li><strong>阻塞</strong>：调用期间主线程被占住，算完才返回。</li>
       <li><strong>一次性</strong>：一批输入进来，整批跑完才交付，没有「边算边给」。</li>
@@ -56,10 +63,11 @@
 <span class="cmt">"""The `AsyncLLMEngine` class is an alias of [vllm.v1.engine.async_llm.AsyncLLM][]."""</span></pre>
     <p>所以「AsyncLLMEngine」这个名字在老版本里是独立类，现在则统一收敛到 <code class="inline">AsyncLLM</code>。本章都围绕它展开。</p>
     <div class="callout warn"><b class="tag">对照</b> 离线 <code class="inline">LLM.generate</code> 适合离线评测、脚本处理；线上服务走 <code class="inline">AsyncLLM.generate()</code>（注意同名但语义不同，前者阻塞整批返回，后者返回一个可逐个迭代、边生成边吐结果的 <code class="inline">AsyncGenerator</code>）。</div>
+    <div class="annotation"><b>接下来的路线：</b>请求怎么进来（9.2 路由）→ 流怎么出来（9.3 异步引擎、9.5 完整链路）→ 为什么拆进程（9.4 分离部署）→ 怎么量（9.6 指标）。9.7 拿 SGLang 对照。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.2</span>OpenAI 兼容入口：路由怎么接进来</h2>
+    <h2><span class="num">9.2</span>请求怎么进来：OpenAI 兼容路由</h2>
     <p>HTTP 层是用 FastAPI 搭的 <code class="inline">build_app()</code>（定义在 <code class="inline">vllm/entrypoints/launchers/app.py</code>；旧的 <code class="inline">openai/api_server.py</code> 已废弃，只是重新导出它）。注意：<strong>实际的 <code class="inline">/v1/...</code> 路由并不直接写在 <code class="inline">build_app</code> 里</strong>——<code class="inline">build_app</code> 调 <code class="inline">register_api_routers()</code>，后者再调各子模块的 <code class="inline">api_router.py</code>，通过 <code class="inline">app.include_router(...)</code> 注册。抓主干：</p>
     <div class="code-title">vllm/entrypoints/launchers/app.py + api_server/routers.py — build_app 的路由装配（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.entrypoints.serve <span class="kw">import</span> register_vllm_serve_api_routers
@@ -96,11 +104,11 @@ register_completion_api_router(app)</pre>
         <span class="kw">return</span> <span class="cl">JSONResponse</span>(content=generator.model_dump(), ...)
 
     <span class="kw">return</span> <span class="cl">StreamingResponse</span>(content=generator, media_type=<span class="st">"text/event-stream"</span>)</pre>
-    <div class="annotation"><b>看懂这段：</b>三种返回分支很有意思——出错了给 <code class="inline">JSONResponse</code>；一次性（非流式）请求给普通 <code class="inline">JSONResponse</code>；而流式请求时 <code class="inline">handler.create_completion(...)</code> 返回的是一个<strong>异步生成器</strong>，被包进 <code class="inline">StreamingResponse(content=generator, media_type="text/event-stream")</code> 逐段推给客户端。相同的处理流程也出现在 <code class="inline">/v1/chat/completions</code> 的 <code class="inline">create_chat_completion</code>。</div>
+    <div class="annotation"><b>三个返回分支各有各的去向：</b>出错了给 <code class="inline">JSONResponse</code>；一次性（非流式）请求给普通 <code class="inline">JSONResponse</code>；而流式请求时 <code class="inline">handler.create_completion(...)</code> 返回的是一个<strong>异步生成器</strong>，被包进 <code class="inline">StreamingResponse(content=generator, media_type="text/event-stream")</code> 逐段推给客户端。相同的处理流程也出现在 <code class="inline">/v1/chat/completions</code> 的 <code class="inline">create_chat_completion</code>。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>异步引擎：background loop 与按请求队列</h2>
+    <h2><span class="num">9.3</span>流怎么出来：异步引擎的 background loop 与按请求队列</h2>
     <p>9.2 的路由把请求交给了 engine client；引擎侧接住它的是 <code class="inline">vllm/v1/engine/async_llm.py</code> 的 <code class="inline">AsyncLLM</code>。它回答的问题是「引擎的输出怎么变成调用方能逐个取的流」，关键设计是：</p>
     <ul>
       <li>构造时通过 <code class="inline">EngineCoreClient.make_async_mp_client(...)</code> 在<strong>后台进程</strong>里拉起 EngineCore（见 9.4）。</li>
@@ -118,11 +126,11 @@ register_completion_api_router(app)</pre>
         finished = out.finished
         <span class="kw">if</span> out is <span class="kw">not</span> <span class="cl">STREAM_FINISHED</span>:
             <span class="kw">yield</span> out                     <span class="cmt"># 边生成边交，不攒批</span></pre>
-    <div class="annotation"><b>看懂这段：</b>流式在引擎侧就是队列语义——输出处理器把每个 <code class="inline">RequestOutput</code> 推进该请求自己的队列，<code class="inline">generate()</code> 拿到一个就 yield 一个，调度上不存在「攒一批再交」的动作。这些 yield 出去的对象如何被包成 SSE 字节流写回 TCP，是 9.2 那段路由和 9.5 完整代码的事，这里不重复。</div>
+    <div class="annotation"><b>流式在引擎侧就是队列语义：</b>输出处理器把每个 <code class="inline">RequestOutput</code> 推进该请求自己的队列，<code class="inline">generate()</code> 拿到一个就 yield 一个，调度上不存在「攒一批再交」的动作。这些 yield 出去的对象如何被包成 SSE 字节流写回 TCP，是 9.2 那段路由和 9.5 完整代码的事，这里不重复。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.4</span>引擎/核心分离部署：无状态 API + 有状态 EngineCore</h2>
+    <h2><span class="num">9.4</span>为什么拆进程：无状态 API + 有状态 EngineCore</h2>
     <p>第 <a href="01-architecture.html">1.4 节</a>从引擎内部边界讲过 EngineCore 为什么是独立进程；站在部署视角，这个拆分买到的直接回报是：<strong>「HTTP 接入」和「有状态的部分」可以各自独立伸缩</strong>：</p>
     <ul>
       <li><strong>API server / AsyncLLM（无状态）</strong>：只做 HTTP 解析、请求翻译、流式回包，不持有模型权重、不占 GPU——因此能起任意多副本。</li>
@@ -188,7 +196,7 @@ register_completion_api_router(app)</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.5</span>用代码看：输出怎么走到客户端</h2>
+    <h2><span class="num">9.5</span>接着看：输出怎么走到客户端（完整链路）</h2>
     <p>9.3 给了取流循环的主干；这一节把它背后的「后台输出循环」看完整。它在一个 <code class="inline">asyncio</code> 任务里无限循环，从引擎拉 <code class="inline">EngineCoreOutputs</code>，处理成各请求的 <code class="inline">RequestOutput</code> 塞进队列：</p>
     <div class="code-title">vllm/v1/engine/async_llm.py — _run_output_handler 里的 output_handler 协程（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">output_handler</span>():
@@ -279,7 +287,7 @@ self.output_handler = asyncio.create_task(output_handler())</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.6</span>可观测性：TTFT / ITL / 吞吐，vLLM 怎么量自己</h2>
+    <h2><span class="num">9.6</span>好不好怎么量：TTFT / ITL / 吞吐</h2>
     <p>前面所有章节讲的优化——分页 KV、连续批处理、chunked prefill、CUDA Graph——最终都要落到<strong>数字</strong>上才算数：「这个优化把哪个指标改善了、代价是什么」。vLLM 在引擎内部就埋好了一整套统计：每个请求记录一组时间戳（<code class="inline">vllm/v1/metrics/stats.py</code> 的 <code class="inline">RequestStateStats</code>），汇总成 Prometheus 指标（<code class="inline">vllm/v1/metrics/loggers.py</code>），还能进一步算 MFU（<code class="inline">vllm/v1/metrics/perf.py</code>）。</p>
     <div class="code-title">vllm/v1/metrics/stats.py — RequestStateStats：每个请求的时间戳（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">@dataclass</span>
@@ -356,15 +364,16 @@ name=<span class="st">"vllm:inter_token_latency_seconds"</span>      <span class
 name=<span class="st">"vllm:e2e_request_latency_seconds"</span>      <span class="cmt"># 端到端</span>
 name=<span class="st">"vllm:request_queue_time_seconds"</span>       <span class="cmt"># 排队时长</span>
 name=<span class="st">"vllm:request_num_preemptions"</span>          <span class="cmt"># 被抢占次数（对应第 4 章）</span></pre>
-    <div class="annotation"><b>把指标映射回机制：</b><code class="inline">kv_cache_usage_perc</code> 高位 + <code class="inline">num_requests_waiting</code> 高位 → 该扩 KV 预算（第 8 章）或上抢占/优先级（第 4 章）；<code class="inline">prefix_cache_hits</code> 低 → 前缀缓存没吃上（第 8.5 章，或多副本没做会话亲和）；<code class="inline">request_num_preemptions</code> 非零 → KV 频繁不够，系统在反复重算（第 4.5 章）。<strong>每个指标都能追溯到某一章的机制——这就是「可观测性」和「读懂引擎」的关系。</strong></div>
+    <div class="annotation"><b>把指标映射回机制：</b><code class="inline">kv_cache_usage_perc</code> 高位 + <code class="inline">num_requests_waiting</code> 高位 → 该扩 KV 预算（第 8 章）或上抢占/优先级（第 4 章）；<code class="inline">prefix_cache_hits</code> 低 → 前缀缓存没吃上（第 8.5 节，或多副本没做会话亲和）；<code class="inline">request_num_preemptions</code> 非零 → KV 频繁不够，系统在反复重算（第 4.5 节）。<strong>每个指标都能追溯到某一章的机制——这就是「可观测性」和「读懂引擎」的关系。</strong></div>
     <div class="callout info">
       <b class="tag">延伸：MFU</b>
-      vLLM 还内置了一个更底层的度量：用解析法估算每步的 FLOPs 与读写字节数（<code class="inline">vllm/v1/metrics/perf.py</code> 模块，"Analytic flops/memory estimation ... to help derive MFU (Model Flops Utilization) stats"），打开 <code class="inline">VLLM_DEBUG_MFU_METRICS=1</code> 后日志会输出「MFU: N TF/s/device M GB/s/device」。MFU 回答的问题是「这张卡的算力我用满了几成」——它是判断「瓶颈在算力还是在访存」的最终依据，也正是第 7.1 章 arithmetic intensity 概念的实测形态。
+      vLLM 还内置了一个更底层的度量：用解析法估算每步的 FLOPs 与读写字节数（<code class="inline">vllm/v1/metrics/perf.py</code> 模块，"Analytic flops/memory estimation ... to help derive MFU (Model Flops Utilization) stats"），打开 <code class="inline">VLLM_DEBUG_MFU_METRICS=1</code> 后日志会输出「MFU: N TF/s/device M GB/s/device」。MFU 回答的问题是「这张卡的算力我用满了几成」——它是判断「瓶颈在算力还是在访存」的最终依据，也正是第 7.1 节 arithmetic intensity 概念的实测形态。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>小结与自研启示</h2>
+    <h2><span class="num">9.7</span>SGLang 的工程补强与自研启示</h2>
+    <p>回到 9.1 摆出的四个问题，vLLM 的答案是「OpenAI 兼容路由做翻译 → AsyncLLM 后台循环逐个 yield → 无状态 HTTP 壳与有状态 EngineCore 分进程 → 请求级时间戳两两相减成指标」。同一套架构之下，SGLang 在工程细节上有几处不同取向：</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
       <tr><td>离线</td><td>LLM.generate（阻塞、整批）</td><td>先做同步 CLI + 一个生成接口，最快跑通正确性</td></tr>
@@ -377,6 +386,18 @@ name=<span class="st">"vllm:request_num_preemptions"</span>          <span class
     <div class="callout warn">
       <b class="tag">自研启示</b>
       别一上来就搞 FastAPI + 流式 + 多副本。推荐的成长路径：<strong>先做同步 CLI + 一个 generate 接口</strong>把模型正确性跑通（第 5-7 章），再考虑并发——届时把「引擎（有状态、唯一）」与「HTTP 层（无状态、可复制）」解耦，自然就拿到水平扩展能力。无状态，是一切可扩展性的前提。
+    </div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      HTTP 壳与引擎的边界两边一致，三件工程事逐项对照：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>就绪语义</td><td>路由先接进来（9.2 节），首次请求承担 CUDA Graph 捕获、内核编译的慢</td><td><code class="inline">launch_server</code> 监听端口前发一条 max_new_tokens=8 的真实请求做 warmup，「第一次都贵」的成本消化在就绪之前（<code class="inline">python/sglang/srt/entrypoints/http_server.py</code>）</td></tr>
+        <tr><td>子进程崩溃防护</td><td>依赖进程退出信号</td><td>SubprocessWatchdog 轮询存活——C++ 层崩溃（NCCL 超时）不走 Python 异常，主进程会变成活着但不干活的僵尸</td></tr>
+        <tr><td>配置流</td><td>vllm/config 分文件（VllmConfig 聚合）</td><td>ServerArgs 收全部启动参数，经 runtime_context 发布成进程内只读快照，发布点唯一可查</td></tr>
+        <tr><td>离线入口</td><td><code class="inline">LLM.generate</code></td><td>Engine：同一套进程、不设 HTTP</td></tr>
+      </table>
+      warmup 和 watchdog 两件都是可以照抄的小工程。详见 <a href="../../sglang/books/09-serving-entry.html">深入浅出SGLang · 09 服务入口</a>。
     </div>
     <div class="callout">
       <b class="tag">下一步</b>
@@ -391,7 +412,7 @@ name=<span class="st">"vllm:request_num_preemptions"</span>          <span class
 </div>
 
 <footer>
-  深入浅出vLLM · 09 服务入口 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 09 服务入口 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

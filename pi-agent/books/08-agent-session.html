@@ -35,13 +35,17 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
-    <h1>生产 Harness：agent-session 里的真实运行时</h1>
-    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章看到的是<code class="inline">AgentHarness</code>接口契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 3700 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。它是你未来做 Agent Runtime 时最该抄的样板。</div>
+    <h1>生产 Harness：裸循环到稳定会话之间缺什么</h1>
+    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是 <code class="inline">AgentHarness</code> 契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4000 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">8.1</span>从契约到实现：为什么有「两个 harness」</h2>
-    <p>第 7 章看过 <code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 契约——注意那是<strong>同包 <code class="inline">runtime/</code> 里 <code class="inline">Harness/Lane</code> 的一条实现线</strong>，而这一页的 <code class="inline">AgentSession</code> 是<strong>另一条自主实现线</strong>（直接组合 <code class="inline">Agent</code> 类 + SessionManager，不实现 <code class="inline">AgentLane</code>）。真正干活的主体在 <code class="inline">coding-agent</code> 包里：</p>
+    <h2><span class="num">8.1</span>从契约到实现，中间隔着什么</h2>
+    <p>第 7 章看过 <code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 契约——注意那是<strong>同包 <code class="inline">runtime/</code> 里 <code class="inline">Harness/Lane</code> 的一条实现线</strong>，而这一页的 <code class="inline">AgentSession</code> 是<strong>另一条自主实现线</strong>（直接组合 <code class="inline">Agent</code> 类 + SessionManager，不实现 <code class="inline">AgentLane</code>）。从「能跑的循环」到「跑得稳的生产会话」，中间隔着四件事：用户的一句话怎么进运行时（拦截、改写、展开、入队，先后顺序由什么决定）？模型每次看到的上下文从哪来（第 5 章的投影逻辑，谁负责装进每次 provider 请求）？扩展在哪能真正改写会话（「通知」和「可操作」的事件边界差在哪，凭什么保证扩展写不坏上下文）？一轮跑完之后谁说了算（重试、压缩、续跑、结算的顺序怎么排）？</p>
+    <div class="callout info">
+      <b class="tag">答案地图</b>
+      输入流水线在 8.2，上下文接管在 8.2b（prepareRequest 接管 + prepareNextTurn 刷新），扩展边界在 8.4（事件桥、context 拆分、可操作边界），收敛在 8.5（收敛三段式 + agent_settled）；8.3 双队列、8.6 会话替换作为支撑件穿插。先把结论放在前面：<strong>AgentSession 不是另一个循环，而是循环外面的一层壳——它用四根接管钩子（prepareRequest / prepareNextTurnWithContext / finishTurn / transformContext）把裸循环的每个开放边界都换成自己的实现。</strong>
+    </div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
         <title id="t8">两层 harness 的关系</title>
@@ -59,7 +63,7 @@
         <rect class="node" x="60" y="115" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
         <text class="lbl" x="75" y="142" font-size="13" fill="#1f2937">Agent 类 · prompt / continue / steer</text>
         <rect class="node" x="60" y="170" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
-        <text class="lbl" x="75" y="197" font-size="13" fill="#1f2937">runAgentLoop 双循环（第 3 章）</text>
+        <text class="lbl" x="75" y="197" font-size="13" fill="#1f2937">runAgentLoop 双循环（第 3 章）+ 四个开放钩子</text>
         <rect class="node" x="60" y="225" width="320" height="44" rx="8" fill="#fff" stroke="#2563eb"/>
         <text class="lbl" x="75" y="252" font-size="13" fill="#1f2937">AgentMessage / AgentEvent / 转换器</text>
         <rect class="node" x="60" y="280" width="320" height="40" rx="8" fill="#f3f6fb" stroke="#2563eb"/>
@@ -71,7 +75,7 @@
         <text class="lbl" x="520" y="95" font-size="12" fill="#556674">生产 harness：持久化、鉴权、工具、恢复、扩展</text>
 
         <rect class="node" x="520" y="115" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
-        <text class="lbl" x="535" y="142" font-size="13" fill="#1f2937">SessionManager · buildSessionContext</text>
+        <text class="lbl" x="535" y="142" font-size="13" fill="#1f2937">SessionManager · buildSessionProjection</text>
         <rect class="node" x="520" y="170" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
         <text class="lbl" x="535" y="197" font-size="13" fill="#1f2937">agent-session.ts · prompt / steer / abort</text>
         <rect class="node" x="520" y="225" width="320" height="44" rx="8" fill="#fff" stroke="#0f7d7a"/>
@@ -84,17 +88,10 @@
         <text class="lbl" x="450" y="168" font-size="11" fill="#0f7d7a" text-anchor="middle">组装</text>
       </svg>
     </div>
-    <p>分工很明确：</p>
-    <ul>
-      <li><strong>基础包（右侧列之外）</strong>：纯「消息吞吐机」。它不知道消息要落盘、不知道 API key，也不知道 Bash 工具。只保证「给一串消息，正确地跑出一个 Loop」。</li>
-      <li><strong>生产 harness（右侧列）</strong>：把基础包装在壳里。它负责<strong>持久化</strong>（agent 事件 → SessionManager.appendMessage）、<strong>鉴权</strong>（模型/API key 校验）、<strong>恢复</strong>（压缩、重试、溢出恢复）、<strong>排队</strong>（steer/followUp）、以及<strong>扩展事件</strong>（ExtensionRunner 让第三方能挂进生命周期）。</li>
-    </ul>
     <div class="callout">
       <strong>要点：</strong>两层的分界是「<strong>可测试的纯核心 vs 带副作用的壳</strong>」。基础层不碰 IO，canonical 层才能被单测反复打。你自己做 Agent Runtime 时也值得这样切——核心循环越纯，越好验证。
     </div>
-
-    <h3>那 Harness 到底"是"什么？怎么实现的？没有它会怎样？</h3>
-    <p>这一章后面会散落很多机制点（队列、事件桥、持久化、收敛、换会话），先在这里把它们钉在一个心智模型上，免得读着读着丢了主线。</p>
+    <p>这一章后面会散落很多机制点（流水线、队列、事件桥、收敛、换会话），先在这里把它们钉在一个心智模型上，免得读着读着丢了主线。</p>
     <table class="tbl">
       <tr><th>问题</th><th>答案</th></tr>
       <tr>
@@ -110,7 +107,7 @@
         <td>退回第 3 章的 <code class="inline">agentLoop</code>：能跑一轮，但——<strong>不落盘</strong>（进程一退会话全没）、<strong>流式中无法安全追加/打断</strong>用户输入（没有 steer/followUp）、<strong>遇到错误或超长不会自救</strong>（没有重试/溢出压缩）、<strong>扩展挂不进去</strong>（没有 before_agent_start / input 等钩子）、<strong>运行中无法换会话</strong>（没有 teardown/apply 协议）。用户感知到的"Agent 越跑越稳、从不崩、能续上"，几乎全部来自这层壳，而不是 LLM 本身。</td>
       </tr>
     </table>
-    <div class="annotation"><b>概括：</b> harness 用<strong>固化流程</strong>把"会跑的循环"变成"跑得稳、跑得久、跑得能被观测和介入"的运行时。下面 8.2~8.6 逐段拆这条流程的每一段；8.7 再把它收成一张清单。</div>
+    <div class="annotation"><b>概括：</b> harness 用<strong>固化流程</strong>把"会跑的循环"变成"跑得稳、跑得久、跑得能被观测和介入"的运行时。下面逐段拆这条流程；8.7 再把它收成一张清单。</div>
   </section>
 
   <section class="block">
@@ -260,6 +257,33 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   </section>
 
   <section class="block">
+    <h2><span class="num">8.2b</span>模型面前的上下文：四根接管钩子</h2>
+    <p>裸 <code class="inline">Agent</code> 循环把四个边界留成了公开钩子（第 3 章）；生产 harness 在构造函数里<strong>把四根全部接管</strong>（<code class="inline">_installAgentNextTurnRefresh</code> / <code class="inline">_installAgentRequestProjection</code> / <code class="inline">_installAgentBoundaryHooks</code>，再加 8.5 提到的 <code class="inline">_installAgentForcedPromptProjection</code> 包 <code class="inline">transformContext</code>）。其中最根本的一根是 v0.87 新装的 <code class="inline">prepareRequest</code> 投影——它让 <strong>SessionManager 的投影成为模型上下文的唯一来源</strong>：</p>
+    <div class="code-title">agent-session.ts · _installAgentRequestProjection（行号 608 起；注释为译注）</div>
+    <pre class="code"><code><span class="kw">private</span> <span class="fn">_installAgentRequestProjection</span>(): void {
+  <span class="kw">const</span> previousPrepareRequest = <span class="kw">this</span>.agent.prepareRequest;
+  <span class="kw">this</span>.agent.prepareRequest = async (request, signal) =&gt; {
+    <span class="cmt">// 每次会话请求（含第一次）前，用 SessionManager 的投影替换 agent 手里的消息</span>
+    <span class="kw">const</span> canonicalContext = {
+      ...request.context,
+      messages: <span class="kw">this</span>.sessionManager.<span class="fn">buildSessionProjection</span>().messages,
+      <span class="cmt">// 消息声明 provider 看得见的 loadout；context.tools 保留可执行的实现</span>
+      tools: <span class="kw">this</span>.agent.state.tools.slice(),
+    };
+    <span class="cmt">// 再链上既有的 prepareRequest（比如强制 prompt 投影），以它返回值为准</span>
+    <span class="kw">const</span> previous = <span class="kw">await</span> previousPrepareRequest?.({ ...request, context: canonicalContext, ... }, signal);
+    <span class="kw">return</span> {
+      ...previous,
+      context: previous?.context ?? canonicalContext,
+      model: previous?.model ?? <span class="kw">this</span>.agent.state.model,
+      thinkingLevel: previous?.thinkingLevel ?? <span class="kw">this</span>.agent.state.thinkingLevel,
+    };
+  };
+}</code></pre>
+    <div class="annotation">这根钩子回答了 8.1 的第二个问题。它的位置选得很准：<code class="inline">prepareRequest</code> 在<strong>每次 provider 请求前</strong>触发、且此时 pending 消息（steering/follow-up）已经写入 agent 状态——所以投影永远包含最新内容；它能整体替换 context/model/thinkingLevel，所以换模型、改 thinking 都不需要循环知情。另一根 <code class="inline">prepareNextTurnWithContext</code> 接管则负责「turn 之间的重活」：先 <code class="inline">_compactBeforeNextAssistantResponse</code>（token 过阈值就先压缩），再重算系统提示 + 工具 loadout（<code class="inline">_preparePromptAndToolLoadout</code>），有变化就产出一条 patch system 消息随下轮注入。两根钩子各管一头——<strong>投影管「每次请求发什么」，prepareNextTurn 管「turn 之间要不要先动手术」</strong>。</div>
+  </section>
+
+  <section class="block">
     <h2><span class="num">8.3</span>流式时的双消息队列：steer vs followUp</h2>
     <p>最难的地方：<strong>Agent 正在跑（流式），用户又发了一条消息，怎么办？</strong>Pi 用「双队列」解决，打破了你朴素的一声一答模型。先看关键判断——<code class="inline">prompt()</code> 检测到流式中时，强制你要么 <code class="inline">steer</code> 要么 <code class="inline">followUp</code>：</p>
     <div class="code-title">agent-session.ts · 流式时入队（注释为译注）</div>
@@ -282,18 +306,14 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   <span class="fn">this</span>._steeringMessages.push(text);      <span class="cmt">// 记录待投递（用于 UI 展示）</span>
   <span class="fn">this</span>._emitQueueUpdate();
   <span class="kw">const</span> content: (TextContent | ImageContent)[] = [{ type: <span class="st">"text"</span>, text }];
-  <span class="kw">if</span> (images) {
-    content.push(...images);
-  }
+  <span class="kw">if</span> (images) content.push(...images);
   <span class="fn">this</span>.agent.steer({ role: <span class="st">"user"</span>, content, timestamp: <span class="fn">Date</span>.now() });  <span class="cmt">// 只入队，不 await</span>
 }
 <span class="kw">private</span> <span class="kw">async</span> _queueFollowUp(text: string, images?: ImageContent[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
   <span class="fn">this</span>._followUpMessages.push(text);
   <span class="fn">this</span>._emitQueueUpdate();
   <span class="kw">const</span> content: (TextContent | ImageContent)[] = [{ type: <span class="st">"text"</span>, text }];
-  <span class="kw">if</span> (images) {
-    content.push(...images);
-  }
+  <span class="kw">if</span> (images) content.push(...images);
   <span class="fn">this</span>.agent.followUp({ role: <span class="st">"user"</span>, content, timestamp: <span class="fn">Date</span>.now() });  <span class="cmt">// 等当前动作做完再投</span>
 }</code></pre>
     <p>区分与投递时机：</p>
@@ -305,19 +325,21 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
         <tr><td><code class="inline">nextTurn</code>（结转）</td><td>「这一轮末尾追加的上下文」</td><td>随下一条 user 消息一起作上下文注入（见 prompt 里 <code class="inline">_pendingNextTurnMessages</code>）</td></tr>
       </tbody>
     </table>
-    <p>基础包的 <code class="inline">Agent</code> 类实际维护着这些队列，并提供两种投递模式：</p>
-    <div class="code-title">packages/agent/src/agent.ts · 队列模式（伪代码，注释为本书说明）</div>
-    <pre class="code"><code><span class="cmt">// QueueMode: "all" 或 "one-at-a-time"</span>
-<span class="cmt">// agent-loop 在每个边界（tool call / 一轮结束）检查队列：</span>
-<span class="cmt">//   one-at-a-time：每次只投最新一条 steer + 最新一条 followUp</span>
-<span class="cmt">//   all：同一批次全部投给 LLM</span></code></pre>
+    <p>基础包的 <code class="inline">Agent</code> 类实际维护着这些队列，并提供两种投递模式；v0.87 还补了一个不消费的预览口：</p>
+    <div class="code-title">packages/agent/src/agent.ts · peekQueuedMessages（行号 327 起）</div>
+    <pre class="code"><code><span class="cmt">// 队列模式 QueueMode: "all" 或 "one-at-a-time"（默认每次只投最旧一条）</span>
+<span class="cmt">// 预览：下一个 turn 将送出哪条排队消息，但不消费它（UI 展示用）</span>
+<span class="fn">peekQueuedMessages</span>(): AgentMessage[] {
+  <span class="kw">const</span> steering = <span class="kw">this</span>.steeringQueue.<span class="fn">peek</span>();
+  <span class="kw">return</span> steering.length &gt; <span class="nu">0</span> ? steering : <span class="kw">this</span>.followUpQueue.<span class="fn">peek</span>();
+}</code></pre>
     <div class="callout">
       <strong>为什么需要双队列？</strong>打断语义天然比「排队等」急迫。你在终端里按 <kbd>Esc</kbd> 想叫停 Agent 去读另一个文件，这是 <code class="inline">steer</code>；你顺手补一句「对了记得用 Vite」是 <code class="inline">followUp</code>。UI（TUI）正是靠 <code class="inline">queue_update</code> 事件把两侧队列实时画出来。你的 Runtime 若支持中断/追加，照抄这对队列即可。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>事件桥与持久化：Agent 事件 → 会话落盘</h2>
+    <h2><span class="num">8.4</span>事件桥：Agent 事件 → 扩展 → 监听器 → 会话落盘</h2>
     <p>基础包的 <code class="inline">Agent</code> 只发 <code class="inline">AgentEvent</code>。生产层要做的两件事：<strong>(a)</strong> 把它转成扩展事件喂给 ExtensionRunner；<strong>(b)</strong> 把 <code class="inline">message_end</code> 落盘到 SessionManager。这就是 <code class="inline">_handleAgentEvent</code>，一块事件枢纽：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8c d8c">
@@ -376,49 +398,78 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   }
   <span class="cmt">// bashExecution / compactionSummary / branchSummary 在别处单独落盘</span>
 }</code></pre>
-    <p>注意 system 消息也在落盘之列——系统提示如今是消息流里的一条条 SystemMessage，跟着普通消息一起持久化（它怎么来的，见 8.4 末尾）。注意事件在扩展层可以<strong>改写和拦截</strong>。工具调用先过 <code class="inline">emitToolCall</code>——扩展可以 <code class="inline">block</code> 它；助手消息结束过 <code class="inline">emitMessageEnd</code>——扩展可返回替换消息（这正是一致性/审校型扩展的挂点）。</p>
+    <p>注意 system 消息也在落盘之列——系统提示如今是消息流里的一条条 SystemMessage，跟着普通消息一起持久化（它怎么来的，见 8.5 的三个写入时机）。注意事件在扩展层可以<strong>改写和拦截</strong>。工具调用先过 <code class="inline">emitToolCall</code>——扩展可以 <code class="inline">block</code> 它；助手消息结束过 <code class="inline">emitMessageEnd</code>——扩展可返回替换消息（这正是一致性/审校型扩展的挂点）。</p>
     <div class="callout">
       <strong>顺序很重要：</strong>先是 <code class="inline">_emitExtensionEvent(event)</code>（给扩展，允许改写），再 <code class="inline">_emit(...)</code>（给 UI 监听器，只读展示），最后 <code class="inline">appendMessage</code>（落盘）。改写在先、展示在中、存盘在后——三层各吃一份，互不阻塞。
+    </div>
+    <h3>上下文转换事件的拆分：context 与 context_with_system</h3>
+    <p>扩展挂进请求前的最后一道转换 <code class="inline">context</code>，v0.87 把它的可见范围收紧了：<strong>handler 只看得到对话消息，看不到 system（prompt + 工具声明）</strong>。pi 在每个 handler 跑完后把 prompt 状态恢复回去；只有需要完整转写的场景才走另一扇门 <code class="inline">context_with_system</code>：</p>
+    <div class="code-title">extensions/runner.ts · emitContext 两段派发（行号约 1192；摘录，注释为译注）</div>
+    <pre class="code"><code><span class="cmt">// 第一段：context handler 只看对话</span>
+<span class="kw">const</span> visibleMessages = currentMessages.filter((m) =&gt; m.role !== <span class="st">"system"</span>);
+<span class="kw">const</span> returned = <span class="kw">await</span> handler({ type: <span class="st">"context"</span>, messages: visibleMessages }, ctx);
+<span class="cmt">// handler 完毕后恢复 prompt 状态：若返回的消息列表没变，转写原样保留（缓存前缀不破）；</span>
+<span class="cmt">// 变了则把当前 system 头部接回去，作为唯一的前置 system 消息</span>
+currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
+
+<span class="cmt">// 第二段：context_with_system handler 拥有完整转写，输出原样采用</span>
+<span class="kw">const</span> hadLeadingSystemMessage = currentMessages[<span class="nu">0</span>]?.role === <span class="st">"system"</span>;
+currentMessages = handlerResult?.messages ?? currentMessages;
+<span class="cmt">// provider 从头部 system 消息读 prompt 与初始工具——丢了它请求就没有 prompt，</span>
+<span class="cmt">// 所以检查并报错（但尊重 handler 的输出）</span>
+<span class="kw">if</span> (hadLeadingSystemMessage &amp;&amp; currentMessages[<span class="nu">0</span>]?.role !== <span class="st">"system"</span>) {
+  <span class="cmt">// "Handler removed the leading system message; … Keep it at index 0 …"</span>
+}</code></pre>
+    <div class="callout info">
+      <b class="tag">两扇门怎么选</b>
+      绝大多数动态上下文（RAG、注入记忆、过滤历史）只关心对话，走 <code class="inline">context</code>——pi 替你把 prompt 状态保护起来，返回未改动时还能保住缓存前缀。只有「请求级、必须拿到完整转写」的转换（如导出审计、转写级重排）才走 <code class="inline">context_with_system</code>，且结果原样采用，你得自己保证 index 0 是 system 消息。
+    </div>
+    <p>除了这种「转换流」事件，扩展还有两个<strong>可操作边界</strong>：<code class="inline">turn_end</code> 与 <code class="inline">agent_before_settle</code>。它们能链式提出要写入会话的条目（custom / custom_message / context_edit / compaction 四种草稿）并请求一次续跑。写入安全由 <code class="inline">emitBoundary</code> 保证：</p>
+    <div class="code-title">extensions/runner.ts · emitBoundary（行号 928 起；摘录，注释为译注）</div>
+    <pre class="code"><code><span class="kw">async</span> <span class="fn">emitBoundary</span>(baseEvent, buildContext): Promise&lt;BoundaryDispatchResult&gt; {
+  <span class="kw">let</span> entries = [], shouldContinue = false, valid = true;
+  <span class="kw">let</span> context = <span class="kw">await</span> buildContext(entries);     <span class="cmt">// 用「当前草稿集」预览上下文</span>
+  <span class="kw">for</span> (<span class="kw">const</span> { ext, handlers } <span class="kw">of</span> snapshotEventHandlers(<span class="kw">this</span>.extensions, baseEvent.type)) {
+    <span class="kw">for</span> (<span class="kw">const</span> handler <span class="kw">of</span> handlers) {
+      <span class="kw">const</span> event = { ...baseEvent, entries, continue: shouldContinue, context };
+      <span class="kw">const</span> handlerResult = <span class="kw">await</span> handler(event, ctx);
+      <span class="kw">if</span> (handlerResult?.entries !== undefined) entries = handlerResult.entries;   <span class="cmt">// 链式累积</span>
+      <span class="kw">if</span> (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
+      context = <span class="kw">await</span> buildContext(entries);    <span class="cmt">// 每轮重算预览：新草稿必须能投影出合法上下文</span>
+      valid = true;                             <span class="cmt">// 投影失败 → valid = false，全部草稿作废</span>
+    }
+  }
+  <span class="kw">return</span> valid ? { entries, continue: shouldContinue, ... } : { entries: [], continue: false, ... };
+}</code></pre>
+    <div class="callout info">
+      <b class="tag">边界为什么这么设计</b>
+      每个草稿都即时重算预览，等于<strong>「先在沙盘上推演，推演失败就整体撤销」</strong>——扩展永远不能把「模型面前的上下文」写坏，最多是自己的提案被丢弃。<code class="inline">continue: true</code> 的语义与第 3 章 finishTurn 相同：保证一次下一请求，且 AgentSession 会校验「当前上下文确实跑得动一次请求」（canContinue 检查，见 <code class="inline">_buildBoundaryContext</code>）——凭空 <code class="inline">continue</code> 而上下文以 assistant 结尾、也没有排队消息，会被拒绝并报错。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.5</span>运行后收敛：重试 → 压缩 → 续跑的三段式</h2>
-    <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有没有消息？</strong>看 <code class="inline">_runAgentPrompt</code> 和它的收敛函数：</p>
-    <div class="code-title">agent-session.ts · prompt 后收敛循环</div>
-    <pre class="code"><code><span class="kw">private async</span> <span class="fn">_runAgentPrompt</span>(messages: AgentMessage | AgentMessage[]): <span class="fn">Promise</span>&lt;<span class="kw">void</span>&gt; {
-  <span class="fn">this</span>._isAgentRunActive = <span class="nu">true</span>;
-  <span class="kw">try</span> {
-    <span class="kw">await</span> <span class="fn">this</span>.agent.prompt(messages);
-    <span class="cmt">// 收敛：每次 continue 后再判断还要不要继续</span>
-    <span class="kw">while</span> (<span class="kw">await</span> <span class="fn">this</span>._handlePostAgentRun()) {
-      <span class="kw">await</span> <span class="fn">this</span>.agent.continue();
-    }
-  } <span class="kw">finally</span> {
-    <span class="fn">this</span>._runSystemPromptOptions = <span class="kw">undefined</span>;
-    <span class="fn">this</span>._flushPendingBashMessages();
-    <span class="fn">this</span>._flushPendingCustomMessages();   <span class="cmt">// 流式期间排队的 custom 消息，此刻落盘</span>
-    <span class="kw">await</span> <span class="fn">this</span>._emitAgentSettled();
+    <h2><span class="num">8.5</span>运行后收敛：重试 → 压缩 → 续跑 → 结算</h2>
+    <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有消息吗？能结算了吗？</strong>看 <code class="inline">_runAgentPrompt</code> 的主循环：</p>
+    <div class="code-title">agent-session.ts · _runAgentPrompt 主循环（行号约 1470；注释为译注）</div>
+    <pre class="code"><code><span class="kw">await</span> <span class="fn">this</span>.agent.prompt(messages);
+<span class="kw">while</span> (!<span class="fn">this</span>._agentRunAbortRequested) {
+  <span class="kw">if</span> (<span class="kw">await</span> <span class="fn">this</span>._handlePostAgentRun()) {          <span class="cmt">// 重试/压缩/队列有活 → 续跑</span>
+    <span class="kw">if</span> (<span class="fn">this</span>._agentRunAbortRequested) <span class="kw">break</span>;
+    <span class="kw">await</span> <span class="fn">this</span>.agent.<span class="fn">continue</span>();
+    <span class="kw">continue</span>;
   }
+  <span class="cmt">// 收敛到头：过最后一道可操作边界 agent_before_settle</span>
+  <span class="cmt">// （扩展仍可追加条目、请求一次续跑；返回 false 才结算）</span>
+  <span class="kw">if</span> (<span class="fn">this</span>._agentRunAbortRequested || !(<span class="kw">await</span> <span class="fn">this</span>._runBeforeSettleBoundary())) <span class="kw">break</span>;
+  <span class="kw">await</span> <span class="fn">this</span>.agent.<span class="fn">continue</span>();
 }
-
-<span class="kw">private async</span> <span class="fn">_handlePostAgentRun</span>(): <span class="fn">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
-  <span class="kw">const</span> msg = <span class="fn">this</span>._lastAssistantMessage;
-  <span class="fn">this</span>._lastAssistantMessage = <span class="kw">undefined</span>;
-  <span class="kw">if</span> (!msg) <span class="kw">return</span> <span class="kw">false</span>;
-
-  <span class="cmt">// 1. 可重试错误? → 准备重试并续跑</span>
-  <span class="kw">if</span> (<span class="fn">this</span>._isRetryableError(msg) &amp;&amp; (<span class="kw">await</span> <span class="fn">this</span>._prepareRetry(msg))) <span class="kw">return</span> <span class="nu">true</span>;
-
-  <span class="kw">if</span> (msg.stopReason === <span class="st">"error"</span> &amp;&amp; <span class="fn">this</span>._retryAttempt &gt; <span class="nu">0</span>) { <span class="cmt">/* 收尾 auto_retry_end 事件 */</span> }
-
-  <span class="cmt">// 2. 需要压缩? → 压缩后继续</span>
-  <span class="kw">if</span> (<span class="kw">await</span> <span class="fn">this</span>._checkCompaction(msg)) <span class="kw">return</span> <span class="nu">true</span>;
-
-  <span class="cmt">// 3. 队列还有消息（agent_end 扩展又追加了）? → 继续</span>
-  <span class="kw">return</span> <span class="fn">this</span>.agent.hasQueuedMessages();
+<span class="kw">finally</span> { <span class="cmt">// 结算是通知，不是决策：清临时 prompt、冲刷排队消息、发 agent_settled</span>
+  <span class="fn">this</span>._runSystemPromptOptions = <span class="kw">undefined</span>;
+  <span class="fn">this</span>._flushPendingBashMessages();
+  <span class="fn">this</span>._flushPendingCustomMessages();
+  <span class="kw">await</span> <span class="fn">this</span>._emitAgentSettled();
 }</code></pre>
-    <p>收敛顺序的表达力：<strong>重试优先于压缩，压缩优先于兜底续跑</strong>。判断「要不要」的逻辑堆积在三个函数里，生产版比基础 harness 契约多了「自动重试」这一维。重试的关键判断是 <code class="inline">_willRetryAfterAgentEnd</code>（回扫最后一条 assistant，看是否可重试错误且未超 <code class="inline">maxRetries</code>）：</p>
+    <p>收敛顺序的表达力：<strong>重试优先于压缩，压缩优先于兜底续跑，续跑之后才允许结算</strong>。判断「要不要」的逻辑堆积在三个函数里，生产版比基础 harness 契约多了「自动重试」这一维。重试的关键判断是 <code class="inline">_willRetryAfterAgentEnd</code>（回扫最后一条 assistant，看是否可重试错误且未超 <code class="inline">maxRetries</code>）：</p>
     <div class="code-title">agent-session.ts · 是否要在 agent_end 后自动重试</div>
     <pre class="code"><code><span class="kw">private</span> <span class="fn">_willRetryAfterAgentEnd</span>(event): <span class="kw">boolean</span> {
   <span class="kw">const</span> settings = <span class="fn">this</span>.settingsManager.getRetrySettings();
@@ -429,17 +480,34 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   }
   <span class="kw">return</span> <span class="kw">false</span>;
 }</code></pre>
-    <p>压缩分支是第 6 章的接驳处。<code class="inline">_checkCompaction</code> 是生产 harness 里最精巧的函数之一，它处理<strong>三类</strong>自动触发并带一堆「防误触发」守卫（三类都汇入同一个 <code class="inline">_runAutoCompaction()</code>）：</p>
+    <p>压缩分支是第 6 章的接驳处。<code class="inline">_checkCompaction</code> 处理<strong>三类</strong>自动触发并带一堆「防误触发」守卫（三类都汇入同一个 <code class="inline">_runAutoCompaction()</code>）：</p>
     <ul>
-      <li><strong>溢出 + 重试（overflow with retry）</strong>：assistant 因上下文溢出而错误或可恢复截断。此时<strong>先把被截断的 assistant 从 agent state 里剥掉</strong>（<code class="inline">messages.slice(0, -1)</code>），压缩后重试一轮；<code class="inline">_overflowRecoveryAttempted</code> 保证只试一次，避免死循环。</li>
+      <li><strong>溢出 + 重试（overflow with retry）</strong>：assistant 因上下文溢出而错误或可恢复截断。此时<strong>先用 context_edit 把失败尝试持久化省略</strong>（<code class="inline">_omitRecoveryAttempt</code>，第 6 章 6.5b 详过），压缩后作为全新 run 重试；<code class="inline">_overflowRecoveryAttempted</code> 保证只试一次，避免死循环。</li>
       <li><strong>溢出但不重试（overflow without retry）</strong>：一次<strong>成功</strong>的响应仍超出了上下文窗口。此时压缩，但<strong>保留这条已完成的响应</strong>、不重试——溢出不是错误，所以不丢工作成果。</li>
-      <li><strong>阈值（threshold without retry）</strong>：上下文用量（实际或估计）越过阈值，静默压缩，同样不重试。</li>
-      <li><strong>守卫</strong>：换模型后跳过旧模型的溢出判断；「消息比最近一次压缩还旧」就不再次触发（避免刚压完又被旧 usage 拉回）；aborted 消息默认跳过。</li>
+      <li><strong>阈值（threshold without retry）</strong>：上下文用量（实际或估计）越过阈值，静默压缩，同样不重试。会话里有 context_edit 时用量改由 <code class="inline">estimateProjectedContextTokens</code> 按投影计算。</li>
+      <li><strong>守卫</strong>：换模型后跳过旧模型的溢出判断；「消息比最近一次压缩还旧」就不再次触发（避免刚压完又被旧 usage 拉回）；aborted 消息默认跳过；若 assistant 之后的省略编辑已把它的回复清空（<code class="inline">latestAssistantEdit?.replacement === null</code>），溢出判断也不再触发——那次尝试已经从模型上下文里隐去了。</li>
     </ul>
     <p>注意「怎么知道溢出了」这个判断本身的分工：识别逻辑（错误文本正则 + usage 兜底 + 零输出贴窗检测）收在 pi-ai 的 <code class="inline">isContextOverflow</code>（第 10 章 10.3.1 详过），生产层只负责消费它。<code class="inline">_isRetryableError</code> 的实现因此只有三行，且顺序是设计：<strong>先排除溢出，再问可重试</strong>——溢出由压缩管道负责，重试管道不越界。重试与压缩不是竞争关系，而是按错误类型分流的两条管道。</p>
     <div class="callout">
-      <strong>这是「自适应收敛」的精髓：</strong>基础 harness 契约只定义了「有 compaction 操作」；生产层负责<strong>自己判断何时触发、何时不触发</strong>。除了这条「跑完后」的收敛线，生产层还装了一条「开跑前」的线：<code class="inline">_installAgentNextTurnRefresh</code> 把 <code class="inline">agent.prepareNextTurnWithContext</code> 接管过来，每个 turn 开始前调 <code class="inline">_compactBeforeNextAssistantResponse</code>——若按估算 token 已过阈值，就先 <code class="inline">_runAutoCompaction("threshold", false)</code> 压一轮再让模型看到上下文。而且它不只管压缩：接管的函数随后会重算「现在该有的系统提示 + 工具 loadout」（<code class="inline">_preparePromptAndToolLoadout</code>，见下面的小节），有变化就产出一条 patch system 消息随下轮注入。注意压缩前还会给扩展一个 <code class="inline">session_before_compact</code> 钩子——扩展可以拿到准备对象并 <code class="inline">cancel</code> 掉压缩。所有这些「自动驾驶」叠加起来，就是用户感知里「Agent 自己越跑越聪明、尽量不因上下文超限而中断」的来源。
+      <strong>这是「自适应收敛」的精髓：</strong>基础 harness 契约只定义了「有 compaction 操作」；生产层负责<strong>自己判断何时触发、何时不触发</strong>。除了「跑完后」的收敛线，还有两根「开跑前」的线：8.2b 的 <code class="inline">prepareNextTurnWithContext</code> 接管（每 turn 前按估算压缩 + 重算 loadout），以及压缩前给扩展的 <code class="inline">session_before_compact</code> 钩子——扩展可以拿到准备对象并 <code class="inline">cancel</code> 掉压缩。所有这些「自动驾驶」叠加起来，就是用户感知里「Agent 自己越跑越聪明、尽量不因上下文超限而中断」的来源。
     </div>
+    <h3>结算的最后两站：agent_before_settle 与 agent_settled</h3>
+    <p><code class="inline">_handlePostAgentRun</code> 全部说「不用续」之后，循环不立即退出——先过 <code class="inline">_runBeforeSettleBoundary</code>：</p>
+    <div class="code-title">agent-session.ts · _runBeforeSettleBoundary（行号 1531 起；摘录，注释为译注）</div>
+    <pre class="code"><code><span class="kw">private async</span> <span class="fn">_runBeforeSettleBoundary</span>(): Promise&lt;boolean&gt; {
+  <span class="kw">if</span> (!<span class="fn">this</span>._extensionRunner.hasHandlers(<span class="st">"agent_before_settle"</span>)) <span class="kw">return this</span>.agent.hasQueuedMessages();
+  <span class="kw">const</span> result = <span class="kw">await this</span>._extensionRunner.<span class="fn">emitBoundary</span>(
+    { type: <span class="st">"agent_before_settle"</span>, outcome: <span class="fn">this</span>._lastActivityOutcome },
+    (entries) =&gt; <span class="fn">this</span>._buildBoundaryContext(entries, <span class="st">"agent_before_settle"</span>),
+  );
+  <span class="fn">this</span>._commitBoundaryDrafts(result.entries);   <span class="cmt">// 草稿此刻才真正写入会话</span>
+  <span class="fn">this</span>._flushPendingCustomMessages();
+  <span class="cmt">// continue 有效的前提：修复后的投影能跑一次请求（canContinue 校验）</span>
+  <span class="kw">const</span> shouldContinue = result.continue || <span class="fn">this</span>.agent.hasQueuedMessages();
+  <span class="kw">if</span> (shouldContinue &amp;&amp; !finalContext.canContinue) { …报错…; <span class="kw">return false</span>; }
+  <span class="kw">return</span> shouldContinue;
+}</code></pre>
+    <p>它俩的分工写在扩展文档里：<code class="inline">agent_before_settle</code> 是<strong>最后一个可操作边界</strong>——能追加条目、请求一次续跑（重试/恢复/压缩/排队消息带来的续跑都在它之前完成）；<code class="inline">agent_settled</code> 则<strong>纯通知</strong>——发给「需要知道 Pi 不会再自动继续」的集成方，它返回什么都不会改变调度，其中的延迟动作也不可重入（<code class="inline">_isEmittingAgentSettled</code> 守卫着不重入）。<code class="inline">_emitAgentSettled</code> 还会顺带唤醒空闲等待（<code class="inline">_resolveIdleWaitIfIdle</code>）与触发缓存预热回调（<code class="inline">cacheWarmer.onAgentSettled</code>）。</p>
     <h3>系统提示的三个写入时机</h3>
     <p>8.4 里那句「system 消息也在落盘之列」值得展开。系统提示是消息流里的状态，而生产 harness 在<strong>三个时机</strong>写它：</p>
     <ul>
@@ -449,17 +517,17 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
     </ul>
     <div class="code-title">agent-session.ts · _preparePromptAndToolLoadout（节选，注释为译注）</div>
     <pre class="code"><code><span class="kw">private</span> <span class="fn">_preparePromptAndToolLoadout</span>(options, messages = <span class="kw">this</span>.agent.state.messages) {
-  options.selectedTools = [...<span class="kw">new</span> <span class="cl">Set</span>(options.selectedTools)].filter((name) =&gt; <span class="kw">this</span>._toolRegistry.has(name));
-  <span class="kw">this</span>.agent.state.tools = ...;                     <span class="cmt">// 让 agent 能执行的工具对齐</span>
+  options.selectedTools = [...new Set(options.selectedTools)].filter((name) =&gt; <span class="fn">this</span>._toolRegistry.has(name));
+  <span class="fn">this</span>.agent.state.tools = ...;                     <span class="cmt">// 让 agent 能执行的工具对齐</span>
   <span class="cmt">// 只对 prompt 的 section 做差量：拿「消息流里当前生效的 sections」和「现在该有的」比</span>
   <span class="kw">const</span> sections = <span class="fn">diffSystemPromptSections</span>(
     getCurrentSystemMessage(messages)?.sections ?? {},   <span class="cmt">// 重放出来的当前状态</span>
     buildSystemPromptSections(options),                  <span class="cmt">// 现在该有的结构化 sections</span>
   );
   <span class="cmt">// 有变化 → 产出一条只带 sections 补丁的 system 消息；没变化 → undefined（不发）</span>
-  <span class="kw">return</span> sections ? { role: <span class="st">"system"</span>, content: <span class="st">""</span>, sections, timestamp: <span class="cl">Date</span>.now() } : <span class="kw">undefined</span>;
+  <span class="kw">return</span> sections ? { role: <span class="st">"system"</span>, content: <span class="st">""</span>, sections, timestamp: <span class="fn">Date</span>.now() } : <span class="kw">undefined</span>;
 }</code></pre>
-    <div class="annotation"><b>读懂这段：</b> 这段函数经历过一次值得记住的简化：早先它有两条产出路径——sections 差量补丁，或整段 <code class="inline">content</code> + <code class="inline">replace: true</code> 的替换消息（处理「扩展用 <code class="inline">forceSystemPrompt</code> 塞进来一整段不透明 prompt」的情况）。后来 <code class="inline">replace</code> 字段被整体删除：扩展强制注入的 prompt 是<strong>「本次请求临时渲染出来的文本」，不是对话状态</strong>——把它持久化进 transcript，会每次变更都重写一遍完整 prompt、丢掉结构化 sections，还让之后的中途 system 消息全部失效。如今的分工是：transcript 里<strong>只存结构化 sections</strong>（所以这里永远只做差量）；强制文本在发请求时才投影——<code class="inline">_installAgentForcedPromptProjection()</code> 在 <code class="inline">agent.transformContext</code> 外再包一层，若本次运行设了 <code class="inline">forceSystemPrompt</code>，就把 system 消息收拢成一条持有强制文本的头部消息，加上当前工具声明。transcript 与请求从「同一条消息流」解耦成「状态层 + 请求层」（重放规则见 <a href="10-ai-layer.html">第 10 章</a>）。</div>
+    <div class="annotation"><b>这段函数经历过一次值得记住的简化：</b>早先它有两条产出路径——sections 差量补丁，或整段 <code class="inline">content</code> + <code class="inline">replace: true</code> 的替换消息（处理「扩展用 <code class="inline">forceSystemPrompt</code> 塞进来一整段不透明 prompt」的情况）。后来 <code class="inline">replace</code> 字段被整体删除：扩展强制注入的 prompt 是<strong>「本次请求临时渲染出来的文本」，不是对话状态</strong>——把它持久化进 transcript，会每次变更都重写一遍完整 prompt、丢掉结构化 sections，还让之后的中途 system 消息全部失效。如今的分工是：transcript 里<strong>只存结构化 sections</strong>（所以这里永远只做差量）；强制文本在发请求时才投影——<code class="inline">_installAgentForcedPromptProjection()</code> 在 <code class="inline">agent.transformContext</code> 外再包一层，若本次运行设了 <code class="inline">forceSystemPrompt</code>，就把 system 消息收拢成一条持有强制文本的头部消息，加上当前工具声明。transcript 与请求从「同一条消息流」解耦成「状态层 + 请求层」（重放规则见 <a href="10-ai-layer.html">第 10 章</a>）。</div>
   </section>
 
   <section class="block">
@@ -474,7 +542,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   <span class="kw">const</span> previousSessionFile = <span class="fn">this</span>.session.sessionFile;
   <span class="cmt">// 2. 打开目标会话，校验其 cwd 存在</span>
   <span class="kw">const</span> sessionManager = <span class="fn">SessionManager</span>.<span class="fn">open</span>(sessionPath, <span class="kw">undefined</span>, options?.cwdOverride);
-  <span class="fn">assertSessionCwdExists</span>(sessionManager, <span class="fn">this</span>.cwd);
+  assertSessionCwdExists(sessionManager, <span class="fn">this</span>.cwd);
 
   <span class="cmt">// 3. 拆旧：abort → session_shutdown 事件 → UI 摘除 → dispose</span>
   <span class="kw">await</span> <span class="fn">this</span>.teardownCurrent(<span class="st">"resume"</span>, sessionManager.getSessionFile());
@@ -493,7 +561,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   <span class="cmt">// 1. 先把当前响应的工具结果等落盘（abort 会妥善收尾）</span>
   <span class="kw">await</span> <span class="fn">this</span>.session.abort();
   <span class="cmt">// 2. 发 session_shutdown 事件，给扩展一个钩子</span>
-  <span class="kw">await</span> <span class="fn">emitSessionShutdownEvent</span>(<span class="fn">this</span>.session.extensionRunner,
+  <span class="kw">await</span> emitSessionShutdownEvent(<span class="fn">this</span>.session.extensionRunner,
     { type: <span class="st">"session_shutdown"</span>, reason, targetSessionFile });
   <span class="cmt">// 3. 同步回调：主机 UI 在旧扩展上下文变 stale 前摘除组件</span>
   <span class="fn">this</span>.beforeSessionInvalidate?.();
@@ -507,14 +575,22 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   </section>
 
   <section class="block">
-    <h2><span class="num">8.7</span>把这一章装进你的 Runtime 清单</h2>
-    <p>这一章的信息密度很高。把它压缩成一张「生产 harness 必备件」清单，也是你第 12 章自制 Runtime 的骨架：</p>
+    <h2><span class="num">8.7</span>收尾：四问的答案</h2>
+    <ul>
+      <li><strong>输入怎么进？</strong><code class="inline">prompt()</code> 一条固定流水线：扩展命令 → input 钩子 → 技能/模板展开 → 流式则强制入 steer/followUp 队列 → flush bash → 模型/鉴权校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>。三个可短路点（命令、钩子、入队），一个「钩子之后才归一化」的顺序决定。</li>
+      <li><strong>上下文从哪来？</strong>四根接管钩子把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt。</li>
+      <li><strong>扩展在哪能改写会话？</strong>转换流两扇门（context 只看对话 / context_with_system 拥有完整转写）；可操作边界（turn_end / agent_before_settle）四种草稿链式累积、沙盘预演、失败整体作废，continue 需过 canContinue 校验。</li>
+      <li><strong>跑完谁收敛？</strong>重试→压缩→续跑的 while 循环，配三类压缩守卫与一次性的溢出恢复；收敛到头后 agent_before_settle 仍可追加条目续跑一次，最终 agent_settled 纯通知——集成方由此知道 Pi 不会再动。</li>
+    </ul>
+    <p>把这一章压成一张「生产 harness 必备件」清单，也是你第 12 章自制 Runtime 的骨架：</p>
     <table class="tbl">
       <thead><tr><th>能力</th><th>Pi 的做法（文件）</th><th>为什么缺它不行</th></tr></thead>
       <tbody>
         <tr><td>输入管道</td><td><code class="inline">prompt()</code>：命令→钩子→展开→队列/校验</td><td>没有统一入口，拦截/改写在别处无从挂</td></tr>
+        <tr><td>上下文接管</td><td><code class="inline">prepareRequest 装投影 + prepareNextTurn 重算</code></td><td>模型看到的上下文必须单一来源、可投影、可换模型</td></tr>
         <tr><td>双队列</td><td><code class="inline">steer / followUp / nextTurn</code></td><td>流式中无法安全追加/打断用户输入</td></tr>
         <tr><td>事件桥</td><td><code class="inline">_handleAgentEvent → _emitExtensionEvent</code></td><td>扩展与 UI 都靠它观察，三层顺序=可扩展性</td></tr>
+        <tr><td>可操作边界</td><td><code class="inline">emitBoundary：草稿链 + 沙盘预演</code></td><td>扩展改写会话必须写不坏上下文</td></tr>
         <tr><td>持久化</td><td><code class="inline">message_end → appendMessage</code></td><td>不落盘则无法恢复、分叉、跨进程续跑</td></tr>
         <tr><td>自适应收敛</td><td><code class="inline">_handlePostAgentRun</code>：重试→压缩→续跑</td><td>Agent 遇到错误/超长要自己能消化，而非干等</td></tr>
         <tr><td>会话替换</td><td><code class="inline">teardownCurrent → createRuntime → rebind</code></td><td>换会话在最坏时机（运行中）也必须不丢数据</td></tr>
@@ -528,7 +604,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

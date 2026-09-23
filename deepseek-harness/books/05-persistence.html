@@ -35,22 +35,22 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 持久化</div>
     <h1>持久化与崩溃恢复：把日志安全地放到磁盘上</h1>
-    <div class="subtitle">第 2 章说会话日志是唯一事实——这一章回答两个工程问题：这条日志如何可靠地落到磁盘（写所有权、代际文件、迁移链），以及进程在任意一行代码处被 kill 后，重启如何把「撕裂的尾巴」缝合成供应商可接受的历史。</div>
+    <div class="subtitle">问题：第 2 章说会话日志是唯一事实——那这条日志怎么可靠地落到磁盘（①）？进程在任意一行代码处被 kill，重启怎么把「撕裂的尾巴」缝合成供应商可接受的历史（②）？格式版本怎么演进，旧日志还能不能读（③）？5.1 把问题摆出来，5.2–5.4 作答①，5.5 作答③，5.6 作答②，5.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">5.1</span>一分钟版本</h2>
+    <h2><span class="num">5.1</span>问题：可靠落盘、撕裂尾巴、格式演进</h2>
+    <p>三个工程问题，一个比一个靠后：</p>
     <ul>
-      <li>存储缝是 <code class="inline">SessionPersistence</code>（create/open/flush/stat/list 五个抽象方法），返回 <code class="inline">SessionHandle</code>；JSONL 后端实现它（<code class="inline">packages/session/session-persistence-jsonl</code>）。</li>
-      <li><strong>单写者</strong>：写所有权由内核仲裁——POSIX 用 <code class="inline">flock(2)</code>，Windows 用命名内核信号量；竞争映射为 <code class="inline">SessionAlreadyOwnedError</code>。</li>
-      <li><strong>append 尽力而为，flush 才是持久性屏障</strong>——检查点策略插件（dsh-session-checkpoint-policy）决定在哪些语义边界 flush。</li>
-      <li>格式版本 vN 文件不可变：<code class="inline">session.v3.jsonl[.zstd]</code>；迁移链 vN→vN+1 逐级静态组合，后继文件只在 write 打开、拿到写所有权后发布，原文件永不改名/替换/删除。</li>
-      <li>崩溃恢复 = <code class="inline">interruptedTurnClosers()</code>：给未完成的工具调用合成确定的错误结果 + 补 step/end + <code class="inline">turn/end {reason:'interrupted'}</code>。</li>
+      <li>① <strong>日志怎么可靠地落盘</strong>——谁拥有写？append 和持久是一回事吗？进程死了日志会不会半行？</li>
+      <li>② <strong>崩溃之后怎么恢复</strong>——开口的 turn、未结算的 tool/call，怎么缝成供应商接受、模型可决策的历史？</li>
+      <li>③ <strong>格式怎么演进</strong>——V4 改了事件词汇表（第 2 章），昨天存在磁盘上的 v3 日志今天还读得回来吗？</li>
     </ul>
+    <p>速览答案：① 存储是缝（SessionPersistence 接口 + JSONL 后端），写所有权由内核仲裁，append 尽力而为、flush 才是持久性屏障，flush 点由独立的检查点策略插件挂载（5.2–5.4）；② 缝合 = interruptedTurnClosers()，确定性合成闭包（5.6）；③ 不可变代际文件 + 静态迁移链，v3→v4 的迁移包是最新样本（5.5）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.2</span>SessionHandle 契约</h2>
+    <h2><span class="num">5.2</span>① SessionHandle 契约</h2>
     <p>所有后端共用的句柄接口（<code class="inline">packages/session/session-persistence/src/handle.ts</code>）。注释把每条契约写得极精确：</p>
     <div class="code-title">packages/session/session-persistence/src/handle.ts（节选，注释为译注除末段外）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
@@ -102,7 +102,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.3</span>单写者：内核仲裁的写锁</h2>
+    <h2><span class="num">5.3</span>① 单写者：内核仲裁的写锁</h2>
     <p>「同一会话只能有一个写者」不是靠应用层约定，而是靠操作系统（<code class="inline">packages/session/session-persistence-jsonl/src/lease.ts</code> 文档注释）：</p>
     <div class="code-title">packages/session/session-persistence-jsonl/src/lease.ts — SessionWriteLease（文档注释）</div>
     <pre class="code"><span class="lang-tag">text</span><span class="cmt">/**
@@ -130,7 +130,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.4</span>检查点策略：flush 的语义边界</h2>
+    <h2><span class="num">5.4</span>① 检查点策略：flush 的语义边界</h2>
     <p>检查点不是循环的职责，而是一个独立插件（<code class="inline">packages/session/session-checkpoint-policy/src/index.ts</code>）。整个插件只有三个监听器，全部实现为「先 flush，再放行下游」：</p>
     <div class="code-title">packages/session/session-checkpoint-policy/src/index.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> name = <span class="st">'session-checkpoint-policy'</span>
@@ -171,8 +171,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.5</span>JSONL 后端：不可变代际与迁移链</h2>
-    <p>JSONL 后端把一个会话存为「一个目录 + 若干不可变代际文件」：<code class="inline">session.v3.jsonl[.zstd]</code>（v0 时代是 <code class="inline">session.jsonl[.zstd]</code>）。关键机制（<code class="inline">packages/session/session-persistence-jsonl/src/index.ts</code>）：</p>
+    <h2><span class="num">5.5</span>③ JSONL 后端：不可变代际与迁移链</h2>
+    <p>JSONL 后端把一个会话存为「一个目录 + 若干不可变代际文件」：<code class="inline">session.v4.jsonl[.zstd]</code>（v0 时代是 <code class="inline">session.jsonl[.zstd]</code>；文件名模板在 <code class="inline">packages/session/session-format/src/filename.ts:16</code>）。关键机制（<code class="inline">packages/session/session-persistence-jsonl/src/index.ts</code>）：</p>
     <div class="code-title">packages/session/session-persistence-jsonl/src/index.ts — 代际选择与发布（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/** Select the numerically highest canonical generation in one Session directory. */</span>
   <span class="kw">private async</span> <span class="fn">resolveGenerationInDirectory</span>(dir: <span class="kw">string</span>, signal?: <span class="cl">AbortSignal</span>) {
@@ -183,16 +183,34 @@
 
   <span class="cmt">/** Decode one historical generation without publishing a successor. */</span>
   <span class="kw">private async</span> <span class="fn">prepareStoredMigration</span>(id, selected, signal) {
-    <span class="kw">const</span> prepared = <span class="kw">await</span> <span class="fn">prepareJsonlMigration</span>({
-      sourcePath: selected.sourcePath,
-      sourceVersion: selected.sourceVersion,
-      currentPath: selected.currentPath,
-      compression: <span class="kw">this</span>.compression,
-      format: <span class="kw">this</span>.generationFormat,          <span class="cmt">// 相邻迁移 vN→vN+1 的静态组合</span>
-      verifyCurrentFile: verifyCurrentGenerationInWorker,
-      validateHistoricalHeader: header =&gt; <span class="kw">this</span>.<span class="fn">validateSourceIdentity</span>(...),
-      signal,
-    })
+    <span class="kw">try</span> {
+      <span class="cmt">// 子会话证据：目录里 origin='subagent' 且 parentSession 指向本会话的代际文件。</span>
+      <span class="kw">const</span> children = <span class="kw">async</span> () =&gt; (<span class="kw">await</span> <span class="kw">this</span>.<span class="fn">listArtifacts</span>(signal))
+        .<span class="fn">filter</span>(source =&gt; source.header.origin === <span class="st">'subagent'</span> && source.header.parentSession === id)
+      <span class="kw">const</span> sources = <span class="kw">await</span> <span class="fn">children</span>()
+      <span class="kw">const</span> related = <span class="kw">await</span> <span class="fn">prepareCatalogFacts</span>(id, sources, <span class="kw">this</span>.compression, signal)
+      <span class="kw">const</span> membership = sources.<span class="fn">map</span>(source =&gt; source.path).<span class="fn">sort</span>()
+      validateRelatedSources = <span class="kw">async</span> () =&gt; {
+        <span class="cmt">// 发布前重扫子代际：清单变了（子会话中途增删）→ 整个迁移作废。</span>
+        <span class="kw">const</span> current = (<span class="kw">await</span> <span class="fn">children</span>()).<span class="fn">map</span>(source =&gt; source.path).<span class="fn">sort</span>()
+        <span class="cmt">// …diff membership 与 current，不同则抛 JsonlGenerationSourceChangedError…</span>
+      }
+      prepared = <span class="kw">await</span> <span class="fn">prepareJsonlMigration</span>({
+        sourcePath: selected.sourcePath,
+        sourceVersion: selected.sourceVersion,
+        currentPath: selected.currentPath,
+        compression: <span class="kw">this</span>.compression,
+        format: {
+          ...<span class="kw">this</span>.generationFormat,          <span class="cmt">// 相邻迁移 vN→vN+1 的静态组合</span>
+          createRestore: header =&gt; <span class="fn">createSessionFormatCatalogWithChildren</span>(related.facts)
+            .<span class="fn">createRestore</span>(header, { recovery: <span class="st">'recoverable'</span>, validation: <span class="st">'transformed'</span> }),
+        },
+        validateRelatedSources,
+        verifyCurrentFile: verifyCurrentGenerationInWorker,
+        validateHistoricalHeader: header =&gt; <span class="kw">this</span>.<span class="fn">validateSourceIdentity</span>(...),
+        signal,
+      })
+    }
     <span class="cmt">// …校验身份/事件、memoize 为 status:'prepared'，</span>
     <span class="cmt">// 并把尚未落盘的 publication 挂在结论上…</span>
   }
@@ -208,16 +226,18 @@
       <span class="cmt">// 迁移失败：源 vN 产物保持不变，错误信息带 raw log 路径</span>
     }
   }</pre>
-    <p>迁移链是构建期静态组合的——目录里每个相邻迁移包只负责一步（<code class="inline">packages/session/session-format-catalog/src/generated.ts</code>）；注意被拒绝的未来版本走的是另一条更早的分支：<code class="inline">requireStoredLog()</code>（index.ts:495）在 <code class="inline">sourceVersion &gt; SESSION_FORMAT_VERSION</code> 时直接抛 <code class="inline">SessionFormatUnsupportedError</code>，连头都只读翻译版：</p>
+    <p>迁移链是构建期静态组合的——目录里每个相邻迁移包只负责一步（<code class="inline">packages/session/session-format-catalog/src/generated.ts</code>）；注意被拒绝的未来版本走的是另一条更早的分支：<code class="inline">requireStoredLog()</code>（index.ts:514）在 <code class="inline">sourceVersion &gt; SESSION_FORMAT_VERSION</code> 时直接抛 <code class="inline">SessionFormatUnsupportedError</code>（:547），连头都只读翻译版：</p>
     <div class="code-title">packages/session/session-format-catalog/src/generated.ts（节选）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">sessionFormatCatalog</span> = <span class="fn">createSessionFormatCatalog</span>({
-  currentVersion: <span class="nu">3</span>,
-  codecs: [releasedV0SessionFormatCodec, releasedV1SessionFormatCodec, releasedV2SessionFormatCodec, releasedV3SessionFormatCodec],
-  currentEncoder: releasedV3SessionFormatCodec,
-  migrations: [sessionFormatV0ToV1, sessionFormatV1ToV2, sessionFormatV2ToV3],
-  <span class="cmt">// …restoreCurrent / restoreTransformedCurrent / restoreCurrentHeader 均校验 V3…</span>
-})</pre>
-    <div class="annotation"><b>规则回顾</b>（docs/architecture.md + <code class="inline">SESSION_FORMAT_VERSION</code> 注释）：header-only 的 stat/list 只扫目录、选最高代际、翻译历史头，<strong>不读事件体也不发布后继</strong>；body 读（<code class="inline">requireStoredLog()</code>）才在内存中组合迁移链、校验最终结果，把它 memoize 成 <code class="inline">status:'prepared'</code>——但这时还<strong>没有写任何文件</strong>。<code class="inline">publishStoredMigration()</code> 只在 <strong>write 打开</strong>（index.ts:375）被调用，「独占发布」的独占指的是写所有权，不是读路径的动作；只读打开拿到的就是一个 prepared 结论，文件保持原样。已提交的代际路径永不重命名、替换或删除。最新的 <code class="inline">session-format-v2-to-v3</code> 步骤把系统提示词提升为 <code class="inline">system/message</code> 表面事件、重映射本地事件引用、翻译 PTC/preset 名称、并把信封规范化（<code class="inline">surfaceOp.start/end</code> → <code class="inline">startSeq/endSeq</code>）——插入 system 事件会改变事件数与紧邻 seq，这正是 v2→v3 必须 bump 的原因。</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">sessionFormatCatalogOptions</span> = {
+  currentVersion: <span class="nu">4</span>,
+  codecs: [releasedV0SessionFormatCodec, releasedV1SessionFormatCodec, releasedV2SessionFormatCodec, releasedV3SessionFormatCodec, releasedV4SessionFormatCodec],
+  currentEncoder: releasedV4SessionFormatCodec,
+  migrations: [sessionFormatV0ToV1, sessionFormatV1ToV2, sessionFormatV2ToV3, sessionFormatV3ToV4],
+  <span class="cmt">// …restoreCurrent → restoreReleasedV4Artifact + validateInstalledCurrentSessionArtifact，</span>
+  <span class="cmt">//   restoreTransformedCurrent / restoreCurrentHeader 同样校验 V4…</span>
+}</pre>
+    <div class="annotation"><b>规则回顾</b>（docs/architecture.md + <code class="inline">SESSION_FORMAT_VERSION</code> 注释）：header-only 的 stat/list 只扫目录、选最高代际、翻译历史头，<strong>不读事件体也不发布后继</strong>；body 读（<code class="inline">requireStoredLog()</code>）才在内存中组合迁移链、校验最终结果，把它 memoize 成 <code class="inline">status:'prepared'</code>——但这时还<strong>没有写任何文件</strong>。<code class="inline">publishStoredMigration()</code> 只在 <strong>write 打开</strong>（index.ts:387）被调用，「独占发布」的独占指的是写所有权，不是读路径的动作；只读打开拿到的就是一个 prepared 结论，文件保持原样。已提交的代际路径永不重命名、替换或删除。v2→v3 步骤把系统提示词提升为 <code class="inline">system/message</code> 表面事件、重映射本地事件引用、翻译 PTC/preset 名称、并把信封规范化（<code class="inline">surfaceOp.start/end</code> → <code class="inline">startSeq/endSeq</code>）——插入 system 事件会改变事件数与紧邻 seq，这正是 v2→v3 必须 bump 的原因。</div>
+    <div class="annotation"><b>V3→V4 的迁移为什么「只有头」</b>：V4 引入了「父/子目录代际」——子 agent 会话自己成了持久代际文件，迁移一个父会话的历史时，体转换必须知道它当时有哪些子会话（tool-result 语义依赖子会话事实）。所以 <code class="inline">sessionFormatV3ToV4</code> 的 <code class="inline">createStage()</code> 直接抛 <code class="inline">SessionFormatUnsupportedMigrationError</code>（migration.ts:14 注释原话 "Header-only migration declaration; body restoration requires explicit child evidence"），真正的体迁移由调用方带 <code class="inline">createSessionFormatV3ToV4(children)</code> 显式驱动——JSONL 后端在 prepareStoredMigration 里干这件事：<code class="inline">children()</code> 过滤 origin='subagent' 且 parentSession 指向本会话的目录产物，<code class="inline">prepareCatalogFacts()</code> 把子代际快照成目录事实，<code class="inline">validateRelatedSources()</code> 在发布前重扫目录（清单变了就作废整个 prepared 结论），最后 <code class="pre">createSessionFormatCatalogWithChildren(related.facts).createRestore(header, { recovery: 'recoverable', validation: 'transformed' })</code> 用「带子证据的目录」替换静态目录。没有子会话的父会话要传<strong>空数组</strong>——错误信息原话：「V3 catalog migration requires explicit historical child facts, including an empty array for a parent without children」。这是 V4 带来的结构性变化：格式迁移不再只是「转换器写对了就行」，还要证明「转换时看到的世界是完整的」。</div>
     <div class="annotation"><b>这个迁移包自己也是迭代的产物</b>：初版 v2-to-v3（提交 f7a6221158，"add identity V2-to-V3 migration and writer skeleton"）只做恒等转换；随后几轮提交逐步加入系统提示词提升（e04cfc4c87）、旧 preset 引用到 PTC 的迁移（ff33f79eb1）、信封规范化（657e68186a）。发布前的最后一轮修复（5212603a4b，"audit every historical content carrier before V3 migration"）补的是初版缺失的<strong>内容准入审计</strong>：日志里藏着 message 内容的位置远不止五种 Message 事件——压缩摘要（<code class="inline">compaction/summary.data.summary</code>）、PTC 前身输出（<code class="inline">tool/code-dispatch.data.content</code>）、嵌套在 <code class="inline">assistant/message.data.stream[]</code> 里的原始 chunk 块，都是内容载体。为什么必须逐一审计：迁移承诺「保留历史请求含义」，而一个没被理解过的未知 block 类型，无法证明迁移保留了它的含义——所以未知种类直接拒绝整个迁移（<code class="inline">SessionFormatUnsupportedMigrationError</code>，诊断带源事件类型、seq 和完整索引路径），而不是「保留字节、假装安全」。审计只检查不重写：tool arguments 和 replayState 保持不透明。写迁移代码时「枚举所有藏数据的位置」这一步没有捷径，唯一的办法是把事件清单过一遍——这个教训对所有要写 format migration 的人适用。</div>
 
     <div class="figure">
@@ -235,17 +255,17 @@
         <text class="lbl sm" x="315" y="86" text-anchor="middle">迁移一次后发布</text>
         <rect class="node" x="450" y="40" width="150" height="64" rx="9"/>
         <text class="lbl sm" x="525" y="66" text-anchor="middle">session.v2.jsonl</text>
-        <text class="lbl sm" x="525" y="86" text-anchor="middle">历史代际（只读）</text>
+        <text class="lbl sm" x="525" y="86" text-anchor="middle">session.v3.jsonl</text>
         <rect class="node core" x="660" y="40" width="160" height="64" rx="9"/>
-        <text class="lbl sm" x="740" y="66" text-anchor="middle">session.v3.jsonl</text>
+        <text class="lbl sm" x="740" y="66" text-anchor="middle">session.v4.jsonl</text>
         <text class="lbl sm" x="740" y="86" text-anchor="middle">当前代际（写到这里）</text>
         <line class="edge" x1="180" y1="72" x2="238" y2="72"/>
         <line class="edge" x1="390" y1="72" x2="448" y2="72"/>
         <line class="edge" x1="590" y1="72" x2="658" y2="72"/>
         <text class="lbl sm" x="210" y="62" text-anchor="middle">v0→v1</text>
-        <text class="lbl sm" x="420" y="62" text-anchor="middle">v1→v2</text>
-        <text class="lbl sm" x="625" y="62" text-anchor="middle">v2→v3</text>
-        <text class="lbl sm" x="470" y="150" text-anchor="middle">每个相邻迁移包只负责一步；链在构建期静态组合；发布是独占的（已存在则直接用）。</text>
+        <text class="lbl sm" x="420" y="62" text-anchor="middle">v1→v2→v3</text>
+        <text class="lbl sm" x="625" y="62" text-anchor="middle">v3→v4</text>
+        <text class="lbl sm" x="470" y="150" text-anchor="middle">每个相邻迁移包只负责一步；v3→v4 的体迁移还需显式子会话证据；发布是独占的（已存在则直接用）。</text>
         <rect class="node acc" x="30" y="130" width="150" height="34" rx="9"/>
         <text class="lbl sm" x="105" y="152" text-anchor="middle">session.lock（flock 锁）</text>
       </svg>
@@ -255,17 +275,16 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.6</span>崩溃恢复：interruptedTurnClosers()</h2>
-    <p>进程在任何时刻死掉，日志都会留下「开口的 turn、开口的 step、未结算的 tool/call」。恢复代码扫描整条日志、合成确定性闭包（<code class="inline">packages/core/session/src/repair.ts</code>）：</p>
-    <div class="code-title">packages/core/session/src/repair.ts — interruptedTurnClosers()（节选）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export const</span> <span class="cl">TOOL_NOT_STARTED</span> = <span class="st">'TOOL_NOT_STARTED'</span>
-<span class="kw">export const</span> <span class="cl">TOOL_OUTCOME_UNKNOWN</span> = <span class="st">'TOOL_OUTCOME_UNKNOWN'</span>
+    <h2><span class="num">5.6</span>② 崩溃恢复：openTurnClosers() 的确定性缝合</h2>
+    <p>进程在任何时刻死掉，日志都会留下「开口的 turn、开口的 step、未结算的 tool/call」。恢复代码扫描整条日志、合成确定性闭包（<code class="inline">packages/core/session/src/repair.ts</code>）。V4 里这个函数泛化成了两用途——崩溃恢复用 <code class="inline">interrupted</code> 原因，fork 种子（切割点落在源会话开口回合内）用 <code class="inline">forked</code> 原因，共享同一条缝合路径（<code class="inline">OpenTurnCloseCause</code>，repair.ts:32）：</p>
+    <div class="code-title">packages/core/session/src/repair.ts — openTurnClosers()（节选）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">OpenTurnCloseCause</span> = { <span class="kw">readonly</span> kind: <span class="st">'interrupted'</span> } | { <span class="kw">readonly</span> kind: <span class="st">'forked'</span> }
 
-<span class="kw">export function</span> <span class="fn">interruptedTurnClosers</span>(events: <span class="kw">readonly</span> <span class="cl">SessionEvent</span>[]): <span class="cl">SessionEvent</span>[] {
+<span class="kw">export function</span> <span class="fn">openTurnClosers</span>(events: <span class="kw">readonly</span> <span class="cl">SessionEvent</span>[], cause: <span class="cl">OpenTurnCloseCause</span>): <span class="cl">SessionEvent</span>[] {
   <span class="kw">let</span> openTurn: <span class="kw">number</span> | <span class="kw">null</span> = <span class="kw">null</span>
   <span class="kw">let</span> openStep: <span class="kw">number</span> | <span class="kw">null</span> = <span class="kw">null</span>
   <span class="cmt">// 每个回合边界重置；assistant 块登记调用，tool/call 事件补充 seq。</span>
-  <span class="kw">const</span> pendingCalls = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="cl">ToolCallId</span>, { step: <span class="kw">number</span>; callSeq?: <span class="cl">SessionSeq</span> }&gt;()
+  <span class="kw">const</span> pendingCalls = <span class="kw">new</span> <span class="cl">Map</span>&lt;<span class="cl">ToolCallId</span>, { step: <span class="kw">number</span>; callSeq?: <span class="cl">SessionSeqType</span> }&gt;()
   <span class="kw">for</span> (<span class="kw">const</span> event <span class="kw">of</span> events) {
     <span class="kw">switch</span> (event.type) {
       <span class="kw">case</span> <span class="st">'turn/start'</span>: openTurn = event.data.turn; openStep = <span class="kw">null</span>; pendingCalls.<span class="fn">clear</span>(); <span class="kw">break</span>
@@ -290,10 +309,13 @@
   <span class="kw">let</span> seq = last.seq + <span class="nu">1</span>
   <span class="kw">const</span> time = last.time
   <span class="kw">const</span> closers: <span class="cl">SessionEvent</span>[] = []
-  <span class="cmt">// ① 先给未决调用补结果（供应商拒绝悬挂的 assistant 调用）</span>
+  <span class="cmt">// ① 先给未决调用补结果（供应商拒绝悬挂的 assistant 调用）。</span>
+  <span class="cmt">//    正文文案按 cause.kind 取 CLOSER_TEXT：interrupted 与 forked 措辞不同。</span>
+  <span class="kw">const</span> text = <span class="cl">CLOSER_TEXT</span>[cause.kind]
   <span class="kw">for</span> (<span class="kw">const</span> [callId, { step, callSeq }] <span class="kw">of</span> pendingCalls) {
     <span class="kw">const</span> started = callSeq !== <span class="kw">undefined</span>
-    <span class="cmt">/* …合成 ToolResultMessage：isError: true，文案区分两种情况… */</span>
+    <span class="cmt">/* …合成 ToolResultMessage：isError: true，</span>
+    <span class="cmt">       id 前缀 `${cause.kind}-tool-result-${callId}-${seq}` 确定性… */</span>
     closers.<span class="fn">push</span>({
       type: <span class="st">'tool/result'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time,
       data: { turn: openTurn, step, message, error: started
@@ -307,11 +329,13 @@
   <span class="kw">if</span> (openStep !== <span class="kw">null</span>) {
     closers.<span class="fn">push</span>({ type: <span class="st">'step/end'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time, data: { turn: openTurn, step: openStep } })
   }
-  <span class="cmt">// ③ 最后以 interrupted 结束回合</span>
-  closers.<span class="fn">push</span>({ type: <span class="st">'turn/end'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time, data: { turn: openTurn, reason: { kind: <span class="st">'interrupted'</span> } } })
+  <span class="cmt">// ③ 最后以 cause 对应的 reason 结束回合（interrupted 或 forked）</span>
+  closers.<span class="fn">push</span>({ type: <span class="st">'turn/end'</span>, seq: <span class="cl">SessionSeq</span>(seq++), time, data: { turn: openTurn, reason: { kind: cause.kind } } })
   <span class="kw">return</span> closers
-}</pre>
-    <div class="annotation"><b>两种错误码的语义差</b>（合成结果正文明确写给模型看）：已开始但结果未知（<code class="inline">TOOL_OUTCOME_UNKNOWN</code>）→ 模型被告知「仅当只读或幂等才重试；可能有副作用时先核实外部状态或询问用户，不要盲目重试」；未记录为已开始（<code class="inline">TOOL_NOT_STARTED</code>）→「若仍需要就重试」。缝合顺序固定为：先结果、再 step/end、最后 turn/end——因为供应商 API 拒绝悬挂的调用，且 turn/end 出现在开口 step 上是重建不变量违例。</div>
+}
+
+<span class="cmt">// 崩溃恢复入口：interruptedTurnClosers(events) = openTurnClosers(events, {kind:'interrupted'})</span></pre>
+    <div class="annotation"><b>两种错误码的语义差</b>（合成结果正文明确写给模型看）：已开始但结果未知（<code class="inline">TOOL_OUTCOME_UNKNOWN</code>）→ 模型被告知「仅当只读或幂等才重试；可能有副作用时先核实外部状态或询问用户，不要盲目重试」；未记录为已开始（<code class="inline">TOOL_NOT_STARTED</code>）→「若仍需要就重试」。V4 的 <code class="inline">forked</code> cause 让同一套机制多了一个消费者：fork 种子在源会话开口回合内切割时，同样的缝合逻辑给出 <code class="inline">forked</code> 版措辞——「本分支继承的历史记录了这次调用开始，但不含结果；父会话可能在 fork 点之后已完成它」——模型据此自己决定重试策略，错误码两种 cause 共享（事实相同：调用的记录生命周期不完整）。缝合顺序固定为：先结果、再 step/end、最后 turn/end——因为供应商 API 拒绝悬挂的调用，且 turn/end 出现在开口 step 上是重建不变量违例。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 190" xmlns="http://www.w3.org/2000/svg">
@@ -333,10 +357,10 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">5.7</span>要点</h2>
+    <h2><span class="num">5.7</span>收尾：三个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① 存储是缝不是单体：SessionPersistence 接口 + JSONL 后端，换后端（对象存储、SQLite）不动核心；② 持久性分两级——append 可见、flush 耐崩溃，检查点策略插件把 flush 挂在模型/工具/step 三个语义边界上，且全部 fail-closed；③ 格式演进靠不可变代际 + 静态迁移链，后继文件只在 write 打开时发布，旧文件保留在原地，随时可以回去看；④ 崩溃恢复不追求还原现场，只求「供应商可接受 + 模型可决策」——错误码和正文都在告诉模型下一步怎么做。下一步进入 <a href="06-tools.html">第 6 章：工具系统与并行调度</a>。
+      <b class="tag">答案回收</b>
+      ① 可靠落盘 → 三道机制叠出来：存储是缝（SessionPersistence 五方法接口 + JSONL 后端，换后端不动核心），写所有权由内核仲裁（flock/命名信号量，故意无过期），append 可见、flush 耐崩溃，检查点策略插件把 flush 挂在 llm/stream、tools/execute、agent/pre-step 三个语义边界且全部 fail-closed（5.2–5.4）。② 撕裂尾巴 → openTurnClosers() 确定性缝合：未决调用按「已开始/未开始」给两种错误码与写给模型看的正文，顺序固定结果→step/end→turn/end；同一条路径现在也服务 fork 种子（5.6）。③ 格式演进 → 不可变代际 + 静态迁移链，后继文件只在 write 打开时发布；V3→V4 迁移把「显式子会话证据」变成硬要求——体转换必须证明自己看到的世界是完整的（5.5）。下一步进入 <a href="06-tools.html">第 6 章：工具系统与并行调度</a>。
     </div>
   </section>
 
@@ -348,7 +372,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 05 持久化 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 05 持久化 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

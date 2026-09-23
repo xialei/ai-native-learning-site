@@ -71,7 +71,7 @@ _BANK_BYTES_PER_EXPERT = {
       </table>
     </div>
     <p>137 GiB（最低量化）对上 8-24 GB 显存，差距是一个数量级。但注意 top_k=6：每层每步只激活 6/256 ≈ 2.3% 的专家。<strong>稀疏性给了缓存机会</strong>——如果在 GPU 上留一个 L×E 总量中一小部分的「槽池」，把热专家放里面，冷专家按需从 CPU 内存经 PCIe 搬进来，就能用远小于全量的显存吃到大部分命中。这个槽池就是 OffloadMoeCache。</p>
-    <div class="annotation"><b>读懂这段：</b> 这里的账目与 KV cache 完全不同量级：一个 KV 格子是 head_dim 级的几个 KB，一个专家槽是 12-48 MiB。<strong>搬错一次的代价是搬 KV 的上千倍</strong>，所以替换策略（LRU）、搬运方式（合并拷贝）、甚至磁盘格式（对齐到 O_DIRECT）都要为「减少搬运」服务。llama.cpp 没有这个问题——它从不把专家当可换入换出的资源，见 11.7。</div>
+    <div class="annotation">这里的账目与 KV cache 完全不同量级：一个 KV 格子是 head_dim 级的几个 KB，一个专家槽是 12-48 MiB。<strong>搬错一次的代价是搬 KV 的上千倍</strong>，所以替换策略（LRU）、搬运方式（合并拷贝）、甚至磁盘格式（对齐到 O_DIRECT）都要为「减少搬运」服务。llama.cpp 没有这个问题——它从不把专家当可换入换出的资源，见 11.7。</div>
   </section>
 
   <section class="block">
@@ -171,7 +171,7 @@ _BANK_SCHEMAS = {
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert</span>
 <span class="cmt"># dimension; moe_align_block_size requires round_up(experts, 32) &lt; 1024, i.e. &lt;= 992.</span>
 MARLIN_MAX_CACHE_SIZE = <span class="nu">992</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 992 这个数字的外来性值得停下来看：槽池明明是 FreeToken 自己的数据结构，上限却由「借用的 vLLM marlin 内核要求对齐后的 expert 维 &lt; 1024」倒逼出来——<code class="inline">moe_align_block_size</code> 要求 <code class="inline">round_up(experts, 32) &lt; 1024</code>，向上取整到 32 的倍数后仍小于 1024，上限就落在 992。nvfp4_marlin 格式下 cache_size 不得超过 992（validate_rebuild，:443-463 里强制），其他格式没有此限。<strong>复用别人的内核，就要接受别人的约束写进自己的配置</strong>——这是工程边界真实的样子。</div>
+    <div class="annotation">992 这个数字的外来性值得停下来看：槽池明明是 FreeToken 自己的数据结构，上限却由「借用的 vLLM marlin 内核要求对齐后的 expert 维 &lt; 1024」倒逼出来——<code class="inline">moe_align_block_size</code> 要求 <code class="inline">round_up(experts, 32) &lt; 1024</code>，向上取整到 32 的倍数后仍小于 1024，上限就落在 992。nvfp4_marlin 格式下 cache_size 不得超过 992（validate_rebuild，:443-463 里强制），其他格式没有此限。<strong>复用别人的内核，就要接受别人的约束写进自己的配置</strong>——这是工程边界真实的样子。</div>
   </section>
 
   <section class="block">
@@ -223,7 +223,7 @@ cache.copy_missing()                                <span class="cmt"># 缺失�
     <span class="kw">for</span> per_layer, cache <span class="kw">in</span> self.banks:
         fast_index_copy_jit(cache, self.evict_slots, per_layer[layer_id],
                             self.src_indices, self.num_indices)</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个细节撑起了「CUDA-graph 安全」这个硬约束：① 所有簿记数组（evict_slots、src_indices、num_indices）形状固定、内容设备端产生，图重放时直接复用；② fused copy 的指针描述符在 set_bank_sources 时固化成设备端 tensor（_copy_dst_ptrs 等），cache 生命周期内地址不变；③ 非 pinned 层（LOCKED/PAGEABLE，见第 12 章）没有设备别名，无法表达「把行搬到任意槽」，所以直接抛错——把不可能表达的约束在运行时喊出来，好过静默出错。注意 ensure_experts 与 copy_missing 之间没有同步原语：同一流上先 launch 后 launch 天然有序。</div>
+    <div class="annotation">「CUDA-graph 安全」这个硬约束靠三个细节撑起来。所有簿记数组（evict_slots、src_indices、num_indices）形状固定、内容设备端产生，图重放时直接复用；fused copy 的指针描述符在 set_bank_sources 时固化成设备端 tensor（_copy_dst_ptrs 等），cache 生命周期内地址不变；非 pinned 层（LOCKED/PAGEABLE，见第 12 章）没有设备别名，无法表达「把行搬到任意槽」，所以直接抛错——把不可能表达的约束在运行时喊出来，好过静默出错。另外注意 ensure_experts 与 copy_missing 之间没有同步原语：同一流上先 launch 后 launch 天然有序。</div>
   </section>
 
   <section class="block">
@@ -263,7 +263,7 @@ self.prefill_bank_buffers = [
 <span class="cmt"># empirically bisected: a single 5-22KB entry beside one large entry blocks the</span>
 <span class="cmt"># calling thread for the full transfer; &gt;=253KB entries never do). ...</span>
 _SMALL_BANK_FEAT_BYTES = <span class="nu">256</span> * <span class="nu">1024</span></pre>
-    <div class="annotation"><b>读懂这段：</b> hit-D2D 的可用性判定（_hit_d2d_usable，:703-733，包含日志收尾到 :733）是一个可复用的模式：任何不可用条件（快照缓冲没建、fused copy 不可用、cache_size ≤ 2E、驱动缺 batch memcpy）都<strong>降级到整层拷贝路径，且在日志里喊一次</strong>（_hit_d2d_fallback_logged 防刷屏）。静默降级是性能调优最深的坑——用户以为开了优化，实际跑的是旧路径，数字对不上还查不出来。</div>
+    <div class="annotation">hit-D2D 的可用性判定（_hit_d2d_usable，:703-733，包含日志收尾到 :733）是一个可复用的模式：任何不可用条件（快照缓冲没建、fused copy 不可用、cache_size ≤ 2E、驱动缺 batch memcpy）都<strong>降级到整层拷贝路径，且在日志里喊一次</strong>（_hit_d2d_fallback_logged 防刷屏）。静默降级是性能调优最深的坑——用户以为开了优化，实际跑的是旧路径，数字对不上还查不出来。</div>
   </section>
 
   <section class="block">
@@ -304,7 +304,7 @@ moe_cache_size = max(lo, min(raw, hi))
 <span class="cmt"># later CUDA allocation.</span>
 total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 <span class="kw">assert</span> total &lt;= budget_bytes, (...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:43 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
+    <div class="annotation">策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:43 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
     <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:874 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:124）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
   </section>
 
@@ -346,16 +346,7 @@ total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 
   <section class="block">
     <h2><span class="num">11.8</span>小结</h2>
-    <ul>
-      <li>容量账：137 GiB（ds_fp4）vs 12 GiB 显存；top_k=6 的稀疏性让小槽池吃到高命中。</li>
-      <li>扁平槽池 + slot_for_id/id_of_slot 双映射；LRU = usage 时间戳 + argmin，无链表无堆，可进 CUDA Graph。</li>
-      <li>机制与格式解耦：8 种 quant_format 只在 _BANK_SCHEMAS 声明 bank 布局，缓存只按行搬字节。</li>
-      <li>decode 三步走：ensure_experts（选槽改写）→ copy_missing（fused copy）→ GEMM；簿记全在设备端。</li>
-      <li>prefill 整层流式：借槽池前 2E 槽当双缓冲，begin_prefill fence 防 decode 踩字节，hit-D2D 分流命中行。</li>
-      <li>FTW 把全模型排成 4096 对齐的连续字节区，O_DIRECT 直读；pin-after-fill 免掉一轮白搬。</li>
-      <li>预算 MoE 优先贪心 + 两段式运行时重调，拒绝在算术层发生而不是在 CUDA 分配上。</li>
-      <li>llama.cpp 的对照：静态 buffer override，张量不动计算动——简单，且不共享热度。</li>
-    </ul>
+    <p>回到开头的账：137 GiB（ds_fp4）对 12 GiB 显存，靠 top_k=6 的稀疏性，一个小槽池就能吃到高命中。支撑这个槽池的是一套刻意保持简单的机制：扁平槽池 + slot_for_id/id_of_slot 双映射，LRU 只是 usage 时间戳加 argmin，没有链表没有堆，可以整段编进 CUDA Graph；8 种量化格式只在 _BANK_SCHEMAS 里声明 bank 布局，缓存机制对 bank 内部字节一概不感兴趣，只按行搬字节。decode 走三步：ensure_experts（选槽改写）→ copy_missing（fused copy）→ GEMM，簿记全在设备端；prefill 则整层流式，借槽池前 2E 槽当双缓冲，begin_prefill fence 防 decode 踩字节，hit-D2D 把命中行分流出去。磁盘侧 FTW 把全模型排成 4096 对齐的连续字节区供 O_DIRECT 直读，pin-after-fill 免掉一轮白搬；预算侧 MoE 优先贪心 + 两段式运行时重调，拒绝发生在算术层而不是 CUDA 分配上。llama.cpp 的对照是静态 buffer override——张量不动计算动，简单，且不共享热度。</p>
     <p>槽池解决「谁在显存里」。下一步是「剩下的缺失怎么办」：PCIe 搬与 CPU 算这两条路怎么分、怎么并行。<a href="12-hybrid-exec.html">第 12 章：CPU/GPU 带宽协同</a>。</p>
   </section>
 
@@ -366,7 +357,7 @@ total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 11 MoE 专家缓存 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

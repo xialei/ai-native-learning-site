@@ -137,7 +137,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.3</span>用代码看｜进程是怎么被拉起来的</h2>
+    <h2><span class="num">1.3</span>进程是怎么被拉起来的</h2>
     <p><code class="inline">launch_server</code> 的 docstring 就是官方架构图。它明确写出三个组件和通信方式：</p>
     <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server（摘录，docstring 译文）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">launch_server</span>(server_args, ...):
@@ -159,7 +159,7 @@
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 主进程持有 HTTP server 和 TokenizerManager；Scheduler 和 Detokenizer 都是子进程。进程个数不是写死的：<code class="inline">tp_size=8</code> 就是 8 个 Scheduler 子进程（每 rank 一张卡）。</div>
+    <div class="annotation"><b>看布局：</b> 主进程持有 HTTP server 和 TokenizerManager；Scheduler 和 Detokenizer 都是子进程。进程个数不是写死的：<code class="inline">tp_size=8</code> 就是 8 个 Scheduler 子进程（每 rank 一张卡）。</div>
 
     <p>子进程在 <code class="inline">Engine._launch_scheduler_processes</code> 里创建，注意循环的嵌套顺序——外层 PP rank、内层 TP rank，每个组合一个 <code class="inline">mp.Process</code>：</p>
     <div class="code-title">python/sglang/srt/entrypoints/engine.py — _launch_scheduler_processes（摘录，注释为译注）</div>
@@ -180,11 +180,11 @@
             proc = mp.<span class="fn">Process</span>(
                 target=run_scheduler_process_func,
                 args=(server_args, port_args, gpu_id, tp_rank, ...), ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 两种进程拓扑走两个分支——<code class="inline">dp_size == 1</code> 时直接为每个 TP/PP rank 起 Scheduler 进程；<code class="inline">dp_size &gt; 1</code> 时改由 <code class="inline">DataParallelController</code> 统一拉起并做请求分发（第 10 章）。<code class="inline">mp.Pipe(duplex=False)</code> 的 reader 用来等子进程初始化完成，真正的请求/响应流量走 ZMQ。</div>
+    <div class="annotation"><b>两条分支：</b> <code class="inline">dp_size == 1</code> 时直接为每个 TP/PP rank 起 Scheduler 进程；<code class="inline">dp_size &gt; 1</code> 时改由 <code class="inline">DataParallelController</code> 统一拉起并做请求分发（第 10 章）。<code class="inline">mp.Pipe(duplex=False)</code> 的 reader 用来等子进程初始化完成，真正的请求/响应流量走 ZMQ。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.3</span>用代码看｜Scheduler 里持有哪些状态</h2>
+    <h2><span class="num">1.3</span>Scheduler 里持有哪些状态</h2>
     <p>Scheduler 的构造函数把所有引擎状态聚到一处。内存池和缓存不是 Scheduler 私有的，而是从 <code class="inline">TpModelWorker</code> 初始化结果里拿来的引用——也就是说，<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 做</strong>：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — Scheduler.__init__ 的组件接线（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Scheduler</span>:
@@ -200,12 +200,12 @@
 
 <span class="cmt"># init_model_worker 内部（同名文件）：</span>
 <span class="kw">def</span> <span class="fn">init_tp_model_worker</span>(self):
-    worker_kwargs = <span class="fn">dict</span>(server_args=..., gpu_id=self.ps.gpu_id, ps=self.ps, nccl_port=...)
+    worker_kwargs = <span class="fn">dict</span>(server_args=..., gpu_id=get_device().gpu_id, nccl_port=...)
     <span class="kw">if</span> <span class="fn">use_mlx</span>():
         self.tp_worker = <span class="cl">MlxTpModelWorker</span>(**worker_kwargs)
     <span class="kw">else</span>:
         self.tp_worker = <span class="cl">TpModelWorker</span>(**worker_kwargs)</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个核心状态的分工：<code class="inline">req_to_token_pool</code> 是「请求 → 它的 token 都在哪些槽位」的目录；<code class="inline">token_to_kv_pool_allocator</code> 管 KV 物理槽位；<code class="inline">tree_cache</code>（RadixCache）管哪些前缀可以复用。第 3、5 章会分别展开。注意这中间的<span class="kw">两跳</span>：worker 的构造被收进了 <code class="inline">init_tp_model_worker()</code>（多一个 MLX 分支），而内存池结果来自 <code class="inline">kv_cache_builder.build_kv_cache()</code> 而非 worker 本身——<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 通过 builder 做出</strong>。这是「Scheduler 拿引用、不持有实现」的具体形态。</div>
+    <div class="annotation"><b>三个核心状态的分工：</b> <code class="inline">req_to_token_pool</code> 是「请求 → 它的 token 都在哪些槽位」的目录；<code class="inline">token_to_kv_pool_allocator</code> 管 KV 物理槽位；<code class="inline">tree_cache</code>（RadixCache）管哪些前缀可以复用。第 3、5 章会分别展开。注意这中间的<span class="kw">两跳</span>：worker 的构造被收进了 <code class="inline">init_tp_model_worker()</code>（多一个 MLX 分支），而内存池结果来自 <code class="inline">kv_cache_builder.build_kv_cache()</code> 而非 worker 本身——<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 通过 builder 做出</strong>。这是「Scheduler 拿引用、不持有实现」的具体形态。</div>
   </section>
 
   <section class="block">
@@ -244,7 +244,7 @@
         ...  <span class="cmt"># event_loop_*_disagg_prefill（定义在 disaggregation/prefill.py 的 mixin 里）</span>
     <span class="kw">elif</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.DECODE:
         ...  <span class="cmt"># event_loop_*_disagg_decode（定义在 disaggregation/decode.py 的 mixin 里）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这是一张完整的「模式矩阵」：PD 分离 × PP × overlap 各选一个入口。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">disaggregation/prefill.py:632</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
+    <div class="annotation"><b>模式矩阵：</b> PD 分离 × PP × overlap 各选一个入口。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">disaggregation/prefill.py:632</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
   </section>
 
   <section class="block">
@@ -265,7 +265,7 @@
     <h2><span class="num">1.7</span>对「自研引擎」的第一个启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      多进程不是必需品。自研引擎的 MVP 用一个进程、一个 asyncio 事件循环 + 一个 GPU 前向线程就够。SGLang 拆进程换来的收益（GIL 隔离、rank 独立、崩溃隔离）只有在并发上去之后才值得。但有一个设计从第一天就该照抄：<strong>token id 通道和文本通道分开</strong>——调度层只传 id，反分词独立成段，这决定了你的流式协议好不好做。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
+      多进程不是必需品。自研引擎的 MVP 用一个进程、一个 asyncio 事件循环 + 一个 GPU 前向线程就够。SGLang 拆进程换来的收益（GIL 隔离、rank 独立、崩溃隔离）只有在并发上去之后才值得。但有一个设计从第一天就该学：<strong>token id 通道和文本通道分开</strong>——调度层只传 id，反分词独立成段，这决定了你的流式协议好不好做。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
     </div>
   </section>
 
@@ -276,7 +276,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 01 整体架构 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 01 整体架构 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

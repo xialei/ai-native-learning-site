@@ -34,7 +34,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 多智能体</div>
     <h1>多智能体：Supervisor、层级与 Swarm</h1>
-    <div class="subtitle">当单个 agent 装不下你的任务时，把它拆成多个分工的子 agent。本章拆解 LangGraph 编排多智能体的三种主流架构，以及它们共同的技术基础——「子图即节点」。</div>
+    <div class="subtitle">多个 agent 各管一摊，谁调度谁、怎么传话、出了岔子谁兜底？本章从「一张图装不下」的困境出发，拆解三种主流架构和它们共同的技术基础——「子图即节点」。</div>
   </div>
 
   <section class="block">
@@ -51,6 +51,8 @@
       <b class="tag">不要过早引入多智能体</b>
       先问自己：单 agent + 好工具能否解决？把工具描述写精、prompt 调好，往往比拆成多 agent 更简单也更可控。只有当工具/职责确实需要分离、或确实需要并行时，再上多 agent。而一旦决定上，<strong>Supervisor 是最稳妥的起点</strong>——它可控性最高，后续也最容易演进成层级或 Swarm。
     </div>
+
+    <p>假设你已经确认需要拆分，接下来有一连串问题要回答：多个 agent 之间的拓扑有哪几种范式、各自把控制权放在哪（7.2）；这些模式共同依赖的技术基础是什么——为什么编译好的子图可以直接当节点、状态字段怎么在父子图之间流动（7.3）；agent 之间传信息有哪几条路径，「越级」指挥父图怎么实现、在什么条件下会失效（7.4）；三种模式怎么选，落地时最容易踩的静默坑有哪些（7.5–7.7）。</p>
   </section>
 
   <section class="block">
@@ -58,12 +60,12 @@
     <p>多智能体的拓扑千变万化，但归结下来就三种基本范式：<strong>Supervisor（主管）</strong>、<strong>Hierarchical（层级）</strong>、<strong>Swarm（群集/接力）</strong>。它们的区别本质上是「控制权在哪里」。</p>
 
     <h3>1. Supervisor 主管模式：中央调度</h3>
-    <p>一个 supervisor 节点充当「调度员」：它看着当前状态，决定下一步调用哪个 worker agent;worker 执行完回到 supervisor，由它再决定继续派活还是结束。这是最常用、最可控的形态——所有跨 agent 的协调都经过一个点，便于观测和加审核。</p>
+    <p>一个 supervisor 节点充当「调度员」：它看着当前状态，决定下一步调用哪个 worker agent；worker 执行完回到 supervisor，由它再决定继续派活还是结束。这是最常用、最可控的形态——所有跨 agent 的协调都经过一个点，便于观测和加审核。</p>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t72a d72a">
         <title id="t72a">Supervisor 主管模式</title>
-        <desc id="d72a">用户输入到 Supervisor,Supervisor 路由到检索/编码 worker,worker 回到 Supervisor</desc>
+        <desc id="d72a">用户输入到 Supervisor，Supervisor 路由到检索/编码 worker，worker 回到 Supervisor</desc>
         <defs><marker id="arr72a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
         <ellipse class="node" cx="70" cy="160" rx="50" ry="28"></ellipse>
         <text class="lbl" x="70" y="165" text-anchor="middle">用户输入</text>
@@ -101,6 +103,8 @@
 
     <p>在 LangGraph 里，最直接的实现方式是：每个 worker 用 <code class="inline">create_react_agent</code> 包成一个独立子图（它本身是一个 <code class="inline">CompiledStateGraph</code>），再把这些子图作为节点 <code class="inline">add_node</code> 进外层图；supervisor 节点是一个调 LLM 的函数，返回 <code class="inline">Command(goto=..., update=...)</code> 同时指定下一跳并写入状态。</p>
 
+    <p>写 supervisor 函数时有一个容易忽略的细节：LLM 回 <code class="inline">FINISH</code> 时，<code class="inline">goto</code> 要给 <code class="inline">END</code>，而不是原样转发 <code class="inline">FINISH</code>。<code class="inline">FINISH</code> 不是注册过的节点，原样转发不会报错——运行时只打一条 warning 然后忽略（<code class="inline">_algo.py:312</code>），但图不会结束，supervisor 会被再次触发，要么死循环到 <code class="inline">recursion_limit</code>，要么行为不可预测。这类「图不停但不报错」的症状，排查时先检查 goto 的哨兵值有没有翻译成 <code class="inline">END</code>。</p>
+
     <div class="code-title">Supervisor 模式：子图即节点 + Command 路由</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -136,7 +140,8 @@ coder = create_react_agent(model, tools=[python_repl], name=<span class="st">"co
         *state[<span class="st">"messages"</span>],
     ])
     choice = decision.content.strip()
-    goto = <span class="st">"FINISH"</span> <span class="kw">if</span> choice == <span class="st">"FINISH"</span> <span class="kw">else</span> choice
+    <span class="cmt"># FINISH 是 LLM 的哨兵词，不是节点名——必须翻译成 END 再交给 goto</span>
+    goto = END <span class="kw">if</span> choice == <span class="st">"FINISH"</span> <span class="kw">else</span> choice
     <span class="kw">return</span> <span class="cl">Command</span>(goto=goto, update={<span class="st">"next"</span>: goto})
 
 <span class="cmt"># --- 组装外层图 ---</span>
@@ -151,7 +156,7 @@ builder.add_edge(<span class="st">"coder"</span>, <span class="st">"supervisor"<
 graph = builder.compile()
 result = graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"北京天气怎么样？"</span>}]})
 print(result[<span class="st">"messages"</span>][-<span class="nu">1</span>].content)</pre>
-    <div class="annotation"><b>读懂这段：</b> supervisor 返回的 <code class="inline">Command(goto=..., update=...)</code> 把「决策」和「写状态」合在一步——这是 Command 的核心价值，无需为 supervisor 单独画条件边。<code class="inline">goto</code> 的类型注解 <code class="inline">Literal["researcher", "coder", "__end__"]</code> 既给编辑器看，也让 LangGraph 据此渲染出完整的分支拓扑。</div>
+    <div class="annotation"><b>决策和写状态合在一步：</b> supervisor 返回的 <code class="inline">Command(goto=..., update=...)</code> 把「决策」和「写状态」合在一步——这是 Command 的核心价值，无需为 supervisor 单独画条件边。<code class="inline">goto</code> 的类型注解 <code class="inline">Literal["researcher", "coder", "__end__"]</code> 既给编辑器看，也让 LangGraph 据此渲染出完整的分支拓扑。</div>
 
     <h3>2. Hierarchical 层级模式：树状分解</h3>
     <p>当任务复杂到一层 supervisor 管不过来——比如「做一份市场调研报告」要拆成「数据收集」「分析」「写作」三大块，而每块内部又有多个子 agent——就给 supervisor 之上再叠 supervisor，形成树。每一层 supervisor 只管理自己那一组子 agent，把子任务的结果汇报给上一层。</p>
@@ -159,7 +164,7 @@ print(result[<span class="st">"messages"</span>][-<span class="nu">1</span>].con
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 780 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t72b d72b">
         <title id="t72b">Hierarchical 层级模式</title>
-        <desc id="d72b">顶层 supervisor 管理调研组和写作组 supervisor，每组再管两个叶子 agent</desc>
+        <desc id="d72b">顶层 supervisor 管理调研组和写作组两个 supervisor，每组再管两个叶子 agent</desc>
         <defs><marker id="arr72b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
         <rect class="node core" x="310" y="20" width="160" height="56" rx="10"></rect>
         <text class="lbl" x="390" y="45" text-anchor="middle" font-weight="bold" fill="var(--brand)">顶层 Supervisor</text>
@@ -195,7 +200,7 @@ print(result[<span class="st">"messages"</span>][-<span class="nu">1</span>].con
       <div class="fig-cap">图 7.2：层级模式——「supervisor + 子 agent」这一组本身就是一个子图，把它作为节点放进更外层的图，递归下去就是任意深度。</div>
     </div>
 
-    <p>层级模式的技术实现和 Supervisor 完全一样——「supervisor + 子 agent」这一组本身就是一个子图，把这个子图作为节点放进更外层的图，就形成了第二层。递归下去就是任意深度。下面是把一组「调研 supervisor」整体打包成节点的示意：</p>
+    <p>层级模式的技术实现和 Supervisor 完全一样——「supervisor + 子 agent」这一组本身就是一个子图，把这个子图作为节点放进更外层的图，就形成了第二层，递归下去就是任意深度。下面是把一组「调研 supervisor」整体打包成节点的示意：</p>
 
     <div class="code-title">层级模式：把内层子图当节点塞进外层</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -235,12 +240,12 @@ top_graph = root.compile()</pre>
     <p>层级的代价是<strong>调试复杂度随深度上升</strong>：一次顶层调用可能触发多层嵌套的子图执行，流式输出和 checkpoint 的层级关系会变深。实践上两到三层通常是上限，再深就该考虑是否任务本身可以重新切分。</p>
 
     <h3>3. Swarm 群集/接力模式：直接交接</h3>
-    <p>Swarm 没有「中央调度员」。每个 agent 自己判断「这件事我还能不能继续做，不能就交给谁」，通过共享 state 直接把控制权 handoff 给下一个 agent。这适合<strong>线性流水线</strong>（A 做完交给 B,B 做完交给 C）或<strong>动态切换</strong>（根据当前状态决定下一步该谁接手，但没有一个独立的调度节点）。</p>
+    <p>Swarm 没有「中央调度员」。每个 agent 自己判断「这件事我还能不能继续做，不能就交给谁」，通过共享 state 直接把控制权 handoff 给下一个 agent。这适合<strong>线性流水线</strong>（A 做完交给 B，B 做完交给 C）或<strong>动态切换</strong>（根据当前状态决定下一步该谁接手，但没有一个独立的调度节点）。</p>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 820 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t72c d72c">
         <title id="t72c">Swarm 接力模式</title>
-        <desc id="d72c">Agent A 交接给 B,B 交接给 C,C 完成；B 条件不满足可回退到 A</desc>
+        <desc id="d72c">Agent A 交接给 B，B 交接给 C，C 完成；B 条件不满足可回退到 A</desc>
         <defs><marker id="arr72c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
         <ellipse class="node" cx="50" cy="110" rx="42" ry="26"></ellipse>
         <text class="lbl" x="50" y="115" text-anchor="middle">用户输入</text>
@@ -272,9 +277,9 @@ top_graph = root.compile()</pre>
       <div class="fig-cap">图 7.3：Swarm 接力——每个 agent 结束前返回 <code class="inline">Command(goto="下一个 agent")</code>，无中央调度节点。</div>
     </div>
 
-    <p>在 LangGraph 里，Swarm 的实现方式是让每个 agent 节点在结束前返回 <code class="inline">Command(goto="下一个 agent", update={...})</code>。交接的「信号」通常是一条带特殊标记的 message，下一个 agent 从共享的 <code class="inline">messages</code> 里读到上下文继续。下面是一个最小接力示例：</p>
+    <p>在 LangGraph 里，Swarm 的实现方式是让每个 agent 节点在结束前返回 <code class="inline">Command(goto="下一个 agent", update={...})</code>。交接的「信号」通常是一条 message，下一个 agent 从共享的 <code class="inline">messages</code> 里读到上下文继续。下面是一个最小接力示例：</p>
 
-    <div class="code-title">Swarm:用 Command 在 agent 间接力</div>
+    <div class="code-title">Swarm：用 Command 在 agent 间接力</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
@@ -308,26 +313,85 @@ graph = builder.compile()</pre>
 
   <section class="block">
     <h2><span class="num">7.3</span>子图即节点：多智能体的技术基础</h2>
-    <p>上面三种模式能成立，都依赖 LangGraph 的一个核心设计：<strong>任何 <code class="inline">CompiledStateGraph</code> 都可以作为另一个图的节点</strong>。<code class="inline">create_react_agent</code> 返回的是 <code class="inline">CompiledStateGraph</code>，手写的 <code class="inline">builder.compile()</code> 也是，所以它们都能直接 <code class="inline">add_node</code> 进外层图。</p>
+    <p>先把三种模式的共同点摆出来：无论 Supervisor、层级还是 Swarm，图上出现的都是「编译好的子图当节点」。这一节解释这个机制的两半——<strong>怎么把子图挂进去</strong>，以及挂进去之后<strong>状态字段怎么在父子图之间流动</strong>。后者决定了一个 agent 能看到什么、看不到什么，是多智能体排错时最先要检查的地方。</p>
+    <p>任何 <code class="inline">CompiledStateGraph</code> 都可以作为另一个图的节点。<code class="inline">create_react_agent</code> 返回的是 <code class="inline">CompiledStateGraph</code>，手写的 <code class="inline">builder.compile()</code> 也是，所以它们都能直接 <code class="inline">add_node</code> 进外层图。</p>
     <p>这里有一个必须理解的关键点：<strong>state schema 的兼容</strong>。子图可以有自己的 schema，不必和父图完全一致——父图调用子图时，会按字段名做输入/输出映射，同名字段自动传递，子图里没有的字段被忽略。这就允许每个 agent 拥有自己专属的状态字段，同时通过共享字段（通常是 <code class="inline">messages</code>）与外层通信。</p>
 
-    <div class="code-title">schema 映射：同名字段自动传递</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 800 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t73a d73a">
+        <title id="t73a">子图即节点：schema 同名字段映射</title>
+        <desc id="d73a">父图状态有 messages 和 parent_only 两个字段，进入子图节点时只有同名的 messages 被传入，parent_only 被丢弃；子图内部有专属字段 child_only，输出时同样被过滤，只有 messages 回到父图</desc>
+        <defs><marker id="arr73a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <!-- 父图状态 -->
+        <rect class="node core" x="20" y="110" width="190" height="110" rx="10"></rect>
+        <text class="lbl" x="115" y="135" text-anchor="middle" font-weight="bold" fill="var(--brand)">父图状态</text>
+        <text class="lbl sm code" x="115" y="160" text-anchor="middle">messages ✓</text>
+        <text class="lbl sm code" x="115" y="180" text-anchor="middle">parent_only ✓</text>
+        <text class="lbl sm" x="115" y="205" text-anchor="middle">（父图能看到全部）</text>
+
+        <!-- 过滤闸门：输入侧 -->
+        <line class="edge" x1="210" y1="165" x2="318" y2="165" marker-end="url(#arr73a)"></line>
+        <text class="lbl sm code" x="264" y="148" text-anchor="middle">messages</text>
+        <text class="lbl sm" x="264" y="190" text-anchor="middle" fill="var(--fg-muted)">parent_only ✗</text>
+
+        <!-- 子图边界框 -->
+        <rect class="st" x="320" y="60" width="250" height="220" rx="12" stroke-dasharray="6 4"></rect>
+        <text class="lbl sm" x="445" y="52" text-anchor="middle">子图（独立 schema）</text>
+        <text class="lbl sm code" x="445" y="88" text-anchor="middle">子图输入：{messages}</text>
+        <rect class="node" x="360" y="110" width="170" height="56" rx="8"></rect>
+        <text class="lbl" x="445" y="136" text-anchor="middle">子图节点</text>
+        <text class="lbl sm" x="445" y="154" text-anchor="middle">child_node</text>
+        <text class="lbl sm code" x="445" y="196" text-anchor="middle">child_only（专属）</text>
+        <text class="lbl sm" x="445" y="222" text-anchor="middle" fill="var(--fg-muted)">子图内部随便用，</text>
+        <text class="lbl sm" x="445" y="238" text-anchor="middle" fill="var(--fg-muted)">父图看不见</text>
+
+        <!-- 过滤闸门：输出侧 -->
+        <line class="edge" x1="570" y1="165" x2="678" y2="165" marker-end="url(#arr73a)"></line>
+        <text class="lbl sm code" x="624" y="148" text-anchor="middle">messages</text>
+        <text class="lbl sm" x="624" y="190" text-anchor="middle" fill="var(--fg-muted)">child_only ✗</text>
+
+        <!-- 父图状态（更新后） -->
+        <rect class="node core" x="680" y="110" width="100" height="110" rx="10"></rect>
+        <text class="lbl" x="730" y="135" text-anchor="middle" font-weight="bold" fill="var(--brand)">父图</text>
+        <text class="lbl sm code" x="730" y="160" text-anchor="middle">messages ✓</text>
+        <text class="lbl sm code" x="730" y="180" text-anchor="middle">parent_only ✓</text>
+        <text class="lbl sm" x="730" y="205" text-anchor="middle">子图字段没进来</text>
+
+        <text class="lbl sm" x="400" y="310" text-anchor="middle">按字段名过滤：进子图只带同名字段，出子图只回收同名字段</text>
+      </svg>
+      <div class="fig-cap">图 7.4：schema 映射的双向过滤。父子图靠<strong>同名字段</strong>对接，专属字段在边界处被静默丢弃——这正是「字段拼错不报错、agent 失忆」这类坑的机制根源。</div>
+    </div>
+
+    <p>这个过滤不是运行时逐次判断的，而是编译期就定了。源码在 <code class="inline">graph/state.py</code>：</p>
+    <ul>
+      <li><strong>输入侧</strong>：每个节点只订阅自己 input schema 里声明的通道（<code class="inline">state.py:1517</code>，<code class="inline">input_channels = list(self.builder.schemas[input_schema])</code>），父图状态里多余的字段根本不会写进子图的通道；</li>
+      <li><strong>输出侧</strong>：节点返回的 dict 逐键过滤，只有 <code class="inline">k in output_keys</code> 的键会写回（<code class="inline">state.py:1462</code>，<code class="inline">_get_updates</code>）；</li>
+      <li>两侧都没有报错路径——字段名对不上就是静默丢弃（输入侧多出的键在 <code class="inline">_io.py:97</code> 打一条 warning：<code class="inline">Input channel {k} not found in {input_channels}</code>，输出侧连 warning 都没有）。</li>
+    </ul>
+
+    <div class="code-title">schema 映射：同名字段自动传递，专属字段双向隔离</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
 <span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
 
-<span class="cmt"># 父图状态：只关心 messages</span>
+<span class="cmt"># 父图状态：messages 与子图对接，parent_only 是父图自己的字段</span>
 <span class="kw">class</span> <span class="cl">ParentState</span>(<span class="cl">TypedDict</span>):
     messages: Annotated[<span class="cl">list</span>, add_messages]
+    parent_only: <span class="cl">str</span>
 
-<span class="cmt"># 子图状态：有专属字段 notes，但也有 messages 用来与父图对接</span>
+<span class="cmt"># 子图状态：有专属字段 child_only，靠 messages 与父图对接</span>
 <span class="kw">class</span> <span class="cl">ChildState</span>(<span class="cl">TypedDict</span>):
     messages: Annotated[<span class="cl">list</span>, add_messages]
-    notes: <span class="cl">list</span>[<span class="cl">str</span>]   <span class="cmt"># 子图专用，父图看不到</span>
+    child_only: <span class="cl">list</span>[<span class="cl">str</span>]   <span class="cmt"># 子图专用，父图看不到</span>
 
 <span class="kw">def</span> <span class="fn">child_node</span>(state: <span class="cl">ChildState</span>):
-    <span class="kw">return</span> {<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: <span class="st">"子图处理完毕"</span>}]}
+    <span class="cmt"># 实测：这里 state 的键只有 messages——parent_only 没跟进来，</span>
+    <span class="cmt"># 也不报错（子图通道里压根没这个字段）</span>
+    <span class="kw">return</span> {
+        <span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"assistant"</span>, <span class="st">"content"</span>: <span class="st">"子图处理完毕"</span>}],
+        <span class="st">"child_only"</span>: [<span class="st">"x"</span>],   <span class="cmt"># 实测：这个键出子图时被过滤，父图最终结果里没有</span>
+    }
 
 child_builder = <span class="cl">StateGraph</span>(<span class="cl">ChildState</span>)
 child_builder.add_node(<span class="st">"child_node"</span>, child_node)
@@ -342,35 +406,89 @@ parent.add_edge(START, <span class="st">"child"</span>)
 parent.add_edge(<span class="st">"child"</span>, END)
 parent_graph = parent.compile()
 
-result = parent_graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"hi"</span>}]})
+result = parent_graph.invoke({
+    <span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"hi"</span>}],
+    <span class="st">"parent_only"</span>: <span class="st">"p"</span>,
+})
+<span class="cmt"># result 的键：messages、parent_only——child_only 没泄漏进来</span>
 print(result[<span class="st">"messages"</span>][-<span class="nu">1</span>][<span class="st">"content"</span>])  <span class="cmt"># 子图处理完毕</span></pre>
-    <p>这种「子图即节点 + schema 映射」的设计是多智能体可组合性的根基。它意味着你可以先把每个 agent 当独立图开发、测试，再像搭积木一样拼进更大的编排图，而不必为「agent 之间怎么嵌套」写特殊胶水代码。</p>
+    <p>这种「子图即节点 + schema 映射」的设计是多智能体可组合性的根基。它意味着你可以先把每个 agent 当独立图开发、测试，再像搭积木一样拼进更大的编排图，而不必为「agent 之间怎么嵌套」写特殊胶水代码。代价是字段对接<strong>完全靠名字</strong>：父图写 <code class="inline">messages</code>、子图 schema 里拼成 <code class="inline">msgs</code>，编译不报错、运行不报错，worker 就是收不到历史消息。写完 schema 映射代码，最好用一条真实输入跑一遍，确认每个共享字段都真的到达了对面。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.4</span>通信机制</h2>
-    <p>多智能体之间怎么传信息？LangGraph 提供三条路径，按「作用域」从近到远排列：</p>
+    <h2><span class="num">7.4</span>通信机制：三条路径，一条越级</h2>
+    <p>三种模式里 agent 之间都要传信息。LangGraph 提供三条路径，按「作用域」从近到远排列：</p>
     <ul>
-      <li><strong>共享 state</strong>:最基本的方式。所有 agent 读写同一个 state（通常是 <code class="inline">messages</code> 列表），一个 agent 写入后，下一个 agent 自然读到。字段合并由 reducer 决定——<code class="inline">add_messages</code> 是追加，<code class="inline">operator.add</code> 是列表拼接。</li>
-      <li><strong>Command(goto=, update=)</strong>:在指定下一跳的同时写入状态。这是 Supervisor / Swarm 模式里 supervisor 和 worker 之间的标准通信方式——「去 researcher 那儿，顺便把这条指令带上」。</li>
-      <li><strong>Command(graph=Command.PARENT, goto=...)</strong>:从子图向父图发指令。子图内部的节点可以「越级」告诉父图下一步去哪，而不是只回到自己的直接调用者。这是层级模式下实现「跨层跳转」的关键。</li>
+      <li><strong>共享 state</strong>：最基本的方式。所有 agent 读写同一个 state（通常是 <code class="inline">messages</code> 列表），一个 agent 写入后，下一个 agent 自然读到。字段合并由 reducer 决定——<code class="inline">add_messages</code> 是追加，<code class="inline">operator.add</code> 是列表拼接。</li>
+      <li><strong>Command(goto=, update=)</strong>：在指定下一跳的同时写入状态。这是 Supervisor / Swarm 模式里 supervisor 和 worker 之间的标准通信方式——「去 researcher 那儿，顺便把这条指令带上」。</li>
+      <li><strong>Command(graph=Command.PARENT, goto=...)</strong>：从子图向父图发指令。子图内部的节点可以「越级」告诉父图下一步去哪，而不是只回到自己的直接调用者。这是层级模式下实现「跨层跳转」的关键。</li>
     </ul>
+    <p>前两条在 7.2 已经用过了，这一节聚焦第三条。它是最「魔法」的一条：一条 goto 指令要<strong>穿过子图边界、被父图执行栈接住</strong>才能生效。先看正确的用法，再看它为什么会失效。</p>
 
-    <div class="code-title">Command.PARENT:子图向父图发跳转指令</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 820 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t74a d74a">
+        <title id="t74a">Command.PARENT 的执行栈：子图作为节点 vs 手动 invoke</title>
+        <desc id="d74a">左半：子图作为父图节点时，ParentCommand 沿图执行栈向上抛，父图捕获后改道到 parent_final。右半：父图节点里手动 invoke 子图，ParentCommand 抛到最近的图执行层就被当成那条图自己的跳转处理，跳不过边界</desc>
+        <defs><marker id="arr74a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+
+        <!-- 左：正确姿势 -->
+        <text class="lbl sm" x="205" y="24" text-anchor="middle" font-weight="bold">✓ 子图作为节点挂进父图</text>
+        <rect class="node core" x="60" y="40" width="290" height="120" rx="10"></rect>
+        <text class="lbl" x="205" y="66" text-anchor="middle" font-weight="bold" fill="var(--brand)">父图执行栈</text>
+        <text class="lbl sm" x="205" y="90" text-anchor="middle">child（子图作为节点）→ parent_final</text>
+        <text class="lbl sm" x="205" y="112" text-anchor="middle">捕获 ParentCommand</text>
+        <text class="lbl sm code" x="205" y="136" text-anchor="middle">_retry.py:618 except ParentCommand</text>
+
+        <rect class="node" x="100" y="230" width="210" height="60" rx="8"></rect>
+        <text class="lbl" x="205" y="256" text-anchor="middle">子图节点 child_node</text>
+        <text class="lbl sm code" x="205" y="276" text-anchor="middle">return Command(graph=PARENT, ...)</text>
+
+        <line class="edge" x1="205" y1="230" x2="205" y2="166" marker-end="url(#arr74a)"></line>
+        <text class="lbl sm" x="245" y="200" text-anchor="middle">ParentCommand 上抛</text>
+        <path class="edge" d="M350 100 Q 420 100 445 150" fill="none" stroke="#556674" stroke-width="1.4" marker-end="url(#arr74a)" stroke-dasharray="5 3"></path>
+        <text class="lbl sm" x="430" y="90" text-anchor="middle">父图捕获后改道</text>
+
+        <rect class="node acc" x="445" y="150" width="140" height="56" rx="8"></rect>
+        <text class="lbl" x="515" y="176" text-anchor="middle">parent_final</text>
+        <text class="lbl sm" x="515" y="194" text-anchor="middle">（父图节点）</text>
+
+        <!-- 分隔线 -->
+        <line x1="630" y1="20" x2="630" y2="310" stroke="var(--fg-muted)" stroke-width="1" stroke-dasharray="4 4" opacity="0.5"></line>
+
+        <!-- 右：错误姿势 -->
+        <text class="lbl sm" x="730" y="24" text-anchor="middle" font-weight="bold">✗ 在节点里手动 invoke</text>
+        <rect class="node" x="660" y="40" width="140" height="80" rx="10"></rect>
+        <text class="lbl" x="730" y="68" text-anchor="middle">某个父图节点</text>
+        <text class="lbl sm code" x="730" y="90" text-anchor="middle">child_graph.invoke(...)</text>
+
+        <rect class="node" x="680" y="230" width="120" height="56" rx="8"></rect>
+        <text class="lbl" x="740" y="256" text-anchor="middle">被调的子图</text>
+        <text class="lbl sm" x="740" y="274" text-anchor="middle">return PARENT goto</text>
+
+        <line class="edge" x1="740" y1="230" x2="730" y2="126" marker-end="url(#arr74a)"></line>
+        <text class="lbl sm" x="762" y="180" text-anchor="middle" fill="var(--warn,#b45309)">抛到手动 invoke</text>
+        <text class="lbl sm" x="762" y="198" text-anchor="middle" fill="var(--warn,#b45309)">这一层就到头了</text>
+        <text class="lbl sm" x="730" y="306" text-anchor="middle" fill="var(--fg-muted)">跳转语义困在子图自己的命名空间里，穿不过边界</text>
+      </svg>
+      <div class="fig-cap">图 7.5：Command.PARENT 走的是图执行栈，不是 Python 函数调用栈。左：子图作为节点，ParentCommand 沿执行栈上抛被父图捕获改道；右：手动 invoke 时，指令在最近的图执行层就被消化，跳转语义传不过子图边界。</div>
+    </div>
+
+    <div class="code-title">Command.PARENT：子图向父图发跳转指令</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
 <span class="kw">from</span> langgraph.types <span class="kw">import</span> <span class="cl">Command</span>
 
 <span class="kw">class</span> <span class="cl">ParentState</span>(<span class="cl">TypedDict</span>):
     done: <span class="cl">bool</span>
+    jump: <span class="cl">bool</span>   <span class="cmt"># 和子图同名的对接字段——少了它，子图拿不到 jump（见 7.3 的 schema 映射）</span>
 
 <span class="kw">class</span> <span class="cl">ChildState</span>(<span class="cl">TypedDict</span>):
     jump: <span class="cl">bool</span>
 
 <span class="kw">def</span> <span class="fn">child_node</span>(state: <span class="cl">ChildState</span>):
     <span class="kw">if</span> state[<span class="st">"jump"</span>]:
-        <span class="cmt"># graph=Command.PARENT： 这条 goto 是给父图的，不是给当前子图的</span>
-        <span class="cmt"># 源码 state.py:1761 见到 PARENT 会 raise ParentCommand， 由父图执行栈捕获并改道</span>
+        <span class="cmt"># graph=Command.PARENT：这条 goto 是给父图的，不是给当前子图的</span>
+        <span class="cmt"># 源码 state.py:1762 见到 PARENT 会 raise ParentCommand，由父图执行栈捕获并改道</span>
         <span class="kw">return</span> <span class="cl">Command</span>(graph=<span class="cl">Command</span>.PARENT, goto=<span class="st">"parent_final"</span>)
     <span class="kw">return</span> {}
 
@@ -382,20 +500,23 @@ child_graph = child.compile()
 <span class="kw">def</span> <span class="fn">parent_final</span>(state: <span class="cl">ParentState</span>):
     <span class="kw">return</span> {<span class="st">"done"</span>: <span class="kw">True</span>}
 
-<span class="cmt"># 关键： 子图必须作为节点 add_node 进父图(而不是在某个节点里手动 .invoke()),</span>
+<span class="cmt"># 关键：子图必须作为节点 add_node 进父图（而不是在某个节点里手动 .invoke()），</span>
 <span class="cmt"># 这样父图的执行栈才会捕获子图抛上来的 ParentCommand 并改道。</span>
 parent = <span class="cl">StateGraph</span>(<span class="cl">ParentState</span>)
-parent.add_node(<span class="st">"child"</span>, child_graph)        <span class="cmt"># 子图即节点(正确姿势)</span>
+parent.add_node(<span class="st">"child"</span>, child_graph)        <span class="cmt"># 子图即节点（正确姿势）</span>
 parent.add_node(<span class="st">"parent_final"</span>, parent_final)
 parent.add_edge(START, <span class="st">"child"</span>)
 parent.add_edge(<span class="st">"parent_final"</span>, END)
 parent_graph = parent.compile()
 
-parent_graph.invoke({<span class="st">"done"</span>: <span class="kw">True</span>})  <span class="cmt"># child 收到 jump=True， 向父图发 PARENT goto=parent_final</span></pre>
+<span class="cmt"># 实测：jump 经同名映射传进子图，child_node 向父图发 PARENT goto=parent_final，</span>
+<span class="cmt"># 父图改道执行 parent_final，最终 {'done': True, 'jump': True}</span>
+parent_graph.invoke({<span class="st">"done"</span>: <span class="kw">False</span>, <span class="st">"jump"</span>: <span class="kw">True</span>})</pre>
+    <p>注意 <code class="inline">jump</code> 必须出现在两个 schema 里——它既要触发子图的行为，也要从父图传进来。如果只在 <code class="inline">ChildState</code> 里有，按 7.3 的输入侧过滤，子图通道里没有这个字段，代码第一行 <code class="inline">state["jump"]</code> 就会 <code class="inline">KeyError</code>（实测症状，不是假设）。</p>
     <p><code class="inline">Command.PARENT</code> 让子图拥有「向上反馈」的能力，而不必把决策全堆在父图里。但要用得克制——跨层跳转多了，控制流会变得难以追踪。原则上，层内的协调用普通 <code class="inline">Command(goto=...)</code>，只有「子任务提前完成、需要父图改道」这类确有必要的情况才用 <code class="inline">Command.PARENT</code>。</p>
     <div class="callout warn">
-      <b class="tag">Command.PARENT 只在「子图作为节点」时生效</b>
-      上面子图是通过 <code class="inline">parent.add_node("child", child_graph)</code> 挂进父图的——<strong>这是 Command.PARENT 能工作的前提</strong>。源码 <code class="inline">_retry.py</code> 里，只有当子图作为父图的一个节点执行时，父图执行栈才会 <code class="inline">except ParentCommand</code> 捕获子图抛上来的跳转指令并改道。如果你换成在某个节点里<strong>手动</strong> <code class="inline">child_graph.invoke(...)</code> 调子图，那 <code class="inline">ParentCommand</code> 没有外层栈去接，会直接冒泡成异常（<code class="inline">_io.py</code> 的 <code class="inline">map_command</code> 在无父图时 <code class="inline">raise InvalidUpdateError("There is no parent graph")</code>）——达不到改道效果。结论：<strong>Command.PARENT 走的是图执行栈，不是普通函数调用</strong>。
+      <b class="tag">Command.PARENT 的正确性依赖「子图作为节点」</b>
+      上面子图是通过 <code class="inline">parent.add_node("child", child_graph)</code> 挂进父图的——<strong>这是 Command.PARENT 语义正确的前提</strong>。机制上，子图节点返回 PARENT 指令时，运行时在 <code class="inline">_retry.py:618</code> 用 <code class="inline">except ParentCommand</code> 接住，检查指令的命名空间后交给父图改道。如果你换成在某个父图节点里<strong>手动</strong> <code class="inline">child_graph.invoke(...)</code>，行为就不是教程里常说的「直接报错」了——实测分两种：子图<strong>单独</strong> invoke（比如写单测时），异常没人接，冒泡出来的是 <code class="inline">ParentCommand</code>；子图在<strong>另一个图的节点里</strong>被手动 invoke，<code class="inline">ParentCommand</code> 会被<strong>最近一层的图执行栈</strong>接住——那条 goto 被当成「这一层自己的跳转」消化掉。跳转语义穿不过手动调用的边界，至于它落在哪一层，取决于你的嵌套结构，而不是你想指挥的那张图。结论：<strong>Command.PARENT 走的是图执行栈，不是普通函数调用；要让指令准确到达你想指挥的那张图，子图必须以节点身份挂在那张图里</strong>。
     </div>
   </section>
 
@@ -420,7 +541,7 @@ parent_graph.invoke({<span class="st">"done"</span>: <span class="kw">True</span
       <li>从 Supervisor 起步：worker 用 <code class="inline">create_react_agent</code>，supervisor 用 <code class="inline">Command(goto=...)</code> 路由。这是可控性最高、也最容易后续演进的结构。</li>
       <li>定义清晰的共享 state（通常以 <code class="inline">messages</code> 为枢纽），让 agent 间的信息流转有明确的载体，而不是靠隐式约定。</li>
       <li>子图即节点：把每个 agent 当独立图开发测试，再 <code class="inline">add_node</code> 拼装；注意 schema 同名字段自动映射，专属字段不会泄漏到父图。</li>
-      <li>只在确有必要时用 <code class="inline">Command(graph=Command.PARENT, goto=...)</code> 做跨层跳转，避免控制流失控。</li>
+      <li>只在确有必要时用 <code class="inline">Command(graph=Command.PARENT, goto=...)</code> 做跨层跳转，且必须以节点身份挂子图——手动 invoke 的跳转语义不可靠（7.7③）。</li>
     </ul>
   </section>
 
@@ -434,54 +555,80 @@ parent_graph.invoke({<span class="st">"done"</span>: <span class="kw">True</span
 <span class="kw">from</span> langgraph.graph.message <span class="kw">import</span> add_messages
 <span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent
 
-<span class="cmt"># ✗ 想给 worker 加专属字段， 但忘了 messages / remaining_steps</span>
+<span class="cmt"># ✗ 想给 worker 加专属字段，但忘了 messages / remaining_steps</span>
 <span class="kw">class</span> <span class="cl">MyWorkerState</span>(<span class="cl">TypedDict</span>):
-    notes: <span class="kw">Annotated</span>[<span class="cl">list</span>[<span class="cl">str</span>], add_messages]   <span class="cmt"># 只有 notes， 没 messages</span>
+    notes: <span class="kw">Annotated</span>[<span class="cl">list</span>[<span class="cl">str</span>], add_messages]   <span class="cmt"># 只有 notes，没 messages</span>
 
 agent = create_react_agent(model, tools=[...], state_schema=MyWorkerState)
 <span class="cmt"># ValueError: Missing required key(s) {'messages', 'remaining_steps'} in state_schema</span>
-<span class="cmt"># 源码 chat_agent_executor.py:545 校验： 自定义 schema 必须含 messages + remaining_steps</span>
+<span class="cmt"># 源码 chat_agent_executor.py:545 校验：自定义 schema 必须含 messages + remaining_steps</span>
 <span class="cmt">#</span>
 <span class="cmt"># ✓ 自定义 schema 必须继承或显式带上这两个键：</span>
 <span class="kw">class</span> <span class="cl">MyWorkerState</span>(<span class="cl">TypedDict</span>):
     messages: <span class="kw">Annotated</span>[<span class="cl">list</span>, add_messages]
     remaining_steps: <span class="cl">int</span>
     notes: <span class="kw">Annotated</span>[<span class="cl">list</span>[<span class="cl">str</span>], add_messages]   <span class="cmt"># 专属字段</span></pre>
-    <div class="annotation"><b>踩坑点：</b> <code class="inline">create_react_agent</code> 默认用内置 <code class="inline">AgentState</code>（含 <code class="inline">messages</code>），一旦传 <code class="inline">state_schema</code> 覆盖，框架就<strong>不再自动补 messages</strong>，你得自己保证 schema 里有 <code class="inline">messages</code> 和 <code class="inline">remaining_steps</code>。漏了会直接报错（还算友好）；更隐蔽的是<strong>字段名拼错</strong>——父图的 <code class="inline">messages</code> 和子图的 <code class="inline">msgs</code> 不同名，schema 映射时不会自动传，worker 收不到历史消息却不会报错，表现为「agent 像失忆了」。</div>
+    <div class="annotation"><b>踩坑点：</b> <code class="inline">create_react_agent</code> 默认用内置 <code class="inline">AgentState</code>（含 <code class="inline">messages</code>），一旦传 <code class="inline">state_schema</code> 覆盖，框架就<strong>不再自动补 messages</strong>，你得自己保证 schema 里有 <code class="inline">messages</code> 和 <code class="inline">remaining_steps</code>。漏了会直接报错（还算友好）；更隐蔽的是<strong>字段名拼错</strong>——父图的 <code class="inline">messages</code> 和子图的 <code class="inline">msgs</code> 不同名，schema 映射时不会自动传（7.3 的图 7.4 就是这个机制），worker 收不到历史消息却不会报错，表现为「agent 像失忆了」。</div>
 
-    <div class="code-title">② Command（goto=...） 的目标没写进 Literal → 边缺失、可静态分析性丢失</div>
+    <div class="code-title">② Command(goto=...) 的目标没写进 Literal → 边缺失、可静态分析性丢失</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Literal
 <span class="kw">from</span> langgraph.types <span class="kw">import</span> <span class="cl">Command</span>
 
-<span class="cmt"># ✗ supervisor 可能 goto "reviewer"， 但 Literal 里没列它</span>
+<span class="cmt"># ✗ supervisor 可能 goto "reviewer"，但 Literal 里没列它</span>
 <span class="kw">def</span> <span class="fn">supervisor</span>(state) -> <span class="cl">Command</span>[<span class="cl">Literal</span>[<span class="st">"researcher"</span>, <span class="st">"coder"</span>, <span class="st">"__end__"</span>]]:
     <span class="kw">return</span> <span class="cl">Command</span>(goto=<span class="st">"reviewer"</span>, update={...})   <span class="cmt"># reviewer 不在 Literal 里！</span>
-<span class="cmt"># 源码 state.py:850-856： 分支边(ends)从返回类型 Literal 反推注册。</span>
+<span class="cmt"># 源码 state.py:850-856：分支边(ends)从返回类型 Literal 反推注册。</span>
 <span class="cmt"># Literal 里没有 "reviewer" → 图拓扑里没有 coder→reviewer 这条边。</span>
 <span class="cmt"># 但注意：运行时仍会路由成功！goto 在 _io.py:69 变成对 branch:to:reviewer</span>
 <span class="cmt"># 通道的写，目标节点是已注册节点时照常执行（实测验证）。</span>
-<span class="cmt"># 代价在别处： mermaid 拓扑图少边、checkpointer 断点续跑受影响、</span>
+<span class="cmt"># 代价在别处：mermaid 拓扑图少边、checkpointer 断点续跑受影响、</span>
 <span class="cmt"># 以及如果 goto 了一个完全没注册的节点名（如拼错），</span>
 <span class="cmt"># 只会在运行时看到一条 warning：</span>
 <span class="cmt">#   "Task coder ... wrote to unknown channel branch:to:ghost, ignoring it."</span>
-<span class="cmt">#   （_algo.py:312）——节点被静默跳过， 图提前结束。</span>
+<span class="cmt">#   （_algo.py:312）——节点被静默跳过，图提前结束。</span>
 <span class="cmt">#</span>
 <span class="cmt"># ✓ goto 的所有可能目标都要进 Literal 注解：</span>
 <span class="kw">def</span> <span class="fn">supervisor</span>(state) -> <span class="cl">Command</span>[<span class="cl">Literal</span>[<span class="st">"researcher"</span>, <span class="st">"coder"</span>, <span class="st">"reviewer"</span>, <span class="st">"__end__"</span>]]:
     ...</pre>
     <div class="annotation"><b>踩坑点：</b> 先说实测结论（很多教程把这条坑讲反了）：<code class="inline">Command(goto="X")</code> 的 X <strong>不在 Literal 里也能路由成功</strong>——前提是 X 是一个已注册节点。机制是：goto 在运行时被 <code class="inline">map_command</code> 转成对 <code class="inline">branch:to:X</code> 通道的写入，进而调度 X 节点；这条路不查 Literal。那 Literal 到底管什么？它决定<strong>图拓扑</strong>——Literal 的值被设为 <code class="inline">ends</code>，静态注册 coder→X 的条件边：漏写后 <code class="inline">get_graph()</code>/mermaid 里少这条边，可视化、静态校验都会失真。而真正的静默炸弹是<strong>goto 一个没注册的节点名</strong>（拼错、删了节点忘改）：不会抛 <code class="inline">InvalidUpdateError</code>，只会打一条 warning 然后跳过——图「无声地」提前结束。所以纪律是两条：<strong>Literal 要列全</strong>（为了拓扑完整性）；<strong>上线前跑一遍冒烟测试</strong>（防止 goto 目标拼错时只有 warning 没有异常）。锚点：<code class="inline">map_command</code> 在 <code class="inline">_io.py:69</code>、ends 注册在 <code class="inline">state.py:850-856</code>、warning 在 <code class="inline">_algo.py:312</code>。</div>
 
-    <div class="code-title">③ 拿 Command.PARENT 却手动 invoke 子图 → There is no parent graph</div>
+    <div class="code-title">③ 拿 Command.PARENT 却手动 invoke 子图 → 跳转穿不过边界，落到哪层全凭运气</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ 在节点里手动调子图， 期望它用 Command.PARENT 改父图的道</span>
 <span class="kw">def</span> <span class="fn">parent_first</span>(state):
     child_graph.<span class="fn">invoke</span>({<span class="st">"jump"</span>: <span class="kw">True</span>})   <span class="cmt"># 子图内部 return Command(graph=Command.PARENT, ...)</span>
     <span class="kw">return</span> {}
-<span class="cmt"># InvalidUpdateError: There is no parent graph  (_io.py:59 的 map_command)</span>
-<span class="cmt"># 因为手动 invoke 没有外层图执行栈， ParentCommand 没人接。</span>
+<span class="cmt"># 教程常写「会报 InvalidUpdateError: There is no parent graph」——实测不是。</span>
+<span class="cmt"># 实测一：子图单独 invoke（单测场景）→ 冒泡出 ParentCommand 异常（没人接）。</span>
+<span class="cmt"># 实测二：parent_first 里手动 invoke、外层父图照常跑 → 父图"意外地"改道成功，</span>
+<span class="cmt">#   parent_final 被执行（ParentCommand 被最近一层图执行栈接住了）。</span>
+<span class="cmt"># 实测三：手动 invoke 发生在中间层（父图→子图A→子图B 手动调 A）→ 跳转被</span>
+<span class="cmt">#   中间层消化，目标 parent_final 不存在 → 只有一条 warning：</span>
+<span class="cmt">#   "Task mid_first ... wrote to unknown channel branch:to:parent_final, ignoring it."</span>
+<span class="cmt">#   （_algo.py:312）——图无声地跑完，改道根本没有发生。</span>
 <span class="cmt">#</span>
-<span class="cmt"># ✓ 子图作为节点挂进父图， 走图执行栈 (见 §7.4):</span>
+<span class="cmt"># ✓ 子图作为节点挂进父图， 走图执行栈 (见 §7.4 的 图 7.5):</span>
 parent.<span class="fn">add_node</span>(<span class="st">"child"</span>, child_graph)   <span class="cmt"># 而非在 parent_first 里手动 invoke</span></pre>
-    <div class="annotation"><b>踩坑点：</b> <code class="inline">Command.PARENT</code> 走的是<strong>图执行栈</strong>，不是普通函数调用栈。手动 <code class="inline">.invoke()</code> 一个子图时，它不在父图的执行上下文里，抛出的 <code class="inline">ParentCommand</code> 无栈可接，直接变异常。详见 §7.4 的 callout。记住：<strong>要让 Command.PARENT 生效，子图必须是父图里的一个节点</strong>。</div>
+    <div class="annotation"><b>踩坑点：</b> <code class="inline">Command.PARENT</code> 走的是<strong>图执行栈</strong>，不是普通函数调用栈。手动 <code class="inline">.invoke()</code> 时，<code class="inline">ParentCommand</code> 会落在<strong>最近一层的图执行栈</strong>上——实测三种症状：单独 invoke 报 <code class="inline">ParentCommand</code>；隔一层手动调用「碰巧」能改道（更危险，测试通过但语义是错的）；隔两层时指令被中间层消化、只留一条 warning。三种都达不到「子图指挥指定父图」的本意。详见 §7.4 的 callout 和 图 7.5。记住：<strong>要让 Command.PARENT 可靠生效，子图必须以节点身份挂进你想指挥的那张图</strong>。另外 <code class="inline">_io.py:59</code> 那句 <code class="inline">There is no parent graph</code> 确实存在，但触发场景是「把 PARENT Command 当作图输入传给 invoke」，不是手动 invoke 子图。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.8</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · 父图状态有 <code class="inline">messages</code> 和 <code class="inline">parent_only</code>，子图 schema 只有 <code class="inline">messages</code>。子图节点里 <code class="inline">print(state.keys())</code> 会输出什么？如果子图 schema 里把 <code class="inline">messages</code> 拼成了 <code class="inline">msgs</code>，编译和运行各自报不报错？worker 会怎么表现？</summary>
+      <div class="a">输出 <code class="inline">['messages']</code>——子图只订阅自己 input schema 声明的通道（state.py:1517），parent_only 在边界处就被过滤掉了，不会出现在子图状态里。拼成 msgs 时：编译不报错（schema 各自合法），运行也不报错（两侧都没有「字段必须对上」的校验；只有父图向子图输入时多出的键会打一条 warning，_io.py:97）。表现是 worker 收到的 messages 永远是空的——每次调用都像失忆。这类坑的排查入口就是 7.3 的双向过滤图：字段对接完全靠名字，编译期不会替你兜底。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · 图 7.5 说 Command.PARENT 走的是图执行栈。如果子图 A 里手动 invoke 了子图 B，B 里返回了 <code class="inline">Command(graph=Command.PARENT, goto="x")</code>，这条 goto 最终由谁处理？如果 A 和 B 挂在同一个父图下、A 里 goto 的目标 "x" 其实是父图的另一个节点呢？</summary>
+      <div class="a">由最近一层的图执行栈处理——也就是承载「A 里那次手动 invoke」的图（子图 A）自己的执行层，而不是你想指挥的父图。ParentCommand 抛上来，先被 A 所在层的异常处理接住，goto 被换算成 A 命名空间里的跳转。此时 "x" 在 A 里未必是注册过的节点：如果 A 里没有 x，就是一条 warning 加静默忽略（_algo.py:312），图无声地继续；如果 A 里恰好有同名的 x（比如 A 也有个叫 x 的节点），会更糟——跳转被 A 的节点消化，父图上那个真正的 x 根本没被触发。手动 invoke 的跳转语义永远落在最近一层，这是「手动调子图时 Command.PARENT 不可靠」的机制根源。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · supervisor 的 LLM 回了 "FINISH"，代码却原样 <code class="inline">Command(goto="FINISH")</code>。图会怎么表现——报错、正常结束，还是别的？如果这个 bug 一直没被发现，你最先观察到的症状是什么？</summary>
+      <div class="a">不报错，也「不结束」。FINISH 不是注册过的节点，运行时把 goto 变成对 branch:to:FINISH 通道的写，发现没有节点订阅它，只打一条 warning（_algo.py:312）就继续推进。而 supervisor 没有任何回边让自己结束——它会被再次触发（取决于图的边结构：有回边就循环，没回边这一轮就自然结束）。最常见的情况是带 researcher→supervisor 回边的 Supervisor 图：LLM 说 FINISH 后 supervisor 再次被唤醒，反复消耗 recursion_limit，最后以 GraphRecursionError 收场。症状「图跑很久最后报 recursion 错误、日志里全是 ignored branch:to:FINISH」就是这条坑的指纹。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · 7.7② 说 goto 目标不进 Literal 也能路由成功。那为什么还要维护 Literal？至少说出两个「少了它你会付出代价」的具体场景。</summary>
+      <div class="a">Literal 决定的是图拓扑，运行时路由走的是另一条路（branch:to: 通道写入），所以两者解耦。代价场景：① 可视化与静态分析失真——get_graph()/mermaid 里没有那条边，读图的人（和依赖图结构做校验、代码生成的工具）都不知道这条路径存在；② checkpointer 断点续跑受影响——拓扑里的边是恢复执行时计算「下一步该触发谁」的依据之一，缺边会让恢复后的路由行为和首次执行不一致；③ 团队协作时接口失约——函数签名声明的 Literal 就是「我这个节点可能去哪」的契约，漏列等于契约撒谎，下游按图排错的人会被 topology 引偏。纪律是：Literal 列全 + 冒烟测试兜住 goto 目标拼错只有 warning 没异常的情形。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 7.4 的示例里，如果把 <code class="inline">jump: bool</code> 从 ParentState 里删掉（ChildState 保留），运行 <code class="inline">parent_graph.invoke({"done": False})</code> 会发生什么？这个错误和「字段拼错」是同一个机制吗？</summary>
+      <div class="a">会 KeyError: 'jump'——child_node 第一行读 state["jump"] 就崩。机制上和「字段拼错」是同一个：schema 映射按同名字段过滤输入（7.3），ParentState 没有 jump，子图通道里就没有这个字段，子图启动时状态里根本没有它的键。区别只在症状：拼错是「worker 收不到数据但继续跑」（静默），而这里节点函数用下标硬取一个不存在的键，把静默的过滤变成了显式崩溃。如果想避免崩溃、只把「有没有这个字段」当成可选信息，用 state.get("jump") 就回到了静默路径——所以 schema 对接问题排查时，先看两边 TypedDict 的字段名是否逐字一致，再谈代码逻辑。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

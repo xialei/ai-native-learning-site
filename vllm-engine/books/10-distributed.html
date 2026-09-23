@@ -36,11 +36,18 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 10 分布式</div>
     <h1>分布式推理：一张卡装不下时怎么办</h1>
-    <div class="subtitle">模型太大、一张 GPU 放不下或跑不动时，就要把它「切开」分到多张卡。切法不同，通信量、实现难度、适用场景天差地别。这一章从 vLLM 的 Executor 层看它如何把「一次推理」分发到多个 worker 进程。</div>
+    <div class="subtitle">模型太大、一张 GPU 放不下或跑不动时，就要把它「切开」分到多张卡。这一章回答三个问题：切法有哪几种、各切的是什么？谁来把「一次推理」分发到多个 worker 进程？切开的卡之间要付出多少通信代价？先立概念，再看 Executor 层的代码，末了拿 SGLang 对照一眼。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">10.1</span>为什么需要并行：单卡放不下 / 算不动</h2>
+    <h2><span class="num">10.1</span>单卡放不下、算不动，怎么办</h2>
+    <p>这一章要回答的问题有三个：</p>
+    <ul>
+      <li><strong>切法有哪几种，各切的对象是什么</strong>——TP/PP/DP/EP 名字都听过，但「切模型」和「复制模型」是两回事，通信量天差地别。→ 10.1 本节、10.4 通信取舍。</li>
+      <li><strong>谁把「一次推理」分发到多个 worker 进程</strong>——引擎的调度意图怎么落到每张卡。→ 10.2 Executor 职责、10.3 三种后端。</li>
+      <li><strong>切开的卡之间要付出多少通信代价</strong>——TP 每层都通信、PP 只传一次，取舍怎么定。→ 10.4。</li>
+    </ul>
+    <p>其中切法和通信代价是概念问题——切法先在本节立住、通信到 10.4 收拢；中间的 10.2、10.3 是工程问题，用 vLLM 的 Executor 层代码作答「谁来分发」。两个最原始的动机：</p>
     <p><strong>放不下</strong>：模型权重 + KV cache + 激活，加起来超过单卡显存。比如 671B 参数的 MoE 模型，光权重就几百 GB，任何一张消费级卡都装不下。</p>
     <p><strong>算不动</strong>：即使塞得进一张卡，单卡算力也有上限。吞吐（每秒处理多少 token）上不去，尤其面对高并发请求时，需要多张卡分摊计算。</p>
     <p>于是有了四种「切法」。它们切的对象不同，通信的频率和量也完全不同：</p>
@@ -117,10 +124,11 @@
       </div>
       <div class="fig-cap">图 10.1：四种并行的直观区分。TP/PP 切模型，DP 复制模型，EP 只切 MoE 的 expert 层。</div>
     </div>
+    <div class="annotation"><b>带着这三个问题往下走：</b>切法怎么选 → 图 10.1 给直观区分、10.4 讲通信取舍；谁来分发 → 10.2 Executor 职责、10.3 三种后端代码；通信代价 → 10.4 TP vs PP。10.5 拿 SGLang 对照。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.2</span>Executor 层职责：把「意图」分发给 worker</h2>
+    <h2><span class="num">10.2</span>谁来分发：Executor 把「意图」交给 worker</h2>
     <p>在 <code class="inline">vllm/v1/executor/abstract.py</code> 里，Executor 是抽象基类，注释写得很直白：<em>“An executor is responsible for executing the model on one device, or it can be a distributed executor that can execute the model on multiple devices.”</em> 它位于 <strong>EngineCore 的调度意图</strong> 和 <strong>每个 worker 进程</strong> 之间：引擎拿到调度输出后，把它交给 Executor，由 Executor 决定如何落到一个个 worker 上。</p>
     <p>关键接口是 <code class="inline">collective_rpc(method, ...)</code>——「把同一个方法名广播给所有 worker 执行」，以及 <code class="inline">execute_model(scheduler_output)</code>。抽象基类还声明了两个类级标志位，用于描述实现的能力：</p>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">Executor</span>(ABC):
@@ -139,7 +147,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">10.3</span>用代码看：三种 Executor 的差异 & 并行配置</h2>
+    <h2><span class="num">10.3</span>落到代码：三种 Executor 的差异与并行配置</h2>
     <p>10.2 的表格落到代码上是三件事：后端怎么被选出来、两种 IPC 形态（同进程直调 vs 远程 actor）长什么样、并行规模怎么算。先看后端是怎么被选出来的，下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
     <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">elif</span> distributed_executor_backend == <span class="st">"ray"</span>:
@@ -187,7 +195,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
   </section>
 
   <section class="block">
-    <h2><span class="num">10.4</span>通信的成本：TP 与 PP 的取舍</h2>
+    <h2><span class="num">10.4</span>切开的代价：TP 与 PP 的通信取舍</h2>
     <p>分布式的悖论在于：<strong>切开的多卡必须互相说话</strong>，而跨卡通信（甚至跨机走网卡）比显存内带宽慢得多。两种主要切法通信模式截然不同：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 190" xmlns="http://www.w3.org/2000/svg">
@@ -227,7 +235,8 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
   </section>
 
   <section class="block">
-    <h2><span class="num">10.5</span>小结 + 自研启示</h2>
+    <h2><span class="num">10.5</span>SGLang 的进程组织与自研启示</h2>
+    <p>回到 10.1 摆出的三个问题，vLLM 的答案是「四种切法按对象区分：切模型（TP/PP）、复制模型（DP）、切 expert（EP）」「Executor 拉起 worker、collective_rpc 广播每步」「TP 均衡但每层通信、PP 省通信但有气泡——默认优先 TP」。先把四种切法收进一张表：</p>
     <table class="tbl">
       <tr><th>并行</th><th>切的对象</th><th>通信</th><th>什么时候用</th></tr>
       <tr><td>TP</td><td>同一层权重</td><td>每层 all-reduce（多）</td><td>单卡放得下、想更快，带宽好</td></tr>
@@ -239,6 +248,17 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
       <b class="tag">自研启示</b>
       先跑通<strong>单卡</strong>（等价 vLLM 的 <code class="inline">UniProcExecutor</code>），把正确性搞对。等需要更大模型时，再上 <strong>TP</strong>——它最容易且通信模型清晰，是「单卡放不下」时的第一选择；PP/DP 是更晚的优化，别一开始就为多机并行分心。原则不变：<strong>正确性优先，并行度后置</strong>。
     </div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      同一个「多卡推理」，SGLang 的进程组织根本不同，逐项对照：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>进程组织</td><td>一个 EngineCore 经 Executor（UniProc/Multiproc/Ray）把每步调度结果分发给 worker——一个调度者、多个执行者</td><td>每个 TP rank 一个完整 Scheduler 子进程，各自跑事件循环，靠「输入相同 → 输出一致」同步——每张卡一个完整调度者</td></tr>
+        <tr><td>TP 通信选路</td><td>GroupCoordinator.all_reduce 走 custom op 或 device_communicator（10.3 节）</td><td>GroupCoordinator.all_reduce 六路分流：pymscclpp / symmetric-memory pynccl / flashinfer / torch 等，按平台与消息大小现选（<code class="inline">python/sglang/srt/distributed/parallel_state.py</code>）</td></tr>
+        <tr><td>DP 的含义</td><td>多副本分摊负载（10.4 节）</td><td>DataParallelController 做请求路由（四种均衡策略）+ dp_attention：注意力复制、MoE 分片，每张卡仍是完整 Scheduler</td></tr>
+      </table>
+      dp_attention 那行值得展开：大 MoE 模型上注意力复制 + MoE 分片，每张卡仍是完整 Scheduler，只是并行组换了切法——这正是「每卡一个完整调度者」这个组织换来的扩展自由度。详见 <a href="../../sglang/books/10-distributed.html">深入浅出SGLang · 10 分布式推理</a>。
+    </div>
   </section>
 
   <div class="arrow-nav">
@@ -248,7 +268,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 </div>
 
 <footer>
-  深入浅出vLLM · 10 分布式 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 10 分布式 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

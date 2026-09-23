@@ -70,7 +70,7 @@
         }
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 这是一个插件系统的最小实现：约定导出符号（注册表 + score），运行时扫描 libggml-*.so / .dll。价值在于：硬件厂商可以不碰主仓发布自己的后端；用户可以只编译需要的后端；同一台机器上不同实现的库按 score 择优。静态编译时这些符号退化成内置注册。注意 llama 二进制是<strong>统一的</strong>——不存在「llama-cuda」「llama-metal」分身。</div>
+    <div class="annotation">这套东西其实就是一个插件系统的最小实现：约定导出符号（注册表 + score），运行时扫描 libggml-*.so / .dll。好处很实际——硬件厂商可以不碰主仓发布自己的后端；用户可以只编译需要的后端；同一台机器上不同实现的库按 score 择优。静态编译时这些符号退化成内置注册。还有一点值得强调：llama 二进制是<strong>统一的</strong>——不存在「llama-cuda」「llama-metal」分身。</div>
   </section>
 
   <section class="block">
@@ -111,7 +111,7 @@
 
 <span class="cmt">// 输入层恒 CPU：offload 收益太小</span>
 pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };</pre>
-    <div class="annotation"><b>读懂这段：</b> 切分算法朴素到令人安心：free memory 比例 → 归一化前缀和 → upper_bound 定层所属卡。有个此前没展开的细节：<strong>embedding/input 层恒 CPU</strong>——注释原话是「there is very little benefit to offloading the input layer」。这段逻辑同时决定权重分布和 KV cache 归属（层在哪卡，那层的 KV 就在哪卡）。</div>
+    <div class="annotation">切分算法朴素到令人安心：free memory 比例 → 归一化前缀和 → upper_bound 定层所属卡。有个此前没展开的细节：<strong>embedding/input 层恒 CPU</strong>——注释原话是「there is very little benefit to offloading the input layer」。这段逻辑同时决定权重分布和 KV cache 归属（层在哪卡，那层的 KV 就在哪卡）。</div>
   </section>
 
   <section class="block">
@@ -129,7 +129,7 @@ pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };</pre>
       <b class="tag">layer vs tensor（docs/multi-gpu.md 原文大意）</b>
       流水线并行（layer）让不同层驻留不同卡、token 顺序流过——跨卡传输最少，但需要足够多的 token 才能摊平流水线气泡。张量并行（tensor）把每层切到多卡、每层做多次跨卡规约——对互联带宽极其敏感。layer 最大化 batch 吞吐，tensor 最小化延迟。消费级多卡通常没有 NVLink，PCIe 上 layer 几乎总是对的选择。
     </div>
-    <p>tensor 模式还有硬约束，源码里直接写死（src/llama-context.cpp:3713-3723）：</p>
+    <p>tensor 模式还有硬约束，源码里直接写死（src/llama-context.cpp:3762-3772）：</p>
     <div class="code-title">src/llama-context.cpp — TENSOR 模式约束（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (model-&gt;<span class="fn">split_mode</span>() == LLAMA_SPLIT_MODE_TENSOR) {
     <span class="kw">if</span> (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
@@ -144,12 +144,12 @@ pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };</pre>
         LLAMA_LOG_WARN(<span class="st">"%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n"</span>, __func__);
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> tensor 模式强制 FA 的原因：张量并行下注意力头被切到多卡，每卡只握有一部分 head 的 K/V，普通 eager attention 要拼完整 mask 矩阵，FA 按块算不依赖完整形状。文档还明确：tensor 模式下自动 fit（--fit）不可用，得自己压 ctx-size / parallel / ngl。</div>
+    <div class="annotation">为什么 tensor 模式非要 FA 不可？张量并行下注意力头被切到多卡，每卡只握有一部分 head 的 K/V，普通 eager attention 要拼完整 mask 矩阵，而 FA 按块算、不依赖完整形状。文档还明确：tensor 模式下自动 fit（--fit）不可用，得自己压 ctx-size / parallel / ngl。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.4</span>pipeline parallel：layer 模式的调度细节</h2>
-    <p>layer 模式下多卡可以组成流水线，但流水线并行「会增加内存用量」，所以只在特定条件组合下启用（src/llama-context.cpp:426-433）：</p>
+    <p>layer 模式下多卡可以组成流水线，但流水线并行「会增加内存用量」，所以只在特定条件组合下启用（src/llama-context.cpp:427-434）：</p>
     <div class="code-title">src/llama-context.cpp — pipeline_parallel 条件（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// TODO: move these checks to ggml_backend_sched</span>
 <span class="cmt">// enabling pipeline parallelism in the scheduler increases memory usage,</span>
@@ -163,7 +163,7 @@ pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };</pre>
 
 <span class="cmt">// pipeline parallelism requires support for async compute and events in all devices</span>
 <span class="cmt">// （逐设备检查 async compute + events，CPU 后端跳过）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> n_gpu_layers() &gt; n_layer_all 的意思是「全部层（含输出层）都在 GPU 上」——部分层在 CPU 时 CPU 本来就是瓶颈，流水线无益还费内存。内存代价来自每个 split 边界要缓冲一个 micro-batch 的中间结果。async compute + events 检查防止不支持流间事件的老设备死锁。此外第 5 章见过：pp 预留失败时还会退掉 pipeline_parallel 重试一次。</div>
+    <div class="annotation">条件里 n_gpu_layers() &gt; n_layer_all 的意思是「全部层（含输出层）都在 GPU 上」——部分层在 CPU 时 CPU 本来就是瓶颈，流水线无益还费内存。内存代价来自每个 split 边界要缓冲一个 micro-batch 的中间结果。async compute + events 检查则防止不支持流间事件的老设备死锁。此外第 5 章见过：pp 预留失败时还会退掉 pipeline_parallel 重试一次。</div>
   </section>
 
   <section class="block">
@@ -176,18 +176,12 @@ pimpl-&gt;dev_input = { cpu_dev, &amp;pimpl-&gt;cpu_buft_list };</pre>
 mems = self.<span class="fn">_sync_get_memory</span>()
 <span class="kw">if</span> max(mems) - min(mems) &gt; <span class="nu">2</span> * (<span class="nu">1</span> &lt;&lt; <span class="nu">30</span>):
     <span class="kw">raise</span> <span class="cl">RuntimeError</span>(<span class="st">"TP rank free memory imbalance &gt; 2GiB ..."</span>)</pre>
-    <div class="annotation"><b>对照读：</b> llama.cpp 的多设备是「把一个稠密模型拆开」，优化目标是跨卡流量最小；FreeToken 是「把一个稀疏模型安放好」，优化目标是专家搬运带宽最大。<strong>切层 vs 放专家</strong>：前者的切分单位是层（一个大矩阵不拆），后者是专家（矩阵集合里按需搬运的子矩阵）。这个差别决定了第 11 章 OffloadMoeCache 的整个设计空间。</div>
+    <div class="annotation">这两个引擎对「多设备」的理解根本不是一回事。llama.cpp 的多设备是「把一个稠密模型拆开」，优化目标是跨卡流量最小；FreeToken 是「把一个稀疏模型安放好」，优化目标是专家搬运带宽最大。<strong>切层 vs 放专家</strong>：前者的切分单位是层（一个大矩阵不拆），后者是专家（矩阵集合里按需搬运的子矩阵）。这个差别决定了第 11 章 OffloadMoeCache 的整个设计空间。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.6</span>小结</h2>
-    <ul>
-      <li>后端注册表 = 运行时动态库扫描 + score 择优；llama 二进制统一，不按后端分文件。</li>
-      <li>layer 模式：free-memory 比例切层，输入层恒 CPU，sched 运行时再微调。</li>
-      <li>tensor 模式：实验性 TP，强制 FA、不支持 fit；row 已弃用。</li>
-      <li>pipeline parallel 只在「全层上卡 + LAYER 模式 + 无 override」时启用。</li>
-      <li>FreeToken 单卡 + CPU 专家库：多设备问题的另一种解——不切模型，切「搬运什么」。</li>
-    </ul>
+    <p>这一章的两条路线说到底都是在回答「装不下怎么办」。llama.cpp 的答案是把模型拆开运：后端注册表靠运行时扫描动态库 + score 择优，llama 二进制统一不分后端；layer 模式按 free-memory 比例切层、输入层恒留 CPU、sched 运行时再微调；tensor 模式是实验性的 TP，强制 FA、不支持 fit，row 已弃用；pipeline parallel 只在「全层上卡 + LAYER 模式 + 无 override」时才启用。FreeToken 的答案更釜底抽薪——单卡 + CPU 专家库，不切模型，切「搬运什么」。</p>
     <p>下一章：logits 变成 token 的那段流水线。<a href="07-sampling.html">第 7 章：采样</a>。</p>
   </section>
 
@@ -198,7 +192,7 @@ mems = self.<span class="fn">_sync_get_memory</span>()
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 06 多设备 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 06 多设备 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

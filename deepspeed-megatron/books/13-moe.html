@@ -37,11 +37,13 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 13 MoE</div>
     <h1>MoE：专家并行与 token 的往返</h1>
-    <div class="subtitle">MoE 把 FFN 换成 N 个专家、每个 token 只走 top-k 个。参数量乘 N、计算量不变——但前提是 token 能被送到专家所在的卡上。这一章看 Megatron 的四段流水（route→dispatch→compute→combine）与三种 token dispatcher 家族，以及 DeepSpeed 的另一条路（residual MoE + Tutel）。</div>
+    <div class="subtitle">MoE 参数量乘 N、计算量不变——代价是什么，token 的往返通信怎么构成？一个 token 的四段旅程（route→dispatch→compute→combine）在代码里各对应什么，router 的四个中间量叫什么名字？负载均衡 aux loss 为什么用「未截断的 scores」算？DS 的 residual MoE 是另一条什么路？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">13.1</span>一分钟版本</h2>
+    <h2><span class="num">13.1</span>token 怎么找到自己的专家</h2>
+    <p>MoE 把 FFN 换成 N 个专家、每个 token 只走 top-k 个。参数量乘 N、计算量不变——但前提是 <strong>token 能被送到专家所在的卡上</strong>，而 MoE 的代价也全藏在这个「送」字里。一句话结论先放这：<strong>MoE 的代价全在 token 往返——dispatch/combine 两次 all-to-all 是通信大头，EP 与 DP 共卡时带宽预算要一起算。</strong>下面顺着 token 的旅程看。</p>
+    <h3>一分钟版本</h3>
     <p>MoE 层的一个 token 的旅程：</p>
     <ol>
       <li><strong>route</strong>：router（一个小线性层 + softmax）给每个 token 算出 N 个专家的得分，选 top-k。</li>
@@ -56,7 +58,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">13.2</span>用代码看｜MoELayer 的四段流水</h2>
+    <h2><span class="num">13.2</span>MoELayer 的四段流水</h2>
+    <p>一分钟版本里的四段旅程，在 MoELayer.forward 里依次展开——</p>
     <div class="code-title">megatron/core/transformer/moe/moe_layer.py — MoELayer.forward（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states):
     <span class="cmt"># ① route：router 打分 + top-k 选择 → probs + routing_map</span>
@@ -69,7 +72,7 @@
     <span class="cmt"># ④ combine：unpermute + 加权合并 + all-to-all 回程</span>
     output, mlp_bias = self.token_dispatcher.<span class="fn">token_unpermutation</span>(expert_output, mlp_bias)
     <span class="kw">return</span> output, mlp_bias</pre>
-    <div class="annotation"><b>命名约定值得记：</b>router 的输出链是 <code class="inline">logits → scores（softmax 后）→ probs（top-k 后归一）→ routing_map（bool：谁去哪）</code>——读 MoE 源码时抓住这四个名字就不迷路。② 与 ④ 是一对（permute/unpermute），dispatcher 决定它们的实现。aux loss（负载均衡）在 router 里算、加进总 loss，不在这四段里。</div>
+    <div class="annotation"><b>命名约定值得记：</b>router 的输出链是 <code class="inline">logits → scores（softmax 后）→ probs（top-k 后归一）→ routing_map（bool：谁去哪）</code>——读 MoE 源码时抓住这四个名字就不迷路。dispatch 与 combine 是一对（permute/unpermute），dispatcher 决定它们的实现。aux loss（负载均衡）在 router 里算、加进总 loss，不在这四段里。</div>
 
     <div class="code-title">megatron/core/transformer/moe/router.py — TopKRouter（结构摘录，译注）</div>
     <pre class="code"><span class="kw">class</span> <span class="cl">TopKRouter</span>(...):
@@ -82,10 +85,64 @@
         <span class="cmt"># aux loss 用「无 topk 的 scores」算——这是与主梯度不同的信号</span>
         self.apply_load_balancing_loss(scores, ...)   <span class="cmt"># save_to_aux_losses_tracker</span></pre>
     <div class="annotation"><b>aux loss 的语义：</b>负载均衡 loss 惩罚「专家间分配不均」——没有它，router 会早期锁死少数专家（富者愈富），其他专家永远得不到训练。注意代码细节：aux 用<strong>未截断的 scores</strong>（即使某 token 因容量限制没被派去那个专家，均衡信号仍然传递）。<code class="inline">capacity_factor</code> 是另一个正交机制：给每个专家设 token 容量上限，超出的 token 丢弃（或走 residual）——它是通信量与训练质量之间的旋钮。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t131 d131">
+        <title id="t131">一个 MoE 层的四段流水：route → dispatch → compute → combine</title>
+        <desc id="d131">四个横向段：route（router 打分 top-k，得到 probs + routing_map，全在本卡）；dispatch（permute + all-to-all 跨卡发送，通信第一跳）；compute（各专家本地 MLP，EP 内部可再 TP）；combine（all-to-all 回程 + unpermute + k 个输出加权求和，通信回程）。EP 组各卡只持一部分专家。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node" x="20" y="40" width="170" height="70" rx="8"></rect>
+        <text class="lbl" x="127" y="62" text-anchor="middle">① route（本卡）</text>
+        <text class="lbl sm" x="127" y="82" text-anchor="middle">router 打分 + top-k</text>
+        <text class="lbl code" x="127" y="98" text-anchor="middle">probs + routing_map</text>
+
+        <line class="edge" x1="190" y1="80" x2="248" y2="110"></line>
+        <text class="lbl sm" x="216" y="90" text-anchor="middle">routing_map</text>
+
+        <rect class="node acc" x="192" y="92" width="200" height="70" rx="8"></rect>
+        <text class="lbl" x="292" y="114" text-anchor="middle">② dispatch</text>
+        <text class="lbl sm" x="292" y="132" text-anchor="middle">permute 重排</text>
+        <text class="lbl code" x="292" y="148" text-anchor="middle">all-to-all（第一跳）</text>
+
+        <line class="edge" x1="392" y1="127" x2="252" y2="176"></line>
+
+        <rect class="node core" x="44" y="184" width="200" height="70" rx="8"></rect>
+        <text class="lbl" x="144" y="206" text-anchor="middle">③ compute（专家卡）</text>
+        <text class="lbl sm" x="144" y="226" text-anchor="middle">各自 MLP</text>
+        <text class="lbl code" x="144" y="242" text-anchor="middle">EP 内可再 TP</text>
+
+        <line class="edge" x1="244" y1="219" x2="404" y2="152"></line>
+        <text class="lbl sm" x="330" y="230" text-anchor="middle">expert_output</text>
+
+        <rect class="node acc" x="404" y="122" width="200" height="70" rx="8"></rect>
+        <text class="lbl" x="504" y="144" text-anchor="middle">④ combine</text>
+        <text class="lbl code" x="504" y="150" text-anchor="middle">all-to-all 回程 + unpermute</text>
+        <text class="lbl sm" x="504" y="168" text-anchor="middle">k 个输出加权求和</text>
+
+        <line class="edge" x1="604" y1="127" x2="700" y2="76"></line>
+        <rect class="node" x="702" y="42" width="170" height="70" rx="8"></rect>
+        <text class="lbl" x="785" y="62" text-anchor="middle">输出（回到原位）</text>
+        <text class="lbl sm" x="785" y="82" text-anchor="middle">形状与输入同</text>
+        <text class="lbl sm" x="785" y="98" text-anchor="middle">对上层透明</text>
+
+        <text class="lbl sm" x="740" y="170">两跳通信第一跳送 token、</text>
+        <text class="lbl sm" x="740" y="186">第二跳送回结果（两跳都是 all-to-all）</text>
+
+        <rect class="node warn" x="20" y="266" width="880" height="28" rx="6"></rect>
+        <text class="lbl sm" x="470" y="286" text-anchor="middle" fill="#8f2d2d">dispatch/combine 两次 all-to-all 是通信大头：EP 组与 DP 组共卡时，与梯度归约共享同一批卡的带宽预算</text>
+      </svg>
+      <div class="fig-cap">图 13.1：token 的四段旅程。dispatch 与 combine 是一对（permute/unpermute），dispatcher 家族（13.3 节）决定它们的实现；aux loss 在 router 内算，不占这四段。</div>
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">13.3</span>三种 token dispatcher 家族</h2>
+    <p>dispatch/combine 这对操作用哪种集合通信实现？Megatron 提供三族 dispatcher：</p>
     <table class="tbl">
       <tr><th>Dispatcher</th><th>机制</th><th>适用</th></tr>
       <tr><td>AllGather</td><td>先 all-gather 全部 token，本地算完自己的专家再 reduce-scatter 回去</td><td>EP=1（专家不跨卡）或小规模</td></tr>
@@ -99,7 +156,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">13.4</span>用代码看｜DeepSpeed 的 MoE 与 Tutel</h2>
+    <h2><span class="num">13.4</span>DeepSpeed 的 MoE 与 Tutel</h2>
+    <p>DS 的 MoE 是可插拔模块，另外还带两条特色路线：</p>
     <div class="code-title">deepspeed/moe/layer.py — MoE 类（docstring 摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">MoE</span>(torch.nn.Module):
     <span class="st">"""    MoE(MLP): capacity_factor=1.0, top_k=1, ...
@@ -112,11 +170,12 @@
             <span class="cmt"># residual MoE：输出 = 原始 FFN + 专家修正项（DeepSpeed 特色）</span>
             output_mlp = self.deepspeed_moe(hidden_states)
             ...</pre>
-    <div class="annotation"><b>两条特色路线：</b>① <strong>residual MoE</strong>——不是替换 FFN，而是在普通 FFN 之上并联一个「专家修正」分支，token 用不完的容量走原路径，对「先训 dense 再改 MoE」的迁移场景友好；② <strong>Tutel</strong>——微软的 all-to-all 优化库（自适应分块、与计算重叠的调度），<code class="inline">use_tutel: true</code> 一键切换。DS 的 noisy_gate_policy（Jitter/RSample）是 router 的噪声注入策略，与 Megatron 的 aux loss 是「鼓励探索」的两种手段。另有 top2_2nd_expert_sampling 之类的实现细节开关，属于复现论文行为用。</div>
+    <div class="annotation"><b>两条特色路线：</b>第一条是 <strong>residual MoE</strong>——不是替换 FFN，而是在普通 FFN 之上并联一个「专家修正」分支，token 用不完的容量走原路径，对「先训 dense 再改 MoE」的迁移场景友好；第二条是 <strong>Tutel</strong>——微软的 all-to-all 优化库（自适应分块、与计算重叠的调度），<code class="inline">use_tutel: true</code> 一键切换。DS 的 noisy_gate_policy（Jitter/RSample）是 router 的噪声注入策略，与 Megatron 的 aux loss 是「鼓励探索」的两种手段。另有 top2_2nd_expert_sampling 之类的实现细节开关，属于复现论文行为用。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.5</span>两库对打 + 自研启示</h2>
+    <h2><span class="num">13.5</span>两份实现对照 + 自研启示</h2>
+    <p>token 的旅程串完了：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（all-to-all 回程 + unpermute + 加权求和），代价全在中间两跳（图 13.1）。router 那边的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 topk_softmax_with_capacity 处截断；AlltoAll 无求和语义、纯路由，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡则各有各的手段——Megatron 的 aux loss（用未截断 scores），DS 的 noisy gate。两份实现放到一张表里对照：</p>
     <table class="tbl">
       <tr><th>维度</th><th>Megatron MoE</th><th>DeepSpeed MoE</th></tr>
       <tr><td>架构定位</td><td>专家是模型内的一等公民（experts 层）</td><td>MoE 是可插拔模块（包一层 MLP）</td></tr>
@@ -126,7 +185,7 @@
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>
-      自研 MoE 的最小正确路径：① 先做 <strong>EP=1 的本地 MoE</strong>（router + top-k + 按专家分组 GEMM），验证 aux loss 收敛行为；② 再上 all-to-all dispatch（dispatch 的正确性测试：EP=1 与 EP=2 在相同 seed 下输出应一致）；③ 容量因子最后加——它引入「丢 token」的非确定性，调试期关掉。最容易错的三点：unpermute 时 k 个专家输出的加权顺序错了（静默数值错误）、aux loss 忘了乘 aux_loss_coeff 就加进主损失（量级失衡）、EP 组 rank 计算复用 DP group（token 发错卡）。
+      自研 MoE 的最小正确路径：先做 <strong>EP=1 的本地 MoE</strong>（router + top-k + 按专家分组 GEMM），验证 aux loss 收敛行为；再上 all-to-all dispatch（dispatch 的正确性测试：EP=1 与 EP=2 在相同 seed 下输出应一致）；容量因子最后加——它引入「丢 token」的非确定性，调试期关掉。最容易错的三点：unpermute 时 k 个专家输出的加权顺序错了（静默数值错误）、aux loss 忘了乘 aux_loss_coeff 就加进主损失（量级失衡）、EP 组 rank 计算复用 DP group（token 发错卡）。
     </div>
   </section>
 
@@ -137,7 +196,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

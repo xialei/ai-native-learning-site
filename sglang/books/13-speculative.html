@@ -186,7 +186,7 @@
     <p>调度器不认识 EAGLE。它只看到一个实现了 <code class="inline">forward_batch_generation(batch, on_publish)</code> 接口的 worker——普通模式这是 <code class="inline">TpModelWorker</code>，开投机后换成 <code class="inline">EAGLEWorkerV2</code>，内部包着「目标 worker + 草稿 worker」两个 <code class="inline">TpModelWorker</code>：</p>
     <div class="code-title">python/sglang/srt/speculative/eagle_worker_v2.py — EAGLEWorkerV2 构造（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EAGLEWorkerV2</span>(<span class="cl">BaseSpecWorker</span>):
-    <span class="kw">def</span> <span class="fn">__init__</span>(self, server_args, gpu_id, ps, nccl_port, target_worker: <span class="cl">TpModelWorker</span>):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, server_args, gpu_id, nccl_port, target_worker: <span class="cl">TpModelWorker</span>):
         ...
         self.topk = <span class="fn">get_spec</span>().speculative_eagle_topk
         self.speculative_num_steps = <span class="fn">get_spec</span>().speculative_num_steps
@@ -194,13 +194,13 @@
         self._target_worker = target_worker
 
         <span class="cmt"># 只有 PP 最后一级真的跑草稿；其余 rank 拿代理，保持各 rank 分发一致</span>
-        self._hosts_draft = <span class="fn">get_pp_group</span>().is_last_rank
+        self._hosts_draft = <span class="fn">get_parallel</span>().pp_group.is_last_rank
         self._draft_worker = (
-            <span class="cl">EagleDraftWorker</span>(server_args, gpu_id, ps, nccl_port, target_worker)
+            <span class="cl">EagleDraftWorker</span>(server_args, gpu_id, nccl_port, target_worker)
             <span class="kw">if</span> self._hosts_draft
             <span class="kw">else</span> <span class="kw">None</span>
         )</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">EagleDraftWorker</code>（同文件 ~237 行）内部再起一个 <code class="inline">TpModelWorker</code>，只是 <code class="inline">is_draft_worker=True</code>——草稿模型复用整套 ModelRunner/注意力后端/CUDA Graph 机制，只是权重小、层数少。所以「草稿模型」在 SGLang 里不是一个特殊物种，是同一个执行框架的第二次实例化。</div>
+    <div class="annotation"><b>草稿模型不是特殊物种：</b> <code class="inline">EagleDraftWorker</code>（同文件 ~237 行）内部再起一个 <code class="inline">TpModelWorker</code>，只是 <code class="inline">is_draft_worker=True</code>——草稿模型复用整套 ModelRunner/注意力后端/CUDA Graph 机制，只是权重小、层数少。所以「草稿模型」在 SGLang 里不是一个特殊物种，是同一个执行框架的第二次实例化。</div>
 
     <p>一次 decode 迭代在这个 worker 里的顺序是 draft → verify → draft_extend，publish 卡在 verify 结束的时点：</p>
     <div class="code-title">python/sglang/srt/speculative/eagle_worker_v2.py — forward_batch_generation 的 decode 分支（摘录，注释为译注）</div>
@@ -221,7 +221,7 @@
         <span class="kw">if</span> on_publish <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
             <span class="fn">on_publish</span>(batch_output.new_seq_lens)
         ...  <span class="cmt"># draft_extend：草稿模型消化验证结果，为下一轮准备</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">draft()</code>（~701 行）按 topk 逐层展开草稿树，输出 <code class="inline">EagleVerifyInput</code>；<code class="inline">verify()</code>（~1836 行）委托给 <code class="inline">eagle_worker_common.py</code> 的 <code class="inline">run_eagle_verify</code>。注意 publish 的位置——它在 verify 之后、draft_extend 之前，这个时点选择是 13.5 节 overlap 设计的关键。</div>
+    <div class="annotation"><b>publish 卡在 verify 之后：</b> <code class="inline">draft()</code>（~701 行）按 topk 逐层展开草稿树，输出 <code class="inline">EagleVerifyInput</code>；<code class="inline">verify()</code>（~1836 行）委托给 <code class="inline">eagle_worker_common.py</code> 的 <code class="inline">run_eagle_verify</code>。注意 publish 的位置——它在 verify 之后、draft_extend 之前，这个时点选择是 13.5 节 overlap 设计的关键。</div>
 
     <p>验证的核心在 <code class="inline">run_eagle_verify</code>：准备 TARGET_VERIFY 批 → 目标模型一次前向 → 采样并统计接受长度：</p>
     <div class="code-title">python/sglang/srt/speculative/eagle_worker_common.py — run_eagle_verify（摘录，注释为译注）</div>
@@ -246,7 +246,7 @@
 
     (predict, accept_lens, accept_index) = <span class="fn">eagle_sample</span>(
         verify_input, batch, logits_output, grammar_mask, ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">accept_lens</code> 是每个请求实际接受的 token 数，后续 <code class="inline">new_seq_lens = batch.seq_lens + accept_lens</code> 直接以它为准；未接受位置的 KV 会被回收（调用 <code class="inline">clear_unaccepted_c128_draft_states</code>，定义在 <code class="inline">deepseek_v4_memory_pool.py</code>，由 <code class="inline">eagle_worker_common.py</code> 用 <code class="inline">getattr</code> 探测式调用——所以是 DSV4 专用的一条路径，别的模型不会碰它）。验证批的 ForwardMode 在 <code class="inline">eagle_prepare_for_verify</code> 里被置为 <code class="inline">ForwardMode.TARGET_VERIFY</code>（<code class="inline">eagle_utils.py:592</code>），idle batch 则保持 IDLE。</div>
+    <div class="annotation"><b>accept_lens 是记账依据：</b> <code class="inline">accept_lens</code> 是每个请求实际接受的 token 数，后续 <code class="inline">new_seq_lens = batch.seq_lens + accept_lens</code> 直接以它为准；未接受位置的 KV 会被回收（调用 <code class="inline">clear_unaccepted_c128_draft_states</code>，定义在 <code class="inline">deepseek_v4_memory_pool.py</code>，由 <code class="inline">eagle_worker_common.py</code> 用 <code class="inline">getattr</code> 探测式调用——所以是 DSV4 专用的一条路径，别的模型不会碰它）。验证批的 ForwardMode 在 <code class="inline">eagle_prepare_for_verify</code> 里被置为 <code class="inline">ForwardMode.TARGET_VERIFY</code>（<code class="inline">eagle_utils.py:592</code>），idle batch 则保持 IDLE。</div>
 
     <div class="callout info">
       <b class="tag">演进痕迹</b>
@@ -270,7 +270,7 @@ batch_result = self.model_worker.<span class="fn">forward_batch_generation</span
 <span class="kw">if</span> batch.spec_algorithm.is_none():
     <span class="cmt"># 非投机：worker 返回后再 publish</span>
     self.future_map.<span class="fn">publish</span>(future_indices, batch.seq_lens + <span class="nu">1</span>)</pre>
-    <div class="annotation"><b>读懂这段：</b> 对比两种时序：非投机在 worker 返回后由调度器 publish（此时 GPU 侧已全部结束）；投机则在 verify 与 draft_extend 之间由 worker 主动 publish——schedule stream 上的下一批准备得以与 draft_extend 重叠。<code class="inline">grammar_barrier</code> 同理：让 grammar FSM 的推进也塞进这段空隙。</div>
+    <div class="annotation"><b>两种 publish 时序：</b> 非投机在 worker 返回后由调度器 publish（此时 GPU 侧已全部结束）；投机则在 verify 与 draft_extend 之间由 worker 主动 publish——schedule stream 上的下一批准备得以与 draft_extend 重叠。<code class="inline">grammar_barrier</code> 同理：让 grammar FSM 的推进也塞进这段空隙。</div>
 
     <p>两个专用 ForwardMode 在 <code class="inline">forward_batch_info.py</code> 里紧挨着普通模式定义：</p>
     <div class="code-title">python/sglang/srt/model_executor/forward_batch_info.py — ForwardMode 中的投机项（摘录）</div>
@@ -284,7 +284,7 @@ batch_result = self.model_worker.<span class="fn">forward_batch_generation</span
     <span class="kw">def</span> <span class="fn">is_draft_extend_v2</span>(self):
         <span class="cmt"># For fixed shape logits output in eagle v2 worker</span>
         <span class="kw">return</span> self == <span class="cl">ForwardMode</span>.DRAFT_EXTEND_V2</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">TARGET_VERIFY</code> 被归入 <code class="inline">is_extend()</code>（验证批的注意力形态与 prefill 同类：一次算多个位置），但它不进 prefill 调度，而是由 spec worker 在 decode 迭代内部构造。DRAFT_EXTEND_V2 的注释点出它的存在理由：给 EAGLE v2 worker 一个固定形状的 logits 输出，方便图捕获。</div>
+    <div class="annotation"><b>TARGET_VERIFY 是 extend 的近亲：</b> <code class="inline">TARGET_VERIFY</code> 被归入 <code class="inline">is_extend()</code>（验证批的注意力形态与 prefill 同类：一次算多个位置），但它不进 prefill 调度，而是由 spec worker 在 decode 迭代内部构造。DRAFT_EXTEND_V2 的注释点出它的存在理由：给 EAGLE v2 worker 一个固定形状的 logits 输出，方便图捕获。</div>
 
     <p>CUDA Graph 的约束也随之而来：草稿侧有自己的图 runner（<code class="inline">eagle_draft_cuda_graph_runner.py</code> / <code class="inline">eagle_draft_extend_cuda_graph_runner.py</code>），目标侧的验证批要按「bs × num_draft_tokens」的加宽形状捕获——这就是配置项 <code class="inline">--speculative-num-draft-tokens</code> 必须在启动时定死的原因之一。验证路径里也能看到对图边界的处理：<code class="inline">update_verify_buffers_to_fill_after_draft</code> 在草稿结束后回填 custom_mask/position 这类依赖草稿输出的元数据（<code class="inline">eagle_worker_common.py:533</code>）。</p>
     <div class="callout warn">
@@ -304,11 +304,11 @@ batch_result = self.model_worker.<span class="fn">forward_batch_generation</span
     <h2><span class="num">13.7</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      投机解码不是采样器上的补丁，它会穿过你的引擎三层：调度器（验证批要按 num_draft_tokens 预留 KV 与图形状）、ForwardMode（TARGET_VERIFY / DRAFT_EXTEND）、采样（拒绝采样替换普通 argmax 路径）。SGLang 的切入方式值得照抄：<strong>① 新增 TARGET_VERIFY 模式，让验证批 ride 在既有 extend 机制上；② spec worker 实现与 TpModelWorker 相同的 forward_batch_generation(batch, on_publish) 接口，调度器零改动；③ 先测接受长度，再谈参数调优——平均接受长度不到 1.5 的负载上，投机解码大概率是负收益</strong>。另外留意 zero-step 分支（<code class="inline">speculative_num_steps == 0</code>，eagle_worker_v2.py:1461）：高并发时引擎会主动停掉草稿、只做验证，让草稿 KV 保持温热——这是「投机可动态开关」的实现雏形。本系列到这一章就走完了，<a href="index.html">返回索引</a>可按路径重读。
+      投机解码不是采样器上的补丁，它会穿过你的引擎三层：调度器（验证批要按 num_draft_tokens 预留 KV 与图形状）、ForwardMode（TARGET_VERIFY / DRAFT_EXTEND）、采样（拒绝采样替换普通 argmax 路径）。SGLang 的切入方式值得照抄：先<strong>新增 TARGET_VERIFY 模式，让验证批 ride 在既有 extend 机制上</strong>；再让 <strong>spec worker 实现与 TpModelWorker 相同的 forward_batch_generation(batch, on_publish) 接口，调度器零改动</strong>；最后<strong>先测接受长度，再谈参数调优——平均接受长度不到 1.5 的负载上，投机解码大概率是负收益</strong>。另外留意 zero-step 分支（<code class="inline">speculative_num_steps == 0</code>，eagle_worker_v2.py:1461）：高并发时引擎会主动停掉草稿、只做验证，让草稿 KV 保持温热——这是「投机可动态开关」的实现雏形。本系列到这一章就走完了，<a href="index.html">返回索引</a>可按路径重读。
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      PP 与投机解码的组合正在两条线上收敛，校验集中在 <code class="inline">arg_groups/validation_hook.py</code> 的 <code class="inline">check_pipeline_parallel_compat</code>（commit 3a64faa1f2 重构）。冲突点在草稿模型的归所：lm_head 和末层 hidden states 只在<strong>最后一个 PP stage</strong> 上，所以草稿只能由最后一段做——非末段进程在 <code class="inline">maybe_init_draft_worker</code> 里直接不建 draft worker（scheduler.py:1029 附近），末段草稿完的树要走输出中继往回传。<strong>默认路径</strong>（不开 <code class="inline">SGLANG_ENABLE_PP_SPEC</code>）：PP+EAGLE（MTP）已从「仅 NPU」放宽到全平台，但限定 PD 分离的 <strong>prefill 节点</strong>，且模型架构必须在白名单里（<code class="inline">_PP_EAGLE_SUPPORTED_ARCHITECTURES</code>：DeepSeek V2/V3/V3.2、GLM MoE-DSA、Qwen3.5 系）——这些模型的末 stage 能直接供给 EAGLE 草稿 embedding。<strong>门控路径</strong>（<code class="inline">SGLANG_ENABLE_PP_SPEC</code>，默认关）：非末段草稿、树经 <code class="inline">speculative/pp_spec_relay.py</code> 的 <code class="inline">PPSpecRelayInput</code> 按请求逐行挂在 <code class="inline">ScheduleBatch.spec_info</code> 上随批走——因为 microbatch 会重组（请求完成/被收回/并批），树必须跟着它所属的请求行一起过滤、合并、迁移，各 stage 才能重建出同一份验证输入；验证输入在中间 stage 不重新草拟，直接用上一轮中继来的 <code class="inline">batch.spec_info</code>（eagle_worker_v2.py:1456 的注释写得很直白：必须与前面 stage 已跑的一致）。门控路径的约束比默认路径严：要求 <code class="inline">--disable-overlap-schedule</code>、只支持单层 EAGLE 系草稿、必须跑在非分离模式（<code class="inline">disaggregation_mode == "null"</code>）、不兼容 <code class="inline">--speculative-adaptive</code>（PP relay 按固定的 <code class="inline">num_draft_tokens</code> 切片，adaptive 会在运行时改它）与 dp-attention。DSPARK 另有一条独立分支：允许 pp&gt;1，但仅限 PD prefill 节点（decode 与非分离服务仍要求 pp=1），且与 <code class="inline">SGLANG_ENABLE_PP_SPEC</code> 互斥。
+      PP 与投机解码的组合正在两条线上收敛，校验集中在 <code class="inline">arg_groups/validation_hook.py</code> 的 <code class="inline">check_pipeline_parallel_compat</code>（commit 3a64faa1f2 重构）。冲突点在草稿模型的归所：lm_head 和末层 hidden states 只在<strong>最后一个 PP stage</strong> 上，所以草稿只能由最后一段做——非末段进程在 <code class="inline">maybe_init_draft_worker</code> 里直接不建 draft worker（scheduler.py:1002 附近），末段草稿完的树要走输出中继往回传。<strong>默认路径</strong>（不开 <code class="inline">SGLANG_ENABLE_PP_SPEC</code>）：PP+EAGLE（MTP）已从「仅 NPU」放宽到全平台，但限定 PD 分离的 <strong>prefill 节点</strong>，且模型架构必须在白名单里（<code class="inline">_PP_EAGLE_SUPPORTED_ARCHITECTURES</code>：DeepSeek V2/V3/V3.2、GLM MoE-DSA、Qwen3.5 系）——这些模型的末 stage 能直接供给 EAGLE 草稿 embedding。<strong>门控路径</strong>（<code class="inline">SGLANG_ENABLE_PP_SPEC</code>，默认关）：非末段草稿、树经 <code class="inline">speculative/pp_spec_relay.py</code> 的 <code class="inline">PPSpecRelayInput</code> 按请求逐行挂在 <code class="inline">ScheduleBatch.spec_info</code> 上随批走——因为 microbatch 会重组（请求完成/被收回/并批），树必须跟着它所属的请求行一起过滤、合并、迁移，各 stage 才能重建出同一份验证输入；验证输入在中间 stage 不重新草拟，直接用上一轮中继来的 <code class="inline">batch.spec_info</code>（eagle_worker_v2.py:1458 的注释写得很直白：必须与前面 stage 已跑的一致）。门控路径的约束比默认路径严：要求 <code class="inline">--disable-overlap-schedule</code>、只支持单层 EAGLE 系草稿、必须跑在非分离模式（<code class="inline">disaggregation_mode == "null"</code>）、不兼容 <code class="inline">--speculative-adaptive</code>（PP relay 按固定的 <code class="inline">num_draft_tokens</code> 切片，adaptive 会在运行时改它）与 dp-attention。DSPARK 另有一条独立分支：允许 pp&gt;1，但仅限 PD prefill 节点（decode 与非分离服务仍要求 pp=1），且与 <code class="inline">SGLANG_ENABLE_PP_SPEC</code> 互斥。
     </div>
   </section>
 
@@ -319,7 +319,7 @@ batch_result = self.model_worker.<span class="fn">forward_batch_generation</span
 </div>
 
 <footer>
-  深入浅出SGLang · 13 投机解码 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 13 投机解码 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

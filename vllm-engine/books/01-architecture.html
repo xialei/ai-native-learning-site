@@ -36,21 +36,29 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
     <h1>整体架构：vLLM 的「机器」由哪些部件组成</h1>
-    <div class="subtitle">理解 vLLM（尤其新版 v1 引擎）如何分层，是读懂后续每一章的前提。这一页我们把整台机器拆开，讲清每个部件各干什么。</div>
+    <div class="subtitle">打开 vLLM 源码，第一眼是上百个文件。这一章先回答四个问题：<strong>这台机器由哪些部件组成？它们怎么协作？为什么拆成这么多层和进程？每个部件住在哪个目录？</strong>先摆问题，再一层层往代码里走，末了拿 SGLang 的组织方式对照一眼。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">1.1</span>一分钟版本</h2>
-    <p>现代 LLM 推理引擎要解决的核心矛盾是：<strong>「内存有限，但每步都要保留每个请求的 KV 状态」</strong>。为了让多个请求共享一张 GPU、交错推进，vLLM 把系统拆成两个并发跑的大块：</p>
+    <h2><span class="num">1.1</span>读懂一台推理引擎，要先回答什么</h2>
+    <p>不管读 vLLM 还是自研引擎，上来都会撞到同一串问题。先把它们摆出来：</p>
+    <ul>
+      <li><strong>部件怎么分？</strong>一张 GPU、一堆并发请求，系统里必然有「管事」的和「干活」的。哪些组件管「一批请求现在该跑什么」，哪些管「把请求真正算出来」？这条边界切在哪？</li>
+      <li><strong>数据怎么流？</strong>一个 prompt 进来、一串 token 出去，中间要穿过哪些部件、每站传了什么？整台机器的循环点在哪？</li>
+      <li><strong>为什么拆这么多？</strong>能不能写成一个进程一个循环跑完？vLLM 拆出 Engine / Core / Worker / Executor 这么多层、甚至拆成多个进程，是为了解决什么问题、付出了什么代价？</li>
+      <li><strong>代码在哪？</strong>每个部件对应哪个目录、哪个类？读代码时从哪个文件进？</li>
+    </ul>
+    <p>这四个问题里，前三个的共同背景是一个核心矛盾：<strong>「内存有限，但每步都要保留每个请求的 KV 状态」</strong>——多个请求要共享一张 GPU、交错推进，系统必须切出「决策」和「执行」两个角色。vLLM 的切法是两个并发跑的大块：</p>
     <ul>
       <li><strong>引擎层（Engine / Core，常驻 CPU）</strong>：管「一批请求现在该跑什么」—— 调度（Scheduler）、KV cache 分配（KVCacheManager）、输入输出处理（tokenize / detokenize / 结构化输出）。</li>
       <li><strong>执行层（Worker / Model Runner / Sampler，跑在 GPU）</strong>：管「把这一批请求真正喂给模型算出 token」—— 组装张量、跑 transformer、采样。</li>
     </ul>
     <p>两者之间通过一个 <strong>「步进（step）」同步点</strong>协作：CPU 决定 batch → 发给 GPU → GPU 跑一次模型前向 → 返回新 token → CPU 决定下一步。后续讲的「连续批处理」，全部逻辑就落在这个循环里（动机、预算与调度算法见<a href="04-scheduler.html">第 4 章</a>）。</p>
+    <div class="annotation"><b>四个问题怎么作答：</b>部件与数据流 → 1.2 的分层图；为什么要拆 → 1.3 用代码看构造、1.4 专讲「引擎和 Core 为什么分开」；目录地图 → 1.5 一张表。1.6 拿 SGLang 的进程组织对照。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.2</span>分层图</h2>
+    <h2><span class="num">1.2</span>部件怎么分、数据怎么流：分层图</h2>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
         <title id="t12">vLLM v1 架构分层</title>
@@ -133,8 +141,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.3</span>用代码看｜引擎如何被构造</h2>
-    <p>从入口 <code class="inline">LLM</code> 出发，一步步创建引擎。核心事实：<strong>vLLM 现在默认跑 v1 引擎</strong>。</p>
+    <h2><span class="num">1.3</span>拆这么多，代码里怎么长出来的</h2>
+    <p>先答第三个问题的前一半：这些部件在代码里是怎么被装配起来的。从入口 <code class="inline">LLM</code> 出发，一步步创建引擎。核心事实：<strong>vLLM 现在默认跑 v1 引擎</strong>。</p>
     <div class="code-title">vllm/entrypoints/llm.py — LLM.__init__ 里创建引擎（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> vllm.v1.engine.llm_engine <span class="kw">import</span> <span class="cl">LLMEngine</span>   <span class="cmt"># 用的是 v1 引擎</span>
 
@@ -144,12 +152,12 @@
 
     <span class="kw">def</span> <span class="fn">generate</span>(self, prompts, sampling_params=<span class="kw">None</span>, ...):
         <span class="kw">return</span> self._run_completion(prompts=prompts, params=sampling_params, ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">LLMEngine</code>（在 <code class="inline">vllm/v1/engine/llm_engine.py</code>）是「同步、阻塞」的简单封装；而在线服务用的是它的异步版本 <code class="inline">vllm/engine/async_llm_engine.py</code> 与 <code class="inline">v1/engine/async_llm.py</code>。它们背后都通向同一个 <code class="inline">EngineCore</code>。</div>
+    <div class="annotation"><b>别被名字绕晕：</b> <code class="inline">LLMEngine</code>（在 <code class="inline">vllm/v1/engine/llm_engine.py</code>）是「同步、阻塞」的简单封装；而在线服务用的是它的异步版本 <code class="inline">vllm/engine/async_llm_engine.py</code> 与 <code class="inline">v1/engine/async_llm.py</code>。它们背后都通向同一个 <code class="inline">EngineCore</code>。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">1.4</span>为什么「引擎」和「Core」要分开</h2>
-    <p>v1 里，真正干活的核心是一个独立进程 <code class="inline">EngineCoreProc</code>（可由子进程或 Ray actor 承载），它内部持有 Scheduler 与 KVCacheManager，通过 <strong>ZMQ 套接字</strong>与调用方通信。</p>
+    <h2><span class="num">1.4</span>接着问：为什么「引擎」和「Core」要分开</h2>
+    <p>第三个问题的后一半：拆层的代价是复杂度，那分进程买到的是什么？v1 里，真正干活的核心是一个独立进程 <code class="inline">EngineCoreProc</code>（可由子进程或 Ray actor 承载），它内部持有 Scheduler 与 KVCacheManager，通过 <strong>ZMQ 套接字</strong>与调用方通信。</p>
     <div class="code-title">vllm/v1/engine/core.py — EngineCore 的核心结构（简化，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">EngineCore</span>:
     <span class="cmt"># 持有 CPU 侧核心状态</span>
@@ -161,7 +169,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.5</span>一张表记牢每个部件</h2>
+    <h2><span class="num">1.5</span>部件住在哪：一张表记牢</h2>
     <table class="tbl">
       <tr><th>部件</th><th>目录</th><th>职责</th><th>跑在</th></tr>
       <tr><td>LLM / LLMEngine</td><td>entrypoints/llm.py · v1/engine/llm_engine.py</td><td>用户面入口：tokenize、组装 Request、收集输出</td><td>CPU</td></tr>
@@ -178,11 +186,24 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.6</span>对「自研引擎」的第一个启示</h2>
+    <h2><span class="num">1.6</span>SGLang 的另一种拆法与自研启示</h2>
+    <p>回到 1.1 摆出的四个问题，vLLM 的答案是「两块分层 → step 同步点 → 引擎/Core 分进程 → 十个部件十行目录」。但「拆成两个角色」是共识，「拆到哪一层」是选择——SGLang 给出了不同的切法：</p>
     <div class="callout warn">
       <b class="tag">要点</b>
-      别急着堆并行和分布式。自研引擎的 MVP 只需两块：<strong>① 一个能跑「单请求 prefill + decode」的循环；② 一个最朴素的连续批处理循环。</strong>
+      别急着堆并行和分布式。自研引擎的 MVP 只需两块：<strong>一个能跑「单请求 prefill + decode」的循环，外加一个最朴素的连续批处理循环。</strong>
       分层（Engine / Core / Worker）是 vLLM 为「可扩展性」付出的复杂度，你可以在理解之后再决定要不要这么切。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
+    </div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      两边的共识是「调度和执行要分开」，分歧在把什么当成独立进程。<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>调度进程</td><td>调度 + KV 管理 + 执行编排在一个 EngineCore 进程（<code class="inline">vllm/v1/engine/core.py</code>）</td><td>调度 + KV 管理 + 发起前向在一个 Scheduler 进程，每个 TP rank 一个（<code class="inline">python/sglang/srt/managers/scheduler.py</code>）</td></tr>
+        <tr><td>谁在 EngineCore/Scheduler 之下</td><td>Executor（UniProc/Multiproc/Ray）→ Worker 跑模型</td><td>没有单独执行层——Scheduler 直接调 TpModelWorker</td></tr>
+        <tr><td>反分词（token id → 文本）</td><td>留在前端进程（output_processor）</td><td>独立成第三个进程（DetokenizerManager）</td></tr>
+        <tr><td>进程间通信</td><td>ZMQ</td><td>ZMQ（同名通道设计）</td></tr>
+      </table>
+      每张卡都当独立引擎、调度简单直接，代价是多个 rank 重复持有调度状态；vLLM 的拆法换来了「一个调度者管多个执行者」。对照着读，更容易分辨「必然」与「取舍」。详见 <a href="../../sglang/books/01-architecture.html">深入浅出SGLang · 01 整体架构与进程模型</a>。
     </div>
   </section>
 
@@ -193,7 +214,7 @@
 </div>
 
 <footer>
-  深入浅出vLLM · 01 整体架构 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 01 整体架构 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

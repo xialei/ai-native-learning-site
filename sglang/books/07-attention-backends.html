@@ -170,7 +170,7 @@
             <span class="cl">FlashInferMLAAttnBackend</span>,
         )
         <span class="kw">return</span> <span class="cl">FlashInferMLAAttnBackend</span>(runner)</pre>
-    <div class="annotation"><b>读懂这段：</b> 每个工厂都是一个「字符串 → 实例」的函数，imports 写在函数体内（惰性加载），所以没装 flashinfer 的环境只要不选它就不会 import 失败。工厂也是做兼容检查的地方：比如 <code class="inline">fa3</code> 断言 SM80/SM90、<code class="inline">trtllm_mla</code> 断言 MLA 模型、<code class="inline">triton</code> 拒绝 encoder-decoder 模型——把兼容性检查放在工厂里，报错发生在启动时而不是跑了几步之后。<br><br>工厂还有第三种职责：<strong>建运行时资源</strong>。flashinfer 这个工厂里，投机解码启用时会给 runner 挂一个 <code class="inline">plan_stream_for_flashinfer</code>（注意它检查 <code class="inline">hasattr</code> 再赋值，因为同一 runner 可能被多次创建后端）。这种「副作用写在工厂里」的做法好处是资源跟着后端走、后端不选就不建；代价是工厂不再是纯函数，读代码时别把它当查表。</div>
+    <div class="annotation"><b>工厂的三种职责：</b> 每个工厂都是一个「字符串 → 实例」的函数，imports 写在函数体内（惰性加载），所以没装 flashinfer 的环境只要不选它就不会 import 失败。工厂也是做兼容检查的地方：比如 <code class="inline">fa3</code> 断言 SM80/SM90、<code class="inline">trtllm_mla</code> 断言 MLA 模型、<code class="inline">triton</code> 拒绝 encoder-decoder 模型——把兼容性检查放在工厂里，报错发生在启动时而不是跑了几步之后。<br><br>还有第三种职责：<strong>建运行时资源</strong>。flashinfer 这个工厂里，投机解码启用时会给 runner 挂一个 <code class="inline">plan_stream_for_flashinfer</code>（注意它检查 <code class="inline">hasattr</code> 再赋值，因为同一 runner 可能被多次创建后端）。这种「副作用写在工厂里」的做法好处是资源跟着后端走、后端不选就不建；代价是工厂不再是纯函数，读代码时别把它当查表。</div>
 
     <p>装配发生在 ModelRunner 初始化时，最后一行就是查表：</p>
     <div class="code-title">python/sglang/srt/model_executor/model_runner_components/attention_backend_setup.py — 解析与实例化（摘录，注释为译注）</div>
@@ -216,7 +216,7 @@
         <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">f"Invalid attention backend: {backend_str}"</span>)
     model_runner.init_new_workspace = init_new_workspace
     <span class="kw">return</span> <span class="cl">ATTENTION_BACKENDS</span>[backend_str](model_runner)</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个分支的优先级要按顺序读：<strong>draft 覆盖 &gt; prefill/decode 不同 &gt; 单一后端</strong>。解析分成了两个函数，值得留意：<code class="inline">resolve_attention_backend_strs</code> 只负责<strong>决定用哪些字符串</strong>、并置上 <code class="inline">is_draft_override</code> 这个标志；<code class="inline">_build_resolved_backend</code> 只负责<strong>按标志决定怎么装配</strong>。draft 覆盖之所以要单独走一条路，是因为 draft worker 和 target 模型共存于同一进程，后端不能取自进程级配置，只能来自 <code class="inline">ModelRunner.draft_attention_backend</code>——而且它会先打一条 <code class="inline">logger.warning</code>，说明这是「用户配置被静默改写」的场景，出问题时要先看日志。名字不相等时先包一层 <code class="inline">HybridAttnBackend</code>（prefill 走一个、decode 走另一个），再套 <code class="inline">attn_backend_wrapper</code> 处理混合架构模型（GDN/Mamba 线性注意力层替换部分层）。也就是说「后端」不一定是单个 kernel 实现，可以是一棵组合树。</div>
+    <div class="annotation"><b>三个分支的优先级要按顺序读：</b> <strong>draft 覆盖 &gt; prefill/decode 不同 &gt; 单一后端</strong>。解析分成了两个函数，值得留意：<code class="inline">resolve_attention_backend_strs</code> 只负责<strong>决定用哪些字符串</strong>、并置上 <code class="inline">is_draft_override</code> 这个标志；<code class="inline">_build_resolved_backend</code> 只负责<strong>按标志决定怎么装配</strong>。draft 覆盖之所以要单独走一条路，是因为 draft worker 和 target 模型共存于同一进程，后端不能取自进程级配置，只能来自 <code class="inline">ModelRunner.draft_attention_backend</code>——而且它会先打一条 <code class="inline">logger.warning</code>，说明这是「用户配置被静默改写」的场景，出问题时要先看日志。名字不相等时先包一层 <code class="inline">HybridAttnBackend</code>（prefill 走一个、decode 走另一个），再套 <code class="inline">attn_backend_wrapper</code> 处理混合架构模型（GDN/Mamba 线性注意力层替换部分层）。也就是说「后端」不一定是单个 kernel 实现，可以是一棵组合树。</div>
     <div class="annotation"><b>wrapper 为什么套在外面：</b> 源码这里有一段明确的注释，值得当成演进痕迹读。原来的写法是<strong>每个子后端各包一次</strong> wrapper，再组合。问题出在混合架构模型上：wrapper 内部要建线性/稀疏侧的副后端（比如 GDN dispatcher），包两次就建两个——初始化和状态都翻倍，而一次前向里只有一侧真正生效。现在改成先组合、再统一包一次。<code class="inline">init_new_workspace</code> 这个参数也是一路透传到 <code class="inline">_build_full_attention_backend_from_str</code> 里，赋给 <code class="inline">model_runner.init_new_workspace</code> 后才调用工厂——工厂要靠这个标志决定是新建 workspace 还是复用已有的。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
@@ -263,7 +263,7 @@
             <span class="cmt"># 常规路径：转给当前装配的后端</span>
             <span class="kw">return</span> <span class="fn">get_attn_backend</span>().<span class="fn">forward</span>(
                 q, k, v, self, forward_batch, save_kv_cache, **kwargs)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">get_attn_backend()</code> 从 forward context 里取当前实例——ModelRunner 在每次前向外围把后端挂进 context，模型代码因此完全不用持有后端引用。<code class="inline">layer_id</code> 是后端与 KV 池对上的关键：后端用它去 <code class="inline">k_buffer[layer_id]</code> 读写（第 5 章）。<code class="inline">layer.scaling / logit_cap / sliding_window_size</code> 这些常量也经 <code class="inline">layer</code> 参数透传给 kernel。<br><br>上面那个 <code class="inline">k_rope</code> 分支是目前唯一一处「按 kwargs 决定 reshape 形状」的地方：带 k_rope 的模型（部分 MLA/混合结构）会把 rope 部分从 k 里拆出去，此时 k 剩下的宽度是 <code class="inline">v_head_dim</code> 而不是 <code class="inline">qk_head_dim</code>。这种「靠约定参数名换行为」的写法读起来突然，但它避开了在每层 forward 里传一个显式标志位。<code class="inline">key_value_num_tokens</code> 则是新加的可选形参，给需要显式知道 KV token 数的后端（如跨层共享、异构 batch）留的口子。</div>
+    <div class="annotation"><b>后端引用从 context 里来：</b> <code class="inline">get_attn_backend()</code> 从 forward context 里取当前实例——ModelRunner 在每次前向外围把后端挂进 context，模型代码因此完全不用持有后端引用。<code class="inline">layer_id</code> 是后端与 KV 池对上的关键：后端用它去 <code class="inline">k_buffer[layer_id]</code> 读写（第 5 章）。<code class="inline">layer.scaling / logit_cap / sliding_window_size</code> 这些常量也经 <code class="inline">layer</code> 参数透传给 kernel。<br><br>上面那个 <code class="inline">k_rope</code> 分支是目前唯一一处「按 kwargs 决定 reshape 形状」的地方：带 k_rope 的模型（部分 MLA/混合结构）会把 rope 部分从 k 里拆出去，此时 k 剩下的宽度是 <code class="inline">v_head_dim</code> 而不是 <code class="inline">qk_head_dim</code>。这种「靠约定参数名换行为」的写法读起来突然，但它避开了在每层 forward 里传一个显式标志位。<code class="inline">key_value_num_tokens</code> 则是新加的可选形参，给需要显式知道 KV token 数的后端（如跨层共享、异构 batch）留的口子。</div>
   </section>
 
   <section class="block">
@@ -292,7 +292,7 @@
         <span class="cmt"># eager = 图外准备 + 图内准备，顺序执行</span>
         self.<span class="fn">init_forward_metadata_out_graph</span>(forward_batch)
         self.<span class="fn">init_forward_metadata_in_graph</span>(forward_batch)</pre>
-    <div class="annotation"><b>读懂这段：</b> 为什么要拆成图外/图内两半：<code class="inline">.item()</code>、动态 shape 的 <code class="inline">torch.empty</code>、CPU 端计算都没法被 CUDA Graph 记录，必须放在 <code class="inline">out_graph</code>（每次 capture/replay 前跑，写进固定的静态缓冲区）；<code class="inline">in_graph</code> 只放静态 shape 的纯 GPU op，capture 时被记录、replay 时随图自动重放。基类还写了 lint 约束：in_graph 的覆盖实现不许调用 <code class="inline">.item()/.cpu()/.tolist()</code>。旧的 <code class="inline">init_forward_metadata_capture_cuda_graph</code> / <code class="inline">..._replay_cuda_graph</code> 两个钩子已被删除、统一进 <code class="inline">out_graph(fb, in_capture)</code>——这是接口本身的一次收敛。</div>
+    <div class="annotation"><b>为什么要拆成图外/图内两半：</b> <code class="inline">.item()</code>、动态 shape 的 <code class="inline">torch.empty</code>、CPU 端计算都没法被 CUDA Graph 记录，必须放在 <code class="inline">out_graph</code>（每次 capture/replay 前跑，写进固定的静态缓冲区）；<code class="inline">in_graph</code> 只放静态 shape 的纯 GPU op，capture 时被记录、replay 时随图自动重放。基类还写了 lint 约束：in_graph 的覆盖实现不许调用 <code class="inline">.item()/.cpu()/.tolist()</code>。旧的 <code class="inline">init_forward_metadata_capture_cuda_graph</code> / <code class="inline">..._replay_cuda_graph</code> 两个钩子已被删除、统一进 <code class="inline">out_graph(fb, in_capture)</code>——这是接口本身的一次收敛。</div>
 
     <p>第二组是<strong>真正的前向</strong>。基类的 <code class="inline">forward</code> 按 forward_mode 分派，idle（DP 空跑填充）直接返回空张量：</p>
     <div class="code-title">python/sglang/srt/layers/attention/base_attn_backend.py — forward 分派（摘录，注释为译注）</div>
@@ -340,7 +340,7 @@
         v_scale=layer.v_scale_float,
     )
     <span class="kw">return</span> o.<span class="fn">view</span>(-<span class="nu">1</span>, layer.tp_q_head_num * layer.head_dim)</pre>
-    <div class="annotation"><b>读懂这段：</b> 每步 decode 前的 <code class="inline">init_forward_metadata</code> 已经用本 batch 的 seq_lens 更新了页表并重新 plan 出 <code class="inline">decode_wrappers</code>；这里只是「写 KV → 取 KV → 调 kernel」。注释里那行 <code class="inline">Must use _float to avoid device-to-host copy</code> 值得注意：传量化 scale 的 float 属性而不是 tensor 属性，是为了不触发 D2H 拷贝——那会破坏 CUDA Graph 捕获。这类约束遍布后端代码，是「接口为 CUDA Graph 让路」的具体表现。</div>
+    <div class="annotation"><b>这里只是「写 KV → 取 KV → 调 kernel」：</b> 每步 decode 前的 <code class="inline">init_forward_metadata</code> 已经用本 batch 的 seq_lens 更新了页表并重新 plan 出 <code class="inline">decode_wrappers</code>；这里只是「写 KV → 取 KV → 调 kernel」。注释里那行 <code class="inline">Must use _float to avoid device-to-host copy</code> 值得注意：传量化 scale 的 float 属性而不是 tensor 属性，是为了不触发 D2H 拷贝——那会破坏 CUDA Graph 捕获。这类约束遍布后端代码，是「接口为 CUDA Graph 让路」的具体表现。</div>
 
     <p>prefill（extend）路径多一个分叉：有没有已缓存前缀。无前缀的新 token 用 ragged kernel（直接吃 q/k/v 三个张量），有前缀的用 paged kernel（吃整个 KV 池 + 页表）：</p>
     <div class="code-title">python/sglang/srt/layers/attention/flashinfer_backend.py — forward_extend 的两条路（摘录，注释为译注）</div>
@@ -375,7 +375,7 @@
             o2, s2 = prefill_wrapper_paged.<span class="fn">forward_return_lse</span>(
                 q.<span class="fn">view</span>(...), kv_cache, causal=<span class="kw">False</span>, ...)
             o, _ = <span class="fn">_safe_merge_state</span>(o1, s1, o2, s2)</pre>
-    <div class="annotation"><b>读懂这段：</b> ragged 分叉是 prefill 的重要优化：首批请求（无共享前缀）跳过页表间接寻址，直接在连续张量上算，速度更接近普通 attention；一旦命中 RadixCache 前缀（第 3 章），就只能走 paged 路径，因为历史 KV 散布在池里。这也是「前缀缓存省的是算力，但会增加 kernel 访问模式复杂度」的一个具体体现。<br><br><b>三处演进痕迹：</b>① <code class="inline">use_ragged</code> 之下现在还有一层 <code class="inline">extend_no_prefix</code>——只有当<em>整个批次</em>都没有前缀时才走单次 ragged 调用，否则要用 <code class="inline">forward_return_lse</code> 拿回 log-sum-exp 统计量、再和 paged 段的结果合并（softmax 不能简单相加，必须权重化）。② ragged 分支开头多了 <code class="inline">k is None and v is None</code> 的兜底：调用方可以不传 KV 张量，此时从 <code class="inline">token_to_kv_pool</code> 里取本层已写入的缓存当 KV 源，省掉一次重物化。③ 注意 <code class="inline">causal=False</code> 那行——paged 段已经通过位置索引把可见性编码进去了，不能再叠一层 causal 掩码，否则短 query 会看不到自己的历史。</div>
+    <div class="annotation"><b>ragged 分叉是 prefill 的重要优化：</b> 首批请求（无共享前缀）跳过页表间接寻址，直接在连续张量上算，速度更接近普通 attention；一旦命中 RadixCache 前缀（第 3 章），就只能走 paged 路径，因为历史 KV 散布在池里。这也是「前缀缓存省的是算力，但会增加 kernel 访问模式复杂度」的一个具体体现。<br><br><b>三处演进痕迹：</b>其一，<code class="inline">use_ragged</code> 之下现在还有一层 <code class="inline">extend_no_prefix</code>——只有当<em>整个批次</em>都没有前缀时才走单次 ragged 调用，否则要用 <code class="inline">forward_return_lse</code> 拿回 log-sum-exp 统计量、再和 paged 段的结果合并（softmax 不能简单相加，必须权重化）。其二，ragged 分支开头多了 <code class="inline">k is None and v is None</code> 的兜底：调用方可以不传 KV 张量，此时从 <code class="inline">token_to_kv_pool</code> 里取本层已写入的缓存当 KV 源，省掉一次重物化。其三，注意 <code class="inline">causal=False</code> 那行——paged 段已经通过位置索引把可见性编码进去了，不能再叠一层 causal 掩码，否则短 query 会看不到自己的历史。</div>
 
     <p>关于 MHA 与 MLA 的分野：MHA 后端操作 <code class="inline">k_buffer/v_buffer</code> 两个张量；MLA（DeepSeek 系列）把 KV 压缩成 <code class="inline">kv_lora_rank</code> 维的 latent 向量 + 解耦的 rope 部分，decode 时可以「吸收」（absorb）进投影矩阵，用一个大 latent 头的 kernel 代替多头的 K/V。因此 MLA 有自己的一组后端（flashmla、trtllm_mla、cutedsl_mla、tokenspeed_mla），注册表里多数 MLA 工厂以 <code class="inline">if not runner.use_mla_backend: raise ValueError(...)</code> 开头。fa3（FlashAttention-3）则是 MHA 路线上 Hopper（SM90）卡的常用选择，工厂里用 <code class="inline">get_device_capability()</code> 断言算力等级。</p>
   </section>
@@ -398,7 +398,7 @@
     </table>
     <div class="callout warn">
       <b class="tag">要点</b>
-      自研引擎从头到尾只需要<strong>一个</strong>后端——先写 triton 或 flashinfer 里挑一个能跑通的，把「页面页表 → kernel 参数」这条数据通路跑对。值得照抄的接口形态是三件套：<strong>① 元数据初始化拆成图外/图内两步</strong>（哪怕暂时不用 CUDA Graph，这个拆分会让日后加图变得顺理成章）；<strong>② forward_decode 与 forward_extend 分开</strong>；<strong>③ 注册表就是一个 dict + 装饰器</strong>，工厂里做硬件/模型兼容检查。第二十个后端才需要考虑的事情（wrapper 组合、共享静态缓冲区）到时候再看。下一步进入 <a href="08-sampling.html">第 8 章：采样与结构化输出</a>。
+      自研引擎从头到尾只需要<strong>一个</strong>后端——先写 triton 或 flashinfer 里挑一个能跑通的，把「页面页表 → kernel 参数」这条数据通路跑对。值得照抄的接口形态是三件套：<strong>元数据初始化拆成图外/图内两步</strong>（哪怕暂时不用 CUDA Graph，这个拆分会让日后加图变得顺理成章）、<strong>forward_decode 与 forward_extend 分开</strong>、<strong>注册表就是一个 dict + 装饰器</strong>（工厂里做硬件/模型兼容检查）。第二十个后端才需要考虑的事情（wrapper 组合、共享静态缓冲区）到时候再看。下一步进入 <a href="08-sampling.html">第 8 章：采样与结构化输出</a>。
     </div>
   </section>
 
@@ -409,7 +409,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

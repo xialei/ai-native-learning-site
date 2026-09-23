@@ -35,11 +35,11 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Sim2Real</div>
     <h1>Sim2Real：把策略安全地放到真机上</h1>
-    <div class="subtitle">前两章在仿真里练出了策略，本章解决「下真机」的三道坎：一是差距本身（actuator 延迟、传感器噪声——靠第 10 章的域随机化提前覆盖）；二是推理时延（VLA 推理 100ms 起，机器人等不起——靠 action chunk + 异步推理）；三是工程集成（策略跑在工控机、机器人只有 MCU——靠 gRPC 把两边连起来）。lerobot 的 async_inference 栈是第三个问题的完整参考实现，我们逐行走读。</div>
+    <div class="subtitle">前两章在仿真里练出了策略，本章解决「下真机」的三道坎，沿三个问题展开：<strong>仿真和真机差在哪、各靠什么缓解？VLA 推理 100ms 起机器人等不起，时延怎么藏？策略跑在工控机、机器人只有 MCU，两边怎么连？</strong>11.1 列差距清单，11.2–11.3 走读 async_inference 栈（第三个问题的完整参考实现），11.4–11.5 收拢部署路径与全书汇合，11.6 收尾。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">11.1</span>差距清单与缓解手段</h2>
+    <h2><span class="num">11.1</span>① 差距清单与缓解手段</h2>
     <table class="tbl">
       <tr><th>差距</th><th>仿真里</th><th>真机上</th><th>缓解</th></tr>
       <tr><td>执行器动态</td><td>ImplicitActuator 指令即达</td><td>电机延迟、力矩饱和、摩擦</td><td>DelayedPDActuator（8.5）、DR 随机化刚度/阻尼</td></tr>
@@ -51,8 +51,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.2</span>架构：gRPC 双服务</h2>
-    <p>lerobot 的 transport 层定义了两个 gRPC 服务（transport/services.proto:28-45）——AsyncInference 承载远程推理（机器人把观测发给远端的策略服务器、取回动作），LearnerService 承载在线学习：</p>
+    <h2><span class="num">11.2</span>② 架构：gRPC 双服务</h2>
+    <p>第二个问题（时延）在 11.1 已经点名 chunk 与异步，第三个问题（集成）则要选通信架构。lerobot 的 transport 层定义了两个 gRPC 服务（transport/services.proto:28-45）——AsyncInference 承载远程推理（机器人把观测发给远端的策略服务器、取回动作），LearnerService 承载在线学习：</p>
     <div class="code-title">lerobot/src/lerobot/transport/services.proto — 两个服务的接口</div>
     <pre class="code"><span class="lang-tag">proto</span><span class="cmt">// LearnerService：Actor→Learner 推 transition（在线 RL / 从示范学习用）</span>
 <span class="kw">service</span> <span class="cl">LearnerService</span> {
@@ -143,7 +143,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.3</span>三个精妙的工程细节</h2>
+    <h2><span class="num">11.3</span>②（续）三个精妙的工程细节</h2>
     <p><strong>① must-go 观测直通（robot_client.py:440-450）。</strong>正常情况下队列还有存货时，新观测发上去也不急着推理（服务器会因「与上次太相似」跳过）。但若队列恰好空了<strong>且保险丝处于复位态</strong>（<code class="inline">must_go.is_set()</code>）——机器人面临「无动作可执行」的停摆风险——这条观测才被标记 <code class="inline">must_go=True</code>（robot_client.py:442 是这两个条件的与），服务器无条件处理：</p>
     <div class="code-title">lerobot/src/lerobot/async_inference/robot_client.py:441 — 空队列触发直通</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">with</span> self.action_queue_lock:
@@ -166,7 +166,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.4</span>两条部署路径对比</h2>
+    <h2><span class="num">11.4</span>③ 两条部署路径对比</h2>
     <table class="tbl">
       <tr><th></th><th>路径 A：本地推理</th><th>路径 B：异步远程推理</th></tr>
       <tr><td>策略在哪</td><td>与机器人同一台机器（笔记本/工控机）</td><td>远程 GPU 服务器</td></tr>
@@ -183,15 +183,16 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.5</span>仿真策略与真机栈的汇合</h2>
-    <p>把全书的线收拢：第 10 章 rsl_rl 训出的 RL 策略（MLP，低维观测）可以直接 <code class="inline">play.py</code> 回放到真机吗？不行——中间还隔着第 2 章的硬件抽象：仿真里的 <code class="inline">JointPositionAction</code> 目标要翻译成 Feetech 电机的 goal_position（02 章 MotorsBus），观测要从相机帧 + 电机读数构造出与仿真一致的向量。工程上常见做法：</p>
+    <h2><span class="num">11.5</span>④ 仿真策略与真机栈的汇合</h2>
+    <p>最后把全书的线收拢：第 10 章 rsl_rl 训出的 RL 策略（MLP，低维观测）可以直接 <code class="inline">play.py</code> 回放到真机吗？不行——中间还隔着第 2 章的硬件抽象：仿真里的 <code class="inline">JointPositionAction</code> 目标要翻译成 Feetech 电机的 goal_position（02 章 MotorsBus），观测要从相机帧 + 电机读数构造出与仿真一致的向量。工程上常见做法：</p>
     <p>①<strong>直接移植</strong>：把 Isaac Lab 的 obs/action 归一化参数导出成 lerobot processor（第 4 章的 dataset stats、第 5 章的 preprocessor/postprocessor 管道），RL 策略注册为 PreTrainedPolicy 子类——白名单以外的策略通过 @PreTrainedConfig.register_subclass 插件机制接入——注意注册的是<strong>策略的配置类</strong>（如 ACTConfig，policies/act/configuration_act.py:22），策略本体再按 configuration_* → modeling_* 的命名约定被 factory.py 解析出来。</p>
     <p>②<strong>蒸馏成 VLA 数据</strong>：仿真策略当「老师」在 Isaac Lab 里跑成功 rollout，用 RecorderManager（9.2 节）录成 HDF5 数据集，再用转换脚本（如 scripts/imitation_learning/locomanipulation_sdg/gr00t/convert_dataset.py）转成 LeRobotDataset——再把 VLA（第 6-7 章）当「学生」在这些数据上模仿学习。学生上位后自带视觉泛化，老师负责量产数据。</p>
     <div class="annotation"><b>第 11 章是全书的「汇合点」：</b>仿真线（8-10 章）的产出与真实线（2-7 章）的产出，最终都要通过本章的部署栈变成机器人的动作。12 章的路线图会把两条线串成六个里程碑。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.6</span>小结</h2>
+    <h2><span class="num">11.6</span>收尾：三道坎的一张表</h2>
+    <p>11.1 列的三道坎，答案收拢：差距本身靠 DR + actuator 随机化提前覆盖（第 8.5/10.3 节）；推理延迟靠 action chunk + 队列消费（本地或远程）；工程集成靠 gRPC AsyncInference——观测流上行、动作块下行，timestep 对齐聚合处理新旧动作冲突（默认 weighted_average 0.3 旧 + 0.7 新），must-go 保险丝防饿死，相似观测跳过防服务器过载。一张表：</p>
     <table class="tbl">
       <tr><th>问题</th><th>答案</th><th>锚点</th></tr>
       <tr><td>物理差距</td><td>DR + actuator 随机化 + DelayedPD</td><td>第 8.5/10.3 节</td></tr>
@@ -214,7 +215,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 11 Sim2Real · 基于 lerobot（async_inference/transport）与 isaac-sim/IsaacLab（v3.0.0，694dbf45d）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 11 Sim2Real · 基于 lerobot（async_inference/transport）与 isaac-sim/IsaacLab（v3.0.0，d7cf4f111）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

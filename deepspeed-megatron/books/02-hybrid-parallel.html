@@ -36,13 +36,13 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 3D 并行</div>
-    <h1>3D 并行：五种切法的组合拳</h1>
-    <div class="subtitle">TP、PP、DP、CP、EP——每种切法切的对象不同、通信模式不同、装卡约束不同。这一章建立全景坐标系：后面每章的通信细节，都挂在这张坐标系的某个轴上。</div>
+    <h1>3D 并行：五种切法怎么组合</h1>
+    <div class="subtitle">并行有哪几种切法，各切什么对象、付什么通信代价？一组卡怎么变成 TP/PP/DP 组（rank 映射）？DeepSpeed 侧怎么接进来？组合时先算哪笔账。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">2.1</span>为什么需要并行：单卡的三堵墙</h2>
-    <p><strong>放不下（显存墙）</strong>：第 6 章会算的账——混合精度下每个参数 16 字节状态，671B 模型仅模型状态就 10 TB 量级，任何单卡都装不下。<strong>算不动（算力墙）</strong>：即便放得下（如 7B 模型 + ZeRO-2 offload），单卡每秒浮点数有上限，吞吐上不去。<strong>等不起（时间墙）</strong>：就算吞吐够，一次训练动辄数周，容错和迭代速度都要求把时间维也并行掉。</p>
+    <h2><span class="num">2.1</span>三堵墙与五种切法</h2>
+    <p>为什么非要并行？把单卡撞到的墙数一数就明白了。<strong>放不下（显存墙）</strong>：第 6 章会算的账——混合精度下每个参数 16 字节状态，671B 模型仅模型状态就 10 TB 量级，任何单卡都装不下。<strong>算不动（算力墙）</strong>：即便放得下（如 7B 模型 + ZeRO-2 offload），单卡每秒浮点数有上限，吞吐上不去。<strong>等不起（时间墙）</strong>：就算吞吐够，一次训练动辄数周，容错和迭代速度都要求把时间维也并行掉。</p>
     <p>三种约束对应三类切法，再叠加两种特种切法，构成五种并行：</p>
     <table class="tbl">
       <tr><th>并行</th><th>切的对象</th><th>每步通信</th><th>通信量级</th><th>卡间带宽要求</th></tr>
@@ -53,12 +53,12 @@
       <tr><td><strong>CP</strong> 上下文并行</td><td>序列维</td><td>注意力内部 ring 交换</td><td>∝ 序列长/CP 数</td><td>中高</td></tr>
       <tr><td><strong>EP</strong> 专家并行</td><td>MoE 的专家</td><td>all-to-all ×2</td><td>∝ 派发的 token 数</td><td>中高</td></tr>
     </table>
-    <div class="annotation"><b>记忆法：</b>切「层内权重」= TP（通信最贵，只能在 NVLink 域内）；切「层间」= PP（通信最便宜，可跨机）；切「数据」= DP（什么都不切，所以才有冗余可优化——ZeRO 的战场）；切「序列」= CP/SP；切「专家」= EP。</div>
+    <div class="annotation"><b>这张表有个规律可记：</b>切「层内权重」= TP（通信最贵，只能在 NVLink 域内）；切「层间」= PP（通信最便宜，可跨机）；切「数据」= DP（什么都不切，所以才有冗余可优化——那是 ZeRO 的事，第 6–8 章）；切「序列」= CP/SP；切「专家」= EP。记住这个对应，后面每章的切分方案都能对号入座。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.2</span>用代码看｜world_size 与并行组是怎么定义的</h2>
-    <p>Megatron 把「建组」集中在一个函数里。<code class="inline">initialize_model_parallel()</code> 的签名就是全书的坐标系：</p>
+    <h2><span class="num">2.2</span>world_size 与并行组是怎么定义的</h2>
+    <p>墙和切法都清楚了，接下来的问题更具体：真给你 64 张卡，框架怎么知道谁和谁是一个 TP 组、谁和谁是一个 DP 组？答案集中在 Megatron 的一个函数里。<code class="inline">initialize_model_parallel()</code> 的签名就是全书的坐标系：</p>
     <div class="code-title">megatron/core/parallel_state.py — initialize_model_parallel（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">initialize_model_parallel</span>(
     tensor_model_parallel_size: <span class="cl">int</span> = <span class="nu">1</span>,
@@ -70,10 +70,10 @@
     order: <span class="cl">str</span> = <span class="st">"tp-cp-ep-dp-pp"</span>,   <span class="cmt"># rank 的排列顺序！</span>
     ...
 ):</pre>
-    <div class="annotation"><b>三个关键事实：</b>
-    ① <strong>总卡数 = 各轴之积</strong>：docstring 明确写出 world_size = TP × CP × PP × DP（EP/GTP 是叠在上面的细分轴）。配置 64 卡可以拆成 TP=4×PP=4×DP=4，也可以 TP=8×DP=8——没有唯一解，第 4 章的 bubble 公式和带宽决定取舍。
-    ② <strong>order 参数决定 rank 映射</strong>：默认 "tp-cp-ep-dp-pp" 意思是相邻的 rank 先构成一个 TP 组（这样 TP 的 all-reduce 走机内 NVLink）；PP 组则由跨机器的 rank 构成。改 order 就改变「哪一维吃机内带宽」。
-    ③ 每个并行组是一种「窄通信域」：TP 组内每层通信、PP 组只有 stage 边界通信、DP 组每步规约一次——把通信限制在最小集合里，这是所有并行组设计的共同动机。</div>
+    <div class="annotation"><b>这个签名值得停一停：</b>
+    首先，<strong>总卡数 = 各轴之积</strong>：docstring 明确写出 world_size = TP × CP × PP × DP（EP/GTP 是叠在上面的细分轴）。配置 64 卡可以拆成 TP=4×PP=4×DP=4，也可以 TP=8×DP=8——没有唯一解，第 4 章的 bubble 公式和带宽决定取舍。
+    然后，<strong>order 参数决定 rank 映射</strong>：默认 "tp-cp-ep-dp-pp" 意思是相邻的 rank 先构成一个 TP 组（这样 TP 的 all-reduce 走机内 NVLink）；PP 组则由跨机器的 rank 构成。改 order 就改变「哪一维吃机内带宽」。
+    最后一点贯穿所有并行组：每个组都是一种「窄通信域」——TP 组内每层通信、PP 组只有 stage 边界通信、DP 组每步规约一次。把通信限制在最小集合里，这是所有并行组设计的共同动机。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
@@ -150,17 +150,17 @@
 
   <section class="block">
     <h2><span class="num">2.3</span>DeepSpeed 侧的世界：它只认 DP，其余靠搭档</h2>
-    <p>DeepSpeed 的世界观简单得多：引擎只看到「数据并行组」，模型切分交给搭档。但它有两个入口能感知并行结构：</p>
+    <p>Megatron 把并行结构包办了。DeepSpeed 的世界观简单得多——引擎只看到「数据并行组」，模型切分交给搭档。但它有两个入口能感知并行结构：</p>
     <div class="code-title">deepspeed.initialize() 的 mpu 参数（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>mpu: <span class="cl">Any</span> = <span class="kw">None</span>,
 <span class="cmt"># A model parallelism unit object that implements</span>
 <span class="cmt"># get_{model,data}_parallel_{rank,group,world_size}()</span></pre>
-    <div class="annotation"><b>读懂这段：</b><code class="inline">mpu</code> 是两库协作的插销——把 Megatron 的 <code class="inline">mpu</code> 模块传进来，DeepSpeed 的梯度规约就知道「我的数据并行组是哪些 rank」，不会把 TP 组里的梯度也规约了。BLOOM-176B 的训练脚本正是这样接线的。而 DeepSpeed 自己的流水线（<code class="inline">runtime/pipe/</code>）与 Ulysses 序列并行（<code class="inline">deepspeed/sequence/</code>）则是它自带的切分实现，适用于不带 Megatron 的场景。</div>
+    <div class="annotation"><b><code class="inline">mpu</code> 就是两库协作的插销：</b>把 Megatron 的 <code class="inline">mpu</code> 模块传进来，DeepSpeed 的梯度规约就知道「我的数据并行组是哪些 rank」，不会把 TP 组里的梯度也规约了。BLOOM-176B 的训练脚本正是这样接线的。而 DeepSpeed 自己的流水线（<code class="inline">runtime/pipe/</code>）与 Ulysses 序列并行（<code class="inline">deepspeed/sequence/</code>）则是它自带的切分实现，适用于不带 Megatron 的场景。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.4</span>PP 气泡：必须先算清的账</h2>
-    <p>流水线并行用「分段接力」换低通信，代价是时间线上的<strong>气泡（bubble）</strong>。经典 1F1B 调度下，气泡占比有一个干净的下界公式：</p>
+    <h2><span class="num">2.4</span>PP 气泡：组合前必须先算清的账</h2>
+    <p>插头接好了，最后还有一笔账：两库组合时，PP 的气泡账决定你敢不敢开 PP。流水线并行用「分段接力」换低通信，代价是时间线上的<strong>气泡（bubble）</strong>。经典 1F1B 调度下，气泡占比有一个干净的下界公式：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t22 d22">
         <title id="t22">1F1B 时间线与气泡</title>
@@ -198,11 +198,12 @@
       </svg>
       <div class="fig-cap">图 2.2：1F1B 气泡示意。理想气泡率 ≈ (pp−1)/(num_microbatches + pp − 1)；pp=8、micro-batch=32 时约 19%，靠加大 micro-batch 只能稀释到一定程度——interleaved 调度（第 4 章）才是根治手段。</div>
     </div>
-    <p>这条账决定了组合拳的打法：<strong>先算 PP 需要的 micro-batch 数 → 气泡率可接受时才开 PP；剩下的卡给 TP×DP</strong>。Megatron 默认建议 TP ≤ 单机卡数（NVLink 域），PP 拿跨机带宽，DP 用 ZeRO 砍显存。</p>
+    <p>这笔账直接决定组合方案：<strong>先算 PP 需要的 micro-batch 数 → 气泡率可接受时才开 PP；剩下的卡给 TP×DP</strong>。Megatron 默认建议 TP ≤ 单机卡数（NVLink 域），PP 拿跨机带宽，DP 用 ZeRO 砍显存。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.5</span>选型速查 + 小结</h2>
+    <h2><span class="num">2.5</span>选型速查</h2>
+    <p>这一章的信息量不小，收个尾：三堵墙各对应一类切法，加上 CP/EP 两种特种切法凑成五种并行；rank 怎么分组由 initialize_model_parallel 的 order 参数一次性定型——TP 相邻（吃机内 NVLink）、PP 跨机（吃机间带宽），改 order 就改「哪一维吃机内带宽」；DeepSpeed 只认 DP 组，靠 mpu 插头接入 Megatron 的并行结构。真要组合，先算 PP 气泡账——气泡率可接受才开 PP，剩下的卡给 TP×DP。落到选型，就是下面这张表：</p>
     <table class="tbl">
       <tr><th>你的处境</th><th>第一步</th><th>理由</th></tr>
       <tr><td>单卡放得下，只是想快</td><td>TP=2/4（机内）</td><td>通信全走 NVLink，收益线性</td></tr>
@@ -225,7 +226,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 02 3D 并行 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 02 3D 并行 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

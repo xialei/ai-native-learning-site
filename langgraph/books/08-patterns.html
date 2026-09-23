@@ -44,6 +44,7 @@
       本代码库 <code class="inline">examples/reflection</code>、<code class="inline">examples/reflexion</code>、<code class="inline">examples/plan-and-execute</code>、<code class="inline">examples/rag/</code> 下的 notebook 现在是归档占位文件（指向已合并到 LangChain 文档的教程），但它们记录的图结构、state schema、节点职责划分是真实且稳定的。本章把这些模式用 LangGraph 1.x 的 <code class="inline">StateGraph</code> / <code class="inline">Command</code> / <code class="inline">Send</code> 重新写成可运行骨架，直接对应当前 API。
     </div>
     <p>阅读前请先记住一个心智锚点：第 05 章的 ReAct 是「agent 节点 ↔ tools 节点」的双节点循环。本章所有模式做的事，都可以概括成一句话——<strong>在这个循环里再加一个或几个节点，并在节点之间加条件边和回边，把单向循环变成带反馈的多循环</strong>。掌握了第 04 章的控制流原语，组合这些模式是自然的。</p>
+    <p>后面几节就沿着这条线展开：反思类模式（8.2–8.3）回答「评估者怎么监督生成者、教训怎么沉淀成记忆」；Plan-and-Execute（8.4）负责长任务的「全局计划 + 局部执行 + 重排」；检索类任务的「何时检索 / 检索什么 / 检索错了怎么办」交给 8.5–8.6 的四种 RAG 变体；最后 8.10 收拢这些模式拼起来后必须提前想清楚的坑——循环上限、reducer 语义、路由兜底。先看最简单的反思循环。</p>
   </section>
 
   <section class="block">
@@ -86,7 +87,7 @@
       <div class="fig-cap">图 8.1：Reflection——generator 与 reflector 两节点循环，评估不过就回到 generator 再生成，直到达标或撞循环上限。</div>
     </div>
 
-    <div class="code-title">Reflection:生成器 ↔ 评估器循环</div>
+    <div class="code-title">Reflection：生成器 ↔ 评估器循环</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
@@ -133,7 +134,7 @@ graph = workflow.compile()</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.3</span>Reflexion:把反思沉淀成 episodic memory</h2>
+    <h2><span class="num">8.3</span>Reflexion：把反思沉淀成 episodic memory</h2>
     <p>Reflection 的问题在于：每一轮的批评用完就丢，下次遇到同类问题还会犯同样的错。Reflexion 的改进点是——把反思结论存进一个长期累积的 <code class="inline">reflections</code> 列表（state 的一部分，语义上相当于「情节记忆」），生成者每次动笔前先读这个列表，把历史教训纳入考虑。</p>
     <p>这个设计的关键在于 <code class="inline">reflections</code> 用 <code class="inline">operator.add</code> 作为 reducer（第 03 章）：每次反思节点返回一条新教训，它会被<strong>追加</strong>到列表而不是覆盖。于是状态里就形成了一条不断增长的「经验流」，生成者读它时看到的是全部历史教训。这正是「记忆」在图里的实现方式——一个带累加 reducer 的 state 字段。</p>
 
@@ -181,7 +182,7 @@ graph = workflow.compile()</pre>
       <div class="fig-cap">图 8.2：Reflexion——reflector 把教训写进 <code class="inline">reflections</code>（累加 reducer），generator 下次读全部历史教训再生成。</div>
     </div>
 
-    <div class="code-title">Reflexion:reflections 用 operator.add 累加</div>
+    <div class="code-title">Reflexion：reflections 用 operator.add 累加</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
 <span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -235,7 +236,7 @@ graph = workflow.compile()</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>Plan-and-Execute:先规划全局，再逐步执行</h2>
+    <h2><span class="num">8.4</span>Plan-and-Execute：先规划全局，再逐步执行</h2>
     <p>ReAct 是「想一步做一步」，每一步只看眼前。问题是：没有全局视野，容易在长任务里走偏、重复劳动、或漏掉关键步骤。Plan-and-Execute 把流程拆成两段——<strong>先让 planner 节点一次性生成完整的步骤列表，再让 executor 逐条执行，执行完由 re-planner 评估要不要根据新信息调整计划</strong>。</p>
     <p>为什么 planner 用 <code class="inline">with_structured_output</code> 返回一个 <code class="inline">Plan(steps: list[str])</code>？因为计划是结构化数据（一组步骤），不是自然语言文本。用结构化输出让 LLM 直接产出 Pydantic 对象，比让它写自由文本再去正则解析稳得多。计划存在 state 的 <code class="inline">plan</code> 字段里，executor 每次取第一条执行，执行完把它移到 <code class="inline">past_steps</code>（用 <code class="inline">operator.add</code> 累加），re-planner 看到「已完成哪些 + 还剩哪些 + 最新观察」后决定是否重排。</p>
 
@@ -277,7 +278,7 @@ graph = workflow.compile()</pre>
       <div class="fig-cap">图 8.3：Plan-and-Execute——planner 一次性出全局计划，executor 逐条执行，re-planner 据新信息调整剩余计划。</div>
     </div>
 
-    <div class="code-title">Plan-and-Execute:结构化计划 + 逐条执行 + 重排</div>
+    <div class="code-title">Plan-and-Execute：结构化计划 + 逐条执行 + 重排</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
 <span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">from</span> pydantic <span class="kw">import</span> <span class="cl">BaseModel</span>, <span class="cl">Field</span>
@@ -386,7 +387,7 @@ graph = workflow.compile()</pre>
       <div class="fig-cap">图 8.4：Agentic RAG——结构≈标准 ReAct，只是工具列表里多了一个 <code class="inline">retrieve</code>。</div>
     </div>
 
-    <div class="code-title">Agentic RAG:retrieve 当工具交给 ReAct agent</div>
+    <div class="code-title">Agentic RAG：retrieve 当工具交给 ReAct agent</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> langchain_core.tools <span class="kw">import</span> tool
 <span class="kw">from</span> langchain.chat_models <span class="kw">import</span> init_chat_model
 <span class="kw">from</span> langgraph.prebuilt <span class="kw">import</span> create_react_agent, ToolNode, tools_condition
@@ -460,7 +461,7 @@ graph = create_react_agent(
       <div class="fig-cap">图 8.5：Adaptive RAG——入口 <code class="inline">add_conditional_edges(START, route)</code> 一分多路，各路径互不干扰。</div>
     </div>
 
-    <div class="code-title">Adaptive RAG:入口条件路由一分三路</div>
+    <div class="code-title">Adaptive RAG：入口条件路由一分三路</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
@@ -515,7 +516,7 @@ workflow.add_edge(<span class="st">"web"</span>, END)
 graph = workflow.compile()</pre>
     <div class="annotation"><b>适用场景：</b> 问题类型分布明确、且不同类型适合不同检索源的客服 / 知识问答系统。价值在于「早分流省成本」——简单问题不浪费检索，复杂问题不走错路径。代价是 router 自身可能误判，所以分类边界要设计得清晰。</div>
 
-    <h3>8.5.3 Corrective RAG (CRAG):检索后自我修正</h3>
+    <h3>8.5.3 Corrective RAG (CRAG)：检索后自我修正</h3>
     <p>Adaptive RAG 是「检索前分流」，CRAG 则是「检索后纠错」。它假设检索结果质量参差，所以在检索后加一个 <strong>grading 节点</strong>评估每篇文档与问题的相关性：相关的留下生成，不相关的丢弃并转去 web search 补救。这是一条「检索 → 评估 → 必要时换源重试」的反馈回路。</p>
     <p>为什么要在生成前 grading？因为把不相关文档塞进 prompt 会误导 LLM（它倾向于「信任」给定的上下文）。CRAG 的设计哲学是：与其让 LLM 在一堆噪声里挣扎，不如先用一个轻量判断把噪声过滤掉，过滤不掉就换更可靠的信息源。grading 节点通常用一个便宜的小模型做二元判断，成本远低于让大模型在噪声上下文里胡编。</p>
 
@@ -559,7 +560,7 @@ graph = workflow.compile()</pre>
       <div class="fig-cap">图 8.6：CRAG——检索后 grading 过滤噪声，都不相关就转 web search 换源，一条「检索→评估→换源」纠错回边。</div>
     </div>
 
-    <div class="code-title">CRAG:grading 过滤 + 换源纠错</div>
+    <div class="code-title">CRAG：grading 过滤 + 换源纠错</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
 <span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -624,7 +625,7 @@ graph = workflow.compile()</pre>
     <div class="annotation"><b>适用场景：</b> 知识库质量参差、检索召回不稳定、且对答案准确性要求高的场景（医疗、法律、企业内部文档问答）。CRAG 的核心收益是「用纠错换可信度」，代价是 grading 多一轮 LLM 调用；若你的检索器本身召回率很高，CRAG 的纠错分支几乎不会触发，就是纯开销。</div>
 
     <h3>8.5.4 Self-RAG:全流程自我反思</h3>
-    <p>Self-RAG 把「自我评估」推到极致：不仅检索后评估文档相关性，生成后还自评「回答是否被文档支持」。它内嵌了多个反思点——是否需要检索、检索结果是否相关、回答是否有据——形成多轮自我反思的闭环。</p>
+    <p>Self-RAG 把「自我评估」推到极致：不仅检索后评估文档相关性，生成后还自评「回答是否被文档支持」。它内嵌了多个反思点——是否需要检索、检索结果是否相关、回答是否有据——每个反思点都带一条回边，多轮自我反思就靠这几条回边完成。</p>
     <p>和 CRAG 的区别：CRAG 只在检索后纠错一次，Self-RAG 在<strong>多个环节</strong>都插了评估节点，且生成后还会回头检查「幻觉没有」。代价是图更复杂、LLM 调用更多；收益是幻觉率最低。它适合对事实准确性要求最高的场景。</p>
 
     <div class="figure">
@@ -676,7 +677,7 @@ graph = workflow.compile()</pre>
       <div class="fig-cap">图 8.7：Self-RAG——多环节反思（是否检索 / 文档相关 / 答案被支持），多条回边，幻觉率最低但成本最高。</div>
     </div>
 
-    <div class="code-title">Self-RAG:多环节自我反思闭环</div>
+    <div class="code-title">Self-RAG：多环节自我反思（多条回边）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">import</span> operator
 <span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
@@ -776,13 +777,13 @@ graph = workflow.compile()</pre>
   <section class="block">
     <h2><span class="num">8.9</span>本页要点回顾</h2>
     <ul>
-      <li><strong>Reflection</strong>:generator → reflector 循环，评估者批评、生成者改进，适合写作 / 代码生成。关键是把「生成」和「评估」拆成两个专注的节点。</li>
-      <li><strong>Reflexion</strong>:在 Reflection 基础上，把反思教训存进 <code class="inline">reflections: Annotated[list[str], operator.add]</code> 累加的「情节记忆」，生成器读历史教训避免重蹈覆辙。适合会反复失败、教训可复用的任务。</li>
-      <li><strong>Plan-and-Execute</strong>:planner 用 <code class="inline">with_structured_output(Plan)</code> 一次生成全局步骤列表，executor 逐条执行，re-planner 据新信息调整。适合长任务、需全局规划的场景。</li>
-      <li><strong>Agentic RAG</strong>:retriever 封装成工具，交给 ReAct agent 自行决定是否 / 何时 / 检索几次。最轻量的 RAG 增强，结构≈标准 ReAct。</li>
-      <li><strong>Adaptive RAG</strong>:入口 router 节点用结构化输出分流（直接答 / 本地 RAG / web search），<code class="inline">add_conditional_edges(START, route)</code> 实现一分多路。</li>
-      <li><strong>Corrective RAG</strong>:检索后 grading 节点评估文档相关性，差的转 web search 换源。一条「检索 → 评估 → 换源」纠错回边。</li>
-      <li><strong>Self-RAG</strong>:多环节自我反思（是否检索 / 文档相关 / 答案被支持），多条反思回边，幻觉率最低但成本最高。</li>
+      <li><strong>Reflection</strong>：generator → reflector 循环，评估者批评、生成者改进，适合写作 / 代码生成。关键是把「生成」和「评估」拆成两个专注的节点。</li>
+      <li><strong>Reflexion</strong>：在 Reflection 基础上，把反思教训存进 <code class="inline">reflections: Annotated[list[str], operator.add]</code> 累加的「情节记忆」，生成器读历史教训避免重蹈覆辙。适合会反复失败、教训可复用的任务。</li>
+      <li><strong>Plan-and-Execute</strong>：planner 用 <code class="inline">with_structured_output(Plan)</code> 一次生成全局步骤列表，executor 逐条执行，re-planner 据新信息调整。适合长任务、需全局规划的场景。</li>
+      <li><strong>Agentic RAG</strong>：retriever 封装成工具，交给 ReAct agent 自行决定是否 / 何时 / 检索几次。最轻量的 RAG 增强，结构≈标准 ReAct。</li>
+      <li><strong>Adaptive RAG</strong>：入口 router 节点用结构化输出分流（直接答 / 本地 RAG / web search），<code class="inline">add_conditional_edges(START, route)</code> 实现一分多路。</li>
+      <li><strong>Corrective RAG</strong>：检索后 grading 节点评估文档相关性，差的转 web search 换源。一条「检索 → 评估 → 换源」纠错回边。</li>
+      <li><strong>Self-RAG</strong>：多环节自我反思（是否检索 / 文档相关 / 答案被支持），多条反思回边，幻觉率最低但成本最高。</li>
       <li><strong>共同骨架</strong>：这些模式全部是 <code class="inline">StateGraph</code> + 节点 + 条件边 + 回边 + reducer 的组合，没有新原语。掌握控制流后，组合模式是自然的；从最简模式起步，按需加节点。</li>
     </ul>
   </section>
@@ -792,20 +793,20 @@ graph = workflow.compile()</pre>
     <p>本章的图都能编译通过、也能跑前几步，坑集中在「循环跑飞」和「reducer 语义和直觉相反」上。下面三个都对照本仓库源码验证过。</p>
 
     <div class="code-title">① 反馈循环忘了加循环上限 → GraphRecursionError</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ reflector 永远说"不够好", should_continue 永远回 "generator"， 死循环</span>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ reflector 永远说"不够好"，should_continue 永远回 "generator"，死循环</span>
 <span class="kw">def</span> <span class="fn">should_continue</span>(state):
-    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 没有 iterations 上限， 也没有解析 satisfactory</span>
+    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 没有 iterations 上限，也没有解析 satisfactory</span>
 
 graph.<span class="fn">invoke</span>(initial_state)
 <span class="cmt"># GraphRecursionError: Recursion limit of 10007 reached without hitting a stop condition.</span>
-<span class="cmt"># 默认上限 LANGGRAPH_DEFAULT_RECURSION_LIMIT=10007 (_internal/_config.py:32)， 撞到才停。</span>
+<span class="cmt"># 默认上限 LANGGRAPH_DEFAULT_RECURSION_LIMIT=10007 (_internal/_config.py:32)，撞到才停。</span>
 <span class="cmt">#</span>
-<span class="cmt"># ✓ 任何回边都要配一个"硬上限"兜底(本章所有示例都这么做的):</span>
+<span class="cmt"># ✓ 任何回边都要配一个"硬上限"兜底（本章所有示例都这么做的）：</span>
 MAX_ITER = <span class="nu">3</span>
 <span class="kw">def</span> <span class="fn">should_continue</span>(state):
     <span class="kw">if</span> state[<span class="st">"iterations"</span>] &gt;= MAX_ITER:   <span class="cmt"># 硬上限</span>
         <span class="kw">return</span> END
-    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 再叠一个业务判断(解析 satisfactory)更稳</span></pre>
+    <span class="kw">return</span> <span class="st">"generator"</span>   <span class="cmt"># 再叠一个业务判断（解析 satisfactory）更稳</span></pre>
     <div class="annotation"><b>踩坑点：</b> Reflection / Reflexion / Self-RAG / CRAG 都有回边，只要评估节点一直说「再来一轮」，就是死循环。LangGraph 不会自动检测「你在原地打转」，只靠 <code class="inline">recursion_limit</code> 兜底（默认 10007，撞限抛 <code class="inline">GraphRecursionError</code>）。默认值给得很宽裕——死循环最终会撞限暴露，但可能跑很久才停。所以<strong>每条回边都要配一个计数器上限</strong>，别指望靠撞限兜底，也别指望业务判断永远收敛；更主动的做法是按需把 <code class="inline">recursion_limit</code> 调小（如 <code class="inline">{"recursion_limit": 25}</code>），套一道更紧的保险。锚点：<code class="inline">DEFAULT_RECURSION_LIMIT</code> 在 <code class="inline">_internal/_config.py:32</code>，报错消息在 <code class="inline">main.py:3003</code>。</div>
 
     <div class="code-title">② 给「过滤/替换」语义的字段用了 operator.add → 越过滤越长</div>
@@ -814,7 +815,7 @@ MAX_ITER = <span class="nu">3</span>
 <span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 
 <span class="kw">class</span> <span class="cl">CragState</span>(<span class="cl">TypedDict</span>):
-    <span class="cmt"># ✗ 想用 documents 做"过滤后的相关文档"， 却配了 operator.add</span>
+    <span class="cmt"># ✗ 想用 documents 做"过滤后的相关文档"，却配了 operator.add</span>
     documents: <span class="kw">Annotated</span>[<span class="cl">list</span>, operator.add]   <span class="cmt"># reducer 是 list + list = 拼接</span>
 
 <span class="kw">def</span> <span class="fn">retrieve</span>(state):  <span class="kw">return</span> {<span class="st">"documents"</span>: [<span class="st">"doc1"</span>, <span class="st">"doc2"</span>, <span class="st">"doc3"</span>]}   <span class="cmt"># state.documents = 3 篇</span>
@@ -822,30 +823,50 @@ MAX_ITER = <span class="nu">3</span>
 <span class="kw">def</span> <span class="fn">grade</span>(state):
     filtered = [<span class="st">"doc1"</span>]   <span class="cmt"># 只剩 1 篇相关</span>
     <span class="kw">return</span> {<span class="st">"documents"</span>: filtered}
-<span class="cmt"># 期望： documents 变成 ["doc1"](只剩相关的)</span>
-<span class="cmt"># 实际： documents = ["doc1","doc2","doc3"] + ["doc1"] = 4 篇！ 过滤根本没生效</span>
+<span class="cmt"># 期望：documents 变成 ["doc1"]（只剩相关的）</span>
+<span class="cmt"># 实际：documents = ["doc1","doc2","doc3"] + ["doc1"] = 4 篇！过滤根本没生效</span>
 <span class="cmt">#</span>
-<span class="cmt"># ✓ 要"替换"语义， 就别配 reducer(默认 LastValue = 最后一次写入覆盖):</span>
+<span class="cmt"># ✓ 要"替换"语义，就别配 reducer（默认 LastValue = 最后一次写入覆盖）：</span>
 <span class="kw">class</span> <span class="cl">CragState</span>(<span class="cl">TypedDict</span>):
-    documents: <span class="cl">list</span>   <span class="cmt"># 无 Annotated reducer → LastValue， 覆盖而非累加</span></pre>
+    documents: <span class="cl">list</span>   <span class="cmt"># 无 Annotated reducer → LastValue，覆盖而非累加</span></pre>
     <div class="annotation"><b>踩坑点：</b> 这是本章最容易踩的语义陷阱。<code class="inline">operator.add</code> 是<strong>追加</strong>（list 拼接），适合「只增不减」的记忆字段（reflections、past_steps）；但「过滤」是要<strong>替换</strong>掉旧值，这时不该配 reducer——源码 <code class="inline">state.py:1871</code> 里，没有 reducer 注解的字段会回落到 <code class="inline">LastValue</code>（最后一次写入覆盖），这才是过滤该用的语义。判断准则：这字段是<strong>累加历史</strong>（用 reducer）还是<strong>反映当前最新值</strong>（不配 reducer）？CRAG 的 documents 是后者。</div>
 
     <div class="code-title">③ 路由 LLM 返回了 Literal 之外的值 → KeyError</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Literal
 
-<span class="cmt"># Adaptive RAG 的 router， 期望返回 "llm" / "rag" / "web"</span>
+<span class="cmt"># Adaptive RAG 的 router，期望返回 "llm" / "rag" / "web"</span>
 <span class="kw">def</span> <span class="fn">route_question</span>(state) -> <span class="cl">Literal</span>[<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]:
     resp = router_llm.<span class="fn">invoke</span>(...)   <span class="cmt"># LLM 偶尔会回 "LLM" / " rag " / "search"</span>
     <span class="kw">return</span> resp[<span class="st">"datasource"</span>]
-<span class="cmt"># 假设 LLM 回了 "search"(不在 Literal / path_map 里):</span>
-<span class="cmt"># KeyError: 'search'   (_branch.py:203 的 self.ends[r] 字典查找)</span>
-<span class="cmt"># 若返回 None / START: ValueError: Branch did not return a valid destination</span>
+<span class="cmt"># 假设 LLM 回了 "search"（不在 Literal / path_map 里）：</span>
+<span class="cmt"># KeyError: 'search'   （_branch.py:203 的 self.ends[r] 字典查找）</span>
+<span class="cmt"># 若返回 None / START：ValueError: Branch did not return a valid destination</span>
 <span class="cmt">#</span>
-<span class="cmt"># ✓ 路由函数里做归一化 + 兜底， 别把 LLM 原始输出直接当路由键：</span>
+<span class="cmt"># ✓ 路由函数里做归一化 + 兜底，别把 LLM 原始输出直接当路由键：</span>
 <span class="kw">def</span> <span class="fn">route_question</span>(state) -> <span class="cl">Literal</span>[<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>]:
     raw = router_llm.<span class="fn">invoke</span>(...)[<span class="st">"datasource"</span>].strip().lower()
     <span class="kw">return</span> raw <span class="kw">if</span> raw <span class="kw">in</span> (<span class="st">"llm"</span>, <span class="st">"rag"</span>, <span class="st">"web"</span>) <span class="kw">else</span> <span class="st">"llm"</span>   <span class="cmt"># 未知→走最稳的兜底路</span></pre>
     <div class="annotation"><b>踩坑点：</b> 源码 <code class="inline">_branch.py:201-208</code> 里，带 path_map / Literal 的条件边会把返回值当字典 key 查 <code class="inline">self.ends[r]</code>，查不到就 <code class="inline">KeyError</code>。LLM 输出天然不稳定（大小写、空格、同义词），所以路由节点<strong>不能把 LLM 原始输出直接当路由键</strong>——要先归一化（strip/lower）再做白名单校验，未命中走一条兜底路径。这是 Adaptive RAG / Self-RAG 这类「LLM 当路由器」模式的通病。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.11</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · Reflection 和 Reflexion 只差一个「记忆字段」：<code class="inline">reflections</code> 带 <code class="inline">operator.add</code>。如果把这条注解删掉（变成普通 list），每次循环 generator 读到的教训会怎么变？症状像什么？</summary>
+      <div class="a">reflector 每轮返回的教训会直接覆盖上一轮——reflections 里永远只有最新一条（或最新一批）教训，generator 每轮只「记得」上一次的批评，之前绕过的弯路可能再绕一遍。症状像「反思失忆」：图能跑、迭代也在继续，但收敛没有加速，因为历史教训没有累积。机制和 8.10② 是同一条的两面：operator.add 是「追加/累加」语义，适合只增不减的记忆；去掉 reducer 变成 LastValue 覆盖语义，教训从「图书馆」退化成「便签条」。反方向也要警惕：把「过滤/替换」语义的字段错配成 operator.add，就会越过滤越长（实测：3 篇文档过滤剩 1 篇，结果变 4 篇）。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · Plan-and-Execute 里 re-planner 每执行完一步都会被触发。如果 executor 的某一步永远跑不完（工具卡死），图会停在哪里？这与 8.10① 的死循环是同一类问题吗？</summary>
+      <div class="a">不是同一类。8.10① 是「循环条件写错」——回边一直被触发，图在节点间打转，最终撞 recursion_limit 抛 GraphRecursionError，这是控制流层面的死循环。而工具卡死是「单个节点执行不完」：super-step 的推进以「所有并行节点完成」为界，executor 不返回，这一步永远不结束，图停在当前 super-step——不是打转，是卡住，recursion_limit 管不到它（它数的是 super-step 数，不是节点内耗时）。这也是为什么死循环靠「调小 recursion_limit + 业务计数器」双保险，而节点卡死要靠工具侧的超时策略（或 add_node 的 timeout）兜底。两层失败模式不同，兜底手段也不同。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 图 8.6 的 CRAG 把「检索 → 评估 → 换源」画成纠错回边。如果 grading 把所有文档都判为不相关、web search 也挂了（抛异常），图会怎么表现？这暴露了纠错回边的什么局限？</summary>
+      <div class="a">取决于 web search 节点的错误处理：异常默认向上抛（和 05 章 ToolNode 的窄默认同理——框架不替业务判断「把错误喂回 LLM」是否安全），这一轮 invoke 直接崩出来。如果 catch 住并返回空文档，下一个节点会拿到空上下文继续生成，产出「没有依据的回答」。这暴露了纠错回边的局限：它只能纠「检索源不好」这一类错，纠不了「所有源都不可用」——CRAG 的换源是恢复策略，不是容错策略。要兜住「全军覆没」，得在换源节点之外显式加一条「承认检索失败」的路径（比如返回一条说明检索失败的消息），而不是指望回边自动重试成功。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · 8.10③ 说路由 LLM 返回白名单外的值会 KeyError。把同样的输入换到 Adaptive RAG 的另一个位置——入口 <code class="inline">add_conditional_edges(START, route)</code> 的 route 函数里，症状一样吗？为什么「LLM 当路由器」的模式里，路由函数是全图最不该省 try 的地方？</summary>
+      <div class="a">一样——条件边不管挂在 START 还是普通节点后面，都走 _branch.py:203 的 self.ends[r] 查表，查不到就是裸 KeyError，错误信息里连「哪个边、哪个分支」的上下文都没有，只有一个 key 名。所以排查时看到 KeyError: 'search' 第一反应应该是「谁在路由、谁没做归一化」，而不是去查节点函数。「LLM 当路由器」是全链路里唯一让 LLM 输出直接决定控制流的位置——其他地方 LLM 输出错了顶多内容不好，这里错了是图不往下走。所以这个位置要 strip/lower + 白名单 + 兜底分支三件套齐上，且这条兜底分支也要真的画进 Literal/path_map（否则兜底本身又是一个 KeyError）。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 8.7 说这些模式「没有新原语」。给你一个新需求：QA 系统要求「先自问子问题、并行检索、汇总后统一 grading」。用本章的积木怎么搭？说出每个环节用的是哪个原语，以及 grading 环节该配什么 reducer。</summary>
+      <div class="a">拆成四块：① 自问子问题——planner 式节点（8.4），用 with_structured_output 让 LLM 产出 sub_questions: list[str]；② 并行检索——Send（04 章 fan-out），把每个子问题分发成独立的 retrieve 实例，同一 super-step 里并行执行；③ 汇总——retrieved_docs 字段配 operator.add（04 章 join 语义），所有并行实例的文档自动拼接成一个列表；④ 统一 grading——reflector 式节点（8.2），读拼好的文档列表做相关性过滤。grading 输出的 filtered_docs 是「过滤/替换」语义，不配 reducer（LastValue 覆盖）——注意 grading 节点本身只触发一次（在 join 之后），不存在并行写入冲突；如果你把 grading 也 Send 并行化了，filtered 就得改累加或换 dedupe，否则要撞 04 章「并行写 LastValue」的 InvalidUpdateError。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

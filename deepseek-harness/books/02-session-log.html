@@ -35,23 +35,25 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 会话日志</div>
     <h1>会话日志：一条 append-only 事件流是唯一事实</h1>
-    <div class="subtitle">dsh 的会话不是「消息数组」，而是一条只增不改的 SessionEvent 日志。模型历史、UI 转录、崩溃恢复、fork——全都是对这条日志的投影。这一章讲清事件词汇表、表面（surface）投影机制，以及「Model-visible means logged」这条铁律。</div>
+    <div class="subtitle">问题：同一个会话，模型要读、人要看、崩了要恢复、fork 要切——一份状态怎么同时服务这四个消费者还不互相打架？dsh 的答案是「只有一条 append-only 的 SessionEvent 日志，其余全是投影」。本章回答四个问题：日志里能记什么（①）、日志怎么变成模型历史（②）、新增模型可见输入的第一步是什么（③）、格式演进怎么保证旧日志还能读（④）。2.1 摆问题，2.2–2.6 逐个作答，2.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">2.1</span>一分钟版本</h2>
+    <h2><span class="num">2.1</span>问题：一份状态，四个消费者</h2>
+    <p>先摆出设计会话状态时绕不开的四个问题：</p>
     <ul>
-      <li>会话 = <strong>append-only 的 <code class="inline">SessionEvent</code> 日志</strong>（<code class="inline">packages/core/session</code>，ctx 键 <code class="inline">ctx.sessions</code>）。每条事件带单调递增 <code class="inline">seq</code>、时间戳、类型化 data。</li>
-      <li>只有四类事件能出现在「有序表面」上：<code class="inline">system/message</code>、<code class="inline">user/message</code>、<code class="inline">assistant/message</code>、<code class="inline">tool/result</code>（<code class="inline">SurfaceEventType</code>）。</li>
-      <li><code class="inline">deriveMessages()</code> 把表面节点折叠成 LLM 消息历史，带 O(新节点) 的增量缓存。</li>
-      <li>压缩不是删除：一个 <code class="inline">replace</code> 的 <code class="inline">user/message</code> 遮蔽（shadow）旧区间，原事件仍在日志里。</li>
-      <li>不认识的事件类型：带 <code class="inline">ignorable: true</code> 的可跳过；不带的<strong>必须拒绝重建</strong>，宁可拒绝也不静默丢内容。</li>
+      <li><strong>① 日志里能记什么？</strong>模型的请求历史、token 计账、工具调用原文、每次失败尝试……哪些该进持久日志、哪些只是进程内转瞬即逝？分界线画在哪里？</li>
+      <li><strong>② 日志怎么变成模型历史？</strong>日志是事件流，模型要的是有序消息数组——中间的折叠规则是什么？增量怎么做才不退化为每次全量重算？</li>
+      <li><strong>③ 新增一种模型可见输入，第一步做什么？</strong>文件变更通知、子目录 AGENTS.md、被 offload 的图……想让模型看到新东西，从哪里开始、不破坏既有消费者？</li>
+      <li><strong>④ 格式演进怎么不弄坏旧日志？</strong>运行时升级了，事件词汇表变了、结构变了，三个月前落盘的会话还能读吗？谁决定要不要升版本号？</li>
     </ul>
+    <p>四个问题共享同一个前提：<strong>一切消费方向（模型请求、UI 转录、崩溃恢复、fork）必须能从同一份持久数据重建，且互不相同步也互不矛盾</strong>。dsh 对这四个问题的回答分别是：类型化的 SessionEventMap 词汇表（2.2）＋五类表面事件的投影规则（2.3）＋ O(新节点) 增量折叠（2.4）＋「Model-visible means logged」铁律（2.5）＋ ignorable 逐事件标注与版本递增规则（2.6）。</p>
+    <div class="annotation"><b>四个问题，四节答案：</b>① 词汇表 → 2.2；② 投影 → 2.3 摆表面资格、2.4 看折叠实现；③ 铁律 → 2.5；④ 演进 → 2.6。2.7 收尾把答案收回来。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.2</span>核心事件词汇表</h2>
-    <p>核心 <code class="inline">SessionEventMap</code> 定义在 <code class="inline">packages/core/session/src/types.ts</code>（SESSION_FORMAT_VERSION = 3）。每个事件都带精确的契约注释，摘录关键部分：</p>
+    <h2><span class="num">2.2</span>① 核心事件词汇表</h2>
+    <p>核心 <code class="inline">SessionEventMap</code> 定义在 <code class="inline">packages/core/session/src/types.ts</code>（SESSION_FORMAT_VERSION = 4，types.ts:89）。每个事件都带精确的契约注释，摘录关键部分：</p>
     <div class="code-title">packages/core/session/src/types.ts — SessionEventMap（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">SessionEventMap</span> {
   <span class="cmt">/** Opens turn `turn` before the loop claims queued input or runs pre-step. */</span>
@@ -78,6 +80,20 @@
    * `source` tells them apart.
    */</span>
   <span class="st">'user/message'</span>: <span class="cl">UserMessage</span>
+
+  <span class="cmt">/**
+   * An incremental agent session change admitted at the named turn and step.
+   * V4 新增的第五种表面事件：developer 角色消息，当前承载工具的
+   * tool-addition / tool-removal 块。addition 只存 toolName（模式来自
+   * headerSeq 引用的历史 request/header），removal 只存工具名。
+   */</span>
+  <span class="st">'developer/message'</span>: {
+    turn: <span class="kw">number</span>
+    step: <span class="kw">number</span>
+    message: <span class="cl">DeveloperMessage</span>
+    <span class="cmt">/** Earlier request/header defining every tool addition; required exactly when additions are present. */</span>
+    headerSeq?: <span class="cl">SessionSeq</span>
+  }
 
   <span class="cmt">/**
    * The rendered system prompt on the model-visible surface. The loop appends
@@ -130,7 +146,8 @@
     turn: <span class="kw">number</span>
     step: <span class="kw">number</span>
     message: <span class="cl">ToolResultMessage</span>
-    error?: { name: <span class="kw">string</span>; code: <span class="kw">string</span> }
+    <span class="cmt">/** Optional failure identity, outside model content; allowed only when the message has isError: true. */</span>
+    error?: { name: <span class="kw">string</span>; code: <span class="kw">string</span>; reason?: <span class="kw">string</span> }
     meta?: <span class="cl">JsonValue</span>
   }
 
@@ -161,6 +178,8 @@
 }</pre>
     <div class="annotation"><b>设计要点</b>：① <code class="inline">assistant/message</code> 把产生它的<strong>完整计时流</strong>内嵌进来——输出与 token 记账同进同出，没有独立的 usage 记录；② <code class="inline">tool/call</code> 保存模型产出的<strong>原始未解析 JSON 字符串</strong>；③ <code class="inline">request/header</code> / <code class="inline">request/context</code> / <code class="inline">session/end-seed</code> 是 log-only 事件，只服务审计与重建，不上表面。</div>
 
+    <div class="annotation"><b>V4 新增的两件事</b>：① <code class="inline">developer/message</code> 事件与 <code class="inline">DeveloperMessage</code>（role 'developer'）——工具的动态增删第一次有了模型可见的持久位置（types.ts:311），配套两个新内容块 <code class="inline">tool-addition</code> / <code class="inline">tool-removal</code>（llm/src/types.ts:116/:128）；② <code class="inline">tool/result</code> 事件里的 <code class="inline">ToolResultMessage</code> 从「user 角色 + tool-result 包装块」升为一等 tool 角色消息（role 'tool'，携带 toolCallId/isError，message.ts:173）。v3 的 ContentBlockMap 里的 <code class="inline">tool-result</code> 块在 V4 已删除——块的九成员表见 2.6 的 Map 总表。</div>
+
     <h3>插件合并进来的事件</h3>
     <p><code class="inline">SessionEventMap</code> 是一个 TS declaration- merging 接口——各子系统往里添加自己的持久事件。这也是「新增模型可见输入 = 新增会话事件」的落地方式：</p>
     <table class="tbl">
@@ -174,16 +193,17 @@
       <tr><td><code class="inline">image/offload</code></td><td><code class="inline">compaction/compaction-image-offload/src/projection.ts</code></td><td>{targets: {seq, imageIndexes}[]} — 永久省略所选输入图（见 §2.4 与第 11 章）</td></tr>
       <tr><td><code class="inline">workspace/changes</code></td><td><code class="inline">deliverables/workspace-changes/src/types.ts</code></td><td>{turn} — 每个顶层回合的文件变更摘要（v0.1.6；正文与摘要不进日志，见下方说明）</td></tr>
     </table>
-    <div class="annotation"><b>workspace/changes 的取舍</b>：v0.1.6 新增的事件类型（known-event-types.ts:80 进了 <code class="inline">KNOWN_SESSION_EVENT_TYPES</code>，但<strong>不在</strong> <code class="inline">MESSAGE_PROJECTION_EVENT_TYPES</code> 里——它不需要消息投影，因为它本来就不出现在模型可见历史）。插件 <code class="inline">packages/deliverables/workspace-changes</code>（web-app bundle 挂载）在 <code class="inline">turn/start</code> 用 git 快照工作树（私有临时对象库 + 只读 alternate，绝不碰用户自己的 index/objects）、<code class="inline">agent/turn-stopping</code> 再快照一次并 <code class="inline">diff-tree --numstat</code>；文件工具改不到的路径（被 ignore 的、仓库外的、没有 git 的环境）靠 tools/pre-execute 时<strong>整文件复制</strong>（按内容 SHA-1 命名，每回合每路径一次）兜底。事件里只持久化回合号——文件列表与逐文件对比由 <code class="inline">ctx.workspaceChanges.summary()/diff()</code> 在 Host 进程里按需提供，Session 释放即消失。这是「日志存索引、进程存内容」的又一次应用：重启后的旧会话没有变更卡片，但日志里那行 <code class="inline">workspace/changes {turn}</code> 仍是不可变事实。</div>
+    <div class="annotation"><b>workspace/changes 的取舍</b>：v0.1.6 新增的事件类型（known-event-types.ts:81 进了 <code class="inline">KNOWN_SESSION_EVENT_TYPES</code>——V4 下这张表共 60 个条目，59 + developer/message；但<strong>不在</strong> <code class="inline">MESSAGE_PROJECTION_EVENT_TYPES</code> 里——它不需要消息投影，因为它本来就不出现在模型可见历史）。插件 <code class="inline">packages/deliverables/workspace-changes</code>（web-app bundle 挂载）在 <code class="inline">turn/start</code> 用 git 快照工作树（私有临时对象库 + 只读 alternate，绝不碰用户自己的 index/objects）、<code class="inline">agent/turn-stopping</code> 再快照一次并 <code class="inline">diff-tree --numstat</code>；文件工具改不到的路径（被 ignore 的、仓库外的、没有 git 的环境）靠 tools/pre-execute 时<strong>整文件复制</strong>（按内容 SHA-1 命名，每回合每路径一次）兜底。事件里只持久化回合号——文件列表与逐文件对比由 <code class="inline">ctx.workspaceChanges.summary()/diff()</code> 在 Host 进程里按需提供，Session 释放即消失。这是「日志存索引、进程存内容」的又一次应用：重启后的旧会话没有变更卡片，但日志里那行 <code class="inline">workspace/changes {turn}</code> 仍是不可变事实。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.3</span>表面（Surface）：四类事件 + 两种入场方式</h2>
-    <p>不是所有事件都进入「模型可见历史」。表面资格由两个类型精确刻画（<code class="inline">packages/core/session/src/types.ts</code>）：</p>
-    <div class="code-title">packages/core/session/src/types.ts</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 只有这四类事件产生 LLM 消息、可以出现在有序表面上。 */</span>
+    <h2><span class="num">2.3</span>② 表面（Surface）：五类事件 + 两种入场方式</h2>
+    <p>不是所有事件都进入「模型可见历史」。表面资格由两个类型精确刻画（<code class="inline">packages/core/session/src/types.ts:439</code>）：</p>
+    <div class="code-title">packages/core/session/src/types.ts:439</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 只有这五类事件产生 LLM 消息、可以出现在有序表面上。 */</span>
 <span class="kw">export type</span> <span class="cl">SurfaceEventType</span> =
   | <span class="st">'system/message'</span>
+  | <span class="st">'developer/message'</span>
   | <span class="st">'user/message'</span>
   | <span class="st">'assistant/message'</span>
   | <span class="st">'tool/result'</span>
@@ -198,7 +218,7 @@
 <span class="kw">export type</span> <span class="cl">SurfaceOp</span> =
   | <span class="st">'append'</span>
   | { op: <span class="st">'replace'</span>; startSeq: <span class="cl">SessionSeq</span>; endSeq: <span class="cl">SessionSeq</span> }</pre>
-    <div class="annotation"><b>为什么这么严</b>：注释明确说 <code class="inline">surfaceOp</code> 在消息类事件上<strong>强制存在</strong>、在 log-only 事件上<strong>禁止存在</strong>，编译器在 <code class="inline">Session.append()</code> 调用点强制执行。<code class="inline">assistant/message</code> 内嵌流、<strong>不能</strong>携带 <code class="inline">sourceEventSeqs</code>；v3 把 <code class="inline">system/message</code> 提升为第四类表面事件——系统提示词现在是日志中可见的节点，旧格式（v2）迁移时会补插。<code class="inline">SurfaceOp.replace</code> 的端点字段在 v3 里也规范化为 <code class="inline">startSeq/endSeq</code>。</div>
+    <div class="annotation"><b>为什么这么严</b>：注释明确说 <code class="inline">surfaceOp</code> 在消息类事件上<strong>强制存在</strong>、在 log-only 事件上<strong>禁止存在</strong>，编译器在 <code class="inline">Session.append()</code> 调用点强制执行。<code class="inline">assistant/message</code> 内嵌流、<strong>不能</strong>携带 <code class="inline">sourceEventSeqs</code>。类别成员的两次扩张都是「影响重建语义」的 bump：v3 把 <code class="inline">system/message</code> 提升为表面事件（系统提示词成为日志中可见的节点，SurfaceOp.replace 端点同时规范化为 startSeq/endSeq）；V4 又把 <code class="inline">developer/message</code> 提为第五类——工具增删现在以 developer 角色出现在历史里。空内容的 system/developer 节点保留表面位置但不派生消息（surface.ts:145 附近的派生分支），developer 事件与 developer 角色<strong>必须同时出现</strong>，缺一即拒（surface.ts:180）。</div>
 
     <p>事件信封上有两个关键字段（同文件）：</p>
     <div class="code-title">packages/core/session/src/types.ts — SessionEvent 信封（节选）</div>
@@ -227,7 +247,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.4</span>投影：deriveMessages() 如何从日志得到模型历史</h2>
+    <h2><span class="num">2.4</span>② 投影：deriveMessages() 如何从日志得到模型历史</h2>
     <p>模型历史从不单独存储，它是对表面节点的<strong>折叠</strong>。核心实现带一个精细的增量缓存（<code class="inline">packages/core/session/src/index.ts</code>）：</p>
     <div class="code-title">packages/core/session/src/index.ts — deriveMessages()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">/** The derived-message cache: frozen projections, extended per unseen node. */</span>
@@ -281,7 +301,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.5</span>Model-visible means logged</h2>
+    <h2><span class="num">2.5</span>③ Model-visible means logged</h2>
     <p>这是整个会话子系统的第一不变量（<code class="inline">docs/architecture.md</code>）：</p>
     <div class="callout warn">
       <b class="tag">铁律</b>
@@ -340,8 +360,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.6</span>格式版本与演进规则</h2>
-    <p><code class="inline">SESSION_FORMAT_VERSION = 3</code>（<code class="inline">packages/core/session/src/types.ts:88</code>）。它上方注释给出了版本号何时递增的完整决策规则，值得全文细读：</p>
+    <h2><span class="num">2.6</span>④ 格式版本与演进规则</h2>
+    <p><code class="inline">SESSION_FORMAT_VERSION = 4</code>（<code class="inline">packages/core/session/src/types.ts:89</code>）。它上方注释给出了版本号何时递增的完整决策规则，值得全文细读：</p>
     <div class="code-title">packages/core/session/src/types.ts — 版本号递增规则（注释节选）</div>
     <pre class="code"><span class="lang-tag">text</span><span class="cmt">/**
  * Current logical Session format version, stamped into every newly written
@@ -358,28 +378,31 @@
  * doubt, bump: a near-identity upgrade step is almost free, a missed bump
  * makes older runtimes read new logs wrong silently.
  */</span></pre>
-    <div class="annotation"><b>三个要点</b>：① 由<strong>写入方</strong>决定是否 bump，而不是读取方的宽容度；② 「能解析」不等于「读对了」——跳过影响重建语义的内容就是错误读取；③ 普通加事件类型<strong>不</strong>触发 bump，靠 <code class="inline">ignorable</code> 兜底；拿不准就 bump，因为近似恒等的迁移步骤几乎免费。v2 → v3 的 bump 就是一个现成例子：系统提示词升为表面事件、<code class="inline">SurfaceOp</code> 端点改名，都是「影响重建语义」的结构变化。JSONL 命名规则与完整迁移链在<a href="05-persistence.html">第 5 章</a>展开。</div>
+    <div class="annotation"><b>三个要点</b>：① 由<strong>写入方</strong>决定是否 bump，而不是读取方的宽容度；② 「能解析」不等于「读对了」——跳过影响重建语义的内容就是错误读取；③ 普通加事件类型<strong>不</strong>触发 bump，靠 <code class="inline">ignorable</code> 兜底；拿不准就 bump，因为近似恒等的迁移步骤几乎免费。v2 → v3、v3 → v4 两次 bump 都是现成例子：v3 把系统提示词升为表面事件、<code class="inline">SurfaceOp</code> 端点改名；V4 新增 developer 角色与工具增删块、tool-result 块退役（内容结构变化，影响重建语义）。JSONL 命名规则与完整迁移链在<a href="05-persistence.html">第 5 章</a>展开。</div>
 
     <h3>…Map → 派生联合：类型家族的模式</h3>
     <p>dsh 大量使用同一种类型构造：<strong>一个以字符串字面量为键的 Map 接口 + 从它派生的联合类型 + branded ID</strong>。<code class="inline">docs/subsystems/core.md</code> 记了五个规范 Map（三个在 <code class="inline">dsh-llm</code>、两个在 <code class="inline">dsh-session</code>）：</p>
     <table class="tbl">
       <tr><th>Map</th><th>键（联合成员）</th><th>派生类型</th></tr>
-      <tr><td><code class="inline">ContentBlockMap</code></td><td>text / reasoning / image / file / tool-call / tool-result</td><td><code class="inline">ContentBlock</code></td></tr>
-      <tr><td><code class="inline">MessageSourceMap</code></td><td>user / plugin / model / tool（插件可合并新 kind）</td><td><code class="inline">MessageSource</code></td></tr>
+      <tr><td><code class="inline">ContentBlockMap</code></td><td>text / reasoning / image / file / tool-call / tool-addition / tool-removal（V4：删 tool-result 块，加 tool-addition/tool-removal；llm/src/types.ts:144）</td><td><code class="inline">ContentBlock</code></td></tr>
+      <tr><td><code class="inline">MessageRoleMap</code></td><td>system / developer / user / assistant / tool（V4 新增 developer 与 tool 两个角色；封闭 Map，message.ts:189 注释：每个模型可见角色必须有持久事件与适配器投影）</td><td><code class="inline">Message</code></td></tr>
+      <tr><td><code class="inline">MessageSourceMap</code></td><td>user / plugin / model / tool / system-prompt / runtime-context…（插件可合并新 kind）</td><td><code class="inline">MessageSource</code></td></tr>
       <tr><td><code class="inline">FinishReasonMap</code></td><td>stop / tool-calls / max-tokens / aborted / error</td><td><code class="inline">FinishReason</code></td></tr>
-      <tr><td><code class="inline">TurnEndReasonMap</code></td><td>completed / aborted{user,parent,hook,disposed,legacy} / blocked / error{LlmFailure} / max-tokens（粘滞）/ interrupted（仅崩溃恢复）</td><td><code class="inline">TurnEndReason</code></td></tr>
+      <tr><td><code class="inline">TurnEndReasonMap</code></td><td>completed / aborted{user,parent,hook,disposed} / blocked / error{LlmFailure} / max-tokens（粘滞）/ interrupted（仅崩溃恢复）/ forked（仅 fork 种子，V4 新增）</td><td><code class="inline">TurnEndReason</code></td></tr>
       <tr><td><code class="inline">SessionEventMap</code></td><td>本章词汇表 + 插件合并事件</td><td><code class="inline">SessionEvent</code></td></tr>
       <tr><td><code class="inline">SessionEventType</code></td><td>—（<code class="inline">keyof SessionEventMap</code>，非规范 Map 之一）</td><td>switch(event.type) 窄化 event.data 无需断言</td></tr>
     </table>
+    <p>与 role 扩张配套的是一条退役：v3 的 <code class="inline">EpochHeader.system</code>（把系统提示词文本存进请求头）在 V4 里保留为类型占位 <code class="inline">system?: never</code>，标 <code class="inline">@persistenceReserved</code>（types.ts:246 附近）——头里不再有系统提示词，它属于 surface 节点 0 的 <code class="inline">system/message</code> 事件。占位字段的意义是「谁敢再写这个键，编译期就报错」，而不是兼容期宽容。</p>
     <p>配套的是一组 branded ID（<code class="inline">SessionId</code>、<code class="inline">SessionSeq</code>、<code class="inline">SessionLogOffset</code>、<code class="inline">ToolCallId</code>…）——不同 ID 类型互相不可赋值，把「拿错 ID」从运行时 bug 变成编译错误。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.7</span>要点</h2>
+    <h2><span class="num">2.7</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① 会话是日志不是数组——一切状态从事件流投影而来；② 只有 system/user/assistant/tool 四类事件上表面，入场方式要么 append 要么 replace（遮蔽）；③ <code class="inline">ignorable</code> 逐事件标注而非版本级开关：标了 <code class="inline">ignorable</code> 的事件，旧读者读到就安全跳过；没标的（默认必需）则必须拒绝重建整个会话而不是悄悄丢事件；④ 想给模型看新东西 = 扩展 <code class="inline">SessionEventMap</code>。下一步进入 <a href="03-agent-lifecycle.html">第 3 章：一次对话的完整生命周期</a>。
+      <b class="tag">答案回收</b>
+      ① 日志记什么 → 类型化 <code class="inline">SessionEventMap</code> 词汇表：边界事件、五类表面事件（V4 起 system/developer/user/assistant/tool）、工具调用原文、请求头快照，外加插件合并事件；token 计账内嵌在 assistant/message 里。② 模型历史 → 表面节点的折叠：<code class="inline">deriveMessages()</code> 带 O(新节点) 增量缓存，replace 靠 contentGeneration 失效重建。③ 新增模型可见输入 → 先扩 <code class="inline">SessionEventMap</code>（铁律「Model-visible means logged」），默认派生不够再加插件自有投影。④ 演进 → 写入方决定 bump；<code class="inline">ignorable</code> 管词汇表增长，结构变化才升版本号；v3→v4 的迁移包（只改头声明 + 显式子会话证据 + liftToolResult）是最新样本。下一步进入 <a href="03-agent-lifecycle.html">第 3 章：一次对话的完整生命周期</a>。
     </div>
+    <p>最后把 2.6 留下的 v3 → v4 迁移补完整。<code class="inline">packages/session/session-format-v3-to-v4</code> 的迁移声明是<strong>只有头</strong>的（migration.ts:14 注释原话 "Header-only migration declaration; body restoration requires explicit child evidence"）——<code class="inline">migrateHeader</code> 只把 version 3 改写成 4 并校验头，<code class="inline">createStage()</code> 直接抛 <code class="inline">SessionFormatUnsupportedMigrationError</code>。因为 V4 引入了「父/子目录代际」概念（子 agent 会话自己成了持久代际文件），体迁移必须由调用方显式给出该父会话的历史子代际证据（<code class="inline">createSessionFormatV3ToV4(children)</code>，无子会话也要传空数组）。体转换三件事：<code class="inline">liftToolResult</code> 把 v3 的 user 角色 tool-result 包装块升为一等 tool 角色消息（tool-role.ts:36，包装不匹配即拒，不静默截断）；<code class="inline">migrateV3EventContent</code> 改写内容标签并拒绝退役的 tool-result 内容（cbb4df8750）；未知插件来源加 <code class="inline">plugin:</code> 前缀命名空间。这体现了 2.6 的原则：宁可显式失败，不静默给出一个看起来能读的会话。</p>
   </section>
 
   <div class="arrow-nav">
@@ -390,7 +413,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 02 会话日志 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 02 会话日志 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

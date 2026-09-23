@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 持久化记忆</div>
     <h1>持久化记忆：Checkpointer 与 Store</h1>
-    <div class="subtitle">LangGraph 用两层记忆模型分别解决「单次对话」和「跨会话长期记忆」——Checkpointer 按 thread_id 存状态快照，Store 按 namespace + key 存共享数据，理解它们的边界是自建生产级 Agent 的关键一步。</div>
+    <div class="subtitle">「它能记住我上句话吗」和「它能记住我是谁吗」是两件不同的事。本章从这句话出发，拆两层记忆各自的存取机制、checkpoint 的链式结构和落盘时机，以及自建生产级 Agent 时怎么划清两者的边界。</div>
   </div>
 
   <section class="block">
@@ -74,10 +74,12 @@
       <div class="fig-cap">图 9.1：Checkpointer 按 <code class="inline">thread_id</code> 分桶，每个 thread 是一条独立状态链；Store 是全局命名空间键值库，任何 thread 都能按 <code class="inline">(namespace, key)</code> 读写同一份数据。</div>
     </div>
     <p>上图是核心区分：<strong>Checkpointer 按 <code class="inline">thread_id</code> 分桶，每个 thread 是一条独立的状态链</strong>，彼此完全隔离；而 <strong>Store 是一个全局的命名空间键值库</strong>，任何 thread、任何节点都能按 <code class="inline">(namespace, key)</code> 读写同一份数据。一个管「这次会话走到哪了」，一个管「这个用户是谁、喜欢什么」。</p>
+
+    <p>两层记忆立起来之后，剩下的就是逐个拆开。9.2 先讲 Checkpointer 怎么用——thread_id 怎么标识会话、三种实现怎么选；9.3 转到 Store 怎么做到跨会话共享，语义检索和统一注入又是怎么回事。checkpoint 的本事不止让对话「有记忆」：暂停恢复、时间旅行、容错重试三件事都由它解锁（9.5），快照在磁盘上到底是什么结构、什么时候落盘，也有一套 Durability 语义要掰清（9.7）。落地层面的两件事放在后面：thread_id 怎么设计（9.6），以及最容易踩的静默坑（9.10）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.2</span>Checkpointer:短期 / 会话记忆</h2>
+    <h2><span class="num">9.2</span>Checkpointer：短期 / 会话记忆</h2>
     <p>Checkpointer 的职责是：在图执行的<strong>每个 super-step 之后</strong>，把当前完整状态（channel 值、版本、pending writes）做一次快照，按 <code class="inline">thread_id</code> 存起来。它是在 <code class="inline">compile(checkpointer=...)</code> 时挂上去的，挂上之后你必须在 <code class="inline">invoke</code> 时传入 <code class="inline">thread_id</code>——否则它不知道把快照存到哪个桶里。</p>
 
     <div class="code-title">thread_id 标识一个会话</div>
@@ -115,7 +117,7 @@ graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</spa
 new_config = {<span class="st">"configurable"</span>: {<span class="st">"thread_id"</span>: <span class="st">"thread-2"</span>}}
 state2 = graph.get_state(new_config)
 print(state2.values)   <span class="cmt"># -> {}  (空状态， 新会话从零开始)</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">thread_id</code> 就是「会话」的标识。同一个 <code class="inline">thread_id</code> 多次 <code class="inline">invoke</code>，状态（这里是消息列表）会在 reducer（<code class="inline">add_messages</code>）作用下不断累积——这就是「多轮对话记忆」的全部机制，没有别的，就是「按 key 存取 + 每次加载」。换了 <code class="inline">thread_id</code>，就是开了一个全新会话，对之前的对话一无所知。</div>
+    <div class="annotation"><b>会话就是按 ID 存取：</b> <code class="inline">thread_id</code> 就是「会话」的标识。同一个 <code class="inline">thread_id</code> 多次 <code class="inline">invoke</code>，状态（这里是消息列表）会在 reducer（<code class="inline">add_messages</code>）作用下不断累积——这就是「多轮对话记忆」的全部机制，没有别的，就是「按 key 存取 + 每次加载」。换了 <code class="inline">thread_id</code>，就是开了一个全新会话，对之前的对话一无所知。</div>
 
     <p>那么该选哪种 Checkpointer 实现？本代码库提供了三种，对应不同部署阶段：</p>
     <ul>
@@ -153,7 +155,7 @@ DB_URI = <span class="st">"postgresql://postgres:postgres@localhost:5432/langgra
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>Store:长期 / 跨会话记忆</h2>
+    <h2><span class="num">9.3</span>Store：长期 / 跨会话记忆</h2>
     <p>Checkpointer 的作用域是<strong>单个 thread</strong>——它天生看不到别的 thread。但很多场景需要跨 thread 共享数据：用户偏好、长期档案、知识库片段。这些数据不该塞进某个会话的状态里（否则换会话就丢了），于是有了 <code class="inline">Store</code>。Store 是一个<strong>全局命名空间键值库</strong>，在 <code class="inline">compile(store=...)</code> 时挂上，节点里通过注入的 <code class="inline">store</code> 参数按 <code class="inline">(namespace_tuple, key)</code> 存取。</p>
     <p>关键在于 <code class="inline">namespace</code> 是一个<strong>元组</strong>，能天然表达层级，比如 <code class="inline">("user", user_id)</code>。这样「记住用户偏好」就变成：在节点里 <code class="inline">store.put(("user", user_id), "prefs", {...})</code>，之后<strong>哪怕换了 thread_id</strong>，只要拿到同一个 <code class="inline">user_id</code> 就能 <code class="inline">store.get(("user", user_id), "prefs")</code> 取出来——真正实现了「跨会话记忆」。</p>
 
@@ -212,7 +214,7 @@ result = graph.invoke(
     cfg2,
 )
 <span class="cmt"># result["response"] 里会带上刚才写入的 {lang: zh, theme: dark}</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 节点签名 <code class="inline">def assistant(state, config, store: BaseStore)</code>——LangGraph 会<strong>按参数名注入</strong>已挂载的 <code class="inline">store</code>。这一点在本仓库的节点协议 <code class="inline">langgraph/graph/_node.py</code> 里有明确定义：<code class="inline">store: BaseStore</code> 是可注入的形参。除了 <code class="inline">store</code>，还可以注入 <code class="inline">config</code>、<code class="inline">writer: StreamWriter</code>，或通过 <code class="inline">runtime: Runtime</code> 拿到 <code class="inline">runtime.store</code>。</div>
+    <div class="annotation"><b>注入靠的是形参名：</b> 节点签名 <code class="inline">def assistant(state, config, store: BaseStore)</code>——LangGraph 会<strong>按参数名注入</strong>已挂载的 <code class="inline">store</code>。这一点在本仓库的节点协议 <code class="inline">langgraph/graph/_node.py</code> 里有明确定义：<code class="inline">store: BaseStore</code> 是可注入的形参。除了 <code class="inline">store</code>，还可以注入 <code class="inline">config</code>、<code class="inline">writer: StreamWriter</code>，或通过 <code class="inline">runtime: Runtime</code> 拿到 <code class="inline">runtime.store</code>。</div>
 
     <div class="callout info">
       <b class="tag">为什么 Store 用 namespace 元组</b>
@@ -245,7 +247,7 @@ results = store.search(
     limit=<span class="nu">3</span>,
 )
 <span class="cmt"># results 按相似度排序，最相关的在前；m1 会排前面</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">index</code> 配置三要素：<code class="inline">dims</code>（向量维度）、<code class="inline">embed</code>（embedding 函数）、<code class="inline">fields</code>（对 value 的哪些字段建向量索引）。<code class="inline">search</code> 的 <code class="inline">query</code> 参数一旦传入，就走语义相似度排序；不传则退化为按 namespace 前缀的普通检索。这套机制让 Store 既能做精确 KV（<code class="inline">get/put</code>），又能做模糊语义检索（<code class="inline">search(query=)</code>），是 LangGraph 把「长期记忆」和「检索增强」合并到一处的关键设计。注意 Store 的实现都在 <code class="inline">libs/checkpoint</code>（和 checkpointer 同库），内存版用于开发，生产可换 Postgres 版。</div>
+    <div class="annotation"><b>语义检索就三个配置项：</b> <code class="inline">index</code> 配置三要素：<code class="inline">dims</code>（向量维度）、<code class="inline">embed</code>（embedding 函数）、<code class="inline">fields</code>（对 value 的哪些字段建向量索引）。<code class="inline">search</code> 的 <code class="inline">query</code> 参数一旦传入，就走语义相似度排序；不传则退化为按 namespace 前缀的普通检索。这套机制让 Store 既能做精确 KV（<code class="inline">get/put</code>），又能做模糊语义检索（<code class="inline">search(query=)</code>），是 LangGraph 把「长期记忆」和「检索增强」合并到一处的关键设计。注意 Store 的实现都在 <code class="inline">libs/checkpoint</code>（和 checkpointer 同库），内存版用于开发，生产可换 Postgres 版。</div>
 
     <h3 class="subhead">Runtime:Store 与上下文的统一注入</h3>
     <p>前面节点都是靠形参 <code class="inline">store: BaseStore</code> 单独注入 Store。除了这种「逐个注入」，LangGraph 还提供一个<strong>统一容器</strong> <code class="inline">Runtime</code>（源码 <code class="inline">langgraph/runtime.py:125</code>）：<code class="inline">Runtime[ContextT]</code> 同时持有 <code class="inline">.store</code> 和 <code class="inline">.context</code>。节点声明形参 <code class="inline">runtime: Runtime</code> 就能一次性拿到这两个对象。</p>
@@ -272,7 +274,7 @@ builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>, cont
   </section>
 
   <section class="block">
-    <h2><span class="num">9.4</span>Checkpointer vs Store:一张表说清边界</h2>
+    <h2><span class="num">9.4</span>Checkpointer vs Store：一张表说清边界</h2>
     <table class="tbl">
       <tr><th>维度</th><th>Checkpointer（短期记忆）</th><th>Store（长期记忆）</th></tr>
       <tr><td><strong>作用域</strong></td><td>单个 <code class="inline">thread_id</code> 内</td><td>跨所有 thread / 全局</td></tr>
@@ -291,7 +293,7 @@ builder = <span class="cl">StateGraph</span>(<span class="cl">State</span>, cont
     <h2><span class="num">9.5</span>Checkpoint 的能力：不止于「记住」</h2>
     <p>Checkpointer 的价值远不止「让对话有记忆」。因为每一步都存了完整快照，它顺带解锁了三个生产级能力：</p>
     <h3>暂停 / 恢复（人机协同 HITL）</h3>
-    <p>这是 Checkpointer 存在的<strong>首要理由之一</strong>。当节点调用 <code class="inline">interrupt()</code> 时，框架把当前状态存入 checkpoint 后暂停执行，把控制权交回调用方；等你拿到人的输入后，用 <code class="inline">Command(resume=...)</code> 再次 <code class="inline">invoke</code>，框架从 checkpoint 加载状态、注入 resume 值、继续往下走。没有 Checkpointer,interrupt 之后进程就没了，resume 根本无从谈起——这正是第 06 章讲 HITL 的前提。</p>
+    <p>这是 Checkpointer 存在的<strong>首要理由之一</strong>。当节点调用 <code class="inline">interrupt()</code> 时，框架把当前状态存入 checkpoint 后暂停执行，把控制权交回调用方；等你拿到人的输入后，用 <code class="inline">Command(resume=...)</code> 再次 <code class="inline">invoke</code>，框架从 checkpoint 加载状态、注入 resume 值、继续往下走。没有 Checkpointer，interrupt 之后进程就没了，resume 根本无从谈起——这正是第 06 章讲 HITL 的前提。</p>
     <h3>时间旅行：从历史 checkpoint 重放</h3>
     <p>因为同一个 thread 下存的是一串带 <code class="inline">checkpoint_id</code> 的历史快照，你可以用 <code class="inline">get_state_history(config)</code> 拿到这条时间线，然后挑任意一个历史点作为起点重新跑——就像「存档读档」。</p>
     <div class="code-title">时间旅行：历史快照重放</div>
@@ -315,7 +317,55 @@ print(<span class="st">f"共 {len(history)} 个快照"</span>)
 <span class="cmt"># 这会从那个 checkpoint "分叉"出一条新的状态线， 不影响主线</span>
 past_config = history[-<span class="nu">1</span>].config   <span class="cmt"># 比如选最早的那个</span>
 graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"从过去重新走"</span>}]}, past_config)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">StateSnapshot</code> 是个 NamedTuple（见 <code class="inline">langgraph/types.py</code>），字段包括 <code class="inline">values</code>（当时的状态值）、<code class="inline">next</code>（下一步要执行的节点）、<code class="inline">config</code>（含 <code class="inline">checkpoint_id</code>）、<code class="inline">parent_config</code>（父快照，用于回溯整条链）等。配合 <code class="inline">update_state(config, values)</code> 还能在某个历史点上手动改状态再续跑，实现「假设分析」。</div>
+    <div class="annotation"><b>快照里都有什么：</b> <code class="inline">StateSnapshot</code> 是个 NamedTuple（见 <code class="inline">langgraph/types.py</code>），字段包括 <code class="inline">values</code>（当时的状态值）、<code class="inline">next</code>（下一步要执行的节点）、<code class="inline">config</code>（含 <code class="inline">checkpoint_id</code>）、<code class="inline">parent_config</code>（父快照，用于回溯整条链）等。配合 <code class="inline">update_state(config, values)</code> 还能在某个历史点上手动改状态再续跑，实现「假设分析」。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t95a d95a">
+        <title id="t95a">checkpoint 链与时间旅行分叉</title>
+        <desc id="d95a">一条 thread 的 checkpoint 用 parent_config 串成链：初始快照、step 1、step 2 依次相接；从最早的快照重新 invoke 会在同一条链上追加新快照而不是覆盖，历史快照全部保留</desc>
+        <defs><marker id="arr95a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+
+        <!-- 主链 -->
+        <text class="lbl sm" x="430" y="24" text-anchor="middle" font-weight="bold">同一 thread_id 的 checkpoint 链（get_state_history 从新到旧遍历）</text>
+
+        <rect class="node" x="40" y="60" width="180" height="76" rx="8"></rect>
+        <text class="lbl sm code" x="130" y="84" text-anchor="middle">step = -1</text>
+        <text class="lbl sm" x="130" y="104" text-anchor="middle">初始快照</text>
+        <text class="lbl sm" x="130" y="122" text-anchor="middle">values 空，无 parent</text>
+
+        <rect class="node" x="260" y="60" width="170" height="76" rx="8"></rect>
+        <text class="lbl sm code" x="345" y="84" text-anchor="middle">step 1</text>
+        <text class="lbl sm" x="345" y="104" text-anchor="middle">第一次 invoke 后</text>
+        <text class="lbl sm code" x="345" y="122" text-anchor="middle">parent_config → 初始</text>
+
+        <rect class="node" x="470" y="60" width="170" height="76" rx="8"></rect>
+        <text class="lbl sm code" x="555" y="84" text-anchor="middle">step 3</text>
+        <text class="lbl sm" x="555" y="104" text-anchor="middle">第二次 invoke 后</text>
+        <text class="lbl sm code" x="555" y="122" text-anchor="middle">parent_config → step 1</text>
+
+        <line class="edge" x1="220" y1="98" x2="256" y2="98" marker-end="url(#arr95a)"></line>
+        <line class="edge" x1="430" y1="98" x2="466" y2="98" marker-end="url(#arr95a)"></line>
+        <text class="lbl sm code" x="238" y="86" text-anchor="middle">parent</text>
+        <text class="lbl sm code" x="448" y="86" text-anchor="middle">parent</text>
+
+        <!-- 分叉箭头 -->
+        <path class="edge" d="M470 60 Q 430 24 345 48" fill="none" stroke="#556674" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#arr95a)"></path>
+        <text class="lbl sm" x="420" y="20" text-anchor="middle">从历史快照重新 invoke（时间旅行）</text>
+
+        <!-- 分叉结果 -->
+        <rect class="node acc" x="680" y="60" width="170" height="76" rx="8"></rect>
+        <text class="lbl sm code" x="755" y="84" text-anchor="middle">step 4（分叉）</text>
+        <text class="lbl sm" x="755" y="104" text-anchor="middle">新输入叠在旧状态上</text>
+        <text class="lbl sm" x="755" y="122" text-anchor="middle">历史不被覆盖</text>
+        <line class="edge" x1="640" y1="98" x2="696" y2="98" marker-end="url(#arr95a)"></line>
+        <text class="lbl sm code" x="668" y="86" text-anchor="middle">parent</text>
+
+        <text class="lbl sm" x="430" y="180" text-anchor="middle" fill="var(--fg-muted)">实测：两次 invoke 后链上有 6 个快照（含空初始快照）；从最早快照重新 invoke 后，</text>
+        <text class="lbl sm" x="430" y="242" text-anchor="middle" fill="var(--fg-muted)">历史变 9 个——分叉是「追加新线」，不是「改写历史」；读旧快照仍能回到过去。</text>
+        <text class="lbl sm" x="430" y="270" text-anchor="middle">新值叠在旧值上：旧状态 x=2，新输入 x=100，走完节点后 x=101（add 节点的推论）。</text>
+      </svg>
+      <div class="fig-cap">图 9.3：checkpoint 链。每个快照靠 <code class="inline">parent_config</code> 指向前一个，串成一条可回溯的链；时间旅行从任意历史点 invoke，新快照追加在链上，旧快照原样保留——「存档读档」的机制基础。</div>
+    </div>
 
     <p><strong>动态演示</strong>——步进看 checkpoint 时间线如何累积，再从历史快照分叉出一条新线（回溯/分叉是纯时序操作，静态图读不出）：</p>
     <div data-anim="time-travel"></div>
@@ -327,10 +377,10 @@ graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</spa
     <h2><span class="num">9.6</span>thread_id 设计实践</h2>
     <p><code class="inline">thread_id</code> 看起来是个小细节，但它直接决定了记忆的边界，值得单独说清：</p>
     <ul>
-      <li><strong>一个用户 + 一个会话 = 一个 thread_id</strong>:同一用户连续对话用同一个 <code class="inline">thread_id</code>，状态累加，实现「多轮对话记忆」。</li>
+      <li><strong>一个用户 + 一个会话 = 一个 thread_id</strong>：同一用户连续对话用同一个 <code class="inline">thread_id</code>，状态累加，实现「多轮对话记忆」。</li>
       <li><strong>换 thread_id = 开新会话</strong>：新 <code class="inline">thread_id</code> 从空状态开始，看不到旧 thread 的历史。这是「重开对话」的标准做法。</li>
-      <li><strong>单次独立任务用唯一 ID</strong>:如果每次执行都是独立的一次性工作流（比如批处理一个文档），用 <code class="inline">uuid4</code> 这种唯一 ID，避免互相污染。</li>
-      <li><strong>跨会话记忆不要靠 thread_id</strong>:用户在 thread-A 说「我喜欢深色」，thread-B 不会因为换了 thread_id 就知道——这正是 <code class="inline">Store</code> 要解决的问题。thread_id 管会话内，Store 管跨会话。</li>
+      <li><strong>单次独立任务用唯一 ID</strong>：如果每次执行都是独立的一次性工作流（比如批处理一个文档），用 <code class="inline">uuid4</code> 这种唯一 ID，避免互相污染。</li>
+      <li><strong>跨会话记忆不要靠 thread_id</strong>：用户在 thread-A 说「我喜欢深色」，thread-B 不会因为换了 thread_id 就知道——这正是 <code class="inline">Store</code> 要解决的问题。thread_id 管会话内，Store 管跨会话。</li>
     </ul>
     <p>典型组合是：<code class="inline">thread_id</code> 由你的会话管理逻辑生成（比如 <code class="inline">f"{user_id}-{session_id}"</code>），而 <code class="inline">user_id</code> 同时作为 Store 的 namespace 之一（<code class="inline">("user", user_id)</code>）。这样既保证会话内记忆隔离，又让长期偏好可共享。</p>
 
@@ -390,7 +440,7 @@ graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</spa
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>Durability:检查点到底何时落盘</h2>
+    <h2><span class="num">9.7</span>Durability：检查点到底何时落盘</h2>
     <p>前面几节一直在说「checkpointer 会存状态」，但有一个更细的问题没回答：一个 super-step 内如果有多个节点，检查点是每个节点都存、还是整个 step 存一次？节点执行到一半进程崩了怎么办？这就涉及 <strong>Durability</strong>——源码里它是 <code class="inline">Literal</code>（见 <code class="inline">langgraph/types.py:98</code>）：</p>
 
     <div class="code-title">langgraph/types.py — Durability 定义</div>
@@ -420,7 +470,7 @@ graph.<span class="fn">invoke</span>(
 <span class="cmt"># 也可以不传，默认 "async"。durability 只能按次调用传入，没有对应的</span>
 <span class="cmt"># configurable 公开键；configurable 里的 __pregel_durability 是框架内部键</span>
 <span class="cmt"># (旧参数 checkpoint_during 已弃用，改为传 durability=)</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">durability</code> 是<strong>运行期参数</strong>，传给 <code class="inline">invoke</code>/<code class="inline">stream</code>，而不是 <code class="inline">compile</code>——源码里 <code class="inline">CompiledStateGraph.stream()</code> 的签名有 <code class="inline">durability: Durability | None = None</code>，为 <code class="inline">None</code> 时回落到 <code class="inline">"async"</code>。<strong>sync 与 async 的真实区别</strong>：无论哪种模式，checkpoint 都是每个 super-step 结束时提交一次（<code class="inline">_put_checkpoint</code> 以 future 形式提交给后台执行器）；<code class="inline">"sync"</code> 只是在每个 step 的循环里多了一句 <code class="inline">loop._put_checkpoint_fut.result()</code>——<strong>阻塞主循环直到这次写完成</strong>再跑下一个 step；<code class="inline">"async"</code> 则不等，写与下一步执行重叠。用三个并行节点的图实测：sync 和 async 的 checkpoint put 次数完全相同（都是 4 次），exit 只有 1 次。这意味着 sync 的「安全」是用吞吐换来的：每步都同步等 I/O，慢很多。默认 <code class="inline">"async"</code> 是个经过权衡的选择：它保证「已完成的 super-step 大概率不丢」，对绝大多数 Agent 场景够用——Agent 的一个 step 通常就是一个完整的推理+工具调用轮次，丢失未完成的那一步重新跑即可，代价可接受。只有当进程被 kill 时「最后一步的 checkpoint 可能还在后台写」成为不可接受的风险时，才需要上 <code class="inline">"sync"</code>。锚点：签名与回落 <code class="inline">pregel/main.py</code>（回落取值在 <code class="inline">main.py:2602</code>）、sync 阻塞点 <code class="inline">_loop.py:1202</code> + <code class="inline">main.py:2987</code>。</div>
+    <div class="annotation"><b>重点在 sync 和 async 的差别：</b> <code class="inline">durability</code> 是<strong>运行期参数</strong>，传给 <code class="inline">invoke</code>/<code class="inline">stream</code>，而不是 <code class="inline">compile</code>——源码里 <code class="inline">CompiledStateGraph.stream()</code> 的签名有 <code class="inline">durability: Durability | None = None</code>，为 <code class="inline">None</code> 时回落到 <code class="inline">"async"</code>。<strong>sync 与 async 的真实区别</strong>：无论哪种模式，checkpoint 都是每个 super-step 结束时提交一次（<code class="inline">_put_checkpoint</code> 以 future 形式提交给后台执行器）；<code class="inline">"sync"</code> 只是在每个 step 的循环里多了一句 <code class="inline">loop._put_checkpoint_fut.result()</code>——<strong>阻塞主循环直到这次写完成</strong>再跑下一个 step；<code class="inline">"async"</code> 则不等，写与下一步执行重叠。用三个并行节点的图实测：sync 和 async 的 checkpoint put 次数完全相同（都是 4 次），exit 只有 1 次。这意味着 sync 的「安全」是用吞吐换来的：每步都同步等 I/O，慢很多。默认 <code class="inline">"async"</code> 是个经过权衡的选择：它保证「已完成的 super-step 大概率不丢」，对绝大多数 Agent 场景够用——Agent 的一个 step 通常就是一个完整的推理+工具调用轮次，丢失未完成的那一步重新跑即可，代价可接受。只有当进程被 kill 时「最后一步的 checkpoint 可能还在后台写」成为不可接受的风险时，才需要上 <code class="inline">"sync"</code>。锚点：签名与回落 <code class="inline">pregel/main.py</code>（回落取值在 <code class="inline">main.py:2602</code>）、sync 阻塞点 <code class="inline">_loop.py:1202</code> + <code class="inline">main.py:2987</code>。</div>
 
     <div class="callout info">
       <b class="tag">怎么选</b>
@@ -429,7 +479,7 @@ graph.<span class="fn">invoke</span>(
   </section>
 
   <section class="block">
-    <h2><span class="num">9.8</span>DeltaChannel:增量通道（Beta）</h2>
+    <h2><span class="num">9.8</span>DeltaChannel：增量通道（Beta）</h2>
     <p>这是持久化体系里较新的一块。<code class="inline">DeltaChannel</code> 是一种特殊的 channel 类型（源码 <code class="inline">langgraph/channels/delta.py:25</code>），和普通 channel 不同：普通 channel 的 checkpoint blob 里存「当前值」，<code class="inline">DeltaChannel</code> 的 blob 里只存一个 sentinel（哨兵）——状态本身靠<strong>重放（replay）祖先写入记录、重新过 reducer</strong> 来重建，而不是直接落盘最终值。</p>
 
     <p>它解决的问题是：<strong>checkpoint 的存储开销</strong>。有些状态字段天生是「只增不减」的（比如逐 token 累积的 LLM 输出、事件日志），每一步都把「当前全量」写进 checkpoint 会浪费大量空间。DeltaChannel 的思路是：平时 blob 里不存值，读的时候沿祖先链把历史 writes 重放一遍还原出当前值；同时用两个计数器控制快照节奏（每 N 次更新、或每 N 个 super-step 写一次全量快照），保证重放深度有上限、不会越积越慢。</p>
@@ -452,8 +502,8 @@ graph.<span class="fn">invoke</span>(
     <h2><span class="num">9.9</span>安装与本仓库对照</h2>
     <p>Checkpointer 的不同实现是各自独立发布的包。核心抽象 <code class="inline">BaseCheckpointSaver</code> 在 <code class="inline">langgraph-checkpoint</code>（本仓库 <code class="inline">libs/checkpoint</code>），<code class="inline">InMemorySaver</code> 就在这里；SQLite 和 Postgres 实现是单独的库：</p>
     <ul>
-      <li><strong>SQLite</strong>:随 <code class="inline">langgraph-checkpoint-sqlite</code> 提供，源码在 <code class="inline">libs/checkpoint-sqlite</code>。开箱即用，无需额外依赖。</li>
-      <li><strong>Postgres</strong>:需要单独安装，源码在 <code class="inline">libs/checkpoint-postgres</code>。</li>
+      <li><strong>SQLite</strong>：随 <code class="inline">langgraph-checkpoint-sqlite</code> 提供，源码在 <code class="inline">libs/checkpoint-sqlite</code>。开箱即用，无需额外依赖。</li>
+      <li><strong>Postgres</strong>：需要单独安装，源码在 <code class="inline">libs/checkpoint-postgres</code>。</li>
     </ul>
     <div class="code-title">生产实现替换</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Postgres checkpointer 需要单独安装(psycopg 3 + 连接池)</span>
@@ -543,6 +593,26 @@ store.<span class="fn">put</span>((), <span class="st">"prefs"</span>, {<span cl
 <span class="cmt"># ✓ 用元组分层， 每段都是纯字符串、无点号：</span>
 store.<span class="fn">put</span>((<span class="st">"user"</span>, <span class="st">"42"</span>), <span class="st">"prefs"</span>, {<span class="st">"theme"</span>: <span class="st">"dark"</span>})</pre>
     <div class="annotation"><b>踩坑点：</b> 点号被保留给 Postgres 实现里的路径/前缀匹配语义，所以 label 内禁用；空 namespace 也不行。这条校验在 <code class="inline">store/base/__init__.py</code> 的 <code class="inline">_validate_namespace</code> 里，所有 Store 实现共享。想用 <code class="inline">user.id</code> 这种复合 key，拆成元组 <code class="inline">("user", "42")</code> 才是正确姿势。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.11</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · 9.4 的表说「对话历史别用 Store 存」。有同事反驳：「我把每轮对话 store.put 进 Store，跨会话也能查，不是更好？」说出这个方案至少会烂在哪里。</summary>
+      <div class="a">三个烂点：① 时序没了——对话历史是带顺序的状态，Store 是 (namespace, key) 的键值桶，要么每个 key 手工编排序号，要么把整个列表塞进一个 value，两个方向都要自己维护 add_messages 已经免费提供的东西；② 与图状态脱钩——Checkpointer 在每个 super-step 自动快照，回滚、时间旅行、interrupt 恢复都基于它；Store 里那份手工副本没人同步，一旦某步异常，两边立刻不一致，你排查时要先回答「信哪份」；③ 写入时机是人写的节点代码——节点崩了、忘了 put、put 在条件分支里，历史就缺页。Store 的正确定位是「跨 thread 的、与单次会话无关的数据」，比如「这个用户上次问过什么主题」可以摘要后放 Store；逐条对话原文放 Checkpointer。判据就是 9.4 那句：这份数据是否需要跨 thread_id 共享。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · 图 9.3 说时间旅行是「追加新线，不改写历史」。实测从最早快照（x=2）用输入 x=100 重新 invoke 一个 add 节点，thread 最终状态是 101 而不是「恢复成 2」。解释为什么是叠加而不是覆盖，这对「回滚后重跑」意味着什么？</summary>
+      <div class="a">因为 invoke 的输入会先经过 reducer 和已有通道值合并——那个历史快照只是「起点状态」，新输入 x=100 作为待合并的增量写进通道，add 节点读到 2+100=101 后又推进了新的一步。checkpoint 分叉不是「把线程状态重置成快照」的 reset 操作，而是「从那个快照开始再跑一次」。对回滚重跑的含义：如果节点函数对状态是幂等叠加的（消息追加、列表累加），从旧快照重跑会得到「双份」结果——想真正复现「当时的下一步」，要么用 update_state 先把状态修正，要么保证节点语义对重复执行不敏感。这也是为什么时间旅行适合「假设分析/调试」，不适合当通用的数据回滚工具。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · durability="async" 下，每个 super-step 的 checkpoint 都是后台 future 提交的。现在进程在 step 5 执行中被 kill。重启后用同一个 thread_id 恢复，状态大概率是哪一步的？丢的是什么？如果必须「一步都不许丢」，代价是什么？</summary>
+      <div class="a">大概率恢复到 step 4 完成时的快照——step 4 的 checkpoint future 已提交并大概率已写完；step 5 的快照还没提交（节点没跑完），自然没有；step 5 正在后台写的那份（如果 sync 场景存在）也可能不完整，但 async 下 step 5 的 checkpoint 压根还没开始。丢的是 step 5 节点的执行效果——外部副作用（已经发出去的 API 调用、已经写的数据库行）不会跟着 checkpoint 回滚，这是「恢复到 checkpoint」恢复不了的部分，需要业务层自己做幂等。要一步不丢，把 durability 换成 "sync"：每个 super-step 阻塞等落盘完成才走下一步，代价是吞吐——每步都要同步等一次 I/O，实测 checkpoint 次数与 async 完全相同，慢就慢在「等」。再叠一层：任何 durability 前提是配了落盘型 checkpointer，InMemorySaver 谈不上耐久。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · 9.2 说 SqliteSaver 「does not scale to multiple threads」。如果 QPS 上来了，用 AsyncSqliteSaver 继续扛，边界在哪里？什么时候必须换 PostgresSaver？</summary>
+      <div class="a">AsyncSqliteSaver 解决的是「异步调用不阻塞事件循环」，不是「多进程并发写」——底层还是一个 SQLite 文件，写操作仍然是文件锁级别的串行，多个 worker 进程（比如多副本部署）同时写同一个文件会互相等待甚至锁冲突。所以边界在「单机、单进程、并发量温和」：单进程内的并发请求 AsyncSqliteSaver 可以撑，跨进程/跨机器就不行。必须换 Postgres 的信号有三个：多副本部署（共享一个数据库）、需要连接池和 pipeline 吞吐、需要真正的行级并发写。判据不是「快不快」，而是「有几种进程要写这份数据」——一份持久化后端，只服务一个进程就 SQLite，服务多个就 Postgres。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 9.10④ 里 store.put(("user.42",), ...) 会抛 InvalidNamespaceError。为什么不直接允许点号、框架替你转义？这个约束设计背后的取舍是什么？</summary>
+      <div class="a">因为 namespace 元组在 Postgres 实现里要映射成 JSONB 路径做前缀匹配——search(("user",)) 之所以能「按前缀批量取某用户全部条目」，靠的就是 namespace 的层级结构与数据库路径语义一一对应。如果 label 里允许点号，"user.42" 是一个 label 还是 user 下挂 42 两级，在内存实现和数据库实现里会得出不同答案——同一个 API 在两个后端上行为分叉，抽象就破了。所以框架选择在入口统一禁掉点号（_validate_namespace，所有实现共享），把「复合标识」的表达责任交还给元组本身：要分层就用 ("user","42")，元组的每个元素永远是一段纯字符串。代价是录入时要自己拆（还会得到一个显式报错提醒），换来的是所有 Store 实现「同样的 namespace 树、同样的 search 语义」——这是约束换一致性的典型取舍。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

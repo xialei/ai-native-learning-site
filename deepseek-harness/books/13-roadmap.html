@@ -35,11 +35,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 13 自制 Harness</div>
     <h1>自制 Harness 路线图：从 MVP 到完整生态</h1>
-    <div class="subtitle">读完 12 章源码，最后回答一个问题：如果从零写你自己的 harness，该按什么顺序长出什么？这一章先讲清 dsh 对外的三个入口（CLI profile / SDK / Web），再把「能力缝配方」提炼成可复用的清单，最后给一条按不变量排序的路线图。</div>
+    <div class="subtitle">问题：读完 12 章源码，最后一问——从零写你自己的 harness，该按什么顺序长出什么？具体拆成四个——①应用形态怎么组合 ②怎么把整个 runtime 交给别的进程 ③Web host 怎么保持纯路由 ④路线图按什么排序；13.1 摆问题，13.2–13.6 逐个作答，13.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">13.1</span>一分钟版本</h2>
+    <h2><span class="num">13.1</span>问题：从零写 harness，先长什么后长什么</h2>
+    <p>dsh 本身就是一条走完的路线——所以最后一个问题可以反过来问：如果从零写你自己的 harness，该按什么顺序长出什么？dsh 对外的三个入口（CLI profile / SDK / Web）不是三种代码，而是同一棵 Cordis 树上的三种组合方式——把它们的组合纪律看清楚，路线图就有了参照系。拆成四个问题：</p>
+    <p><strong>①应用形态怎么组合</strong>——web / headless / acp / sdk 四种形态共用一个 base，形态差异怎么表达成数据（patch 层）而不是代码？</p>
+    <p><strong>②怎么把整个 runtime 交给别的进程</strong>——别的程序要驱动一个完整 harness，跨进程协议要定义到什么程度、客户端要包多少层？</p>
+    <p><strong>③Web host 怎么保持纯路由</strong>——HTTP 层不做身份、不做静态文件，边界划在哪？</p>
+    <p><strong>④路线图按什么排序</strong>——八个里程碑的先后顺序由什么决定？</p>
+    <div class="callout info">
+      <b class="tag">速览答案</b>
+      ① profile bundle：<code class="inline">dsh --profile web|headless|acp|sdk</code> 都叠在 <code class="inline">dsh-base</code> 之上；bundle 只是「可安装的 patch 层」，不引入第二种启动机制。② SDK 是跨进程接口：newline 分隔的 JSON-RPC over stdio，三个请求方法 + 四个通知；TypeScript 与 Python 客户端结构对等；客户端 spawn 一个<strong>完整运行时</strong>子进程（同版本强校验、<code class="inline">--profile sdk</code>、有序 patch），高层 <code class="inline">DeepSeekHarness</code> 管生命周期，低层 <code class="inline">HarnessClient</code> 管 wire。③ Web host 是<strong>纯路由注册表</strong>：exact → 最长前缀 → 唯一的 fallback；「knows no harness concepts and serves no files」，dist 与 /api 都属于注册方插件。④ 自制路线图：append-only 日志 → 循环 → 工具缝 → LLM 适配层 → 沙箱/审批 → 压缩 → 编排 → 对外接口。每一步都先立不变量，再长功能。
+    </div>
     <ul>
       <li>dsh 的应用形态由 <strong>profile bundle</strong> 决定：<code class="inline">dsh --profile web|headless|acp|sdk</code> 都叠在 <code class="inline">dsh-base</code> 之上；bundle 只是「可安装的 patch 层」，不引入第二种启动机制。</li>
       <li>SDK 是跨进程接口：newline 分隔的 JSON-RPC over stdio，三个请求方法 + 四个通知；TypeScript 与 Python 客户端结构对等，驱动同一套协议。</li>
@@ -50,7 +59,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">13.2</span>profile bundle：一个 base，五种应用形态</h2>
+    <h2><span class="num">13.2</span>① profile bundle：一个 base，五种应用形态</h2>
     <p>第 1 章说过 dsh 是「组合出来的应用」。这份组合清单本身也是仓库的一部分——<code class="inline">packages/bundle/</code> 下六个包，每个声明 <code class="inline">dsh.bundle.patch</code>，启动器把它们叠成命名 profile：</p>
     <table class="tbl">
       <tr><th>bundle</th><th>形态</th><th>一句话</th></tr>
@@ -64,7 +73,7 @@
     <div class="annotation">注意 <strong>sdk-minimal 的存在理由</strong>：SDK 运行时要被别的程序以子进程方式批量拉起，最贵的就是无关插件的激活。它的 patch 文件第一行注释就把话说死：「this bundle does not layer over dsh-base: this insert is the complete Cordis tree」，README 也逐项列出刻意排除的东西（Web、settings、托管凭据、telemetry、compaction、文件系统工具、workspace instructions、skills、jobs、subagents）。所以准确的说法不是「一个内核套五种壳」——<strong>base 本身就是「组合选择」而非必然</strong>：当你的 harness 只需要会话+循环+一个适配器时，可以整棵树换掉。这对自制 harness 是重要启示：<u>内核也要能被整个替换，前提是缝足够稳定</u>。</div>
   </section>
   <section class="block">
-    <h2><span class="num">13.3</span>SDK：把整个 runtime 交给别的进程</h2>
+    <h2><span class="num">13.3</span>② SDK：把整个 runtime 交给别的进程</h2>
     <div class="code-title">packages/sdk/README.md — 组说明（摘要，原文为英文）</div>
     <pre class="code"><span class="lang-tag">text</span>The SDK family lets another process drive a complete DeepSeek Harness runtime
 over newline-delimited JSON-RPC. Its protocol package defines the public
@@ -139,7 +148,7 @@ define another application.</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.4</span>Web host：纯路由注册表</h2>
+    <h2><span class="num">13.4</span>③ Web host：纯路由注册表</h2>
     <div class="code-title">packages/host/webserver/src/index.ts:1 — 模块注释（全文）</div>
     <pre class="code"><span class="lang-tag">ts</span><span class="cmt">/**
  * @deepseek-ai/dsh-host-webserver — node:http route registration with optional
@@ -148,7 +157,7 @@ define another application.</pre>
  * uses file:// plus IPC instead, and this package never prints the URL.
  * Route handlers retain direct response ownership.
  */</span></pre>
-    <div class="code-title">packages/host/webserver/src/index.ts:165 — register() / registerFallback()（节选）</div>
+    <div class="code-title">packages/host/webserver/src/index.ts:161 — register() / registerFallback()（节选）</div>
     <pre class="code"><span class="lang-tag">ts</span>  <span class="cmt">/**
    * Register a named route. Duplicate (kind, path) throws — route patterns are
    * a composition-level contract, so a collision is a misconfiguration.
@@ -172,7 +181,7 @@ define another application.</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.5</span>能力缝配方：一条能抄的清单</h2>
+    <h2><span class="num">13.5</span>④ 能力缝配方：一条能抄的清单</h2>
     <p>把第 9/10/12 章的缝放在一起看，dsh 每加一条能力缝的套路高度一致：</p>
     <table class="tbl">
       <tr><th>#</th><th>步骤</th><th>dsh 中的证据</th></tr>
@@ -187,12 +196,12 @@ define another application.</pre>
     </table>
     <div class="callout info">
       <b class="tag">文档也是架构</b>
-      <code class="inline">docs/subsystems/</code> 有 60 份子系统文档（不含目录 README），每个包 README 都有固定小节（Use this package / Understand the implementation / Known Limitations and Deferred Work / Dev Note）。dsh 把「写清楚契约」当成与「写对代码」同级的工程活动——自制 harness 时把这条抄走，成本最低、收益最大。
+      <code class="inline">docs/subsystems/</code> 有 63 份子系统文档（不含目录 README；近期新增 product-telemetry 与 voice-input 两篇），每个包 README 都有固定小节（Use this package / Understand the implementation / Known Limitations and Deferred Work / Dev Note）。dsh 把「写清楚契约」当成与「写对代码」同级的工程活动——自制 harness 时把这条抄走，成本最低、收益最大。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.6</span>自制路线图：八个里程碑</h2>
+    <h2><span class="num">13.6</span>④ 自制路线图：八个里程碑</h2>
     <p>按「不变量优先」排序，每步先立不变量再长功能。括号内是 dsh 对应物：</p>
     <table class="tbl">
       <tr><th>步</th><th>里程碑</th><th>先立的不变量</th><th>dsh 对应</th></tr>
@@ -247,10 +256,10 @@ define another application.</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.7</span>要点</h2>
+    <h2><span class="num">13.7</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① profile bundle 让「换应用形态」成为换 patch 而非换内核，sdk-minimal 证明内核本身也可整体替换；② SDK 协议刻意最小（3 请求 + 4 通知），事件直接复用 SessionEvent，不发明第二种 wire 形状；③ Web host 是零 harness 词汇的纯路由表，安全归组成层；④ 能力缝配方八条——契约先行、注册表、稳定错误码、结构类型、事件审计、companion 自证、fail-closed——是本书 13 章真正想让你带走的可复用资产；⑤ 路线图八个里程碑按不变量排序，MVP = 日志 + 循环。
+      <b class="tag">答案回收</b>
+      <strong>①应用形态怎么组合</strong>——profile bundle 让「换应用形态」成为换 patch 而非换内核，sdk-minimal 证明内核本身也可整体替换；<strong>②怎么交给别的进程</strong>——SDK 协议刻意最小（3 请求 + 4 通知），事件直接复用 SessionEvent，不发明第二种 wire 形状；<strong>③Web host 怎么保持纯路由</strong>——零 harness 词汇的纯路由表，安全归组成层；<strong>④路线图按什么排序</strong>——八个里程碑按不变量排序，MVP = 日志 + 循环。贯穿全程的还有能力缝配方八条——契约先行、注册表、稳定错误码、结构类型、事件审计、companion 自证、fail-closed——这是本书 13 章真正想让你带走的可复用资产。
     </div>
   </section>
 
@@ -262,7 +271,7 @@ define another application.</pre>
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 13 自制 Harness 路线图 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 13 自制 Harness 路线图 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -35,17 +35,24 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 生命周期</div>
     <h1>一次对话的完整生命周期：从 inbox 到 turn/end</h1>
-    <div class="subtitle">第 2 章看了「日志里有什么」，这一章看「日志是怎么被写出来的」：一条消息如何被认领、被 pre-step 决策、被派发给模型、触发工具、又如何收尾。掌握这条时序，你就掌握了 dsh 的主干道。</div>
+    <div class="subtitle">问题：日志是怎么被写出来的？具体拆成四个——一条消息从进来到被派发，中间的认领与决策点在哪（①）？turn/step 两层怎么套，谁开谁关（②）？一次模型请求的一生（含流中断与失败结算）怎么走（③）？请求配置的演化怎么在日志里留痕（④）？3.1 把问题摆出来，3.2–3.7 逐个作答，3.8 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">3.1</span>一分钟版本</h2>
+    <h2><span class="num">3.1</span>问题：一条消息怎么走完整条流水线</h2>
+    <p>第 2 章看了「日志里有什么」，这一章看「日志是怎么被写出来的」。把问题摆出来：</p>
     <ul>
-      <li><strong>step</strong> = 一次模型请求 + 它触发的全部工具调用；<strong>turn</strong> = 零或多步（第一个输入被认领前打开，无事可欠时关闭）；<strong>round</strong> = 外层策略迭代（goal round、Ralph round）。</li>
-      <li>输入经唯一的 <strong>inbox</strong> 进入驱动器。消息可立即唤醒；注入型上下文在 inbox 里等下一班车。</li>
-      <li><code class="inline">agent/pre-step</code> waterfall 决定模型看见什么：改写消息、追加上下文、或直接 <code class="inline">reject</code>。</li>
-      <li>每个 step 把「Prompt 段 + 工具 schema + 从日志派生的历史」组装成请求，流式接收，结算为 <code class="inline">assistant/message</code> 或 <code class="inline">assistant/attempt</code>。</li>
-      <li>有工具调用 → 执行 → 结果回填 → 可能再来一步；没有 → <code class="inline">agent/turn-stopping</code>（serial）→ <code class="inline">turn/end</code>。</li>
+      <li>① <strong>认领与决策点在哪</strong>——一条消息从 inbox 到被派发，中间谁决定「模型看见什么」？被拒绝的消息去哪了？</li>
+      <li>② <strong>turn/step 两层怎么套</strong>——谁打开、谁关闭、什么情况可以零 step 关闭一个 turn？</li>
+      <li>③ <strong>一次模型请求的一生怎么走</strong>——流式接收、中断、失败各结算成什么？工具调用怎么触发下一步？</li>
+      <li>④ <strong>请求配置的演化怎么留痕</strong>——换了模型、加了工具、重启进程，日志里怎么区分？</li>
+    </ul>
+    <p>先给速览答案，细节在后四节展开：</p>
+    <ul>
+      <li>① 认领 + 决策都在 <strong>step 的第一步</strong>（preStep()）：claim 取走 inbox 消息 → <code class="inline">agent/pre-step</code> waterfall 决定改写/追加/<code class="inline">reject</code>（3.2–3.3）。</li>
+      <li>② <strong>turn = 零或多步</strong>，step 才花钱；turn 由循环体打开，无事可欠时关闭（3.4）。</li>
+      <li>③ 一次请求 = prepareRequest → 流式接收 → 结算：<strong>committed 的 assistant/message 或 settled 的 assistant/attempt，不存在第三种结局</strong>；有工具调用则执行 → 回填 → 再来一步（3.5）。</li>
+      <li>④ <code class="inline">request/header</code> 用四种 reason（initial/resume/change/series）把配置演化史记在日志里（3.6）。</li>
     </ul>
   </section>
 
@@ -108,8 +115,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.3</span>用代码看：preStep() —— 决策点</h2>
-    <p>step 的第一步永远是「认领 + 决策」。注意默认决策如何把运行时投影出的上下文（<code class="inline">renderContextSections</code>）追加到认领的消息后面（<code class="inline">packages/core/agent-loop/src/agent.ts:241</code>）：</p>
+    <h2><span class="num">3.3</span>① 用代码看：preStep() —— 决策点</h2>
+    <p>step 的第一步永远是「认领 + 决策」。注意默认决策如何把运行时投影出的上下文（<code class="inline">renderContextSections</code>）追加到认领的消息后面（<code class="inline">packages/core/agent-loop/src/agent.ts:266</code>）：</p>
     <div class="code-title">packages/core/agent-loop/src/agent.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">preStep</span>(target: <span class="cl">InboxTarget</span>, position: { turn: <span class="kw">number</span>; step: <span class="kw">number</span> }): <span class="cl">Promise</span>&lt;<span class="cl">PreparedStep</span>&gt; {
     <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'running'</span>) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`agent "${this.id}": pre-step outside running phase`</span>)
@@ -143,8 +150,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.4</span>用代码看：turn() —— 骨架循环</h2>
-    <div class="code-title">packages/core/agent-loop/src/agent.ts:270 — turn()</div>
+    <h2><span class="num">3.4</span>② 用代码看：turn() —— 骨架循环</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:295 — turn()</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">turn</span>(): <span class="cl">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
     <span class="cmt">// ... phase 校验省略</span>
     <span class="kw">const</span> phase = <span class="kw">this</span>.phase
@@ -190,8 +197,9 @@
         target = <span class="st">'next-step'</span>
       }
     } <span class="kw">catch</span> (error: <span class="kw">unknown</span>) {
-      <span class="kw">if</span> (signal.aborted) {
-        turnEnds = { kind: <span class="st">'aborted'</span>, reason: signal.reason <span class="kw">as</span> <span class="cl">AgentCancelCause</span> }
+      <span class="kw">const</span> cause = <span class="fn">abortedCancelCause</span>(signal)
+      <span class="kw">if</span> (cause !== <span class="kw">undefined</span>) {
+        turnEnds = { kind: <span class="st">'aborted'</span>, reason: cause }
         <span class="kw">throw</span> error
       }
       <span class="cmt">// 所有失败都是结构化的：LlmError 保留事实，其余扁平化为</span>
@@ -208,12 +216,12 @@
     }
     <span class="kw">return</span> <span class="kw">this</span>.inbox.<span class="fn">hasPending</span>()   <span class="cmt">// 还有排队输入 → 换新 AbortController 再来一回合</span>
   }</pre>
-    <div class="annotation"><b>细节</b>：① <code class="inline">turnEnds</code> 的 max-tokens <strong>粘滞</strong>语义在两处体现：step 返回后不覆盖已有的 max-tokens 结果；② <code class="inline">agent/turn-stopping</code> 只在「回合要结束且无 next-step」时以 <strong>serial</strong> 模式派发——它是没有 <code class="inline">next()</code> 的收口点（例如 Claude Code 的 Stop hook 桥在这里把 deny 转成 <code class="inline">steer()</code>，强制再走一步；plan-mode 不走这里，它拦在 <code class="inline">agent/pre-step</code>）；③ 出错时 <code class="inline">LlmError</code> 保留其 failure，其他错误扁平化为 errorChain 文本、code 为 <code class="inline">UNKNOWN</code>；④ <code class="inline">finally</code> 里无条件写 <code class="inline">turn/end</code>，所以崩溃前的最后一次尝试也会留下回合结束记录（如果进程没死）。</div>
+    <div class="annotation"><b>细节</b>：① <code class="inline">turnEnds</code> 的 max-tokens <strong>粘滞</strong>语义在两处体现：step 返回后不覆盖已有的 max-tokens 结果；② <code class="inline">agent/turn-stopping</code> 只在「回合要结束且无 next-step」时以 <strong>serial</strong> 模式派发——它是没有 <code class="inline">next()</code> 的收口点（例如 Claude Code 的 Stop hook 桥在这里把 deny 转成 <code class="inline">steer()</code>，强制再走一步；plan-mode 不走这里，它拦在 <code class="inline">agent/pre-step</code>）；③ 出错时 <code class="inline">LlmError</code> 保留其 failure，其他错误扁平化为 errorChain 文本、code 为 <code class="inline">UNKNOWN</code>；④ <code class="inline">finally</code> 里无条件写 <code class="inline">turn/end</code>，所以崩溃前的最后一次尝试也会留下回合结束记录（如果进程没死）。⑤ catch 里的 <code class="inline">abortedCancelCause</code>（agent.ts:79）值得单独看：取消时不能直接把 <code class="inline">signal.reason</code> 当作原因写日志——Node 的 fetch 在 abort 时会自造一个带栈的 reason 对象，塞进 <code class="inline">session.append</code> 会被冻结校验拒掉。这个辅助函数只拷贝 <code class="inline">AgentCancelCause</code> 的 kind 字段（hook 保留 reason，其余只留 kind），等于对原因做了一次「形状清洗」；wakeDriver 的超时唤醒（:213/:218）用的是同一个函数。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.5</span>用代码看：step() —— 一次模型请求的一生</h2>
-    <div class="code-title">packages/core/agent-loop/src/agent.ts:353 — step()（节选）</div>
+    <h2><span class="num">3.5</span>③ 用代码看：step() —— 一次模型请求的一生</h2>
+    <div class="code-title">packages/core/agent-loop/src/agent.ts:380 — step()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">step</span>(decision: <span class="cl">Extract</span>&lt;<span class="cl">PreparedStep</span>, { kind: <span class="st">'enter'</span> }&gt;): <span class="cl">Promise</span>&lt;<span class="cl">StepEndReason</span> | <span class="kw">null</span>&gt; {
     <span class="kw">const</span> { turn, step, abort: { signal } } = <span class="kw">this</span>.phase
     <span class="kw">const</span> { assembly } = decision
@@ -309,7 +317,7 @@
 
   <section class="block">
     <h2><span class="num">3.6</span>请求头折叠：request/header 的四种 reason</h2>
-    <p>每次派发前，循环用 <code class="inline">buildRequest</code> 组装冻结请求，并决定是否追加一条 <code class="inline">request/header</code>（<code class="inline">packages/core/agent-loop/src/agent.ts:554</code>）：</p>
+    <p>每次派发前，循环用 <code class="inline">buildRequest</code> 组装冻结请求，并决定是否追加一条 <code class="inline">request/header</code>（<code class="inline">packages/core/agent-loop/src/agent.ts:581</code>）：</p>
     <div class="code-title">packages/core/agent-loop/src/agent.ts — buildRequest()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span>    <span class="kw">const</span> surfaceGeneration = session.surface.contentGeneration
     <span class="kw">const</span> header = <span class="fn">canonicalHeader</span>({
@@ -343,8 +351,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.7</span>Inbox：认领与拼接</h2>
-    <p>inbox 是持久的：它的每次拼接都写成 <code class="inline">agent/inbox/spliced</code> 会话事件，重启后重放即可恢复排队消息（<code class="inline">packages/core/agent/src/types.ts:87</code>）：</p>
+    <h2><span class="num">3.7</span>④ Inbox：认领与拼接</h2>
+    <p>inbox 是持久的：它的每次拼接都写成 <code class="inline">agent/inbox/spliced</code> 会话事件，重启后重放即可恢复排队消息（<code class="inline">packages/core/agent/src/types.ts:96</code>）：</p>
     <div class="code-title">packages/core/agent/src/types.ts — inbox 拼接事件</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="st">'agent/inbox/spliced'</span>: {
     target: <span class="cl">InboxTarget</span>          <span class="cmt">// 'next-turn' | 'next-step'</span>
@@ -361,15 +369,15 @@
     </ul>
     <div class="callout info">
       <b class="tag">出生宣言：agent/created 是 awaited 的</b>
-      在这一切之前还有一个起点事件：<code class="inline">agent/created</code>（v0.1.6 wave 改为 serial + awaited）。<code class="inline">AgentRegistry.announce(agent, source, signal?)</code>（<code class="inline">packages/core/agent/src/index.ts:534</code>）先把 announcing/announced 双标记置位（listener 不可能借 dispatch 递归制造第二条出生边），然后 <code class="inline">await ctx.serial(entry.carrier, 'agent/created', …)</code>——<strong>发布方等到串行事件落定才返回</strong>。agent-loop 的 <code class="inline">publish()</code>（agent-loop/src/index.ts:666）依次 enter session → enter agent → announce session → <code class="inline">await agents.announce(...)</code>，于是「创建监听器」看到的顺序是严格定义的：存在事件先于一切工作。初始化包在 <code class="inline">initializeAgent</code> 的 <code class="inline">runMaintenance</code> 里，失败即 <code class="inline">cancel({kind:'disposed'}, {keepInbox:true})</code> + 吞掉 dispose 的二次异常再上抛——setup 失败是调用者该看见的第一错误。detach 的配对在 finally 里完成：半送达的 first edge 也会被 detach 对冲。
+      在这一切之前还有一个起点事件：<code class="inline">agent/created</code>（v0.1.6 wave 改为 serial + awaited）。<code class="inline">AgentRegistry.announce(agent, source, signal?)</code>（<code class="inline">packages/core/agent/src/index.ts:537</code>）先把 announcing/announced 双标记置位（listener 不可能借 dispatch 递归制造第二条出生边），然后 <code class="inline">await ctx.serial(entry.carrier, 'agent/created', …)</code>——<strong>发布方等到串行事件落定才返回</strong>。agent-loop 的 <code class="inline">publish()</code>（agent-loop/src/index.ts:614 起，announce 调用在 :624）依次 enter session → enter agent → announce session → <code class="inline">await agents.announce(...)</code>，于是「创建监听器」看到的顺序是严格定义的：存在事件先于一切工作。初始化包在 <code class="inline">initializeAgent</code> 的 <code class="inline">runMaintenance</code> 里，失败即 <code class="inline">cancel({kind:'disposed'}, {keepInbox:true})</code> + 吞掉 dispose 的二次异常再上抛——setup 失败是调用者该看见的第一错误。detach 的配对在 finally 里完成：半送达的 first edge 也会被 detach 对冲。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.8</span>要点</h2>
+    <h2><span class="num">3.8</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① turn/step 两层结构，step 才花钱（模型调用），turn 可以零 step 关闭；② pre-step 是「模型看见什么」的守门人；③ 流式尝试只有两种持久结局——committed 的 assistant/message 或 settled 的 assistant/attempt，不存在第三种；④ request/header 四种 reason 记录了请求配置的完整演化史。下一步进入 <a href="04-agent-loop.html">第 4 章：Agent 循环的并发模型</a>。
+      <b class="tag">答案回收</b>
+      ① 认领与决策 → preStep() 一处完成：claim 取走全部 next-step + 1 个 next-turn，<code class="inline">agent/pre-step</code> waterfall 默认把运行时上下文追加到消息后，监听器可改写、可 <code class="inline">reject</code>（3.3）；被拒绝的首个认领仍关闭一个零 step 的持久 turn。② turn/step 套法：turn/start 由循环体打开，try/finally 保证 turn/end 无条件落日志；step 才花钱，max-tokens 粘滞防降级，收口前 <code class="inline">agent/turn-stopping</code>（serial）有一票否决权（3.4）。③ 请求的一生：prepareRequest → buildRequest → 流式接收 → 结算——成功 = assistant/message，失败/取消且无可见内容 = assistant/attempt，中断但有前缀 = interrupted 消息；工具调用经管线执行后 splice 回 next-step 决定是否再来一步（3.5）。④ 配置演化：request/header 四 reason——initial/resume/change/series，加上 system/message 的追加/替换，就是「为什么这个 step 换了模型」审计的完整数据源（3.6）。下一步进入 <a href="04-agent-loop.html">第 4 章：Agent 循环的并发模型</a>。
     </div>
   </section>
 
@@ -381,7 +389,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 03 生命周期 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 03 生命周期 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

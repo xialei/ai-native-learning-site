@@ -37,11 +37,13 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 10 激活重算</div>
     <h1>激活重算：用 33% 的算力换显存</h1>
-    <div class="subtitle">第 6 章的账本只算了参数侧；长序列大 batch 下，<strong>激活</strong>才是显存大头。重算（activation checkpointing / gradient checkpointing）的策略简单粗暴：前向不存中间激活，反向用到时重算一遍。代价约 33% 额外算力。两库都有实现，且细节不同——DS 保存 RNG 状态、Megatron 做选择性重算。</div>
+    <div class="subtitle">激活显存到底多大，重算换显存的算力代价（33%）怎么算出来的？DS 的 CheckpointFunction 为什么要把三份 RNG 状态存下来，漏一份的后果是什么？Megatron 的 selective 重算保什么、重什么？重算与 PP/ZeRO-3/CP 共存时互相影响吗？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">10.1</span>一分钟版本</h2>
+    <h2><span class="num">10.1</span>显存不够时先砍哪块</h2>
+    <p>第 6 章的账本只算了参数侧；长序列大 batch 下，<strong>激活</strong>才是显存大头。重算（activation checkpointing / gradient checkpointing）的策略简单粗暴：前向不存中间激活，反向用到时重算一遍。听上去是免费的显存，但有两个问题必须先答清楚：重算的那一遍怎么保证和第一遍<strong>逐位相同</strong>——第一遍有 dropout；以及为什么生产默认是 selective 而不是全重算。结论先放在这：<strong>重算是「用 33% 算力换显存」的确定交换，正确性的关键只有一条——重算的前向必须逐位复现第一遍，RNG 恢复是共同责任。</strong></p>
+    <h3>一分钟版本</h3>
     <p>transformer 一层的激活量 ≈ <code class="inline">s × b × h × (34 + 5·a·s/h)</code> 字节（fp16，s 序列长、b batch、h hidden、a 头数）。长序列时注意力矩阵那项平方增长。三个档位：</p>
     <ul>
       <li><strong>不重算</strong>：全存。显存最大，速度最快。</li>
@@ -55,7 +57,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">10.2</span>用代码看｜DeepSpeed 的 CheckpointFunction</h2>
+    <h2><span class="num">10.2</span>DeepSpeed 的 CheckpointFunction</h2>
+    <p>先追那个正确性问题。重算要求第二遍前向和第一遍<strong>逐位相同</strong>——DS 的解法是把所有随机性源头全部存下来：</p>
     <div class="code-title">deepspeed/runtime/activation_checkpointing/checkpointing.py — CheckpointFunction.forward（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">CheckpointFunction</span>(torch.autograd.Function):
     <span class="kw">@staticmethod</span>
@@ -81,11 +84,12 @@
                 outputs = ctx.run_function(*ctx.inputs)
                 <span class="cmt"># 重算时 PARTITION_ACTIVATIONS 需要先 all-gather 输入</span>
         <span class="kw">return</span> <span class="kw">None</span>, <span class="kw">None</span>, *gradients</pre>
-    <div class="annotation"><b>RNG 状态是正确性的命门：</b>重算出来的前向必须和第一遍<strong>逐位相同</strong>——dropout 的 mask、TP 各卡不同的随机数（RNG tracker 给每张卡派不同 seed）都要原样恢复。漏一个就是「重算的前向 ≠ 原前向」，梯度悄悄错，loss 曲线看着正常但收敛变差——这类 bug 极难排查。<code class="inline">PARTITION_ACTIVATIONS</code> 服务于「DP 之内还有数据切分」的场景（如 MoE），<code class="inline">CPU_CHECKPOINT</code> 把存的输入也挪 CPU——三级显存/带宽的取舍。DS 用法是模型里显式包 <code class="inline">checkpoint(checkpoint, f, args)</code>，属于<strong>侵入式 API</strong>。</div>
+    <div class="annotation"><b>漏一份 RNG 状态会怎样：</b>重算出来的前向必须和第一遍<strong>逐位相同</strong>——dropout 的 mask、TP 各卡不同的随机数（RNG tracker 给每张卡派不同 seed）都要原样恢复。漏一个就是「重算的前向 ≠ 原前向」，梯度悄悄错，loss 曲线看着正常但收敛变差——这类 bug 极难排查。<code class="inline">PARTITION_ACTIVATIONS</code> 服务于「DP 之内还有数据切分」的场景（如 MoE），<code class="inline">CPU_CHECKPOINT</code> 把存的输入也挪 CPU——三级显存/带宽的取舍。DS 用法是模型里显式包 <code class="inline">checkpoint(checkpoint, f, args)</code>，属于<strong>侵入式 API</strong>。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.3</span>用代码看｜Megatron 的层内重算与选择性重算</h2>
+    <h2><span class="num">10.3</span>Megatron 的层内重算与选择性重算</h2>
+    <p>全重算存得最少，但每个算子都付一遍算力——能不能只重算「便宜的」、保留「昂贵的」？Megatron 的 selective 档就是这个思路：</p>
     <div class="code-title">megatron/core/transformer/transformer_layer.py — checkpointed_forward（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># full granularity：整个 layer 一个 checkpoint 段</span>
 <span class="kw">def</span> <span class="fn">checkpointed_forward</span>(self, *args):
@@ -98,7 +102,7 @@
         <span class="cmt"># selective：只重算核心注意力段，其余正常建图</span>
         <span class="cmt"># 挂点在 Attention 模块内部（core_attention 的输入输出保留）</span>
         ...</pre>
-    <div class="annotation"><b>配置项的三档：</b>Megatron 用 <code class="inline">--recompute-granularity full|selective</code> + <code class="inline">--recompute-method uniform|block</code> + <code class="inline">--recompute-num-layers n</code> 组合表达档位。selective 的思想（论文 Checkmate/Reduction 系）：attention 概率矩阵是平方级显存大户，重算它最划算；QKV 输出保留（重算它要重跑两个 GEMM，不划算）。<strong>Megatron 的实现是非侵入的</strong>——配置开关决定层怎么包，模型代码不变；DS 是显式函数调用。自研选哪种取决于你的代码形态，但<strong>RNG 恢复是共同的责任</strong>，两库都处理了。</div>
+    <div class="annotation"><b>三档怎么用配置项表达：</b>Megatron 用 <code class="inline">--recompute-granularity full|selective</code> + <code class="inline">--recompute-method uniform|block</code> + <code class="inline">--recompute-num-layers n</code> 组合表达档位。selective 的思想（论文 Checkmate/Reduction 系）：attention 概率矩阵是平方级显存大户，重算它最划算；QKV 输出保留（重算它要重跑两个 GEMM，不划算）。<strong>Megatron 的实现是非侵入的</strong>——配置开关决定层怎么包，模型代码不变；DS 是显式函数调用。自研选哪种取决于你的代码形态，但<strong>RNG 恢复是共同的责任</strong>，两库都处理了。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t101 d101">
@@ -138,6 +142,7 @@
 
   <section class="block">
     <h2><span class="num">10.4</span>与 PP/ZeRO-3 的互动</h2>
+    <p>重算也不是一个孤立开关——它改变显存分布，和 PP、ZeRO-3、CP 都有互动：</p>
     <ul>
       <li><strong>PP</strong>：1F1B 的 in-flight 激活本来就少（第 4 章），但 warmup 阶段的激活仍随阶段位置涨——重算把 in-flight 峰值再压一档，让 PP 能开更多 microbatch。</li>
       <li><strong>ZeRO-3</strong>：fetch 参数本身要占显存，重算省下的激活空间正好给 <code class="inline">max_live_parameters</code> 让路——两者是互补而不是竞争。</li>
@@ -151,6 +156,7 @@
 
   <section class="block">
     <h2><span class="num">10.5</span>小结 + 自研启示</h2>
+    <p>回望这一章：激活公式里的 s² 项既是长序列显存爆炸的根源，也是 selective 重算的靶子；DS 把 CPU、CUDA、TP tracker 三份 RNG 状态全存下来，重算时 fork_rng 恢复，漏一份就是静默数值错误；selective 只重算「一次 GEMM 就能重得」的部分，算力代价不到全重算一半；而它和 PP/ZeRO-3/CP 是互补不是竞争——省下的激活显存正好给参数 fetch 让路。三种实现的差别用一张表收拢：</p>
     <table class="tbl">
       <tr><th>实现</th><th>侵入性</th><th>RNG 处理</th><th>特色</th></tr>
       <tr><td>DS CheckpointFunction</td><td>显式包裹函数</td><td>保存 CPU+CUDA+tracker 三份</td><td>PARTITION_ACTIVATIONS / CPU_CHECKPOINT</td></tr>
@@ -170,7 +176,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 10 激活重算 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 10 激活重算 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

@@ -45,7 +45,7 @@
   </div>
 
   <section class="block">
-    <h2><span class="num">13.1</span>问题：vLLM 不管理会话状态，Agent 需要</h2>
+    <h2><span class="num">13.1</span>vLLM 不管理会话状态，Agent 需要</h2>
     <p>先说清「无状态」在这本书里的准确含义。vLLM 进程内部当然有运行时状态——请求队列、KV cache、后台循环——第 9 章讲的 EngineCore 本身就是「有状态、常驻」的。所谓<strong>无状态</strong>，特指 API server 在<strong>会话语义层面</strong>：它不跨请求保留「这轮对话聊了什么」，每个请求必须自包含。Agent 场景要的恰恰是这种跨请求的会话状态。先回到第 9 章的架构：vLLM 的 OpenAI API server（<code class="inline">vllm/entrypoints/openai/</code>）被刻意设计成<strong>会话无状态、可水平扩</strong>。它其实也实现了一个 Responses API，但状态管理非常有限——看 <code class="inline">vllm/entrypoints/openai/responses/serving.py</code> 里存储是怎么做的：</p>
     <div class="code-title">vllm/entrypoints/openai/responses/serving.py — vLLM 自带的「响应存储」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># HACK(woosuk): This is a hack. We should use a better store.</span>
@@ -53,7 +53,7 @@
 <span class="cmt"># never remove responses from the store.</span>
 <span class="kw">self</span>.<span class="fn">response_store</span>: <span class="cl">dict</span>[<span class="cl">str</span>, <span class="cl">ResponsesResponse</span>] = {}
 <span class="kw">self</span>.<span class="fn">response_store_lock</span> = asyncio.<span class="fn">Lock</span>()</pre>
-    <div class="annotation"><b>看懂这段：</b>三行注释把问题说透了——默认 <code class="inline">store=False</code> 直接忽略；即便用 <code class="inline">VLLM_ENABLE_RESPONSES_API_STORE=1</code> 打开，也只是一个<strong>进程内 dict</strong>：重启即失、单机限死、从不清理（官方注释自认 may cause a memory leak）。对「续聊要带着全部历史、跨请求、跨副本」的 Agent 场景，这层是不够的。</div>
+    <div class="annotation"><b>三行注释把问题说透了：</b>默认 <code class="inline">store=False</code> 直接忽略；即便用 <code class="inline">VLLM_ENABLE_RESPONSES_API_STORE=1</code> 打开，也只是一个<strong>进程内 dict</strong>：重启即失、单机限死、从不清理（官方注释自认 may cause a memory leak）。对「续聊要带着全部历史、跨请求、跨副本」的 Agent 场景，这层是不够的。</div>
     <p>更关键的是<strong>工具循环</strong>。Agent 一句话触发十几次工具调用很常见，而 vLLM 的定位是「一次请求进、一批 token 出」的推理引擎。把循环放在每个客户端里，意味着：每个 SDK、每个脚本都要自己重放历史、自己执行工具、自己处理 SSE 拼接——这就是 agentic-api README 说的「Today, all of that complexity lives in your client code」。</p>
     <p>agentic-api 的答案：<strong>状态上移到网关，推理留在 vLLM</strong>。整体架构是这样：</p>
     <div class="figure">
@@ -104,7 +104,8 @@
       </svg>
       <div class="fig-cap">图 13.1：agentic-api 在 vLLM 前承接「有状态的活」。vLLM 只看到一份份自包含的无状态请求；历史、工具循环、持久化都由网关承担。</div>
     </div>
-    <div class="callout warn"><b class="tag">对照第 9 章</b>第 9 章讲「API server ↔ EngineCore」是<strong>进程内</strong>的无状态/有状态分层——那里的「有状态」指 KV cache、调度队列这类请求内状态；本章是它的<strong>镜像补充</strong>：把「对话级状态」（跨请求、跨重启的历史）从推理进程里彻底拿出去，放到一个独立的 Rust 网关进程。两层拆分之后，vLLM 侧每个请求自包含、可以随便重启、扩缩容，而对话状态安稳地躺在网关的数据库里。</div>
+    <div class="callout warn"><b class="tag">对照第 9 章</b>第 9 章讲「API server ↔ EngineCore」是<strong>进程内</strong>的无状态/有状态分层——那里的「有状态」指 KV cache、调度队列这类请求内状态；本章是它的<strong>镜像补充</strong>：把「对话级状态」（跨请求、跨重启的历史）也从推理进程里彻底拿出去，放到一个独立的 Rust 网关进程。两层拆分之后，vLLM 侧每个请求自包含、可以随便重启、扩缩容，而对话状态安稳地躺在网关的数据库里。</div>
+    <div class="annotation"><b>带着这些问题往下走：</b>状态该放哪 → 13.1 本节（网关承接）；流量都进网关吗 → 13.2 两条路；历史怎么恢复 → 13.3 rehydrate；多轮循环怎么写 → 13.4 EngineOrchestration；工具归谁执行 → 13.5 三种所有权；流与长会话 → 13.6 流重组、13.7 compaction。13.8 把三层拼成一条启动命令。</div>
   </section>
 
   <section class="block">
@@ -122,7 +123,7 @@
 } <span class="kw">else</span> {
     proxy_responses(&state, parts, bytes).await   <span class="cmt">// 原样透传 vLLM</span>
 }</pre>
-    <p>其中 <code class="inline">in_process_feature()</code>（<code class="inline">crates/agentic-server-core/src/types/request_response.rs:299</code>）枚举了「网关专属」的四种特征：<code class="inline">conversation_id</code>、任何非 function 的工具声明（网关自有工具与 client 侧 custom 工具都在此列——后者虽由客户端执行，但「注册、改写为 function」这一步必须发生在网关进程里）、compaction 输入、<code class="inline">context_management</code>。第四个条件 <code class="inline">has_tool_search_state</code> 是 <code class="inline">type: &quot;tool_search&quot;</code> 声明：客户端用一次搜索来动态挑选工具（13.5），这种请求虽然工具都归客户端执行，但网关必须接手生成「可选工具目录」。命中任意一个就走执行器路径。</p>
+    <p>其中 <code class="inline">in_process_feature()</code>（<code class="inline">crates/agentic-server-core/src/types/request_response.rs:299</code>）枚举了「网关专属」的四种特征：<code class="inline">conversation_id</code>、任何非 function 的工具声明（网关自有工具与 client 侧 custom 工具都在此列——后者虽由客户端执行，但「注册、改写为 function」这一步必须发生在网关进程里）、compaction 输入、<code class="inline">context_management</code>。路由判定里还有一个与它并列的条件 <code class="inline">has_tool_search_state</code>，对应 <code class="inline">type: &quot;tool_search&quot;</code> 声明：客户端用一次搜索来动态挑选工具（13.5），这种请求虽然工具都归客户端执行，但网关必须接手生成「可选工具目录」。命中任意一个就走执行器路径。</p>
     <div class="annotation"><b>为什么值得学：</b>这是网关类的「<strong>透明降级</strong>」设计——用户发一个纯无状态请求时，网关只做转发（<code class="inline">agentic_core::proxy</code>，不解析不落库）；只有真的需要状态时才启动编排。代价小、语义清晰：vLLM 自己能干的事绝不代劳。</div>
     <p>把判定条件摊开看，两条路的分野一目了然：</p>
     <table class="tbl">
@@ -132,10 +133,8 @@
           <td>
             ① <code class="inline">store: true</code>——要求把本轮持久化；<br>
             ② 带 <code class="inline">previous_response_id</code>——响应链续聊，要读历史；<br>
-            ③ 带 <code class="inline">conversation_id</code>——会话树取历史；<br>
-            ④ 声明了任何非 function 工具（<code class="inline">web_search</code> / <code class="inline">mcp</code> / <code class="inline">custom</code> / Codex 命名空间）——注册、改写成 function 必须发生在网关进程；<br>
-            ⑤ 带 <code class="inline">type: "tool_search"</code>——网关要接手生成「可选工具目录」（13.5）；<br>
-            ⑥ compaction 输入或 <code class="inline">context_management</code>——上下文压缩归网关（13.7）。
+            ③ <code class="inline">in_process_feature()</code> 命中任一：带 <code class="inline">conversation_id</code>（会话树取历史）、声明了任何非 function 工具（<code class="inline">web_search</code> / <code class="inline">mcp</code> / <code class="inline">custom</code> / Codex 命名空间——注册、改写成 function 必须发生在网关进程）、compaction 输入或 <code class="inline">context_management</code>（上下文压缩归网关，13.7）；<br>
+            ④ 带 <code class="inline">type: "tool_search"</code>——网关要接手生成「可选工具目录」（13.5）。
           </td>
           <td>
             只声明 function 工具、不引用任何历史、不要求存储。<br><br>
@@ -155,7 +154,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">13.3</span>状态恢复：previous_response_id → 完整历史</h2>
+    <h2><span class="num">13.3</span>历史怎么恢复：previous_response_id → 完整历史</h2>
     <p>执行器路径的第一步是 <strong>rehydrate（恢复历史）</strong>：客户端只带一个 <code class="inline">previous_response_id</code>，网关把这条 ID 背后的全部历史从数据库里捞出来，拼到本轮输入前面。入口在 <code class="inline">crates/agentic-server-core/src/executor/rehydrate.rs</code>：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/rehydrate.rs — rehydrate_with_continuation（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> <span class="fn">rehydrate_conversation</span>(
@@ -267,7 +266,7 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
   </section>
 
   <section class="block">
-    <h2><span class="num">13.4</span>核心：多轮工具循环 EngineOrchestration::run</h2>
+    <h2><span class="num">13.4</span>多轮循环怎么写：EngineOrchestration::run</h2>
     <p>这是整章的核心。客户端发来一句话，模型可能要调 3 次工具才能答——<strong>「推理一轮 → 执行工具 → 把结果喂回去 → 再推理」</strong>的循环发生在网关里，客户端对此无感。看 <code class="inline">crates/agentic-server-core/src/executor/engine.rs</code>（下为摘录拼接，保留了原始顺序）：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/engine.rs — EngineOrchestration::run（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">const</span> <span class="cl">MAX_GATEWAY_TOOL_ROUNDS</span>: <span class="cl">usize</span> = <span class="nu">10</span>;
@@ -361,7 +360,7 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
   </section>
 
   <section class="block">
-    <h2><span class="num">13.5</span>工具所有权：一个工具，三种命运</h2>
+    <h2><span class="num">13.5</span>工具归谁执行：一个工具，三种命运</h2>
     <p>循环里「执行工具」这一步有个关键前提：<strong>网关必须知道每个工具归谁执行</strong>。agentic-api 把它做成了显式类型，而不是靠名字猜：</p>
     <div class="code-title">crates/agentic-server-core/src/tool/ownership.rs — 所有权枚举（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> <span class="cl">ToolOwnership</span> {
@@ -471,7 +470,7 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
   </section>
 
   <section class="block">
-    <h2><span class="num">13.6</span>流式重组：N 轮 SSE 拼成一条流</h2>
+    <h2><span class="num">13.6</span>响应流怎么拼：N 轮 SSE 拼成一条流</h2>
     <p>客户端要的是「一次请求、一条平滑的 SSE 流」。但网关内部跑了 N 轮推理，每轮 vLLM 都各自发一套 <code class="inline">response.created</code> / <code class="inline">sequence_number</code> / <code class="inline">output_index</code>。直接转发就会出现「第 3 轮突然又来一个 created、序号倒退」的乱序流。做重组的是 <code class="inline">GatewayStreamAccumulator</code>：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/gateway_accumulator.rs（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub struct</span> <span class="cl">GatewayStreamAccumulator</span> {
@@ -563,11 +562,11 @@ vLLM ──SSE──▶ 网关                          <span class="cmt">（第
         │ ……模型直接给出最终回答，classify_round：gateway_results 为空 → Done
         │ 先 persist（两轮的全部 items + resp_1 一次事务写入），后发 response.completed → [DONE]</pre>
     <p>同一条时间线换成 <strong>function 工具</strong>会怎么变？注册表记为 Client；vLLM 吐出调用后 <code class="inline">classify_round</code> 直接走 <code class="inline">RequiresClientAction</code>——网关不执行任何东西，调用原样翻译成对外事件交还客户端，等客户端下一轮带着 <code class="inline">function_call_output</code> 回来。两条路径的分岔点只有一处：注册表里的所有权判定；循环、翻译、持久化代码完全共享。</p>
-    <div class="annotation"><b>值得数一数的事件守门员：</b>这段流里每帧都过了三道检查——累积器的生命周期去重与序号重打、翻译器的形状改写（function → web_search_call）、执行后合成的事件插队（带 defer 边界）。客户端拿到的流自始至终序号单调、形状合法、时序真实，完全看不出中间经历了两轮推理和一次外部 HTTP 调用。这就是「编排层」存在的意义：把复杂度收敛在服务端，把简单留给协议两端。</div>
+    <div class="annotation"><b>值得数一数的事件检查：</b>这段流里每帧都过了三道检查——累积器的生命周期去重与序号重打、翻译器的形状改写（function → web_search_call）、执行后合成的事件插队（带 defer 边界）。客户端拿到的流自始至终序号单调、形状合法、时序真实，完全看不出中间经历了两轮推理和一次外部 HTTP 调用。这就是「编排层」存在的意义：把复杂度收敛在服务端，把简单留给协议两端。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">13.7</span>上下文压缩：compaction，长会话怎么不被上下文撑爆</h2>
+    <h2><span class="num">13.7</span>长会话怎么不被撑爆：上下文压缩 compaction</h2>
     <p>对话越长，每轮「全量重放」就越贵（这正是第 8 章讲过的 KV/显存预算问题的 API 层版本）。agentic-api 提供了 <strong>compaction</strong>：把旧上下文压成一条「检查点摘要」，之后的轮次只带摘要 + 摘要后的新内容。可以显式调 <code class="inline">POST /v1/responses/compact</code>，也可以挂自动阈值，每轮推理前检查：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/compaction.rs — maybe_compact_context（摘录）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) async fn</span> <span class="fn">maybe_compact_context</span>(
@@ -607,8 +606,8 @@ vLLM ──SSE──▶ 网关                          <span class="cmt">（第
   </section>
 
   <section class="block">
-    <h2><span class="num">13.8</span>实战串联：把三层跑起来</h2>
-    <p>把第 9 章（vLLM 服务）和本章（网关）拼成一条完整命令链——注意 vLLM 的启动参数只有解析器类配置（工具解析器 + 自动工具选择 + 推理解析器），<strong>状态与循环完全不归它管</strong>：</p>
+    <h2><span class="num">13.8</span>把三层跑起来</h2>
+    <p>13.1 提出的问题——「Agent 需要的状态，vLLM 刻意不管」——答案是「状态上移到网关」。把它落成可以启动的东西：把第 9 章（vLLM 服务）和本章（网关）拼成一条完整命令链——注意 vLLM 的启动参数只有解析器类配置（工具解析器 + 自动工具选择 + 推理解析器），<strong>状态与循环完全不归它管</strong>：</p>
     <div class="code-title">三层启动（终端）</div>
     <pre class="code"><span class="lang-tag">bash</span><span class="cmt"># ① vLLM：自包含单轮推理引擎（第 9 章的 AsyncLLM + EngineCore）</span>
 vllm serve Qwen/Qwen3-30B-A3B-FP8 \
@@ -649,7 +648,7 @@ curl http://localhost:9000/v1/responses -H <span class="st">"Content-Type: appli
 </div>
 
 <footer>
-  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.7.0-21-ga38b0f0 · vLLM 侧版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.7.0-21-ga38b0f0 · vLLM 侧版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以各仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -35,12 +35,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 硬件抽象层</div>
     <h1>硬件抽象层：三个基类把千差万别的机器人拉齐</h1>
-    <div class="subtitle">LeRobot 支持 15 种以上的机械臂、移动底盘与人形机器人，但上层代码只认识三个抽象：<code class="inline">Robot</code>（机器人）、<code class="inline">MotorsBus</code>（电机总线）、<code class="inline">Camera</code>(相机)。这一章把这三个基类逐方法读透——它们是整个真机栈的地基，也决定了「换一台机器人要写多少代码」。</div>
+    <div class="subtitle">LeRobot 支持 15 种以上的机械臂、移动底盘与人形机器人，但上层代码只认识三个抽象：<code class="inline">Robot</code>（机器人）、<code class="inline">MotorsBus</code>（电机总线）、<code class="inline">Camera</code>(相机)。本章沿着「换机器人重写一切」这个痛点问下去：<strong>抽象层到底挡住了什么？一台机器人该暴露哪些接口？换机型时协议差异收敛到哪？相机为什么要三种读法？</strong>2.1 把问题摆出来，2.2–2.5 逐个基类作答，2.6 收尾。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">2.1</span>为什么需要硬件抽象：从「换机器人重写一切」到「换一个配置」</h2>
-    <p>机器人领域的现实是：每个硬件厂商都有自己的 SDK、通信协议、标定流程。没有抽象层时，写一个「抓取演示」程序意味着把 SO-101 的 Feetech 协议、Koch 的 Dynamixel 协议、Unitree G1 的整套 SDK 各写一遍。LeRobot 的解法是经典的<strong>依赖倒置</strong>：定义三个稳定接口，所有硬件各自实现接口，上层（遥操作、录制、策略推理）只依赖接口。</p>
+    <h2><span class="num">2.1</span>问题：换一台机器人，要重写多少代码</h2>
+    <p>机器人领域的现实是：每个硬件厂商都有自己的 SDK、通信协议、标定流程。没有抽象层时，写一个「抓取演示」程序意味着把 SO-101 的 Feetech 协议、Koch 的 Dynamixel 协议、Unitree G1 的整套 SDK 各写一遍。要理解 LeRobot 怎么收拾这个局面，先摆出四个问题：</p>
+    <ul>
+      <li><strong>① 抽象到底挡住了什么？</strong>上层为什么敢「只认接口」——依赖倒置在这里具体指什么？</li>
+      <li><strong>② 一台机器人该有几个接口？</strong>Robot 基类的方法签名就是「一台机器人的定义」——它必须回答哪些问题？</li>
+      <li><strong>③ 换机型时，协议差异收敛到哪？</strong>同样的遥操作脚本跑在不同舵机总线上，靠什么对齐？两台机器的读数坐标系怎么统一？</li>
+      <li><strong>④ 相机的节拍怎么设计？</strong>一个主循环里既有 30 Hz 关节读数、又有相机帧，取帧接口怎么设计才不掉帧？</li>
+    </ul>
+    <div class="annotation"><b>四个问题，四节答案：</b>① 挡住的是什么 → 就在本节的分层图里；② Robot 的八个接口 → 2.2；③ 协议差异与标定 → 2.3–2.4.1；④ 相机三种读法 → 2.5。2.6 收尾。</div>
+    <p>先答 ①。LeRobot 的解法是经典的<strong>依赖倒置</strong>：定义三个稳定接口，所有硬件各自实现接口，上层（遥操作、录制、策略推理）只依赖接口——换机器人从「重写一切」变成「换一个配置」：</p>
     <ul>
       <li><strong><code class="inline">Robot</code></strong>：整机抽象。「给我观测 / 接受动作」，是策略和录制脚本唯一看到的对象。</li>
       <li><strong><code class="inline">MotorsBus</code></strong>：关节驱动抽象。电机挂在哪条总线（Feetech/Dynamixel/Damiao/Robstride）上被它挡住，机器人类通过 <code class="inline">sync_read / sync_write</code> 与之交互。</li>
@@ -108,7 +116,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.2</span>Robot 基类：一台机器人该有的八个接口（重点）</h2>
+    <h2><span class="num">2.2</span>② Robot 基类：一台机器人该有的八个接口（重点）</h2>
     <p><code class="inline">Robot</code> 是抽象基类（ABC）。它没有多少代码，但每个方法都是一份「承诺」——子类必须兑现，上层才能放心依赖。通读一遍：</p>
     <div class="code-title">src/lerobot/robots/robot.py:30 — Robot 抽象基类（摘录核心部分）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Robot</span>(abc.ABC):
@@ -162,7 +170,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.3</span>一个具体实现：SO-Follower 如何兑现这七个承诺</h2>
+    <h2><span class="num">2.3</span>③ 一个具体实现：SO-Follower 如何兑现这七个承诺</h2>
     <p>抽象读起来总有点虚，直接看最流行的机型——SO-100/SO-101（<code class="inline">SOFollower</code>）。先看它在 <code class="inline">__init__</code> 里怎么「装配」：</p>
     <div class="code-title">src/lerobot/robots/so_follower/so_follower.py:46 — 六个关节 + 一条 Feetech 总线</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__init__</span>(self, config: SOFollowerRobotConfig):
@@ -212,7 +220,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.4</span>MotorsBus：一条串行总线上的「寄存器读写」</h2>
+    <h2><span class="num">2.4</span>③（续）MotorsBus：一条串行总线上的「寄存器读写」</h2>
     <p>舵机机械臂的关节电机不接网卡、不跑 ROS，它们挂在一条串行总线上（Feetech 用 TTL 串口，Dynamixel 同理），每个电机有 ID，协议本质是<strong>读写寄存器</strong>。LeRobot 把这套「查表寻址」抽象在 <code class="inline">MotorsBusBase</code> 里：</p>
     <div class="code-title">src/lerobot/motors/motors_bus.py:58 — MotorsBusBase 最小接口（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">MotorsBusBase</span>(abc.ABC):
@@ -266,7 +274,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.5</span>Camera 基类：read / async_read / read_latest 三种节拍</h2>
+    <h2><span class="num">2.5</span>④ Camera 基类：read / async_read / read_latest 三种节拍</h2>
     <p>相机抽象比电机简单得多——核心是三种取帧方式的取舍：</p>
     <div class="code-title">src/lerobot/cameras/camera.py:26 — Camera 基类（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Camera</span>(abc.ABC):
@@ -301,7 +309,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.6</span>小结：接口即架构</h2>
+    <h2><span class="num">2.6</span>收尾：接口即架构</h2>
+    <p>2.1 的四个问题，答案收拢：① 抽象挡住的是「每台机器一套 SDK」——三个基类把协议、标定、限幅都关进实现里，上层只认接口；② 一台机器人 = 八个接口（观测/动作特征描述 + 连接/标定/配置/读写/断开）；③ 协议差异收敛到 tables.py 的查表与各厂商的 bus 子类，读数坐标靠标定 JSON 统一；④ 相机用 read / async_read / read_latest 三种节拍覆盖离线、单相机主循环、多传感器并发。一张表带走：</p>
     <table class="tbl">
       <tr><th>概念</th><th>lerobot 实现</th><th>你自己做硬件接入时</th></tr>
       <tr><td>整机接口</td><td>Robot ABC：observation_features / connect / get_observation / send_action / disconnect</td><td>先定接口再写实现；新机型 = 新子类 + 配置类，不动上层</td></tr>
@@ -314,7 +323,7 @@
     <div class="annotation"><b>收束：</b>LeRobot 硬件层的取舍是「<strong>接口窄到不能再窄</strong>」——Robot 只承诺「观测进来、动作出去」，把协议、标定、限幅都关进实现里。上层的一切（录制、训练、部署）都建立在这份承诺上。</div>
     <div class="callout warn">
       <b class="tag">下一步</b>
-      有了能读能写的机器人，怎么让人类「示范」给机器人看？下一章讲遥操作——leader-follower 主从臂、键盘/手柄，以及 <code class="inline">lerobot-record</code> 怎么把示范变成第一份数据集。这是<a href="03-teleop.html">第 3 章：遥操作与数据采集</a>。
+      有了能读能写的机器人，怎么让人类「示范」给机器人看？<a href="03-teleop.html">第 3 章：遥操作与数据采集</a>。
     </div>
   </section>
 
@@ -325,7 +334,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 02 硬件抽象层 · 基于 huggingface/lerobot（89236ea0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 02 硬件抽象层 · 基于 huggingface/lerobot（9a6bb610）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

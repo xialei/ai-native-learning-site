@@ -35,22 +35,23 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 Prompt/Scope</div>
     <h1>System Prompt 组装与 Scope：谁在哪个作用域里说了什么</h1>
-    <div class="subtitle">系统提示词不是一段写死的字符串，而是每次模型请求前由注册表动态组装的产物；而决定「这条注册只影响这一个 agent」的机制，是 dsh 自己的 Scope 原语。这一章把两个半场（prompt 组装 / scope 机制）讲透。</div>
+    <div class="subtitle">问题：系统提示词是动态组装的，那「谁在哪个作用域里说了什么」怎么定？具体拆成四个——注册表收哪几类输入、每次请求怎么组装（①）？段落顺序与插件冲突怎么管（②）？部署人格怎么被 preset 替换而不是重复（③）？动态事实为什么走 user 快照、scope 又怎么收工具（④）？8.1 把问题摆出来，8.2–8.9 逐个作答，8.10 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">8.1</span>一分钟版本</h2>
+    <h2><span class="num">8.1</span>问题：动态组装的系统提示词，作用域怎么切</h2>
+    <p>系统提示词不是写死的字符串，而是每次模型请求前组装的产物；决定「这条注册只影响这一个 agent」的是 dsh 自己的 Scope 原语。四个具体问题：</p>
     <ul>
-      <li><code class="inline">ctx.systemPrompt</code>（<code class="inline">packages/core/system-prompt</code>）是注册表服务：插件往里塞<strong>四类输入</strong>——sections（系统提示词段落）、contexts（动态运行时上下文）、tool providers（工具 schema）、variables（<code class="inline">{{变量}}</code>）。</li>
-      <li>每次 pre-step 调 <code class="inline">assemble()</code>：合并全局层与该 agent 的 scope 层 → 排序 → 跑 <code class="inline">system-prompt/assemble</code> waterfall → 得到 <code class="inline">PromptAssembly</code>。</li>
-      <li>段落顺序由中央常量表 SECTION_ORDERS 分配——所有插件共用同一份「哪里放什么」的分配表，避免两处重复占用同一个顺序。</li>
-      <li>动态上下文<strong>不进 system prompt</strong>，而是作为 plugin 来源的 user/message 快照追加进历史——所以 KV 缓存前缀保持稳定，只有变化时才追加新快照。</li>
-      <li>Scope 是不透明对象 + 父链：注册视图沿链<strong>向下</strong>继承（子 scope 看得见祖先的层），事件准入门沿链<strong>向上</strong>（祖先的监听器收得到子孙的事件，反之不行）。</li>
+      <li>① <strong>注册表收什么、怎么组装</strong>——sections/contexts/tool providers/variables 四类输入，每次 pre-step 怎么合成一条 PromptAssembly？</li>
+      <li>② <strong>版面怎么分配</strong>——N 个插件都想占一个顺序，冲突怎么避免？</li>
+      <li>③ <strong>身份怎么替换</strong>——agent preset 想换掉部署人格，靠什么机制做到「替换」而不是「重复」？</li>
+      <li>④ <strong>动态事实放哪</strong>——中途会变的事实（审批开关、沙箱模式）为什么不进 system prompt？scope 又怎么收走工具？</li>
     </ul>
+    <p>速览答案：① 四类输入在 <code class="inline">assemble()</code> 合并全局层与 scope 层 → 排序 → <code class="inline">system-prompt/assemble</code> waterfall（8.2）；② 中央常量表 SECTION_ORDERS 是唯一版面权威，插件用 <code class="inline">getSectionOrder()</code> 领号（8.3）；③ 人格段是全局注册的<strong>具名段</strong>，persona 行挂同名 section 到 scope 层实现遮蔽——同名遮蔽正是替换的全部机制（8.4）；④ 动态事实渲染成 user/message 快照追加进历史（前缀缓存永不被击穿，8.5–8.7）；Scope 是不透明对象 + 父链，注册视图沿链向下继承、restrict 按链收工具（8.8–8.9）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.2</span>四类输入与 PromptAssembly</h2>
+    <h2><span class="num">8.2</span>① 四类输入与 PromptAssembly</h2>
     <div class="code-title">packages/core/system-prompt/src/index.ts:53 — PromptSection / PromptContext / PromptAssembly</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">PromptSection</span> {
   <span class="cmt">/** 唯一名字——重复注册直接抛错 */</span>
@@ -81,7 +82,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.3</span>SECTION_ORDERS：中央分配的版面</h2>
+    <h2><span class="num">8.3</span>② SECTION_ORDERS：中央分配的版面</h2>
     <div class="code-title">packages/core/system-prompt/src/index.ts:125 — SECTION_ORDERS（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">SECTION_ORDERS</span> = {
   HARNESS_IDENTITY: -<span class="nu">1000</span>,      <span class="cmt">// "You are an AI agent powered by DeepSeek Harness."</span>
@@ -110,7 +111,7 @@
       <tr><td><code class="inline">approval:policy</code></td><td>115</td><td>dsh-user-approval</td><td>一句话：approval 是 ask 还是 never</td></tr>
       <tr><td><code class="inline">subagent:delegation</code></td><td>120</td><td>dsh-subagent</td><td>委派边界说明，挂在子 agent 的 scope 上</td></tr>
     </table>
-    <div class="code-title">packages/interaction/user-approval/src/index.ts:155 — 审批政策作为动态上下文</div>
+    <div class="code-title">packages/interaction/user-approval/src/index.ts:162 — 审批政策作为动态上下文</div>
     <pre class="code"><span class="lang-tag">typescript</span>ctx.<span class="fn">inject</span>([<span class="st">'systemPrompt'</span>], (scope: <span class="cl">Context</span>) =&gt; {
   scope.systemPrompt.<span class="fn">context</span>({
     name: <span class="st">'approval:policy'</span>,
@@ -130,8 +131,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>PERSONA_PREFIX/SUFFIX：用「同名遮蔽」实现身份替换</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:180 — 人格段名常量</div>
+    <h2><span class="num">8.4</span>③ PERSONA_PREFIX/SUFFIX：用「同名遮蔽」实现身份替换</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:179 — 人格段名常量</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * The deployment persona prefix's section name. Exported because a
  * composition can replace this slot — an agent preset shadows the
@@ -143,7 +144,7 @@
 <span class="cmt">/** Deployment persona suffix section name shared by global and scoped contributions. */</span>
 <span class="kw">export const</span> <span class="cl">PERSONA_SUFFIX_SECTION</span> = <span class="st">'deployment:persona-suffix'</span></pre>
     <p>注册表构造时无条件注册这两个段——前缀来自 <code class="inline">config.personaPrefix</code>，后缀来自 <code class="inline">config.personaSuffix</code>（缺省为空串，渲染时空段落直接被丢弃）：</p>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:428 — 注册表构造函数（节选）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:421 — 注册表构造函数（节选，:432）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">this</span>.<span class="fn">section</span>({
   name: <span class="cl">PERSONA_PREFIX_SECTION</span>,
   order: <span class="kw">this</span>.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_PREFIX'</span>),
@@ -156,7 +157,7 @@
   text: config.personaSuffix ?? <span class="st">''</span>,
 })</pre>
     <p>遮蔽机制在 <code class="inline">assemble()</code> 里：同层重复注册抛错，<strong>跨层同名则 scope 层遮蔽全局层</strong>：</p>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:575 — assemble() 的合并（节选）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:558 — assemble() 的合并（节选，:575）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// Scoped sections shadow globals before the deterministic order sort.</span>
 <span class="kw">const</span> sectionByName = <span class="kw">this</span>.layers.<span class="fn">merge</span>(scope, layer =&gt; layer.sections)
 <span class="cmt">// Scope-chain variables, farthest first, so the nearest scope wins a name.</span>
@@ -202,8 +203,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.5</span>渲染与严格插值</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:280 / :304 — renderPrompt / joinContextSections</div>
+    <h2><span class="num">8.5</span>④ 渲染与严格插值</h2>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:279 / :303 — renderPrompt / joinContextSections</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">renderPrompt</span>(assembly: <span class="cl">PromptAssembly</span>): <span class="kw">string</span> {
   <span class="kw">return</span> assembly.sections
     .<span class="fn">map</span>(section =&gt; section.interpolate === <span class="kw">false</span> ? section.text : <span class="fn">interpolate</span>(section, assembly.variables, <span class="st">'section'</span>))
@@ -221,14 +222,21 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.6</span>快照投影：只在变化时追加</h2>
+    <h2><span class="num">8.6</span>④ 快照投影：只在变化时追加</h2>
     <p>快照消息的提交由循环侧的 <code class="inline">RuntimeContextProjection</code> 跟踪（<code class="inline">packages/core/agent-loop/src/runtime-context.ts</code>）：</p>
-    <div class="code-title">packages/core/agent-loop/src/runtime-context.ts</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> SOURCE = <span class="st">'@deepseek-ai/dsh-system-prompt'</span>
+    <div class="code-title">packages/core/agent-loop/src/runtime-context.ts:19</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> SOURCE = <span class="st">'runtime-context'</span>
 <span class="kw">const</span> CLEARED = <span class="st">'Current runtime context: none. Earlier runtime-context snapshots no longer apply.'</span>
 
+<span class="cmt">// MessageSourceMap 增补（runtime-context.ts:14）：快照消息有自己的来源种类</span>
+<span class="kw">declare module</span> <span class="st">'@deepseek-ai/dsh-llm'</span> {
+  <span class="kw">interface</span> <span class="cl">MessageSourceMap</span> {
+    <span class="st">'runtime-context'</span>: { kind: <span class="st">'runtime-context'</span> } &amp; <span class="cl">ContextFormed</span>
+  }
+}
+
 <span class="kw">function</span> <span class="fn">isOwned</span>(message: <span class="cl">UserMessage</span>): <span class="kw">boolean</span> {
-  <span class="kw">return</span> message.source.kind === <span class="st">'plugin'</span> &amp;&amp; message.source.plugin === SOURCE
+  <span class="kw">return</span> message.source.kind === SOURCE
 }
 
 <span class="kw">export class</span> <span class="cl">RuntimeContextProjection</span> {
@@ -243,16 +251,16 @@
       content: [{ type: <span class="st">'text'</span>, text: snapshot }],
       <span class="cmt">// 清空标记没有可归属的贡献了</span>
       source: sections.length === <span class="nu">0</span>
-        ? { kind: <span class="st">'plugin'</span>, plugin: SOURCE }
-        : { kind: <span class="st">'plugin'</span>, plugin: SOURCE, form: <span class="st">'snapshot'</span>, sections },
+        ? { kind: SOURCE }
+        : { kind: SOURCE, form: <span class="st">'snapshot'</span>, sections },
     })
   }
 }</pre>
-    <div class="annotation"><b>三个细节</b>：① 归属权靠 <code class="inline">source.plugin</code> 标记——投影只认自己来源的消息，重启时倒序扫日志即可恢复 <code class="inline">retained</code>；② surface 替换事件（第 2 章 SurfaceOp.replace）引用了保留快照的 seq 时，<code class="inline">retained</code> 置 null，下轮会补一条新快照；③ 变空时不是静默消失，而是写一句 CLEARED——模型永远能「看见」上下文被撤销这件事——仍然满足第 2 章的「model-visible means logged」。</div>
+    <div class="annotation"><b>三个细节</b>：① 归属权靠 <code class="inline">source.kind === 'runtime-context'</code>——快照消息不再借「plugin 来源」，而是在 MessageSourceMap 里<strong>开了一个专用来源种类</strong>（还捎带 ContextFormed 记录是哪些贡献组成的）；投影只认自己来源的消息，重启时倒序扫日志即可恢复 <code class="inline">retained</code>（构造函数 :123，恢复扫描在最新一条命中处停）；② surface 替换事件（第 2 章 SurfaceOp.replace）引用了保留快照的 seq 时，<code class="inline">retained</code> 置 null，下轮会补一条新快照；③ 变空时不是静默消失，而是写一句 CLEARED——模型永远能「看见」上下文被撤销这件事——仍然满足第 2 章的「model-visible means logged」。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.7</span>图 8-1：一次 assemble 的数据流</h2>
+    <h2><span class="num">8.7</span>④ 图 8-1：一次 assemble 的数据流</h2>
     <div class="figure">
       <div class="svg-box">
         <svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="assemble 数据流">
@@ -307,7 +315,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.8</span>Scope 原语：一个 WeakMap 撑起两个方向</h2>
+    <h2><span class="num">8.8</span>④ Scope 原语：一个 WeakMap 撑起两个方向</h2>
     <div class="code-title">packages/core/scope/src/index.ts:15 — ScopeKey 与父链</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** An opaque, identity-compared scope key. */</span>
 <span class="kw">export type</span> <span class="cl">ScopeKey</span> = <span class="kw">object</span>
@@ -368,8 +376,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.9</span>tools.restrict：按 scope 收工具</h2>
-    <div class="code-title">packages/core/tools/src/index.ts:1077 — restrict()（节选）</div>
+    <h2><span class="num">8.9</span>④ tools.restrict：按 scope 收工具</h2>
+    <div class="code-title">packages/core/tools/src/index.ts:1096 — restrict()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="fn">restrict</span>(filter: <span class="cl">ToolRestriction</span>): () =&gt; <span class="kw">void</span> {
   <span class="kw">const</span> scope = <span class="fn">scopeOf</span>(<span class="kw">this</span>.ctx)
   <span class="kw">if</span> (scope === <span class="kw">undefined</span>) {
@@ -391,10 +399,10 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.10</span>要点</h2>
+    <h2><span class="num">8.10</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① 系统提示词是组装产物不是常量——四类输入（sections/contexts/tools/variables）各有管道；② 版面由中央 SECTION_ORDERS 表权威分配，插件只报名字不抢数字；③ 会变的政策走 user 快照，保住 KV 缓存前缀；④ persona 拆成 prefix/suffix 两段、靠同名遮蔽替换，complete 靠恢复机制独占；⑤ Scope 用一条 parent 链同时定义注册继承（向下）与事件准入（向上）。下一步看这些机制最敏感的应用：<a href="09-security.html">第 9 章：沙箱与审批</a>。
+      <b class="tag">答案回收</b>
+      ① 四类输入（sections/contexts/tools/variables）各有管道，在 <code class="inline">assemble()</code> 每请求重合成：scope 遮蔽全局 → 排序 → <code class="inline">system-prompt/assemble</code> waterfall → complete 约束（8.2）。② 版面由中央 SECTION_ORDERS 表权威分配，插件用 <code class="inline">getSectionOrder()</code> 只报名字不抢数字（8.3）。③ persona 拆成 prefix/suffix 两段、靠同名遮蔽替换——agent preset 挂不进 prompt 注册表本身，但挂得进 scope 层，所以身份可换；complete 靠恢复机制独占，includeRuntimeContext 可关快照（8.4）。④ 会变的政策走 user 快照（专用 source.kind、变化才追加、变空写 CLEARED），保住 KV 缓存前缀；Scope 用一条 parent 链同时定义注册继承（向下）与事件准入（向上），tools.restrict 让工具集按 scope 收放且拒绝无 scope 的全局遮蔽（8.5–8.9）。下一步看这些机制最敏感的应用：<a href="09-security.html">第 9 章：沙箱与审批</a>。
     </div>
   </section>
 
@@ -406,7 +414,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

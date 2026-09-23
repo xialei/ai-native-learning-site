@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 Model Runner</div>
     <h1>Model Runner：把「调度器决定跑什么」翻译成「GPU 真正算什么」</h1>
-    <div class="subtitle">调度器交出计划，CPU 侧的决策就结束了。本章站在 GPU 侧回答三个具体问题：几十个请求的 token 怎么拼成一个张量、一次算完；每个 attention 层怎么在显存里找到自己要读写的 KV；一次前向几百次 kernel 启动的固定开销怎么省。</div>
+    <div class="subtitle">调度器交出计划，CPU 侧的决策就结束了。本章站在 GPU 侧回答三个问题：<strong>几十个请求的 token 怎么拼成一个张量？每个 attention 层怎么在显存里找到自己要读写的 KV？一次前向几百次 kernel 启动的固定开销怎么省？</strong>先看翻译全貌，再逐个拆，末了拿 SGLang 的数据结构对照一眼。</div>
   </div>
 
   <section class="block">
@@ -49,7 +49,7 @@
       <li><strong>跑一次前向</strong>：调用 <code class="inline">self.model(**model_inputs)</code>。</li>
       <li><strong>取出需要算 logits 的位置</strong>：前向输出所有位置的 hidden states，但下一步采样只需要其中几个位置。这一步把它们挑出来。对应 <code class="inline">sample</code>。</li>
     </ul>
-    <p>这些步骤都写在 <code class="inline">GPUModelRunner.execute_model</code> 里（<code class="inline">vllm/v1/worker/gpu/model_runner.py</code>）。下面三节按「拼 token → 找 KV → 省启动开销」的顺序拆开。</p>
+    <p>这些步骤都写在 <code class="inline">GPUModelRunner.execute_model</code> 里（<code class="inline">vllm/v1/worker/gpu/model_runner.py</code>）。三件事各有专节：token 怎么拼在 5.2，KV 怎么找在 5.3，启动开销怎么省在 5.4。5.5 再用代码把三件事串成一次完整前向。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 340" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -161,7 +161,7 @@
                                            common_attn_metadata=common_attn_metadata)
     <span class="kw">for</span> layer_name <span class="kw">in</span> attn_group.layer_names:
         attn_metadata[layer_name] = metadata   <span class="cmt"># 这层就用这份 metadata</span></pre>
-    <div class="annotation"><b>读懂这段：</b>metadata 的构建按组进行（外层按 kv_cache_group 分组循环），构建好一份就复制给组内每个 layer（内层按 layer_names 循环）。省内存也省构建时间。至于每个层真正要读写的物理 KV 大张量，则在引擎启动时由 <code class="inline">bind_kv_cache_to_layers</code> 按层名绑定到层上——那是一次性的，不在每步的路径里。每步真正随 batch 变化的只有这两张表。</div>
+    <div class="annotation"><b>看两组循环的分工：</b>metadata 的构建按组进行（外层按 kv_cache_group 分组循环），构建好一份就复制给组内每个 layer（内层按 layer_names 循环）。省内存也省构建时间。至于每个层真正要读写的物理 KV 大张量，则在引擎启动时由 <code class="inline">bind_kv_cache_to_layers</code> 按层名绑定到层上——那是一次性的，不在每步的路径里。每步真正随 batch 变化的只有这两张表。</div>
   </section>
 
   <section class="block">
@@ -183,7 +183,7 @@ self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} �
     <h3>限制：图的形状是死的，batch 是活的</h3>
     <p>CUDA graph 一旦录好，里面每个 kernel 的尺寸就固定了。而第 4 章的连续批处理意味着每个 step 的 batch 大小都在变——请求随时加入、退出。两件事要兼容，只有一个办法：把活 batch 补齐到某张图的尺寸再回放。</p>
     <p>具体做法：预先枚举一组「捕获尺寸」（<code class="inline">cudagraph_capture_sizes</code>，如 1、2、4、8、…直到最大批），batch 落在哪个区间，就补齐到该区间的上限。比如 50 个请求补到 56，多出来的 6 个槽位填上假 token——正是 5.2 里 <code class="inline">is_padding=True</code> 的来源。补的那几个 token 白算一点点计算，换回来的是整次前向只付一次启动开销，划算。</p>
-    <p>拿 5.2 的例子把这组尺寸和补齐算清楚。默认的捕获尺寸不是随便拍的——它是 <code class="inline">[1, 2, 4] + range(8, 256, 8) + range(256, 512 + 1, 16)</code>（源码：vllm/config/compilation.py:691 起的默认值文档，公式在 :699-700；上限默认 512，数据中心 Blackwell 卡可以到 1024）。展开开头一段就是：</p>
+    <p>拿 5.2 的例子把这组尺寸和补齐算清楚。默认的捕获尺寸不是随便拍的——它是 <code class="inline">[1, 2, 4] + range(8, 256, 8) + range(256, 512 + 1, 16)</code>（源码：vllm/config/compilation.py:693 起的默认值文档，公式在 :699-700；上限默认 512，数据中心 Blackwell 卡可以到 1024）。展开开头一段就是：</p>
     <div class="code-title">捕获尺寸数列（默认值展开）</div>
     <pre class="code"><span class="lang-tag">text</span>1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, ... , 256, 272, 288, ... , 512</pre>
     <p>于是「50 个请求」的去向一目了然：50 落在 48 和 56 之间，向上补齐到 <strong>56</strong>。这 6 个补出来的槽位：</p>
@@ -194,7 +194,25 @@ self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} �
       <li><strong>输出</strong>：5.5 的 <code class="inline">logits_indices = query_start_loc[1:] - 1</code>（input_batch.py:175）只会挑出真实请求的末位——空请求长度为 0，不产生 logits，采样阶段根本看不到它们。</li>
     </ul>
     <p>代价可以量化：56 个槽位里 6 个是假的，<strong>≈ 11% 的计算是白做的</strong>。但对比另一头——若不补齐，就得为 50 这一个形状单独录一张图，而请求数天天在 49、51、53 之间波动，等于为每种 batch 大小各录一张图，显存和启动时间都不允许。11% 的浪费买「任意 batch 都能整图回放」，这笔账是划算的。</p>
-    <div class="annotation"><b>为什么 decode 单独一套尺寸：</b>decode 每步固定每个请求 +1 token，batch 之间只差请求数，形状种类少，枚举尺寸容易命中；prefill 的 token 数每个请求各不相同，命中预录形状的概率低得多。所以 vLLM 对 decode 用「枚举尺寸 + 补齐」，prefill 走别的路径（如 PIECEWISE 编译图），两者分开处理。</div>
+    <div class="annotation"><b>为什么 decode 单独一套尺寸：</b>decode 每步固定每请求 +1 token，形状种类少，枚举尺寸容易命中；prefill 每条请求新算的 token 数各不相同，attention 元数据每步都在变，整图录不动。所以 vLLM 给 decode 用「枚举尺寸 + 补齐」，prefill 和混合 batch 改走 PIECEWISE 分段图——机制在下面拆开。</div>
+    <h3>prefill 的另一条路：PIECEWISE 分段图</h3>
+    <p>整图回放有个前提：图里每个 kernel 的尺寸和行为，录制时就定死了。uniform decode 做得到——每请求固定 +1 token，attention 要用的元数据光凭「请求数」就能构造好，捕获时照着录就行。prefill 和混合 batch 不行：每条请求新算的 token 数各不相同，元数据每步都在变。vLLM 的解法是把 attention 挪出图外：默认模式 <code class="inline">FULL_AND_PIECEWISE</code>（枚举定义在 vllm/config/compilation.py:53-59，:614 的文档写明它是 v1 默认值）让 decode 照旧录整图，prefill 和混合 batch 走分段图——用 torch.compile 把 forward 按 attention 算子切成几段，段内录小图，attention 留在段与段之间。整个过程一步一步看：</p>
+    <ul>
+      <li><strong>先编译</strong>：模型类挂 <code class="inline">@support_torch_compile</code>（vllm/compilation/decorators.py:120），torch.compile 拿着 <code class="inline">fullgraph=True</code> 把整条 forward 抓成一张计算图（vllm/compilation/wrapper.py:147）。</li>
+      <li><strong>再切段</strong>：torch.compile 的后端是 vLLM 自己写的，它在图上按 <code class="inline">splitting_ops</code> 切开（<code class="inline">split_graph</code>，vllm/compilation/backends.py:549，调用点 :1175）。默认切分点是一组 attention 自定义算子——第 7 章拆过的 <code class="inline">vllm::unified_attention_with_output</code> 就在名单里（<code class="inline">_attention_ops</code>，vllm/config/compilation.py:764，缺省在 :1160 生效）。attention 之间的普通计算（GEMM、归一化、激活）形状只由 token 总数决定，各自成段；attention 本体不编译、不录图，每次真跑。</li>
+      <li><strong>后录段</strong>：每个编译好的段包一层 <code class="inline">CUDAGraphWrapper</code>（vllm/compilation/backends.py:629），启动捕获时按 token 数逐段录成小图。段图的 key 只有 token 数、没有请求数——源码注释原话：「回放时不限制请求数，无需请求维度的补齐」（vllm/v1/worker/gpu/cudagraph_utils.py:347）。</li>
+    </ul>
+    <div class="code-title">一次 PIECEWISE 前向的执行序列（示意）</div>
+    <pre class="code"><span class="lang-tag">text</span>model(**model_inputs)                <span class="cmt">← 编译后的 callable，本节开头的 else 分支</span>
+  ├─ 段图 #0  嵌入 + 第 0 层的 GEMM/归一化   <span class="cmt">← 查小图，命中就整段回放</span>
+  ├─ attention 层                          <span class="cmt">← 图外 eager 执行，读写 KV</span>
+  ├─ 段图 #1  GEMM/归一化/激活              <span class="cmt">← 回放</span>
+  ├─ attention 层                          <span class="cmt">← 图外</span>
+  │    ……几乎每层重复一次「段图 + attention」……
+  └─ 段图 #N  最后的归一化 + 输出投影        <span class="cmt">← 回放</span></pre>
+    <p>回头再看本节开头 else 分支那句「直接调 <code class="inline">model()</code>」——它不等于没有图。命中 PIECEWISE 时，<code class="inline">model()</code> 内部的小段照样回放，段与段之间各跑一次 attention。真正两级都落空的只剩一种情况：batch 的 token 数超过最大捕获尺寸（默认 512，Blackwell 数据中心卡 1024），段图也命中不了，才逐 kernel 启动——不过这时跑的已是 Inductor 编译优化过的 kernel，不是裸 eager。</p>
+    <div class="annotation"><b>段图为什么不用按请求数枚举：</b>段里没有 attention，所有张量形状都由「token 总数」一个数决定；变长的部分被隔离在段与段之间，交给 eager 的 metadata 构建现算（就是 5.3 那两张表）。代价是每步要回放几十上百个段、每段之间再启动一次 attention——没省干净，但比逐算子 eager 快得多，而且只要 token 总数不超捕获上限，什么组合都接得住。</div>
+    <p>切段这件事还有一条实验路线：不在编译期切，而是录整图录到 attention 算子就地断开，让 attention eager 跑完，再接着录下一段（vllm/compilation/breakable_cudagraph.py:9-13，开关 VLLM_USE_BREAKABLE_CUDAGRAPH，默认关闭）。这个做法学的是 SGLang，源码注明 inspired by sgl-project/sglang#19102。</p>
   </section>
 
   <section class="block">
@@ -220,11 +238,12 @@ model_inputs = {
 <span class="cmt"># 3) 只取每请求最后位置的 hidden state 算 logits</span>
 sample_hidden_states = hidden_states[input_batch.logits_indices]
 logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)</pre>
-    <div class="annotation"><b>逐行读懂：</b>(1) 把输入装进一个字典传给模型，其中的张量就是 5.2 拼好的一维大张量；(2) 是 5.4 说的「命中图就回放，否则 eager」；(3) 里前向输出的是每个 token 位置的 hidden states，<code class="inline">logits_indices</code> 从中挑出每个请求真正要出 logits 的位置（decode 是最后一个 token，prefill 挑到需要的位置），只对这些位置算 logits，不白算整条序列。至于 logits 怎么变成 token，是第 6 章的事。</div>
+    <div class="annotation"><b>三段各对应前面哪一节：</b>(1) 把输入装进一个字典传给模型，其中的张量就是 5.2 拼好的一维大张量；(2) 是 5.4 说的「命中图就回放，否则 eager」；(3) 里前向输出的是每个 token 位置的 hidden states，<code class="inline">logits_indices</code> 从中挑出每个请求真正要出 logits 的位置（decode 是最后一个 token，prefill 挑到需要的位置），只对这些位置算 logits，不白算整条序列。至于 logits 怎么变成 token，是第 6 章的事。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.6</span>小结与自研启示</h2>
+    <h2><span class="num">5.6</span>SGLang 的数据结构与自研启示</h2>
+    <p>回头看本章开头的三个问题，答案分别是「拼成一维张量 + 前缀和分界」「block table + slot mapping」「捕获固定 shape、按尺寸回放」。同样的三个问题，SGLang 给出的数据结构各有取舍：</p>
     <table class="tbl">
       <tr><th>阶段</th><th>vLLM 的做法</th><th>你的引擎该怎么做</th></tr>
       <tr><td>拼 token</td><td>整 batch 拼成一维张量（InputBatch），query_start_loc 记分界</td><td>同上，一个前缀和张量切分请求</td></tr>
@@ -236,6 +255,17 @@ logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)
       <b class="tag">自研启示</b>
       单请求引擎（或 batch 很小的引擎）<strong>不需要 CUDA graph</strong>——kernel launch 的开销只有在并发很大的时候才值得用「固定 shape + 回放」来省。先把 eager 前向完整跑通、验证正确性，再把 CUDA graph 当第二版优化来做。优先级永远是：先对，再快。
     </div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      先看最大的分歧（调度数据什么时候变成 GPU 张量），再列两处「名字不同、思路相同」：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>batch 数据结构</td><td>InputBatch 一类全包：调度侧请求状态和 GPU 侧张量放在一起，边调度边更新</td><td>两类分环节：ScheduleBatch（调度侧）经 <code class="inline">ForwardBatch.init_new</code> 压平成 ForwardBatch（<code class="inline">python/sglang/srt/model_executor/forward_batch_info.py</code>），调度字段不带入前向</td></tr>
+        <tr><td>CUDA Graph 路径</td><td>三级：decode 整图回放 → prefill/混合走分段图（5.4 节）→ 尺寸超上限才 eager</td><td>三级：decode 整图回放 → prefill 分段图 → eager（<code class="inline">ModelRunner._forward_raw</code>，<code class="inline">model_runner.py</code>）</td></tr>
+        <tr><td>KV 寻址</td><td>block table + slot mapping</td><td>req_to_token 行 + out_cache_loc——同样是「每请求一张表 + 槽位号」</td></tr>
+      </table>
+      InputBatch 少一次数据搬运；SGLang 的拆分让调度器与前向的边界在类型系统里可见。详见 <a href="../../sglang/books/06-model-runner.html">深入浅出SGLang · 06 ModelRunner 与 CUDA Graph</a>。
+    </div>
   </section>
 
   <div class="arrow-nav">
@@ -245,7 +275,7 @@ logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)
 </div>
 
 <footer>
-  深入浅出vLLM · 05 Model Runner · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 05 Model Runner · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

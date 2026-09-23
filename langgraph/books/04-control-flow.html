@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 控制流</div>
     <h1>控制流：边、条件路由、并行与跳转</h1>
-    <div class="subtitle">图的「形状」由边决定。本章拆解 LangGraph 的四种控制流原语——普通边、条件边、Send fan-out、Command 跳转，讲清它们各自的语义边界与选型理由。</div>
+    <div class="subtitle">流程写进函数体就「焊死」了——不可视化、不可持久化、不可重放。LangGraph 用「边」回答「下一步去哪」：普通边、条件边、Send fan-out、Command 跳转四种原语各管哪种动态，语义边界各在哪。</div>
   </div>
 
   <section class="block">
@@ -47,12 +47,41 @@
       <li><strong>可持久化</strong>：每一步的转移都被 checkpointer 记录，中断后能从任意节点恢复，而不需要把「当前执行到哪行代码」塞进状态。</li>
       <li><strong>可组合</strong>：同一个节点可以被不同的图复用，因为它的「去向」由外层图决定，而不是写死在自己体内。</li>
     </ul>
-    <p>理解了这一点，就能明白下面四种原语各自承担的职责：普通边表达「确定的顺序」，条件边表达「看状态再决定」，Send 表达「我同时要派发多个独立子任务」，Command 表达「我在节点内部临时改道并顺手更新状态」。</p>
+    <p>但「用边表达控制流」立刻引出一串新问题。最简单的顺序怎么连？多个起点同时指向一个节点时，框架在等什么（4.2）——然后是「看状态再决定去哪」怎么表达，判断函数返回的东西和图结构怎么对上（4.3–4.4）。想同时派发 N 个独立子任务，或者想在节点内部临时改道，这两种「动态」分别用哪个原语（4.5–4.7）；原语用错了会怎样，循环失控、路由出口悬空，框架怎么兜底（4.10）。</p>
+    <p>往下读时会反复碰到同一个追问：每个原语的<strong>语义边界</strong>在哪——哪些事它管，哪些事它不管。先看最普通的边。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.2</span>普通边 add_edge:确定的顺序</h2>
+    <h2><span class="num">4.2</span>普通边 add_edge:确定的顺序，以及隐式的 join</h2>
     <p>最朴素的边。签名是 <code class="inline">add_edge(start_key: str | list[str], end_key: str)</code>。单起点时，起点跑完就跑终点；多起点（传 list）时，图会<strong>等待所有起点都完成</strong>再跑终点——这是隐式的 join 语义，常用于汇聚并行分支。</p>
+    <p>「等待」具体是怎么实现的？值得进源码看一眼。编译时，多起点边会被存进 <code class="inline">waiting_edges</code>（state.py:979），随后逐条交给编译产物 <code class="inline">attach_edge</code>（state.py:1395）。<code class="inline">attach_edge</code> 对多起点做了一件单起点不做的事：创建一个名为 <code class="inline">join:a+b:c</code> 的<strong>屏障通道</strong>（state.py:1551），起点 a、b 各自往屏障里写自己的名字，终点 c 订阅这个屏障。屏障的类型是 <code class="inline">NamedBarrierValue</code>（named_barrier_value.py:13），它的触发条件只有一条：见过的名字集合等于全部名字集合时才放行（named_barrier_value.py:74 的 <code class="inline">is_available</code>）。所以 join 不是「轮询查状态」，而是每个起点完成时往屏障里「签到」，全签到齐了，终点节点才被触发。</p>
+    <p>这条链路有一个容易忽视的推论：<strong>屏障默认不设超时、不设兜底</strong>。如果某个起点节点在你的图里根本不可能被触发（比如它只被一条条件边指向、而条件永远不成立），终点不会报错也不会永远卡住——执行会自然结束，只是终点被永远跳过。想让「终点必须等人齐」变成强约束，需要自己在结构上保证每个起点都可达。</p>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 760 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t42j d42j">
+        <title id="t42j">多起点 join 的屏障语义</title>
+        <desc id="d42j">a 和 b 各自往 join:a+b:c 屏障签到，a 签到后屏障不放行，b 也签到后才触发 c</desc>
+        <defs><marker id="arr42j" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <rect class="node core" x="30" y="30" width="110" height="46" rx="8"></rect>
+        <text class="lbl" x="85" y="58" text-anchor="middle">a</text>
+        <rect class="node core" x="30" y="150" width="110" height="46" rx="8"></rect>
+        <text class="lbl" x="85" y="178" text-anchor="middle">b</text>
+        <rect class="node warn" x="290" y="88" width="200" height="56" rx="10"></rect>
+        <text class="lbl" x="390" y="112" text-anchor="middle">join:a+b:c 屏障</text>
+        <text class="lbl sm code" x="390" y="132" text-anchor="middle">seen == names 才放行</text>
+        <rect class="node acc" x="600" y="88" width="110" height="46" rx="8"></rect>
+        <text class="lbl" x="655" y="118" text-anchor="middle">c</text>
+        <line class="edge" x1="140" y1="53" x2="288" y2="100" marker-end="url(#arr42j)"></line>
+        <line class="edge" x1="140" y1="173" x2="288" y2="133" marker-end="url(#arr42j)"></line>
+        <line class="edge" x1="490" y1="116" x2="598" y2="116" marker-end="url(#arr42j)"></line>
+        <text class="lbl sm code" x="180" y="60">完成 → 签到 "a"</text>
+        <text class="lbl sm code" x="180" y="185">完成 → 签到 "b"</text>
+        <text class="lbl sm" x="540" y="106" text-anchor="middle">齐了，触发</text>
+        <text class="lbl sm" x="390" y="175" text-anchor="middle">只有 a 签到时：不放行（缺 b），但不会报错、不会卡死</text>
+      </svg>
+      <div class="fig-cap">图 4.1：多起点 join 的屏障语义。<code class="inline">add_edge(["a","b"], "c")</code> 编译成 <code class="inline">join:a+b:c</code> 屏障通道，a、b 完成时各签到一次，签到齐才触发 c。</div>
+    </div>
+
     <p>注意两个硬约束：<code class="inline">END</code> 不能作起点（没有「从终点出发」），<code class="inline">START</code> 不能作终点（不能「回到入口」）。在非 StateGraph 的图里，一个节点只能有一条出边；StateGraph 配合 reducer 后可以有多条。</p>
     <div class="code-title">确定顺序的线性图</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
@@ -167,7 +196,7 @@ print(graph.invoke({<span class="st">"choice"</span>: <span class="st">"search"<
         <text class="lbl sm code" x="375" y="108">choice=b</text>
         <text class="lbl sm code" x="375" y="160">choice=end</text>
       </svg>
-      <div class="fig-cap">图 4.1：条件分支图。用 <code class="inline">add_conditional_edges</code>，适合意图识别后分流。</div>
+      <div class="fig-cap">图 4.2：条件分支图。用 <code class="inline">add_conditional_edges</code>，适合意图识别后分流。</div>
     </div>
   </section>
 
@@ -196,7 +225,7 @@ print(graph.invoke({<span class="st">"choice"</span>: <span class="st">"search"<
         <text class="lbl sm code" x="370" y="80">需要工具</text>
         <text class="lbl sm code" x="170" y="142">任务完成</text>
       </svg>
-      <div class="fig-cap">图 4.2：ReAct 循环。agent ↔ tools 形成环，<code class="inline">__end__</code> 跳出。</div>
+      <div class="fig-cap">图 4.3：ReAct 循环。agent ↔ tools 形成环，<code class="inline">__end__</code> 跳出。</div>
     </div>
 
     <div class="code-title">经典 ReAct 循环骨架</div>
@@ -242,7 +271,7 @@ graph = builder.compile()</pre>
   <section class="block">
     <h2><span class="num">4.5</span>Send 并行 fan-out：map-reduce 式并行</h2>
     <p>条件边的 path 函数除了返回节点名，还可以返回 <strong>Send 对象的列表</strong>。<code class="inline">Send</code> 的语义是「向某个节点投递一份独立的输入」。当 path 返回多个 Send 且目标相同，这些任务会在同一个 super-step 里<strong>并行执行</strong>，再用 reducer 汇总结果。</p>
-    <p>这是实现 map-reduce 的标准姿势：map 阶段对每个元素发一个 Send,reducer（如 <code class="inline">operator.add</code>）把所有结果累加。</p>
+    <p>这是实现 map-reduce 的标准姿势：map 阶段对每个元素发一个 Send，reducer（如 <code class="inline">operator.add</code>）把所有结果累加。</p>
     <div class="code-title">map-reduce:多文档并行摘要</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated
 <span class="kw">import</span> operator
@@ -273,7 +302,7 @@ result = graph.invoke({<span class="st">"docs"</span>: [<span class="st">"文档
 print(result[<span class="st">"summaries"</span>])
 <span class="cmt"># ['摘要： 文档一内容......', '摘要： 文档二内容......', '摘要： 文档三内容......']</span>
 <span class="cmt">#  （文档名自带 "..."，截取后再拼一次，所以是 6 个点——输出以实际运行结果为准）</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">Send</code> 的签名是 <code class="inline">Send(node, arg, *, timeout=None)</code>。<code class="inline">arg</code> 是投递给目标节点的输入——它<strong>不必是全局 State 的形状</strong>，这是 Send 最灵活的地方：你可以给同一个节点喂完全不同的数据结构。返回 <code class="inline">operator.add</code> 的 reducer 会把每个 Send 产出的 <code class="inline">{"summaries": [...]}</code> 列表拼接起来。</div>
+    <div class="annotation"><b>Send 灵活在哪：</b> <code class="inline">Send</code> 定义在 types.py:732，签名是 <code class="inline">Send(node, arg, *, timeout=None)</code>——node 和 arg 是位置参数，timeout 是关键字参数。<code class="inline">arg</code> 是投递给目标节点的输入——它<strong>不必是全局 State 的形状</strong>，这是 Send 最灵活的地方：你可以给同一个节点喂完全不同的数据结构。返回 <code class="inline">operator.add</code> 的 reducer 会把每个 Send 产出的 <code class="inline">{"summaries": [...]}</code> 列表拼接起来。</div>
 
     <p><strong>动态演示</strong>——点 ▶ 或 ⏭ 步进，看 3 个 Send 如何在同一 super-step 并发、再由 reducer 归并（并行性是静态图的天敌，动画才看得清）：</p>
     <div data-anim="send-fanout"></div>
@@ -312,7 +341,7 @@ graph = builder.compile()
 
 print(graph.invoke({<span class="st">"foo"</span>: <span class="st">""</span>}))
 <span class="cmt"># {'foo': 'bar', 'bar': 'baz'}</span></pre>
-    <div class="annotation"><b>Command 的能力不止 goto+update:</b> <code class="inline">goto</code> 可以是单个节点名、节点名列表、一个 <code class="inline">Send</code>、或 <code class="inline">Send</code> 列表（即 Command 也能触发并行）；<code class="inline">resume</code> 字段配合 <code class="inline">interrupt()</code> 实现人机协同恢复（详见第 06 章）；<code class="inline">graph=Command.PARENT</code> 能从子图向父图发指令（详见第 07 章多智能体）。这些都建立在「节点 return Command」这个统一入口上。</div>
+    <div class="annotation"><b>Command 的能力不止 goto+update:</b> Command 类定义在 types.py:827，<code class="inline">goto</code> 字段（types.py:852）的类型是 <code class="inline">Send | Sequence[Send | N] | N</code>——可以是单个节点名、节点名列表、一个 <code class="inline">Send</code>、或 <code class="inline">Send</code> 列表（即 Command 也能触发并行）；<code class="inline">resume</code> 字段配合 <code class="inline">interrupt()</code> 实现人机协同恢复（详见第 06 章）；<code class="inline">graph=Command.PARENT</code> 能从子图向父图发指令（详见第 07 章多智能体）。这些都建立在「节点 return Command」这个统一入口上。</div>
   </section>
 
   <section class="block">
@@ -323,6 +352,40 @@ print(graph.invoke({<span class="st">"foo"</span>: <span class="st">""</span>}))
       <p><strong>Send</strong> 是「向节点投递一份独立输入」——它是<strong>消息</strong>，强调并行 fan-out。你在一个地方返回多个 Send，它们各自带着自己的 arg 并行去往目标节点，典型的 map-reduce 场景。Send 通常在条件边的 path 函数里返回。</p>
       <p><strong>Command</strong> 是「从当前节点控制下一步去哪」——它是<strong>指令</strong>，强调就地改道。节点 return 一个 Command，既更新状态又指定去向，适合节点内部根据自身逻辑动态决定流程，而不必预先在图上画边。</p>
       <p>概括：Send 是「我要派发 N 个并行子任务」，Command 是「我这条节点跑完，下一步去这儿，顺便把状态改成这样」。</p>
+    </div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 760 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t47c d47c">
+        <title id="t47c">Send 与 Command 的语义对照</title>
+        <desc id="d47c">左列 Send：条件边 path 返回多个 Send，携带各自 arg 并行到达目标节点；右列 Command：节点内部 return，goto 指定下一跳、update 写状态</desc>
+        <defs><marker id="arr47c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#556674"></path></marker></defs>
+        <rect x="20" y="30" width="340" height="240" rx="12" fill="none" stroke="#d7dde5" stroke-width="1.5"></rect>
+        <rect x="400" y="30" width="340" height="240" rx="12" fill="none" stroke="#d7dde5" stroke-width="1.5"></rect>
+        <text class="lbl" x="190" y="58" text-anchor="middle" font-weight="bold">Send：消息（fan-out）</text>
+        <text class="lbl" x="570" y="58" text-anchor="middle" font-weight="bold">Command：指令（改道）</text>
+        <rect class="node core" x="60" y="90" width="100" height="40" rx="8"></rect>
+        <text class="lbl sm" x="110" y="115" text-anchor="middle">path 函数</text>
+        <rect class="node acc" x="60" y="150" width="100" height="40" rx="8"></rect>
+        <text class="lbl sm" x="110" y="175" text-anchor="middle">目标节点</text>
+        <rect class="node core" x="440" y="90" width="100" height="40" rx="8"></rect>
+        <text class="lbl sm" x="490" y="115" text-anchor="middle">当前节点</text>
+        <rect class="node acc" x="620" y="150" width="100" height="40" rx="8"></rect>
+        <text class="lbl sm" x="670" y="175" text-anchor="middle">下一节点</text>
+        <line class="edge" x1="160" y1="105" x2="112" y2="148" marker-end="url(#arr47c)"></line>
+        <line class="edge acc" x1="160" y1="118" x2="112" y2="150" marker-end="url(#arr47c)"></line>
+        <line class="edge" x1="540" y1="110" x2="668" y2="148" marker-end="url(#arr47c)"></line>
+        <text class="lbl sm code" x="205" y="132">Send("t", arg1)</text>
+        <text class="lbl sm code" x="205" y="152">Send("t", arg2)</text>
+        <text class="lbl sm code" x="555" y="100">return Command(goto="x",</text>
+        <text class="lbl sm code" x="555" y="118">        update={"k": v})</text>
+        <text class="lbl sm" x="190" y="215" text-anchor="middle">一次返回多个，各自带独立 arg</text>
+        <text class="lbl sm" x="190" y="235" text-anchor="middle">arg 可以完全不是 State 的形状</text>
+        <text class="lbl sm" x="570" y="215" text-anchor="middle">goto + update 一次做两件事</text>
+        <text class="lbl sm" x="570" y="235" text-anchor="middle">也能 goto=[Send(...)] 触发并行</text>
+        <text class="lbl sm code" x="190" y="260" text-anchor="middle">在条件边的 path 里返回</text>
+        <text class="lbl sm code" x="570" y="260" text-anchor="middle">由节点函数 return</text>
+      </svg>
+      <div class="fig-cap">图 4.4：Send 与 Command 对照。左边是「边上的动态」——条件边按状态派发多份消息；右边是「节点内的动态」——节点返回一条指令，改道与写状态同时完成。</div>
     </div>
   </section>
 
@@ -373,8 +436,8 @@ print(graph.invoke({<span class="st">"foo"</span>: []}))
     <h2><span class="num">4.10</span>新手常犯的错误</h2>
     <p>控制流这一章最容易踩的两个坑，都和「路径没闭合」有关：一个是循环跑不出去，一个是条件边返回了一个没被声明的出口。</p>
 
-    <h3>① 循环永远到不了 END，撞上 recursion_limit</h3>
-    <p>4.4 讲过循环靠「条件边返回 <code class="inline">__end__</code> 跳出」。但如果你的退出条件写错了（比如 LLM 一直返回 <code class="inline">tool_calls</code>、或判断逻辑恒真），循环就永远停不下来。LangGraph 不会任由它跑死：每个图都有一个 <code class="inline">recursion_limit</code>（源码默认值 <code class="inline">_internal/_config.py</code> 里 <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>，可用环境变量 <code class="inline">LANGGRAPH_DEFAULT_RECURSION_LIMIT</code> 覆盖），超了就抛 <code class="inline">GraphRecursionError</code>。这是循环的「保险丝」——默认值给得很宽裕，正常 Agent 不会撞到，但一旦写出真正的逻辑死循环，跑满 10007 步后仍会撞限报错暴露问题。</p>
+    <h3>循环永远到不了 END，撞上 recursion_limit</h3>
+    <p>4.4 讲过循环靠「条件边返回 <code class="inline">__end__</code> 跳出」。但如果你的退出条件写错了（比如 LLM 一直返回 <code class="inline">tool_calls</code>、或判断逻辑恒真），循环就永远停不下来。LangGraph 不会任由它跑死：每个图都有一个 <code class="inline">recursion_limit</code>（源码默认值在 <code class="inline">_internal/_config.py:32</code> 的 <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>，可用环境变量 <code class="inline">LANGGRAPH_DEFAULT_RECURSION_LIMIT</code> 覆盖），超了就抛 <code class="inline">GraphRecursionError</code>。这是循环的「保险丝」——默认值给得很宽裕，正常 Agent 不会撞到，但一旦写出真正的逻辑死循环，跑满 10007 个 super-step 后仍会撞限报错暴露问题。</p>
     <div class="code-title">最小复现：条件边永远返回 "loop"，撞 recursion_limit 报错</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing_extensions <span class="kw">import</span> <span class="cl">TypedDict</span>
 <span class="kw">from</span> langgraph.graph <span class="kw">import</span> StateGraph, START, END
@@ -404,10 +467,10 @@ graph = builder.<span class="fn">compile</span>()
 graph.<span class="fn">invoke</span>({<span class="st">"n"</span>: <span class="nu">0</span>}, {<span class="st">"recursion_limit"</span>: <span class="nu">5</span>})
 <span class="cmt"># GraphRecursionError: Recursion limit of 5 reached ...
 #                limit by setting the `recursion_limit` config key.</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这里把 <code class="inline">recursion_limit</code> 调到 5 方便复现，框架实际默认值是 10007（<code class="inline">_internal/_config.py</code>： <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>）。报错信息直接告诉你解法：在 config 里设 <code class="inline">{"recursion_limit": N}</code>。注意 recursion_limit 是「每张图最多执行多少个 super-step」，默认值给得很宽裕，正常带工具循环的 Agent 远用不到——所以生产里更常见的做法是按需调小（<code class="inline">{"recursion_limit": N}</code>），给 Agent 套一道更紧的保险。但调参只是兜底——真正的修法是让退出条件确实能成立（比如 LLM 不再带 <code class="inline">tool_calls</code> 时返回 <code class="inline">END</code>）。</div>
+    <div class="annotation"><b>保险丝的用法：</b> 这里把 <code class="inline">recursion_limit</code> 调到 5 方便复现，框架实际默认值是 10007（<code class="inline">_internal/_config.py</code>： <code class="inline">DEFAULT_RECURSION_LIMIT = 10007</code>）。报错信息直接告诉你解法：在 config 里设 <code class="inline">{"recursion_limit": N}</code>。注意 recursion_limit 是「每张图最多执行多少个 super-step」，默认值给得很宽裕，正常带工具循环的 Agent 远用不到——所以生产里更常见的做法是按需调小（<code class="inline">{"recursion_limit": N}</code>），给 Agent 套一道更紧的保险。但调参只是兜底——真正的修法是让退出条件确实能成立（比如 LLM 不再带 <code class="inline">tool_calls</code> 时返回 <code class="inline">END</code>）。</div>
 
-    <h3>② 条件边返回了 Literal/path_map 里没有的出口</h3>
-    <p>4.3 强调过：要么给 path 函数加 <code class="inline">-&gt; Literal[...]</code> 注解，要么提供 <code class="inline">path_map</code>。但常见错误是：注解里漏写一个实际会返回的出口（比如忘了 <code class="inline">"__end__"</code>），或 path 返回的标识在 path_map 里查不到。结果是图走到这一步后「无处可去」——执行停滞或报错，且因为可视化依据的就是 Literal/path_map，你在结构图上根本看不出这条隐藏出口。</p>
+    <h3>条件边返回了 Literal/path_map 里没有的出口</h3>
+    <p>4.3 强调过：要么给 path 函数加 <code class="inline">-&gt; Literal[...]</code> 注解，要么提供 <code class="inline">path_map</code>。但常见错误是：注解里漏写一个实际会返回的出口（比如忘了 <code class="inline">"__end__"</code>），或 path 返回的标识在 path_map 里查不到。这时框架在运行时把返回值当节点名去查映射表，查不到就抛一个裸的 <code class="inline">KeyError</code>（graph/_branch.py:203）——注意它不是 <code class="inline">GraphRecursionError</code> 之类的语义化异常，就是字典查询失败，第一次撞上很容易误以为是别处出了问题。且因为可视化依据的就是 Literal/path_map，你在结构图上根本看不出这条隐藏出口。</p>
     <div class="code-title">反面：Literal 漏写了 "__end__"，却可能返回它</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ 注解只声明了 "tools"，但函数可能返回 "__end__"</span>
 <span class="kw">def</span> <span class="fn">should_continue</span>(state) -&gt; <span class="cl">Literal</span>[<span class="st">"tools"</span>]:
@@ -420,8 +483,28 @@ graph.<span class="fn">invoke</span>({<span class="st">"n"</span>: <span class="
     <span class="kw">if</span> <span class="kw">not</span> <span class="fn">getattr</span>(state[<span class="st">"messages"</span>][-<span class="nu">1</span>], <span class="st">"tool_calls"</span>, <span class="kw">None</span>):
         <span class="kw">return</span> <span class="st">"__end__"</span>
     <span class="kw">return</span> <span class="st">"tools"</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 把 <code class="inline">"__end__"</code> 补进 Literal 后，框架才能正确画出这条到 END 的边、并在运行时识别它。用 <code class="inline">path_map</code> 时同理——path 能返回的每个标识都必须在 map 里有对应节点。养成习惯：path 能返回几个值，Literal/path_map 就列几个，二者必须一一对应。</div>
+    <div class="annotation"><b>声明与返回要对账：</b> 把 <code class="inline">"__end__"</code> 补进 Literal 后，框架才能正确画出这条到 END 的边、并在运行时识别它。用 <code class="inline">path_map</code> 时同理——path 能返回的每个标识都必须在 map 里有对应节点。养成习惯：path 能返回几个值，Literal/path_map 就列几个，二者必须一一对应。</div>
     <div class="callout warn"><b class="tag">共同根源</b> 这两个坑的共同根源都是<strong>路径没闭合</strong>：第一个是循环没有真正的出口（只有回边、没有跳出边），第二个是条件边声明了不全的出口集合。画图时问自己一句「从每个节点出发，所有可能的下一跳我都画出来了吗」，能挡掉绝大多数控制流 bug。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.11</span>读完本章，你应该能回答</h2>
+    <p>先自己作答，再展开对照。</p>
+    <details class="q"><summary><b>Q1</b> · <code class="inline">add_edge(["a", "b"], "c")</code> 的 join 靠屏障通道实现。如果 b 节点在你的图里根本没有被任何边触发过，invoke 会发生什么——报错、永远卡住，还是别的？这暴露了屏障语义的什么特性？</summary>
+      <div class="a">会安静地结束：a 跑完后往屏障 <code class="inline">join:a+b:c</code> 签到 "a"，但 b 永远不来签到，屏障不满足 <code class="inline">seen == names</code>（named_barrier_value.py:74），c 不被触发——而图里也没有别的可执行节点了，于是执行正常返回，结果里没有 c 的产出。不报错、不卡死、不提示，正是屏障「默认不设兜底」的体现：放行条件只有「签到齐」，没有「签到超时」，也没有「起点必须可达」的编译期检查。所以 join 的完整性要靠图结构保证，不能指望框架替你发现「有人的 c 永远等不到」。</div>
+    </details>
+    <details class="q"><summary><b>Q2</b> · 一个 LastValue 字段（无 reducer），三个 Send 在同一个 super-step 里并行写它，会看到什么错误？把同一个实验换到条件边返回三个普通节点名（不是 Send），错误还会发生吗？为什么？</summary>
+      <div class="a">会抛 <code class="inline">InvalidUpdateError: Can receive only one value per step</code>——三个 Send 的目标节点在同一个 super-step 并行执行，三个写入在 step 结束时一起撞进 LastValue，违反「一步一值」。换成条件边返回三个普通节点名后错误不会发生，因为普通条件边的多个出口是<strong>或</strong>的关系：path 只决定下一批去哪些节点，返回值列表里每个节点都在下一个 super-step 执行，彼此的写入同样同 step 合并——但注意，若 path 真的返回了多个节点名，它们也是并行、也会撞 LastValue。「三个不冲突」的真正原因是多数条件边只返回一个出口；返回多个出口时，约束和 Send 场景完全一致：要么配 reducer，要么保证不写同一字段。Send 和普通路由在这个语义上没有区别。</div>
+    </details>
+    <details class="q"><summary><b>Q3</b> · 一个「agent → tools → agent」的循环，从进 agent 到跑完，最多会消耗多少个 <code class="inline">recursion_limit</code> 配额？如果 config 里给了 20，agent 节点实际最多能执行几轮？</summary>
+      <div class="a">每轮 agent→tools 消耗 2 个 super-step：agent 一个、tools 一个，所以限额 20 最多支持 10 轮完整循环（最后一轮 agent 若决定结束，还需要它自己那 1 步，包含在内）。recursion_limit 数的是 super-step 而不是「agent 被调用的次数」——把带工具循环的 Agent 配额想成「循环次数」会差一倍。这也是为什么默认值 10007（_internal/_config.py:32）看起来夸张：它是按 super-step 计的，再宽裕也仍然是一道硬保险丝。</div>
+    </details>
+    <details class="q"><summary><b>Q4</b> · Command 的 <code class="inline">goto</code> 能接受一个 Send 列表，Send 通常也从条件边返回——那 Command 是不是就能完全替代 Send + 条件边？说出一个条件边仍有独立价值的场景。</summary>
+      <div class="a">功能上确实高度重叠：goto 的类型签名（types.py:852）本身就允许 <code class="inline">Sequence[Send]</code>，节点内完全可以 return Command(goto=[Send(...), Send(...)])。但条件边有两个不可替代的价值：一是<strong>可视化</strong>——add_conditional_edges 在编译期就把「可能出口」登记进图结构，get_graph/draw_mermaid 画得出来，Command 的 goto 在节点函数体内，结构图上看不到；二是<strong>多节点复用</strong>——同一节点的路由逻辑写在边上是外层图的属性，节点本身保持纯计算，换一个图复用时不必连带搬走路由代码。Command 适合「路由逻辑属于这个节点自身」的场景，条件边适合「路由属于图的结构」的场景。</div>
+    </details>
+    <details class="q"><summary><b>Q5</b> · 条件边 path 函数返回了一个 Literal 和 path_map 里都没声明的字符串，运行时报什么？为什么说这个错误的「凶手」和报错信息对不上号？</summary>
+      <div class="a">报一个裸的 <code class="inline">KeyError</code>，内容是那个未声明的字符串本身（graph/_branch.py:203）。对不上号的原因：框架把你的返回值直接当作 key 去查 ends 映射表，映射表里没有这个 key，抛出的是 Python 字典查询的原生异常——它不像 GraphRecursionError 那样告诉你是循环问题，也不指明「是条件边的出口没声明」。错误源头（声明不全的 Literal/path_map）和异常形态（KeyError）之间隔着两层：path 函数返回 → ends 查表失败。排查思路就是反着来：看到 KeyError 且值像一个节点名，先检查所有条件边的 Literal/path_map 是否覆盖了 path 的全部返回值。</div>
+    </details>
   </section>
 
   <div class="arrow-nav">

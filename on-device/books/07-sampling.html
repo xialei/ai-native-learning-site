@@ -90,7 +90,7 @@
         samplers.push_back(<span class="fn">llama_sampler_init_dist</span>(params.seed));
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 三个容易忽略的点。① 链头还有 logit_bias：合并用户偏置与模型 suppress tokens（置 -INFINITY），在 mirostat==0 分支之前 push；② dist 是链尾默认值——过滤链只<strong>改数组</strong>不选 token，总得有人掷骰子；③ mirostat 分支直接替换整条链：mirostat v1/v2 各自与 temp 组成两件套，不走过滤链。</div>
+    <div class="annotation">组装逻辑里有三个容易看漏的地方。链头其实还有 logit_bias——合并用户偏置与模型 suppress tokens（置 -INFINITY），在 mirostat==0 分支之前就 push 进去了。链尾的 dist 是默认值：过滤链只<strong>改数组</strong>不选 token，总得有人掷骰子。mirostat 则不走这条链——分支里直接替换整条链，mirostat v1/v2 各自与 temp 组成两件套。</div>
   </section>
 
   <section class="block">
@@ -126,7 +126,7 @@ id = cur_p.data[cur_p.selected].id;
     <span class="kw">if</span> (is_valid) { <span class="kw">return</span> id; }
 }
 <span class="cmt">// 6) 不合法 → 重置 logits，grammar 先行，重新走一遍链</span></pre>
-    <div class="annotation"><b>读懂这段：</b> ① <strong>backend sampler</strong>：新版把部分采样搬进 GPU 计算图（llama-context.cpp:253 注释「Initialize backend samplers here so they are part of the sampling graph」）——链在 CPU 走完之前 GPU 可能已出 token，grammar 相关逻辑被完全跳过；② grammar 的默认模式是「先采样后校验」：链选出 token，grammar 只说行/不行，不行就重置 logits 重新走链；③ reasoning budget（控制思考长度）永远最先施加——它管「思考块抑制」，是逻辑层不是分布层。</div>
+    <div class="annotation">这段主流程最值得注意的是开头的 backend sampler：新版把部分采样搬进了 GPU 计算图（llama-context.cpp:254 注释「Initialize backend samplers here so they are part of the sampling graph」），链在 CPU 走完之前 GPU 可能已经出 token——grammar 相关逻辑此时被完全跳过。grammar 自己的默认模式是「先采样后校验」：链选出 token，grammar 只说行/不行，不行就重置 logits 重新走一遍链。还有个容易看漏的：reasoning budget（控制思考长度）永远最先施加——它管「思考块抑制」，是逻辑层不是分布层。</div>
   </section>
 
   <section class="block">
@@ -161,7 +161,7 @@ cur_p-&gt;selected = idx;
 <span class="kw">float</span> observed_surprise = -log2f(cur_p-&gt;data[idx].p);
 <span class="kw">float</span> e = observed_surprise - ctx-&gt;tau;
 ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
-    <div class="annotation"><b>读懂这段：</b> mirostat v2 就是一个一维控制器：mu 是「当前容忍的意外度上限」，实际意外度高于目标就调低 mu（变保守）、低于就调高（变奔放）。对比固定 top_p 的问题：不同位置的概率分布尖锐程度天差地别，固定比例截断时而过严时而过松——mirostat 用反馈回路替代静态阈值。</div>
+    <div class="annotation">mirostat v2 说穿了就是一个一维控制器：mu 是「当前容忍的意外度上限」，实际意外度高于目标就调低 mu（变保守）、低于就调高（变奔放）。对比固定 top_p 的问题：不同位置的概率分布尖锐程度天差地别，固定比例截断时而过严时而过松——mirostat 用反馈回路替代静态阈值。</div>
     <p><strong>DRY</strong>（Don't Repeat Yourself，src/llama-sampler.cpp:3317 起）：针对<strong>逐字重复</strong>——最近输出里出现过的序列若正被延续（重复长度超过 allowed_length），按指数衰减惩罚其下一个 token。与 penalties 的区别：penalties 惩罚 token 出现次数（不管上下文），DRY 惩罚「正在形成重复序列」——所以它需要 sequence breakers（换行、章节号等「合理重复」的分隔符）。</p>
     <p><strong>adaptive-p</strong>（src/llama-sampler.cpp:3727 起）：比 mirostat 更新的思路——按目标 p 值直接挑「累计概率刚好达到目标」的候选集，无需训练地把输出分布的熵稳定在目标附近。</p>
   </section>
@@ -215,17 +215,12 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
         greedy_tokens = torch.<span class="fn">argmax</span>(logits, dim=-1).to(tokens.dtype)
         tokens = torch.<span class="fn">where</span>(args.greedy_mask, greedy_tokens, tokens)
     <span class="kw">return</span> tokens</pre>
-    <div class="annotation"><b>对照读：</b> ① <strong>全 greedy 特例</strong>：temperatures is None → 直接 argmax，连 softmax 都省；② <strong>混合批的 greedy 行</strong>：旧版把 greedy 行塞成「低温 + 数值地板」去近似 argmax，但低温采样对并列最高分 token 的选择是随机的，argmax 是确定性的——同一个 prompt 前缀两次跑出不同续写。#471（2026-09）改成概率采样照跑、greedy 行最后用 argmax 覆写（torch.where 一次向量化完成），另把 <code class="inline">is_greedy</code> 的定义收窄（去掉 <code class="inline">top_p == 1.0</code> 条件——top_k=1 时分布只含一个 token，top_p 无所谓）；③ <strong>条件上传</strong>：没有任何请求用 top_k 时这个张量根本不上传——batch 里 4 个请求全默认参数时 GPU 采样只剩 softmax + multinomial。llama.cpp 的可组合责任链 vs FreeToken 的固定 kernel 菜单：前者灵活（grammar/mirostat/DRY 随意组合），后者快（一个 kernel 一件事）且没有 CPU↔GPU 往返——但 grammar 约束在 GPU 采样下无从谈起，FreeToken 的 grammar 支持在 API 层做（第 9 章对照）。</div>
+    <div class="annotation"><b>对照读：</b> 先看两个特例的细节。<strong>全 greedy</strong> 时 temperatures is None，直接 argmax，连 softmax 都省。<strong>混合批的 greedy 行</strong>改动更有意思：旧版把 greedy 行塞成「低温 + 数值地板」去近似 argmax，但低温采样对并列最高分 token 的选择是随机的，argmax 是确定性的——同一个 prompt 前缀两次跑出不同续写。#471（2026-09）改成概率采样照跑、greedy 行最后用 argmax 覆写（torch.where 一次向量化完成），另把 <code class="inline">is_greedy</code> 的定义收窄（去掉 <code class="inline">top_p == 1.0</code> 条件——top_k=1 时分布只含一个 token，top_p 无所谓）。再一个省钱细节是条件上传：没有任何请求用 top_k 时这个张量根本不上传——batch 里 4 个请求全默认参数时 GPU 采样只剩 softmax + multinomial。llama.cpp 的可组合责任链 vs FreeToken 的固定 kernel 菜单：前者灵活（grammar/mirostat/DRY 随意组合），后者快（一个 kernel 一件事）且没有 CPU↔GPU 往返——但 grammar 约束在 GPU 采样下无从谈起，FreeToken 的 grammar 支持在 API 层做（第 9 章对照）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.5</span>小结</h2>
-    <ul>
-      <li>责任链：过滤链改数组，dist/adaptive-p/mirostat 选 token；链序 = 加工顺序。</li>
-      <li>后端 sampler 让 GPU 图直接出 token；grammar 与它互斥，走 CPU 链时用「采样后校验 + 重采样」。</li>
-      <li>mirostat v2 = 意外度反馈控制器；DRY 惩罚「正在形成的重复」；top_n_sigma 按统计截断。</li>
-      <li>FreeToken：greedy argmax 特例（混合批用 greedy_mask 覆写）+ flashinfer/triton kernel + per-request 参数压成批量张量。</li>
-    </ul>
+    <p>这一章的核心画面只有一个：候选数组在链上走，每个 sampler 看一眼、动一刀——过滤链只改数组，dist/adaptive-p/mirostat 才是掷骰子的人，链序就是加工顺序。链上还有两个特殊角色：后端 sampler 让 GPU 图直接出 token（grammar 与它互斥，走 CPU 链时靠「采样后校验 + 重采样」兜住）；reasoning budget 永远第一个施加。几个新 sampler 各管一摊：mirostat v2 是意外度反馈控制器，DRY 惩罚「正在形成的重复」，top_n_sigma 按统计截断。FreeToken 那边则是另一套打法：greedy argmax 特例（混合批用 greedy_mask 覆写）、flashinfer/triton kernel、per-request 参数压成批量张量。</p>
     <p>采样快了还不够，能不能一次算多个 token？下一章投机解码。<a href="08-speculative.html">第 8 章：投机解码</a>。</p>
   </section>
 
@@ -236,7 +231,7 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 07 采样 · llama.cpp b11060 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 07 采样 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

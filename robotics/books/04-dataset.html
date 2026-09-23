@@ -35,12 +35,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 LeRobotDataset</div>
     <h1>LeRobotDataset：机器人数据的通用容器</h1>
-    <div class="subtitle">NLP 有 Text，CV 有 ImageNet，机器人学一直没有等价物——直到各实验室自创格式互不相通。LeRobotDataset 用「parquet + mp4 + 元数据」把异构机器人数据统一成一种能放 Hub、能流式读、能直接喂策略的格式。这一章从目录结构读到 <code class="inline">__getitem__</code>，读完你就知道一份训练数据到底由什么构成。</div>
+    <div class="subtitle">NLP 有 Text，CV 有 ImageNet，机器人学一直没有等价物——直到各实验室自创格式互不相通。LeRobotDataset 用「parquet + mp4 + 元数据」把异构机器人数据统一成一种能放 Hub、能流式读、能直接喂策略的格式。本章问下去：<strong>磁盘上怎么分片？特征键名怎么定？第 3 章录的帧怎么写进去？训练时怎么取「历史 + 未来」的窗口？归一化统计从哪来？</strong>4.1 从目录结构开始，4.2–4.5 依次作答，4.6 收尾对照仿真线。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">4.1</span>目录结构：一切按 chunk 分片</h2>
-    <p>先约定全书最重要的数据单位——<strong>episode</strong>：机器人<strong>从头到尾做完一次任务</strong>的一段连续记录（比如「抓起方块→放进盒子」的 30 秒），包含这段时间所有的相机帧和关节读数。一个数据集就是许多 episode 的集合——对应视频里的「一集」。v3.0 格式的磁盘布局由一组路径模板决定（src/lerobot/datasets/utils.py:89-149）：</p>
+    <h2><span class="num">4.1</span>问题：一份机器人数据集该长什么样</h2>
+    <p>先约定全书最重要的数据单位——<strong>episode</strong>：机器人<strong>从头到尾做完一次任务</strong>的一段连续记录（比如「抓起方块→放进盒子」的 30 秒），包含这段时间所有的相机帧和关节读数。一个数据集就是许多 episode 的集合——对应视频里的「一集」。围绕这个单位，格式设计要回答四个问题：</p>
+    <ul>
+      <li><strong>① 磁盘布局怎么排？</strong>几万帧的 parquet、几小时的 mp4，怎么切文件才能流式读、断点续传、单文件不过大？</li>
+      <li><strong>② 特征叫什么名字？</strong>不同机器人键名五花八门，schema 怎么统一——数据集列名、策略输入、CLI 参数才不会各说各话？</li>
+      <li><strong>③ 写入怎么做到「实时循环里不卡」？</strong>30 Hz 循环里每帧要做的事，和 episode 结束才能做的事，怎么分工？</li>
+      <li><strong>④ 读取怎么支持「历史 + 未来」？</strong>策略要历史观测 + 未来动作块，DataLoader 一次取样的窗口怎么定义？统计归一化的依据又从哪来？</li>
+    </ul>
+    <div class="annotation"><b>四个问题，五节答案：</b>① 目录结构 → 就在本节；② 特征命名 → 4.2；③ 写入路径 → 4.3；④ 读取路径与统计量 → 4.4–4.5。4.6 收尾对照仿真线。</div>
+    <p>先答 ①。v3.0 格式的磁盘布局由一组路径模板决定（src/lerobot/datasets/utils.py:89-149）：</p>
     <div class="code-title">src/lerobot/datasets/utils.py — v3.0 布局常量（节选）</div>
     <pre class="code"><span class="lang-tag">python</span>DEFAULT_CHUNK_SIZE = <span class="nu">1000</span>          <span class="cmt"># 每个 chunk 最多 1000 个文件</span>
 DEFAULT_DATA_FILE_SIZE_IN_MB = <span class="nu">100</span>  <span class="cmt"># 单个 parquet 文件上限</span>
@@ -126,7 +134,7 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
   </section>
 
   <section class="block">
-    <h2><span class="num">4.2</span>特征命名：全栈的「通用语言」</h2>
+    <h2><span class="num">4.2</span>② 特征命名：全栈的「通用语言」</h2>
     <p>第 2 章的硬件键名（<code class="inline">shoulder_pan.pos</code>）在进数据集时被加上前缀并整理成标准 schema。<code class="inline">hw_to_dataset_features</code>（utils/feature_utils.py:47）是转换点：</p>
     <div class="code-title">src/lerobot/utils/feature_utils.py:84 — 硬件特征 → 数据集 schema（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> joint_fts <span class="kw">and</span> prefix == OBS_STR:
@@ -151,7 +159,7 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
   </section>
 
   <section class="block">
-    <h2><span class="num">4.3</span>写入路径：add_frame 与 save_episode 的分工</h2>
+    <h2><span class="num">4.3</span>③ 写入路径：add_frame 与 save_episode 的分工</h2>
     <p><code class="inline">LeRobotDataset</code> 有两种模式：写模式（<code class="inline">create/resume</code>）与读模式。第 3 章录制时走的写路径，核心是两个方法：</p>
     <div class="code-title">src/lerobot/datasets/lerobot_dataset.py:475 / dataset_writer.py:213 — add_frame（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">add_frame</span>(self, frame: <span class="cl">dict</span>) -&gt; <span class="kw">None</span>:
@@ -180,8 +188,8 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
   </section>
 
   <section class="block">
-    <h2><span class="num">4.4</span>读取路径：__getitem__ 与 delta_timestamps（重点）</h2>
-    <p>训练时 DataLoader 每次要的不只是「当前帧」——策略要<strong>历史观测 + 未来动作块</strong>（action chunk）。这是靠 <code class="inline">delta_timestamps</code> 实现的：</p>
+    <h2><span class="num">4.4</span>④ 读取路径：__getitem__ 与 delta_timestamps（重点）</h2>
+    <p>写入回答完了，轮到读取。训练时 DataLoader 每次要的不只是「当前帧」——策略要<strong>历史观测 + 未来动作块</strong>（action chunk）。这是靠 <code class="inline">delta_timestamps</code> 实现的：</p>
     <div class="code-title">src/lerobot/datasets/lerobot_dataset.py:53 — 构造时传入 delta_timestamps（摘录 docstring）</div>
     <pre class="code"><span class="lang-tag">python</span>delta_timestamps: <span class="cl">dict</span>[<span class="cl">str</span>, <span class="cl">list</span>[<span class="cl">float</span>]] | <span class="kw">None</span> = <span class="kw">None</span>
 <span class="cmt"># 例：观测取过去 2 帧（-0.1s、-0.05s、0s），动作取未来 0.5 秒的动作块
@@ -252,7 +260,7 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
   </section>
 
   <section class="block">
-    <h2><span class="num">4.5</span>stats.json：归一化从这里来</h2>
+    <h2><span class="num">4.5</span>④（续）stats.json：归一化从这里来</h2>
     <p>第 2 章标定解决了「跨机器坐标统一」，但不同特征量纲仍差几个数量级（夹爪 0-100，关节 ±100，图像 0-255）。训练前的归一化不能临时算——必须<strong>落盘成元数据</strong>，让推理时能精确反变换：</p>
     <div class="code-title">src/lerobot/datasets/compute_stats.py:31 — 流式分位数统计（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">RunningQuantileStats</span>:
@@ -270,7 +278,8 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
   </section>
 
   <section class="block">
-    <h2><span class="num">4.6</span>LeRobotDataset 对比 Isaac Lab 的「数据从哪来」</h2>
+    <h2><span class="num">4.6</span>收尾：真机与仿真的数据在这里汇合</h2>
+    <p>4.1 的四个问题，答案收拢：① 磁盘上按「chunk-000/file-000」滚动分片，50 集 9 万帧也能流式读、单文件不超限；② 特征键名以 <code class="inline">observation.state / observation.images.* / action / task</code> 为骨架，第 2 章的硬件键名经 <code class="inline">hw_to_dataset_features</code> 收拢进 schema；③ 写入是「add_frame 只追加内存 + save_episode 结束时做重活」的分工，实时性不破；④ 读取靠 delta_timestamps 定义「历史 + 未来」窗口，统计量在 save_episode 时增量累积进 stats.json。真机数据贵、仿真数据便宜，但两条线在这里汇成同一格式：</p>
     <p>真机数据贵（50 集 = 一个人一天），仿真数据便宜（4096 个并行环境同时跑）。两条线的数据格式在 LeRobot 栈里是统一的：</p>
     <table class="tbl">
       <tr><th></th><th>真机（lerobot-record）</th><th>仿真（Isaac Lab，第 9-10 章）</th></tr>
@@ -295,7 +304,7 @@ DEFAULT_IMAGE_PATH = <span class="st">"images/{image_key}/episode-{episode_index
 </div>
 
 <footer>
-  深入浅出具身智能 · 04 LeRobotDataset · 基于 huggingface/lerobot（89236ea0，数据格式 v3.0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 04 LeRobotDataset · 基于 huggingface/lerobot（9a6bb610，数据格式 v3.0）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

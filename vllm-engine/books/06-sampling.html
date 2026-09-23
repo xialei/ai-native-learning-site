@@ -36,12 +36,19 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 采样</div>
     <h1>采样：logits 如何变成 token</h1>
-    <div class="subtitle">模型前向的终点是一个 vocab 大小的 logits 向量，但它还不是答案。采样层把它变成一个（或多个）具体的 token id，再交给 detokenizer 变成文本。这一章我们把 logits → token → 文本的整条链路拆开。</div>
+    <div class="subtitle">模型前向的终点是一个 vocab 大小的 logits 向量，但它还不是答案。这一章问：<strong>客户端要的「温度 0.7、top-p 0.9」怎么作用到这串分数上？50 个请求各要各的采样方式，怎么一次算完？什么时候停？</strong>先讲清参数怎么表达、怎么作用到 logits，再看 batch 怎么一次算完、输出怎么停；6.6–6.7 是两个延伸场景，末了拿 SGLang 对照一眼。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>为什么需要采样</h2>
-    <p>Transformer 输出层（LM Head）对每个位置输出一个形状为 <strong>[vocab_size]</strong> 的向量，叫 <strong>logits</strong>。它只是「分数」：分数越高的 token 越像合理的下一个词，但<strong>它本身不是 token</strong>。要拿到一个可读的 token id，必须经过<strong>采样</strong>。</p>
+    <h2><span class="num">6.1</span>分数怎么变成 token</h2>
+    <p>Transformer 输出层（LM Head）对每个位置输出一个形状为 <strong>[vocab_size]</strong> 的向量，叫 <strong>logits</strong>。它只是「分数」：分数越高的 token 越像合理的下一个词，但<strong>它本身不是 token</strong>。要拿到一个可读的 token id，必须经过<strong>采样</strong>。把「分数 → token」这一步拆开，会撞到四个问题：</p>
+    <ul>
+      <li><strong>请求的口味怎么表达？</strong>客户端要「temperature=0.7、top_p=0.9、遇到 stop 就停」——这些要求以什么形式传进引擎、存在哪？</li>
+      <li><strong>参数怎么作用到 logits 上？</strong>温度、top-k、top-p、repetition penalty……这些操作有先后依赖，谁先谁后？顺序错了会怎样？</li>
+      <li><strong>一个 batch 怎么一次算完？</strong>50 个请求各要各的采样方式，是跑 50 次采样还是一次算完？逐请求的参数怎么变成 batch 级的张量运算？</li>
+      <li><strong>输出怎么停？</strong>token id 怎么变回文本、EOS 和 stop 串怎么判、请求什么时候算结束？</li>
+    </ul>
+    <p>最基础的事实先立住：采样的两种根本行为——</p>
     <ul>
       <li><strong>贪心（greedy）</strong>：直接取 logits 最大的下标，即 <code class="inline">argmax</code>。确定性高，但容易重复、呆板。</li>
       <li><strong>随机（random）</strong>：先把 logits 转成概率分布，再按概率随机抽。温度越高分布越平、越随机。</li>
@@ -71,10 +78,11 @@
       </svg>
       <div class="fig-cap">图 6.1：采样即「把 logits 变成 token id」。贪心可跳过 softmax，随机才需要完整概率分布。</div>
     </div>
+    <div class="annotation"><b>本章路线：</b>口味怎么表达（6.2 SamplingParams）→ 参数怎么作用到 logits（6.3 后处理链）→ batch 怎么一次算完（6.4 采样元数据）→ 输出怎么停（6.5 解码与停止）。6.6/6.7 是两个延伸场景（多路采样、投机解码），6.8 拿 SGLang 对照。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>SamplingParams：请求怎么描述「我要怎么采样」</h2>
+    <h2><span class="num">6.2</span>请求的口味怎么表达：SamplingParams</h2>
     <p>每个请求都要带上一组采样参数。vLLM 用 <code class="inline">vllm/sampling_params.py</code> 里的 <code class="inline">SamplingParams</code> 描述。下面只摘和我们本章相关的字段（原文件字段顺序如此）：</p>
     <div class="code-title">vllm/sampling_params.py — SamplingParams（字段摘录；注释为译注，默认值照抄）</div>
     <pre class="code"><span class="lang-tag">python</span>temperature: <span class="cl">float</span> = <span class="nu">1.0</span>
@@ -98,7 +106,7 @@ n: <span class="cl">int</span> = <span class="nu">1</span>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>logits 后处理链：顺序很重要</h2>
+    <h2><span class="num">6.3</span>参数怎么作用到 logits：后处理链的顺序</h2>
     <p>vLLM 的 <code class="inline">Sampler</code>（<code class="inline">vllm/v1/sample/sampler.py</code>）把整条链路写得很直白。类 docstring 列出了严格顺序：先做 allowed-token-ids 白名单、bad-words 排除、可影响贪心的 logits processor，再施加各类 penalty，然后才进 <code class="inline">sample()</code> 做温度缩放、top-k/top-p、softmax 与采样。</p>
     <div class="code-title">vllm/v1/sample/sampler.py — Sampler.forward（主干摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, logits, sampling_metadata, ...):
@@ -130,7 +138,7 @@ random_sampled, _ = self.topk_topp_sampler(
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>Sampler 与采样元数据：一整个 batch 一次算完</h2>
+    <h2><span class="num">6.4</span>一个 batch 一次算完：Sampler 与采样元数据</h2>
     <p>采样层的关键设计是<strong>把所有请求并成一个 batch 向量化算</strong>。为此需要一个描述「这个 batch 各自怎么采样」的结构——<code class="inline">SamplingMetadata</code>（<code class="inline">vllm/v1/sample/metadata.py</code>）：</p>
     <div class="code-title">vllm/v1/sample/metadata.py — SamplingMetadata（字段摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>temperature: <span class="cl">torch.Tensor</span> | <span class="kw">None</span>   <span class="cmt"># 每请求一个温度（batch 向量）</span>
@@ -149,7 +157,7 @@ output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cm
   </section>
 
   <section class="block">
-    <h2><span class="num">6.5</span>解码与停止：token 怎么变成文本、请求怎么结束</h2>
+    <h2><span class="num">6.5</span>输出怎么停：解码、EOS 与请求结束</h2>
     <p>采样给出的是 token id 序列，要让用户看到文本，得<strong>解码（detokenize）</strong>。vLLM 的 <code class="inline">vllm/v1/engine/detokenizer.py</code> 提供 <code class="inline">IncrementalDetokenizer</code> —— <strong>增量</strong>解码：每来一个新 token 只解这段、拼进已有的文本，而不是每次都重解整条序列。它分两类：快路径 <code class="inline">FastIncrementalDetokenizer</code>（走 tokenizers 库的 <code class="inline">DecodeStream</code>）和慢路径 <code class="inline">SlowIncrementalDetokenizer</code>。</p>
     <div class="code-title">vllm/v1/engine/detokenizer.py — IncrementalDetokenizer.update（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">update</span>(self, new_token_ids, stop_terminated):
@@ -190,7 +198,7 @@ output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cm
     <p>为什么这两件事能同时成立。加速来自两半：<strong>草稿便宜</strong>——用一个便宜的来源（小模型、n-gram 匹配、Medusa 头）先猜出 k 个 token；<strong>验证几乎免费</strong>——目标模型一次 forward 本来就能对 k 个位置各出一份 logits（第 4、5 章的统一调度），猜对的部分直接保留，猜错的部分按概率规则回退。分布不变则是数学保证：<a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a> 证明「接受/回退」规则产出的分布与直接用大模型采样完全一致。</p>
     <p>源码锚点。代码分草稿 proposer 和验证 rejection sampler 两块；Model Runner 有两套实现（第 5 章：V2 现在默认，V1 作回退），两套的落点不同：</p>
     <ul>
-      <li><strong>proposer</strong>：V1 用 <code class="inline">vllm/v1/spec_decode/</code> 下的各 proposer，统一 <code class="inline">propose()</code> 接口，由 <code class="inline">gpu_model_runner.py</code> 的 <code class="inline">propose_draft_token_ids</code>（<code class="inline">:5031</code>）在每步采样之后调用；V2 换成 <code class="inline">vllm/v1/worker/gpu/spec_decode/</code> 下的 <code class="inline">BaseSpeculator</code>（<code class="inline">speculator.py:60</code>），由 <code class="inline">self.speculator.propose(...)</code>（<code class="inline">gpu/model_runner.py:881</code>）调用。</li>
+      <li><strong>proposer</strong>：V1 用 <code class="inline">vllm/v1/spec_decode/</code> 下的各 proposer，统一 <code class="inline">propose()</code> 接口，由 <code class="inline">gpu_model_runner.py</code> 的 <code class="inline">propose_draft_token_ids</code>（<code class="inline">:4957</code>）在每步采样之后调用；V2 换成 <code class="inline">vllm/v1/worker/gpu/spec_decode/</code> 下的 <code class="inline">BaseSpeculator</code>（<code class="inline">speculator.py:59</code>），由 <code class="inline">self.speculator.propose(...)</code>（<code class="inline">gpu/model_runner.py:886</code>）调用。</li>
       <li><strong>验证</strong>：V1 是 <code class="inline">vllm/v1/sample/rejection_sampler.py</code> 的 <code class="inline">RejectionSampler.forward</code>；V2 另有一份 <code class="inline">vllm/v1/worker/gpu/spec_decode/rejection_sampler.py</code>（<code class="inline">__call__</code>，配 <code class="inline">rejection_sampler_utils.py</code> 里的 Triton kernel）。两者语义相同，V2 那份改成了「分块验证」以适配 V2 的 batch 表示。</li>
     </ul>
     <p>草稿来源的清单（两套共用）：</p>
@@ -255,7 +263,7 @@ output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cm
       <div class="fig-cap">图 6.7：投机解码把「k 次 decode forward」变成「1 次便宜草稿 + 1 次多位置验证 forward」。decode 是访存瓶颈、算力闲置，正好用它并行验证。</div>
     </div>
     <p>验证的规则在 <code class="inline">RejectionSampler</code>。注意它的位置：不在调度器里，而是嵌在 Model Runner 的采样函数里——投机解码只是「换了一种采样」，第 6.3/6.4 节的整条 logits 后处理链照样要跑。两套 runner 的写法如下，判断条件一样（「本步有没有草稿 token」），差别在传参：</p>
-    <div class="code-title">V1：vllm/v1/worker/gpu_model_runner.py — _sample（摘录，:3670）</div>
+    <div class="code-title">V1：vllm/v1/worker/gpu_model_runner.py — _sample（摘录，:3636）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_sample</span>(self, logits, spec_decode_metadata):
     <span class="kw">if</span> spec_decode_metadata <span class="kw">is</span> <span class="kw">None</span>:          <span class="cmt"># 没开投机 → 走 6.4 的普通路径</span>
         <span class="kw">return</span> self.<span class="fn">sampler</span>(logits=logits, sampling_metadata=...)
@@ -263,7 +271,7 @@ output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cm
     <span class="cmt"># 开了投机 → 由 rejection sampler 接管整个采样</span>
     <span class="kw">return</span> self.<span class="fn">rejection_sampler</span>(
         spec_decode_metadata, draft_probs, logits, sampling_metadata)</pre>
-    <div class="code-title">V2（默认实现）：vllm/v1/worker/gpu/model_runner.py — sample（摘录，:1552–1564）</div>
+    <div class="code-title">V2（默认实现）：vllm/v1/worker/gpu/model_runner.py — sample（摘录，:1554–1566）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># sample() 里算完 logits（还有 grammar bitmask）之后：</span>
 <span class="kw">elif</span> input_batch.num_draft_tokens == <span class="nu">0</span> <span class="kw">or</span> self.rejection_sampler <span class="kw">is</span> <span class="kw">None</span>:
     sampler_output = self.<span class="fn">sampler</span>(logits, input_batch)   <span class="cmt"># 普通路径</span>
@@ -302,11 +310,12 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
     num_draft_tokens=num_draft_tokens,
     num_accepted_tokens=num_accepted, ...)</pre>
     <p>接受率会周期性打进日志（<code class="inline">vllm/v1/spec_decode/metrics.py</code>），格式是一行 <code class="inline">SpecDecoding metrics: Mean acceptance length: %.2f, Accepted throughput: %.2f tokens/s, Drafted throughput: %.2f tokens/s, ...</code>——<strong>平均接受长度</strong>（含 bonus）就是「每个 decode step 实际前进几个 token」的直观度量，也是判断该调大还是调小 k 的依据。注意投机的代价与参数：<code class="inline">num_speculative_tokens</code>（每步猜几个）越大，单步验证的 prefill 越长、KV 占用越多，而接受率通常随位置递减（Per-position acceptance rate），所以 k 不是越大越快。</p>
-    <div class="annotation"><b>读懂这段：</b>投机解码 = 「草稿便宜地猜 + 验证严格地收」。它能加速的本质是<strong>decode 阶段算力闲置</strong>（访存瓶颈，见第 3、4 章）：与其一次 forward 只前进 1 个位置，不如让它并行验证 k 个位置。自研启示：先别做模型类 drafter——n-gram/suffix 这类零成本草稿 + 贪心逐位验证，几十行就能实现，对重复性高的负载马上见效。</div>
+    <div class="annotation"><b>收拢一下：</b>投机解码 = 「草稿便宜地猜 + 验证严格地收」。它能加速的本质是<strong>decode 阶段算力闲置</strong>（访存瓶颈，见第 3、4 章）：与其一次 forward 只前进 1 个位置，不如让它并行验证 k 个位置。自研启示：先别做模型类 drafter——n-gram/suffix 这类零成本草稿 + 贪心逐位验证，几十行就能实现，对重复性高的负载马上见效。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.8</span>小结与自研启示</h2>
+    <h2><span class="num">6.8</span>SGLang 对照与自研启示</h2>
+    <p>回到 6.1 摆出的四个问题，vLLM 的答案是「SamplingParams 带进 Request → 后处理链按固定顺序压 logits → 采样元数据把逐请求参数压成 batch 向量、一次算完 → 输出处理器管解码与停止」。同一串问题，SGLang 的组织方式：</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
       <tr><td>贪心</td><td><code class="inline">greedy_sample</code> → argmax</td><td>先做这个，最简单、最好 debug</td></tr>
@@ -321,6 +330,18 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
       最小引擎只需要：<strong>argmax + 温度采样 + top_k</strong> 三个足矣跑通一条对话链路。penalty、bad-words、beam 全是增量优化——把采样参数、采样元数据从一开始就按「batch 向量」的形状设计，未来加功能才不会返工。
     </div>
     <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      逐项对照：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>逐请求参数 → batch 张量</td><td>SamplingMetadata（<code class="inline">vllm/v1/sample/metadata.py</code>）：temperature/top_p 等压成 batch 向量</td><td>SamplingBatchInfo.from_schedule_batch（<code class="inline">sampling/sampling_batch_info.py</code>），同样压张量 + 归约出布尔标志</td></tr>
+        <tr><td>贪心快路径</td><td>一条路径内按 <code class="inline">all_greedy</code> 分支</td><td><code class="inline">Sampler.forward</code> 开头显式分两条路（<code class="inline">python/sglang/srt/layers/sampler.py</code>）</td></tr>
+        <tr><td>grammar 约束落点</td><td>采样前压 logit</td><td>一致（<code class="inline">apply_logits_bias</code> 一并处理）；function call 解析都在反分词后的 serving 层</td></tr>
+        <tr><td>投机解码怎么插入</td><td>长在 runner 内部（<code class="inline">vllm/v1/spec_decode/</code>），每步采样后由 runner 调 propose</td><td>独立 spec worker，与普通 GPU worker 同接口 <code class="inline">forward_batch_generation</code>——调度器一行不改</td></tr>
+      </table>
+      前三行是同一问题的两种写法；最后一行是真正的组织分歧——「改内部」与「换组件」。详见 <a href="../../sglang/books/08-sampling.html">深入浅出SGLang · 08 采样与结构化输出</a>；EAGLE 草稿-验证结构另见其 <a href="../../sglang/books/13-speculative.html">第 13 章</a>。
+    </div>
+    <div class="callout info">
       <b class="tag">下一步</b>
       采样看似只是一次 argmax 或一次随机抽样，为什么值得单独一章讲 kernel？因为 vLLM 把 top-k/top-p、softmax 都下沉成了高度优化的 kernel。采样加速正是<a href="07-kernels.html">第 7 章：Kernel</a> 的内容。而投机解码被调度器怎么排进 batch（草稿 token 占 <code class="inline">num_speculative_tokens</code> 个调度位）、KV 怎么预留，见<a href="04-scheduler.html">第 4 章：调度器</a>的统一调度。
     </div>
@@ -333,7 +354,7 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
 </div>
 
 <footer>
-  深入浅出vLLM · 06 采样 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 06 采样 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

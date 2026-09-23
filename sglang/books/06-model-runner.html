@@ -166,7 +166,7 @@
 
     <span class="cmt"># === 从 ScheduleBatch 借用：GPU 张量（跨流；流隔离时的克隆目标）===</span>
     <span class="cmt"># FIXME(lsyin): 这些字段目前仍以引用方式与 ScheduleBatch 共享……</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 注释里的 FIXME 是真实演进痕迹：核心四字段目前还与 ScheduleBatch 按引用共享（overlap 模式下两条 CUDA stream 同时读写），计划未来在边界处克隆成 ForwardBatch 私有副本。这解释了为什么 overlap 模式需要 <code class="inline">resolve_forward_inputs</code> 这一层（第 2 章）。</div>
+    <div class="annotation"><b>FIXME 是真实演进痕迹：</b> 核心四字段目前还与 ScheduleBatch 按引用共享（overlap 模式下两条 CUDA stream 同时读写），计划未来在边界处克隆成 ForwardBatch 私有副本。这解释了为什么 overlap 模式需要 <code class="inline">resolve_forward_inputs</code> 这一层（第 2 章）。</div>
 
     <p>模式枚举也集中在这里。值得注意 <code class="inline">is_extend()</code> 的范围比名字大——投机验证、split prefill 都算 extend 家族：</p>
     <div class="code-title">python/sglang/srt/model_executor/forward_batch_info.py — ForwardMode（摘录，注释为原文+译注）</div>
@@ -191,8 +191,8 @@
     SPLIT_PREFILL = <span class="fn">auto</span>()
     <span class="cmt"># Used in dLLM</span>
     DLLM_EXTEND = <span class="fn">auto</span>()</pre>
-    <div class="annotation"><b>读懂这段：</b> 一个 batch 只有一个 ForwardMode——MIXED（chunked prefill 场景 prefill 与 decode 混跑）是唯一例外。IDLE 存在的理由在注释里：DP attention 下分不到请求的 worker 也要参与集合通信，得有「空跑」模式。</div>
-    <div class="annotation"><b>两个容易看漏的成员：</b> <code class="inline">DRAFT_EXTEND_V2</code> 在 <code class="inline">is_extend()</code> 里被单独用参数 <code class="inline">include_draft_extend_v2</code> 控制，默认<strong>不算</strong> extend——它是草稿模型侧的扩展，不是目标模型的 prefill，这个默认值一直是个易错点。<code class="inline">DLLM_EXTEND</code> 则被<strong>无条件</strong>算作 extend，因为 dLLM（扩散语言模型）的整块去噪在调度语义上就是一次 prefill。同一个谓词里两个成员两种待遇，读的时候值得对着 <code class="inline">forward_batch_info.py:205-213</code> 看一眼。</div>
+    <div class="annotation"><b>一个 batch 只有一个 ForwardMode：</b> MIXED（chunked prefill 场景 prefill 与 decode 混跑）是唯一例外。IDLE 存在的理由在注释里：DP attention 下分不到请求的 worker 也要参与集合通信，得有「空跑」模式。</div>
+    <div class="annotation"><b>两个容易看漏的成员：</b> <code class="inline">DRAFT_EXTEND_V2</code> 在 <code class="inline">is_extend()</code> 里被单独用参数 <code class="inline">include_draft_extend_v2</code> 控制，默认<strong>不算</strong> extend——它是草稿模型侧的扩展，不是目标模型的 prefill，这个默认值一直是个易错点。<code class="inline">DLLM_EXTEND</code> 则被<strong>无条件</strong>算作 extend，因为 dLLM（扩散语言模型）的整块去噪在调度语义上就是一次 prefill。同一个谓词里两个成员两种待遇，读的时候值得对着 <code class="inline">forward_batch_info.py:206-214</code> 看一眼。</div>
   </section>
 
   <section class="block">
@@ -218,7 +218,7 @@
     ...
     <span class="cmt"># 分配 KV 槽位 + req 池行号（调 mem_cache/allocation.alloc_for_extend）</span>
     out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = <span class="fn">alloc_for_extend</span>(self)</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">prefix_indices</code> 是 RadixCache 命中的前缀槽位（第 3 章），prefill 只需对增量部分做前向。<code class="inline">alloc_for_extend</code>（<code class="inline">mem_cache/allocation.py:344</code>）返回三元组：新 token 的 KV 槽位、每请求在 req 池中的行号（设备与 CPU 两份）。decode 步骤的对应操作是 <code class="inline">prepare_for_decode</code>，结构类似。</div>
+    <div class="annotation"><b>增量部分才做前向：</b> <code class="inline">prefix_indices</code> 是 RadixCache 命中的前缀槽位（第 3 章），prefill 只需对增量部分做前向。<code class="inline">alloc_for_extend</code>（<code class="inline">mem_cache/allocation.py:344</code>）返回三元组：新 token 的 KV 槽位、每请求在 req 池中的行号（设备与 CPU 两份）。decode 步骤的对应操作是 <code class="inline">prepare_for_decode</code>，结构类似。</div>
 
     <p><strong>worker 侧</strong>的 <code class="inline">init_new</code> 只做字段搬运，不做计算。注意 <code class="inline">init_new must not mutate the input ScheduleBatch</code> 这条契约：</p>
     <div class="code-title">python/sglang/srt/model_executor/forward_batch_info.py — ForwardBatch.init_new（摘录，注释为译注）</div>
@@ -236,7 +236,7 @@
         out_cache_loc=batch.out_cache_loc,
         seq_lens_sum=batch.seq_lens_sum,
         ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 这份「不修改输入」的约束是为 overlap 调度服务的：ScheduleBatch 在调度 stream 上继续被改写（比如 prep 下一个 batch），ForwardBatch 在 forward stream 上消费，共享字段必须只在调度侧写入。违例会造成极难复现的数据竞争。</div>
+    <div class="annotation"><b>「不修改输入」是为谁定的：</b> 这份约束是为 overlap 调度服务的：ScheduleBatch 在调度 stream 上继续被改写（比如 prep 下一个 batch），ForwardBatch 在 forward stream 上消费，共享字段必须只在调度侧写入。违例会造成极难复现的数据竞争。</div>
 
     <p>最后串起前向与采样的是 <code class="inline">TpModelWorker.forward_batch_generation</code>：</p>
     <div class="code-title">python/sglang/srt/managers/tp_worker.py — forward_batch_generation（摘录，注释为译注）</div>
@@ -254,7 +254,7 @@
         logits_output, forward_batch
     )
     <span class="kw">return</span> batch_result</pre>
-    <div class="annotation"><b>读懂这段：</b> 中间省略的分支有两个值得记住：spec 验证步（<code class="inline">is_verify</code>）跳过采样，验证逻辑由投机 worker 接管（第 13 章）；overlap 模式下采样可能被包进 <code class="inline">delay_sample_func</code> 延迟执行，让 GPU 先跑下一批的前向。</div>
+    <div class="annotation"><b>中间省略的分支有两个值得记住：</b> spec 验证步（<code class="inline">is_verify</code>）跳过采样，验证逻辑由投机 worker 接管（第 13 章）；overlap 模式下采样可能被包进 <code class="inline">delay_sample_func</code> 延迟执行，让 GPU 先跑下一批的前向。</div>
   </section>
 
   <section class="block">
@@ -293,7 +293,7 @@ self._prepare_eager_forward_batch(forward_batch)
 <span class="kw">else</span>:
     <span class="cmt"># eager：decode / extend / idle 都在这个 runner 内分派</span>
     ret = self.eager_runner.<span class="fn">execute</span>(forward_batch, ...)</pre>
-    <div class="annotation"><b>读懂这段：</b> 注意注释里的细节：只有 decode 图路径会预先填充静态缓冲并提前返回；split prefill、prefill 图、eager 都要先过 <code class="inline">_prepare_eager_forward_batch</code> 做 DP padding——因为那些路径跑的是真实 batch 形状。</div>
+    <div class="annotation"><b>只有 decode 图路径提前返回：</b> 注意注释里的细节：只有 decode 图路径会预先填充静态缓冲并提前返回；split prefill、prefill 图、eager 都要先过 <code class="inline">_prepare_eager_forward_batch</code> 做 DP padding——因为那些路径跑的是真实 batch 形状。</div>
 
     <p>decode 图 runner 支持三种后端配置，文件头的 docstring 写得很直白：</p>
     <div class="code-title">python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py — 后端选择（摘录，docstring 译文）</div>
@@ -307,7 +307,7 @@ Backend selection comes from cuda_graph_config.decode:
                       segmented capture (no torch.compile).
   - "tc_piecewise"     — not implemented for decode; logs a one-shot warning
                       and falls back to "full".</pre>
-    <div class="annotation"><b>读懂这段：</b> 默认 full：每个捕获形状一张完整 <code class="inline">torch.cuda.CUDAGraph</code>。breakable 是实验性的分段捕获（图内允许断点、不依赖 torch.compile）。tc_piecewise 只用于 prefill，decode 请求它会警告并退回 full。这是「同一个语义、三种捕获策略」的演进现场：full 最快但形状最死，breakable 换灵活性，仍在验证中。</div>
+    <div class="annotation"><b>同一个语义、三种捕获策略：</b> 默认 full：每个捕获形状一张完整 <code class="inline">torch.cuda.CUDAGraph</code>。breakable 是实验性的分段捕获（图内允许断点、不依赖 torch.compile）。tc_piecewise 只用于 prefill，decode 请求它会警告并退回 full。full 最快但形状最死，breakable 换灵活性，仍在验证中。</div>
 
     <p>回放前必须把真实数据拷进捕获时定下的静态 buffer——这就是 padding 的物理实现：</p>
     <div class="code-title">python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py — execute 与 load_batch（摘录，注释为译注）</div>
@@ -329,7 +329,7 @@ Backend selection comes from cuda_graph_config.decode:
     ...
     self.buffers.input_ids[: self.raw_num_token].<span class="fn">copy_</span>(forward_batch.input_ids)
     self.buffers.positions[: self.raw_num_token].<span class="fn">copy_</span>(forward_batch.positions)</pre>
-    <div class="annotation"><b>读懂这段：</b> 捕获时 batch 大小被 pad 到 <code class="inline">capture_bs</code> 列表里的固定值（如 1, 2, 4, 8 …），每档一张图；回放时选不小于真实 bs 的最小档，<code class="inline">load_batch</code> 把真实数据拷进前 <code class="inline">raw_num_token</code> 行，跑完再把输出切片回去。padding 行指向 ReqToTokenPool 的第 0 行（第 5 章讲过的保护行），读写都无害。</div>
+    <div class="annotation"><b>pad 到固定档、跑完切片：</b> 捕获时 batch 大小被 pad 到 <code class="inline">capture_bs</code> 列表里的固定值（如 1, 2, 4, 8 …），每档一张图；回放时选不小于真实 bs 的最小档，<code class="inline">load_batch</code> 把真实数据拷进前 <code class="inline">raw_num_token</code> 行，跑完再把输出切片回去。padding 行指向 ReqToTokenPool 的第 0 行（第 5 章讲过的保护行），读写都无害。</div>
 
     <p>什么样的 batch 会被拒之图外？<code class="inline">can_run_graph</code> 列了一串条件：</p>
     <div class="code-title">python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py — can_run_graph（摘录，注释为原文+译注）</div>
@@ -355,7 +355,7 @@ Backend selection comes from cuda_graph_config.decode:
         <span class="kw">if</span> self.is_encoder_decoder
         <span class="kw">else</span> <span class="kw">True</span>
     )</pre>
-    <div class="annotation"><b>读懂这段：</b> 拒绝图的条件都是「形状动态」类的：embedding 覆写（每请求不同）、投机宽度与捕获宽度不一致、多模态 encoder 长度为 0、bs 超过最大捕获档。默认 <code class="inline">disable_padding=False</code> 时 bs 档位不齐也能 pad 进图；关掉 padding 后就必须精确匹配。</div>
+    <div class="annotation"><b>拒绝的都是「形状动态」：</b> 拒绝图的条件都是「形状动态」类的：embedding 覆写（每请求不同）、投机宽度与捕获宽度不一致、多模态 encoder 长度为 0、bs 超过最大捕获档。默认 <code class="inline">disable_padding=False</code> 时 bs 档位不齐也能 pad 进图；关掉 padding 后就必须精确匹配。</div>
   </section>
 
   <section class="block">
@@ -398,7 +398,7 @@ Backend selection comes from cuda_graph_config.decode:
 </div>
 
 <footer>
-  深入浅出SGLang · 06 Model Runner · 版本 gateway-v0.3.1-9843-g6ad78f2281 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 06 Model Runner · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

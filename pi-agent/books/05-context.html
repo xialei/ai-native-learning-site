@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 上下文构建 Context</div>
     <h1>上下文构建 Context：决定「模型这一轮看到什么」</h1>
-    <div class="subtitle">★ 本站在意的最核心一章。上一章我们把会话存成了「树的条目」；这一章讲清这些条目<strong>如何被挑选、重排、投影成一串能发给 LLM 的消息</strong>——这才是 Agent 的「记忆」真正呈现在模型面前的地方。</div>
+    <div class="subtitle">★ 本站在意的最核心一章。上一章把会话存成了「树的条目」；这一章讲清这些条目<strong>如何被挑选、重排、投影成一串能发给 LLM 的消息</strong>——这才是 Agent 的「记忆」真正呈现在模型面前的地方。条目怎么变成消息？留哪些丢哪些？运行状态藏在哪？已经写进历史的消息还能改吗？</div>
   </div>
 
   <div class="epigraph">
@@ -46,8 +46,23 @@
   </div>
 
   <section class="block">
-    <h2><span class="num">5.1</span>先用一段话讲清楚</h2>
-    <p>Context 构建是一条<strong>两级流水线</strong>，输入是「当前分支的全部 Entry」，输出是「发给模型的消息」。<strong>运行状态（模型/思考级别/激活工具）不在这条管线里</strong>——它们是 <code class="inline">pi.lane.config/{lane}</code> 簿记值，由 lane 直接读（见 5.4）：</p>
+    <h2><span class="num">5.1</span>树上怎么长出模型眼前的消息</h2>
+    <p>第 4 章结束时，会话是一片 append-only 的 Entry 树。但模型不吃「树」，它吃一维的 <code class="inline">AgentMessage[]</code>。从树到消息，路上要过四道坎：</p>
+    <ul>
+      <li><strong>条目怎么变成消息？</strong>一条 message 条目出一条消息，那 compaction、branch_summary、custom 呢？</li>
+      <li><strong>留哪些、丢哪些？</strong>压缩过的旧消息为什么不删条目、却也不再出现在上下文里？</li>
+      <li><strong>运行状态（模型/思考级别）从哪来？</strong>它在不在「消息」里？</li>
+      <li><strong>已经写进历史的消息还能改吗？</strong>消息流 append-only，可「上一轮模型看错了工具结果」这种修正从哪进来？</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">答案地图</b>
+      前两问在 5.2–5.3（两级流水线：裁剪 + 投影），第三问在 5.4（两层各有答案：lane 值 vs 沿路径扫条目），第四问在 5.5（<code class="inline">context_edit</code> 追加式编辑 + <code class="inline">buildSessionProjection</code>）。5.6 汇总两条真实调用链，5.7 给一张投影速查表。先把结论摆在这里：<strong>上下文构建 = 「从树挑一条路径」→「裁剪到最近压缩点」→「逐条投影成消息」→「套用追加式编辑」</strong>，每一步都是可独立替换的纯函数。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>两级流水线：先裁剪，再投影</h2>
+    <p>Context 构建是一条两级流水线，输入是「当前分支的全部 Entry」，输出是「发给模型的消息」。先提醒一处容易混淆的地方：本章有两个同名的 <code class="inline">buildSessionContext</code>——<strong>核心 harness 线</strong>的（<code class="inline">packages/agent/src/harness/session/context.ts</code>，本节）与<strong>生产 canonical 线</strong>的（<code class="inline">packages/coding-agent/src/core/session-manager.ts</code>，5.5）——前者服务 runtime/Lane 实现，后者服务第 8 章的 AgentSession。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t5 d5">
         <title id="t5">Context 构建两级管线</title>
@@ -90,7 +105,7 @@
         <!-- 运行状态旁路 -->
         <line class="edge" x1="100" y1="116" x2="100" y2="170" stroke-dasharray="4 3"></line>
         <rect x="20" y="172" width="430" height="56" rx="8" fill="#e8f3fb" stroke="#2a9dd1" stroke-width="1.5"></rect>
-        <text class="lbl sm" x="235" y="194" text-anchor="middle" fill="#1a5d7a">运行状态不在这条管线里：</text>
+        <text class="lbl sm" x="235" y="194" text-anchor="middle" fill="#1a5d7a">运行状态（核心线）不在这条管线里：</text>
         <text class="lbl sm" x="235" y="214" text-anchor="middle" fill="#1a5d7a">模型/思考级别/激活工具 = pi.lane.config/{lane} 簿记值（4.3）</text>
 
         <!-- 关键提示 -->
@@ -98,14 +113,8 @@
         <text class="lbl sm" x="685" y="194" text-anchor="middle" fill="#92500a">⚠ 消息会被压缩，运行状态不会「跟着丢」——</text>
         <text class="lbl sm" x="685" y="214" text-anchor="middle" fill="#92500a">config 是独立于树的值，压缩/裁剪动不了它</text>
       </svg>
-      <div class="fig-cap">图 5.1：Context 构建两级管线。<code class="inline">pathEntries → contextEntries → messages</code> 是主轴；运行状态（模型/思考级/工具）独立存放在 <code class="inline">pi.lane.config/{lane}</code> 簿记值里。输出的 <code class="inline">messages</code> 再经第 3 章 <code class="inline">convertToLlm</code> 发往 LLM。</div>
+      <div class="fig-cap">图 5.1：Context 构建两级管线。<code class="inline">pathEntries → contextEntries → messages</code> 是主轴；核心线的运行状态（模型/思考级/工具）独立存放在 <code class="inline">pi.lane.config/{lane}</code> 簿记值里。输出的 <code class="inline">messages</code> 再经第 3 章 <code class="inline">convertToLlm</code> 发往 LLM。</div>
     </div>
-    <div class="annotation"><b>为什么要分两级，而不是一步到位？</b> 因为这两步解决的是两个不同的问题，混在一起就没法独立替换：<strong>① 裁剪</strong>管「留哪些 entry」（token 控制，第 6 章压缩在这介入）；<strong>② 投影</strong>管「一条 entry 变成几条消息」（compaction 会展开成「摘要+尾巴」多条，custom 交给 projector，见 5.3）。把它们拆成纯函数，才能让「换压缩策略」「换投影方式」各自演进。而「现在该用什么模型/思考级别」根本不是从历史推出来的——它是 lane 配置值，见 5.4。</div>
-  </section>
-
-  <section class="block">
-    <h2><span class="num">5.2</span>两步：谁干啥，数据怎么流</h2>
-    <p><code class="inline">buildSessionContext</code> 是总装函数，内部两步——先裁剪、再投影。<strong>注意它是 async 的</strong>：custom 条目的 projector 可能要查库/查文件，所以整个函数返回 <code class="inline">Promise&lt;AgentMessage[]&gt;</code>，只产出消息，不管状态：</p>
     <div class="code-title">packages/agent/src/harness/session/context.ts — 总装（async，只出消息）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export async function</span> <span class="fn">buildSessionContext</span>(
   pathEntries: <span class="kw">readonly</span> <span class="cl">Entry</span>[],
@@ -126,9 +135,9 @@
   }
   <span class="kw">return</span> messages;
 }</pre>
-    <div class="annotation"><b>关键看三处：</b> ① <strong>只返回 <code class="inline">messages</code></strong>——老版本会「顺带」派生模型/思考/工具状态，现在那件事完全归 lane 配置值管（5.4），投影管线变纯粹了。② <strong>投影是逐条 <code class="inline">await</code> 的 <code class="inline">for...of</code></strong> 而非 <code class="inline">flatMap</code>，因为 projector 可以是异步的。③ <strong>custom 条目在总装里分发</strong>：<code class="inline">sessionEntryToContextMessages</code> 对 custom 一律返回 <code class="inline">[]</code>，真正的投影由 <code class="inline">entryProjectors[customType]</code> 在总装处做——没配 projector 的 custom 条目<strong>静默消失</strong>，不会报错。另外第三参 <code class="inline">context</code> 原样透传给 projector，扩展可以从中拿运行时信息。</div>
+    <div class="annotation"><b>关键看三处：</b> <strong>只返回 <code class="inline">messages</code></strong>——老版本会「顺带」派生模型/思考/工具状态，现在那件事完全归 lane 配置值管（5.4），投影管线变纯粹了。<strong>投影是逐条 <code class="inline">await</code> 的 <code class="inline">for...of</code></strong> 而非 <code class="inline">flatMap</code>，因为 projector 可以是异步的。<strong>custom 条目在总装里分发</strong>：<code class="inline">sessionEntryToContextMessages</code> 对 custom 一律返回 <code class="inline">[]</code>，真正的投影由 <code class="inline">entryProjectors[customType]</code> 在总装处做——没配 projector 的 custom 条目<strong>静默消失</strong>，不会报错。另外第三参 <code class="inline">context</code> 原样透传给 projector，扩展可以从中拿运行时信息。</div>
 
-    <h3>① 裁剪：<code class="inline">buildContextEntries</code> —— 留哪些 entry</h3>
+    <h3>裁剪：<code class="inline">buildContextEntries</code> 决定留哪些 entry</h3>
     <div class="code-title">packages/agent/src/harness/session/context.ts — 找最近一次 compaction，前置</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">buildContextEntries</span>(pathEntries: <span class="kw">readonly</span> <span class="cl">Entry</span>[]): <span class="cl">Entry</span>[] {
   <span class="kw">let</span> compaction: <span class="cl">CompactionEntry</span> | <span class="kw">undefined</span>;
@@ -141,7 +150,7 @@
     ? [...pathEntries]                                        <span class="cmt">// 没压缩过：全量保留</span>
     : [compaction, ...pathEntries.slice(compactionIndex + <span class="nu">1</span>)]; <span class="cmt">// 有：摘要前置 + 尾巴</span>
 }</pre>
-    <div class="annotation"><b>别误读「丢掉之前」：</b> 丢的是<strong>压缩点之前的原始消息</strong>（它们已被摘要吸收），但 <code class="inline">compaction</code> 条目本身被<strong>拎到最前并保留</strong>——<code class="inline">[compaction, ...之后的尾巴]</code>。所以模型看到的是「摘要 + 最近细节」，而非「啥也没了」。这个函数没有任何 options 参数——扩展点只剩投影一侧（5.5），结构裁剪是<strong>写死的默认策略</strong>。</div>
+    <div class="annotation"><b>别误读「丢掉之前」：</b> 丢的是<strong>压缩点之前的原始消息</strong>（它们已被摘要吸收），但 <code class="inline">compaction</code> 条目本身被<strong>拎到最前并保留</strong>——<code class="inline">[compaction, ...之后的尾巴]</code>。所以模型看到的是「摘要 + 最近细节」，而非「啥也没了」。这个函数没有任何 options 参数——扩展点只剩投影一侧（5.2 末的 projector），结构裁剪是<strong>写死的默认策略</strong>。生产 canonical 线的同名函数（5.5）更精细：按 <code class="inline">firstKeptEntryId</code> 保留压缩点之前的保留区。</div>
 
     <h3>一个具体例子：压缩前后的上下文</h3>
     <p>假设当前分支从旧到新是 6 条 entry（<code class="inline">M</code>=message、<code class="inline">C</code>=compaction、<code class="inline">X</code>=custom），下面是它走完整条管线的样子：</p>
@@ -164,7 +173,6 @@
         <text class="lbl sm" x="760" y="38" text-anchor="middle">模型实际看到 · 6 条</text>
 
         <!-- 列1：原始 6 条（旧→新，纵向） -->
-        <!-- M1..M3 被 ① 丢掉（灰），C4/X5/M6/M7 保留 -->
         <g font-family="var(--font-mono)" font-size="11">
           <rect x="50" y="52" width="170" height="24" rx="5" fill="#eef2f5" stroke="#cfd8e0"></rect>
           <text x="60" y="68" fill="#9aa7b2">M1 user</text>
@@ -230,7 +238,7 @@
       </svg>
       <div class="fig-cap">图 5.2：一个实例。6 条 entry → ① 裁剪丢掉 C4 之前的 2 条（已被摘要吸收）、C4 前置，得 4 条 → ② 投影把 C4 展开成「摘要+尾巴」、X5 交给 async projector，共 6 条消息。custom 条目若没配 projector，会在这里<strong>静默消失</strong>。</div>
     </div>
-    <div class="annotation"><b>概括：</b> <strong>① 裁剪</strong>决定「留哪些 entry」（6→4），<strong>② 投影</strong>决定「一条变几条消息」（4→6，compaction 展开、custom 异步投影）——<strong>消息可压缩，但「当前模型/工具」根本不在消息里</strong>，它是 lane 配置值。</div>
+    <div class="annotation"><b>概括：</b> 裁剪决定「留哪些 entry」（6→4），投影决定「一条变几条消息」（4→6，compaction 展开、custom 异步投影）——两步各自是纯函数，才能独立替换。</div>
   </section>
 
   <section class="block">
@@ -239,7 +247,7 @@
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">isContextMessage</span>(message: <span class="cl">AgentMessage</span>): <span class="cl">boolean</span> {
   <span class="kw">return</span> (
     message.role !== <span class="st">"assistant"</span> ||
-    (message.stopReason !== <span class="st">"error"</span> && message.stopReason !== <span class="st">"aborted"</span> && message.stopReason !== <span class="st">"deferred"</span>)
+    (message.stopReason !== <span class="st">"error"</span> &amp;&amp; message.stopReason !== <span class="st">"aborted"</span> &amp;&amp; message.stopReason !== <span class="st">"deferred"</span>)
   );
 }
 
@@ -258,7 +266,7 @@
       <span class="kw">return</span> [];          <span class="cmt">// 不在这投：buildSessionContext 把 custom 分发给 entryProjectors</span>
   }
 }</pre>
-    <div class="annotation"><b>读懂这段（极其重要）：</b>
+    <div class="annotation">
       <ul>
         <li><strong>message</strong> → 先过 <code class="inline">isContextMessage</code> 过滤：<code class="inline">stopReason</code> 为 <code class="inline">error / aborted / deferred</code> 的 assistant 消息被<strong>丢弃</strong>——出错的、被中断的、挂起待续的半截回复不进上下文，避免污染下一轮对话。</li>
         <li><strong>compaction</strong> → 展开为「1 条摘要假消息 + 保留尾巴」，且<strong>尾巴同样过闸</strong>（<code class="inline">retainedTail.filter(isContextMessage)</code>）——半截回复哪怕被压缩保留下来，也不该再喂给模型。</li>
@@ -266,12 +274,31 @@
         <li><strong>custom</strong> → 这里固定返回 <code class="inline">[]</code>！投影不在本函数做——<code class="inline">buildSessionContext</code> 会查 <code class="inline">entryProjectors[customType]</code>（可能 async）并分发。没配 projector 的 custom 条目静默消失。</li>
       </ul>
     </div>
+    <p>生产 canonical 线的投影函数更多三件活：<code class="inline">custom_message</code> 条目（有 <code class="inline">display</code> 字段，直接投影成 custom 消息进上下文）、compaction 附带的 <code class="inline">systemMessage</code>（压缩边界完整 prompt 快照，第 6 章）、以及 5.5 的 <code class="inline">context_edit</code> 套用。骨架一致：一条 entry → 0~N 条消息。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.4</span>运行状态：不在投影管线里，在 lane 配置值里</h2>
-    <p>「现在用什么模型、哪个思考级别、哪些工具激活」不再从历史条目里<strong>扫</strong>出来——它们是 <code class="inline">pi.lane.config/{lane}</code> 簿记值（第 4 章），lane 启动时读一次，之后<strong>写入即生效</strong>：</p>
-    <div class="code-title">packages/agent/src/harness/runtime/lane.ts — 配置就是一次 value 写入</div>
+    <h2><span class="num">5.4</span>运行状态：两层两种答案</h2>
+    <p>「现在用什么模型、哪个思考级别、哪些工具激活」从哪来？<strong>两条实现线给出了两种答案</strong>，各自的约束不同：</p>
+    <ul>
+      <li><strong>核心 harness 线（Lane/Lane）</strong>：状态是 <code class="inline">pi.lane.config/{lane}</code> 簿记值（第 4 章 4.3）——lane 启动时读一次，写入即生效。多个 lane 并存时各读各的值，读是 O(1)。</li>
+      <li><strong>生产 canonical 线（SessionManager）</strong>：状态是<strong>普通条目</strong>（<code class="inline">thinking_level_change</code> / <code class="inline">model_change</code> entry），投影函数沿当前路径扫到「最后一条」作为现值；<code class="inline">buildSessionProjection</code> 返回的 <code class="inline">SessionProjection</code> 就带着 <code class="inline">{thinkingLevel, model}</code> 两个字段。单文件 JSONL 自描述——重放即恢复，无需独立的值轨道。</li>
+    </ul>
+    <div class="code-title">session-manager.ts · getSessionContextSettings（canonical 线：沿路径扫状态条目）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">getSessionContextSettings</span>(path: <span class="cl">SessionEntry</span>[]): Pick&lt;<span class="cl">SessionContext</span>, <span class="st">"thinkingLevel"</span> | <span class="st">"model"</span>&gt; {
+  <span class="kw">let</span> thinkingLevel = <span class="st">"off"</span>;
+  <span class="kw">let</span> model: { provider: string; modelId: string } | <span class="kw">null</span> = <span class="kw">null</span>;
+  <span class="kw">for</span> (<span class="kw">const</span> entry <span class="kw">of</span> path) {
+    <span class="kw">if</span> (entry.type === <span class="st">"thinking_level_change"</span>) thinkingLevel = entry.thinkingLevel;
+    <span class="kw">else if</span> (entry.type === <span class="st">"model_change"</span>) model = { provider: entry.provider, modelId: entry.modelId };
+    <span class="kw">else if</span> (entry.type === <span class="st">"message"</span> &amp;&amp; entry.message.role === <span class="st">"assistant"</span>)
+      model = { provider: entry.message.provider, modelId: entry.message.model };   <span class="cmt">// 兜底：最后一条回复的模型</span>
+  }
+  <span class="kw">return</span> { thinkingLevel, model };
+}</pre>
+    <div class="annotation"><b>两种答案怎么选：</b> 关键差异是「分支语义」。Lane 线天生多分支（每 lane 一棵子树 + 自己的 config），值必须带地址隔离；canonical 线是单主会话（分叉即造新文件），沿路径扫条目既拿到现值、又免费拿到「切换历史」（哪一轮换的模型，UI 回放时可见）。共同点更重要：<strong>状态都不混进「投影出的消息内容」</strong>——压缩/裁剪动得了消息，动不了「现在该用什么模型」。核心线先看 lane 写入（演示），再看两线对比。</div>
+
+    <div class="code-title">packages/agent/src/harness/runtime/lane.ts — 配置就是一次 value 写入（核心线）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private async</span> <span class="fn">setConfiguration</span>(
   update: (configuration: LaneState[<span class="st">"configuration"</span>]) =&gt; LaneState[<span class="st">"configuration"</span>],
   event: (previous, value) =&gt; LaneConfigEventPayload,
@@ -289,7 +316,6 @@
     };
   }, context);
 }</pre>
-    <div class="annotation"><b>读懂这段 + 三条读写路径：</b> 配置是<strong>一个 JSON 值</strong>（<code class="inline">LaneConfiguration = {model, thinkingLevel, activeToolNames}</code>，session/types.ts:69），不是条目。<strong>读</strong>：<code class="inline">getModel/getThinkingLevel/getActiveTools</code> 直接读内存里的 <code class="inline">this.state.configuration</code>；<strong>写</strong>：<code class="inline">setModel/setThinkingLevel/setActiveTools</code> 走 <code class="inline">setConfiguration</code> 提交 value 写（如上）；<strong>恢复</strong>：重启时 <code class="inline">restoreSession</code> 用 <code class="inline">scanValues(laneConfig(""))</code> 一次性扫出所有 lane 的配置（runtime/restore.ts），与 branch tip、lane state 一起重建运行时。对比老设计（把切换记成 <code class="inline">model_change</code> 等 Entry 再扫历史）：<strong>值读取是 O(1)</strong>，不用扫全分支；且压缩/裁剪永远动不了它——这正是第 4 章「Entry 树与簿记值分离」的直接受益者。</div>
 
     <style>
       .ds-demo{margin-top:18px}
@@ -338,68 +364,173 @@
         </div>
         <div class="ds-chips" id="ds-chips"></div>
       </div>
-      <div class="fig-cap" style="margin-top:8px">配置不是「从历史里推出来的」，而是「谁最后写谁生效」的一个值——恢复时读值即可，无需重放任何条目。</div>
+      <div class="fig-cap" style="margin-top:8px">配置不是「从历史里推出来的」，而是「谁最后写谁生效」的一个值——恢复时读值即可，无需重放任何条目。canonical 线的「扫条目」版本语义相同，只是「值」换成了「最后一条状态条目」。</div>
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.5</span>buildSessionContext 里唯一的扩展点：entryProjectors</h2>
-    <div class="code-title">packages/agent/src/harness/session/context.ts — options + projector 签名</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// 构建选项里只有一个扩展点：custom 条目投影器（hooks/transformContext 等扩展在别的层，见第 8 章）</span>
-<span class="kw">export interface</span> <span class="cl">SessionContextBuildOptions</span> {
-  entryProjectors?: <span class="kw">Readonly</span>&lt;Record&lt;<span class="kw">string</span>, <span class="cl">EntryProjector</span>&gt;&gt;;
-}
+    <h2><span class="num">5.5</span>追加式上下文编辑：context_edit 与规范投影</h2>
+    <p>最后一个问题最难：<strong>消息流 append-only，「改历史」从哪进来？</strong>生产 canonical 线的答案是加一种条目：<code class="inline">context_edit</code>——它不改目标条目，而是<strong>追加一条「编辑指令」</strong>，指明「哪个条目（targetId）在模型上下文里该呈现成什么」：</p>
+    <div class="code-title">session-manager.ts · ContextEditEntry（注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Content that an append-only context edit may replace without changing message metadata. */</span>
+<span class="kw">export type</span> <span class="cl">ContextEditableContent</span> =
+  | UserMessage[<span class="st">"content"</span>]
+  | AssistantMessage[<span class="st">"content"</span>]
+  | ToolResultMessage[<span class="st">"content"</span>]
+  | CustomMessage[<span class="st">"content"</span>];
 
-<span class="cmt">// projector：把一个 custom 条目变成 LLM 消息（异步、两参、可返回 undefined）</span>
-<span class="kw">export type</span> <span class="cl">EntryProjector</span> = (
-  entry: <span class="cl">CustomEntry</span>,
-  context: <span class="cl">Context</span>,            <span class="cmt">// 透传运行时上下文（buildSessionContext 的第三参）</span>
-) =&gt; <span class="cl">AgentMessage</span>[] | <span class="kw">undefined</span> | <span class="cl">Promise</span>&lt;<span class="cl">AgentMessage</span>[] | <span class="kw">undefined</span>&gt;;</pre>
-    <div class="annotation"><b>读懂这段：</b> 扩展点收敛成了一个——老的 <code class="inline">entryTransforms</code>（改条目数组结构的 transform 链）已从源码里移除，结构裁剪收敛为写死的 compaction 策略；想要「隐藏/改写条目结构」，现在只能<strong>在投影层做减法</strong>：projector 返回 <code class="inline">[]</code> 或 <code class="inline">undefined</code> 即可把某个 custom 条目从上下文里隐掉。第二个参数 <code class="inline">context</code> 让 projector 能拿到运行时信息，异步返回意味着 projector 可以查库、查文件后再决定给模型看什么。生产 harness 用 <code class="inline">custom</code> 条目承载「工具产物摘要 / 分支导航」等信息，再配 projector 决定它们如何出现在上下文里。</div>
+<span class="cmt">/** Append-only change to one earlier entry's contribution to model context. */</span>
+<span class="kw">export interface</span> <span class="cl">ContextEditEntry</span> <span class="kw">extends</span> <span class="cl">SessionEntryBase</span> {
+  type: <span class="st">"context_edit"</span>;
+  targetId: string;                          <span class="cmt">// 指向更早的 message / custom_message 等条目</span>
+  <span class="cmt">/** Null omits the target from model context. A value replaces only its content. */</span>
+  replacement: { content: <span class="cl">ContextEditableContent</span> } | <span class="kw">null</span>;   <span class="cmt">// null = 从模型上下文里隐去</span>
+}</pre>
+    <div class="annotation"><b>读懂这个类型：</b> 三个设计决定值得留意。<strong>其一</strong>，<code class="inline">replacement</code> 是「内容替换」而非「整条替换」——消息的 id、role、timestamp 等元数据原样保留，只换 <code class="inline">content</code>；<strong>其二</strong>，<code class="inline">null</code> 有专门语义「从模型上下文省略」——这正是第 6 章溢出恢复用来「隐去失败尝试」的手段（<code class="inline">appendContextEdit(targetId, null)</code>）；<strong>其三</strong>，可编辑范围用类型收窄到四种角色（user/assistant/toolResult/custom）——<code class="inline">system</code> 消息不在其列，prompt 状态不受追加式编辑影响。API 侧是 <code class="inline">SessionManager.appendContextEdit(targetId, replacement)</code>：只追加、不回改，同一 targetId 可以被编辑多次——<strong>同分支上最后一条生效</strong>。</div>
+    <p>这些编辑在哪一步生效？在 <code class="inline">buildSessionProjection</code>——v0.87 把它立为 canonical 线的<strong>唯一投影入口</strong>，返回值从裸消息数组升级成带来源的结构：</p>
+    <div class="code-title">session-manager.ts · buildSessionProjection（行号 543 起；节选，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">buildSessionProjection</span>(
+  entries: <span class="cl">SessionEntry</span>[], leafId?: string | <span class="kw">null</span>, byId?: Map&lt;string, <span class="cl">SessionEntry</span>&gt;,
+): <span class="cl">SessionProjection</span> {
+  <span class="kw">const</span> path = <span class="fn">buildSessionPath</span>(entries, leafId, byId);          <span class="cmt">// 树 → 当前路径</span>
+  <span class="kw">const</span> { thinkingLevel, model } = <span class="fn">getSessionContextSettings</span>(path);   <span class="cmt">// ③ 沿路径扫状态</span>
+  <span class="kw">const</span> contextEntries = <span class="fn">buildContextEntries</span>(entries, leafId, byId);  <span class="cmt">// ② 裁剪（firstKeptEntryId 语义）</span>
+  <span class="cmt">// 收集编辑指令：同 targetId 后写覆盖先写（同分支最后一条生效）</span>
+  <span class="kw">const</span> edits = <span class="kw">new</span> <span class="cl">Map</span>&lt;string, <span class="cl">ContextEditEntry</span>&gt;();
+  <span class="kw">for</span> (<span class="kw">const</span> entry <span class="kw">of</span> contextEntries) {
+    <span class="kw">if</span> (entry.type === <span class="st">"context_edit"</span>) edits.set(entry.targetId, entry);
+  }
+  <span class="kw">const</span> projectedEntries = contextEntries.map(
+    (sourceEntry, index): <span class="cl">ProjectedSessionEntry</span> =&gt; ({
+      sourceEntry,
+      <span class="cmt">// 老压缩条目若被保留在保留区里（其裸 id 在最新保留范围内），只有</span>
+      <span class="cmt">// index 0 的最新 compaction 贡献 checkpoint 与摘要，其余投影为空</span>
+      messages: sourceEntry.type === <span class="st">"compaction"</span> &amp;&amp; index &gt; <span class="nu">0</span>
+        ? []
+        : <span class="fn">projectContextEntry</span>(sourceEntry, edits.get(sourceEntry.id)),
+    }),
+  );
+  <span class="kw">return</span> {
+    entries: projectedEntries,                          <span class="cmt">// 带来源：sourceEntry → messages</span>
+    messages: projectedEntries.<span class="fn">flatMap</span>((entry) =&gt; entry.messages),
+    thinkingLevel, model,
+  };
+}</pre>
+    <div class="annotation">与核心线相比多了四件活。<strong>一是带来源</strong>：每条投影消息都能溯源到 <code class="inline">sourceEntry</code>——第 6 章的切割点算法、压缩的「保留区」都要靠它把「消息」映射回「条目」；<strong>二是 firstKeptEntryId 裁剪</strong>：canonical 线的 compaction 条目带 <code class="inline">firstKeptEntryId</code>，裁剪保留「压缩点之前从它开始的保留区」，比核心线「一刀切」更省（保留区里 5.4 的状态条目也因此能被扫到）；<strong>三是状态随投影返回</strong>：<code class="inline">thinkingLevel</code>/<code class="inline">model</code> 一次算出，调用方不必再扫；<strong>四是编辑套用</strong>：<code class="inline">projectContextEntry</code> 在普通投影之后查 <code class="inline">edits.get(sourceEntry.id)</code>——有编辑就替换 content，<code class="inline">replacement === null</code> 整条隐去，assistant/toolResult 的字符串替换归一化成单个 text block（provider 那侧只认 content block）。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t5f d5f">
+        <title id="t5f">追加式编辑的投影</title>
+        <desc id="d5f">目标条目 + 两条 context_edit 追加指令，投影时最后一条生效</desc>
+        <defs>
+          <marker id="arrow5f" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
+          </marker>
+        </defs>
+        <!-- 上半：append-only 条目流 -->
+        <rect class="node" x="30" y="30" width="200" height="52" rx="8" fill="#eaf6f4" stroke="#14b8a6"></rect>
+        <text class="lbl" x="115" y="52" text-anchor="middle">M3 message</text>
+        <text class="lbl sm" x="115" y="70" text-anchor="middle">toolResult（读错文件）</text>
+
+        <rect class="node" x="250" y="30" width="200" height="52" rx="8" fill="#f5eefb" stroke="#7c5cd6"></rect>
+        <text class="lbl" x="350" y="52" text-anchor="middle">edit#1 → M3</text>
+        <text class="lbl sm" x="350" y="70" text-anchor="middle">replacement: 修正文本</text>
+
+        <rect class="node" x="470" y="30" width="200" height="52" rx="8" fill="#f5eefb" stroke="#7c5cd6"></rect>
+        <text class="lbl" x="570" y="52" text-anchor="middle">edit#2 → M3</text>
+        <text class="lbl sm" x="570" y="70" text-anchor="middle">replacement: null</text>
+
+        <rect class="node" x="690" y="30" width="180" height="52" rx="8" fill="#eaf6f4" stroke="#14b8a6"></rect>
+        <text class="lbl" x="780" y="52" text-anchor="middle">M4 user</text>
+        <text class="lbl sm" x="780" y="70" text-anchor="middle">（正常追加）</text>
+
+        <line x1="230" y1="56" x2="248" y2="56" stroke="#556674" stroke-width="2" marker-end="url(#arrow5f)"></line>
+        <line x1="450" y1="56" x2="468" y2="56" stroke="#556674" stroke-width="2" marker-end="url(#arrow5f)"></line>
+        <line x1="670" y1="56" x2="688" y2="56" stroke="#556674" stroke-width="2" marker-end="url(#arrow5f)"></line>
+
+        <!-- 分流：edits map -->
+        <path d="M570 82 L570 130 L350 130" fill="none" stroke="#7c5cd6" stroke-width="1.6" stroke-dasharray="5 4"></path>
+        <rect x="250" y="130" width="200" height="40" rx="8" fill="#fff" stroke="#7c5cd6"></rect>
+        <text class="lbl" x="350" y="154" text-anchor="middle" fill="#5b3fa0">edits map: M3 → edit#2</text>
+        <text class="lbl sm" x="350" y="122" text-anchor="middle" fill="#5b3fa0">收进 Map（后写覆盖）</text>
+
+        <!-- 下半：投影结果 -->
+        <path d="M115 82 L115 200" fill="none" stroke="#556674" stroke-width="2" marker-end="url(#arrow5f)"></path>
+        <path d="M350 170 L350 200" fill="none" stroke="#7c5cd6" stroke-width="2" marker-end="url(#arrow5f)"></path>
+        <path d="M780 82 L780 200" fill="none" stroke="#556674" stroke-width="2" marker-end="url(#arrow5f)"></path>
+
+        <text class="lbl sm" x="115" y="196" text-anchor="middle" fill="#556674">投影时套用 ↓</text>
+
+        <rect class="node" x="30" y="210" width="250" height="56" rx="8" fill="#eef2f5" stroke="#cfd8e0" stroke-dasharray="5 4"></rect>
+        <text class="lbl" x="155" y="233" text-anchor="middle" fill="#9aa7b2">M3 → （无消息）</text>
+        <text class="lbl sm" x="155" y="253" text-anchor="middle" fill="#9aa7b2">replacement=null → 整条隐去</text>
+
+        <rect class="node" x="330" y="210" width="250" height="56" rx="8" fill="#eaf6f4" stroke="#14b8a6"></rect>
+        <text class="lbl" x="465" y="233" text-anchor="middle">M4 → 1 条 user 消息</text>
+        <text class="lbl sm" x="465" y="253" text-anchor="middle">元数据原样，内容可被后续 edit 换</text>
+
+        <rect class="node" x="630" y="210" width="220" height="56" rx="8" fill="#fdf4e3" stroke="#e8850a"></rect>
+        <text class="lbl" x="740" y="233" text-anchor="middle" fill="#92500a">transcript 没变</text>
+        <text class="lbl sm" x="740" y="253" text-anchor="middle" fill="#92500a">变的只是「投影」这一层</text>
+      </svg>
+      <div class="fig-cap">图 5.3：追加式编辑。edit#1、edit#2 都指向 M3，投影时 Map 收敛后 edit#2 生效——M3 从模型上下文隐去，而 transcript 里的三条原始条目一条未动。「改历史」被搬到了投影层。</div>
+    </div>
+    <div class="callout info">
+      <b class="tag">为什么这么设计</b>
+      「改历史」有两条路：回改原条目（破坏 append-only，崩溃恢复与审计全毁），或<strong>追加编辑指令、投影时套用</strong>（历史不可变，修正可追溯、可撤销——删掉编辑条目即还原）。Pi 选后者，而且把「谁在投影里生效」收敛成一条规则：同分支最后一条编辑赢。第 6 章的溢出恢复（隐去失败尝试）、压缩的 retain-none 语义，都建立在这层之上。
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.6</span>从会话树到 LLM：真实调用链</h2>
-    <p><code class="inline">buildSessionContext</code> 产出的是 <code class="inline">AgentMessage[]</code>。之后走第 3 章说过的转换，最终到 <code class="inline">Message[]</code> 发往 LLM。这条「会话树 → 上下文 → LLM」的链路就是一次 <code class="inline">run</code> 中每一轮模型调用前的必经之路。生产 harness 的入口在 <code class="inline">runtime/drive/generation.ts</code>：</p>
-    <div class="code-title">链路总括（runtime/transcript.ts + runtime/drive/generation.ts）</div>
-    <pre class="code"><span class="lang-tag">text</span>每次生成前的取数（runtime/transcript.ts）：
+    <h2><span class="num">5.6</span>两条真实调用链</h2>
+    <p>两条线各有自己的取数入口，「会话树 → 上下文 → LLM」是每一轮模型调用前的必经之路：</p>
+    <div class="code-title">链路总括（核心线：runtime/transcript.ts + drive/generation.ts；生产线：agent-session.ts）</div>
+    <pre class="code"><span class="lang-tag">text</span>核心线（runtime/Lane，每轮生成前主动取）：
 lane 状态.tipId ──scanBranch({stopAtType:"compaction", order:"newestFirst"})──&gt; 原始 Entry[]
       └─ .reverse() ──&gt; 旧→新的 pathEntries
-            └─ buildSessionContext(entries, {entryProjectors}, context)
+            └─ buildSessionContext(entries, {entryProjectors}, context)   ← transcript.ts:69 readBoundedContext
                  ├─ buildContextEntries（① 裁剪：最近 compaction 前置）
                  └─ sessionEntryToContextMessages / entryProjectors（② 投影）
-                      └─&gt; AgentMessage[]
+                      └─&gt; AgentMessage[] ──transform_context 钩子──&gt; LLM
 
-发往 LLM 前的最后一跳（generation.ts 的 streamHarnessAssistant 调用）：
-AgentMessage[] ──transformContext（transform_context 钩子链，可改 messages/systemPrompt）
-      ──&gt; toProviderMessages ──&gt; Message[] ──&gt; LLM
-      （这批 {systemPrompt, messages, tools} 再往下交给 pi-ai，由 normalizeContext 折叠成 TranscriptContext，见第 10 章）</pre>
-    <div class="annotation"><b>关键点：</b> 「会话树构建的上下文」<strong>替代了</strong>第 3 章里那个朴素 <code class="inline">context.messages</code>——生成入口 <code class="inline">readBoundedContext</code> 每轮直接调 <code class="inline">buildSessionContext</code>（transcript.ts:69），让「模型看到什么」完全由会话树驱动；而 <code class="inline">transform_context</code> 钩子是<strong>树上构建完成之后</strong>的最后一道可编程关（可改消息、也可改系统提示），由 <code class="inline">lane.hooks.runWithGate("transform_context", ...)</code> 触发。</div>
+生产 canonical 线（AgentSession，prepareRequest 被动接管）：
+每次 provider 请求前（含第一次，第 8 章 8.2b）
+      └─ this.sessionManager.buildSessionProjection()    ← session-manager.ts:543
+           ├─ buildSessionPath → 裁剪 → 收集 context_edit → projectContextEntry
+           └─&gt; { entries, messages, thinkingLevel, model }
+      └─ 用投影的 messages 整体替换请求 context；model/thinkingLevel 同步刷新</pre>
+    <div class="annotation"><b>两条线的分工：</b> 核心线是「生成入口主动调投影」（<code class="inline">readBoundedContext</code>，generation.ts:101），扩展点在 <code class="inline">entryProjectors</code>（异步 custom 投影）；生产线是「钩子被动接管请求」——<code class="inline">prepareRequest</code> 每次请求前用 <code class="inline">buildSessionProjection().messages</code> 整体替换上下文，让 SessionManager 成为唯一事实来源。共同的后半程也一样：<code class="inline">AgentMessage[]</code> → <code class="inline">convertToLlm</code> → provider <code class="inline">Message[]</code>（第 3 章），再由 pi-ai 的 <code class="inline">normalizeContext</code> 折叠（第 10 章）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.7</span>一个「思考粒度」示例</h2>
-    <p>假设分支里有这些条目（从新到旧示意）：</p>
+    <h2><span class="num">5.7</span>投影速查表</h2>
+    <p>两条线合并成一张表——「什么条目，投影出什么」：</p>
     <table class="tbl">
-      <tr><th>Entry</th><th>投影出什么（进上下文）</th></tr>
-      <tr><td>message · assistant (stopReason=deferred)</td><td>（无——isContextMessage 丢弃）</td></tr>
-      <tr><td>message · assistant (stopReason=error/aborted)</td><td>（无——isContextMessage 丢弃）</td></tr>
-      <tr><td>message · toolResult</td><td>1 条 toolResult 消息</td></tr>
-      <tr><td>message · assistant</td><td>1 条 assistant 消息</td></tr>
-      <tr><td>message · user</td><td>1 条 user 消息</td></tr>
-      <tr><td>compaction</td><td>1 条摘要 + retainedTail（过滤后）若干条</td></tr>
-      <tr><td>custom（无 projector）</td><td>（无——静默消失）</td></tr>
-      <tr><td>custom（配了 projector）</td><td>0~N 条，await projector(entry, context)</td></tr>
-      <tr><td>（compaction 更早的…）</td><td>（被 buildContextEntries 丢掉）</td></tr>
+      <tr><th>条目</th><th>投影出什么（进上下文）</th><th>在哪条线</th></tr>
+      <tr><td>message · assistant (stopReason=error/aborted/deferred)</td><td>（无——isContextMessage 丢弃）</td><td>两线同</td></tr>
+      <tr><td>message · user / assistant / toolResult / system</td><td>1 条消息（元数据原样）</td><td>两线同</td></tr>
+      <tr><td>compaction</td><td>1 条摘要（+canonical 线附带 systemMessage 快照）+ 保留尾巴（过闸）</td><td>两线同，细节不同</td></tr>
+      <tr><td>branch_summary（有 summary）</td><td>1 条分支摘要假消息</td><td>两线同</td></tr>
+      <tr><td>custom（核心线，无 projector / 有 projector）</td><td>（无） / 0~N 条，await projector(entry, context)</td><td>核心线</td></tr>
+      <tr><td>custom（canonical 线，display/state 条目）</td><td>（无——纯状态条目，重放恢复扩展内部状态用）</td><td>canonical 线</td></tr>
+      <tr><td>custom_message</td><td>1 条 custom 消息（display 控制 TUI 渲染，不影响上下文）</td><td>canonical 线</td></tr>
+      <tr><td>context_edit → targetId</td><td>套用到目标条目的投影：换 content，或 null 整条隐去</td><td>canonical 线</td></tr>
+      <tr><td>thinking_level_change / model_change</td><td>（不投影成消息；被 ③ 扫成现值）</td><td>canonical 线</td></tr>
     </table>
-    <p>最终发给 LLM 的是：<strong>压缩摘要 + 过滤后的尾巴 + 最近的 user/assistant/toolResult + custom 投影</strong>。而「当前用什么模型」不在消息里——它是 <code class="inline">pi.lane.config/{lane}</code> 值，生成准备阶段读出后传给循环。</p>
+    <p>最终发给 LLM 的是：<strong>压缩摘要 + 过滤后的尾巴 + 最近的消息 + custom 投影 + 套用编辑后的修正</strong>。而「当前用什么模型」不在消息里——核心线读 lane 值，canonical 线由投影随行返回。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">5.8</span>对自研与使用的启示</h2>
+    <h2><span class="num">5.8</span>收尾：四个答案</h2>
+    <ul>
+      <li><strong>条目怎么变消息？</strong>逐条投影：message 出 1 条（半截回复过闸丢弃）、compaction 展开成摘要+尾巴、branch_summary 出 1 条摘要、custom 走 projector（核心线）或 custom_message 直投影（canonical 线）。</li>
+      <li><strong>留哪些丢哪些？</strong>裁剪到最近压缩点：核心线「摘要前置 + 之后全留」；canonical 线按 <code class="inline">firstKeptEntryId</code> 连保留区一起留。原始条目永远不删——丢的只是「投影」。</li>
+      <li><strong>运行状态从哪来？</strong>不混进消息：核心线是 <code class="inline">pi.lane.config</code> 值（O(1) 读写），canonical 线沿路径扫状态条目、由投影随行返回。压缩/裁剪动不了它。</li>
+      <li><strong>历史还能改吗？</strong><code class="inline">context_edit</code> 追加式编辑：投影时按 targetId 套用，最后一条生效；<code class="inline">replacement: null</code> 整条隐去。transcript 永不回改，修正全在投影层。</li>
+    </ul>
     <div class="callout warn">
       <b class="tag">要点</b>
-      <strong>① 把「上下文管理」做成独立的纯函数</strong>（输入条目 → 输出消息），不要散落在循环里。<strong>② 用「条目 → 投影」而非「直接存消息」</strong>，才能支持压缩摘要、分支摘要、自定义投影。<strong>③ 运行状态别混进上下文</strong>：模型/思考/工具是带地址的配置值，读写 O(1)、恢复即读，别学老设计扫历史重推。<strong>④ 扩展点宁少而稳</strong>：一个 async projector（条目 → 消息）就够覆盖「注入/隐藏/改写」三类需求；给用户改「结构」的自由，往往意味着压缩策略失效。</div>
+      给自研者四条：把「上下文管理」做成独立的纯函数（输入条目 → 输出消息），不要散落在循环里；用「条目 → 投影」而非「直接存消息」，才能支持压缩摘要、分支摘要、自定义投影、追加式编辑——Pi 能加 <code class="inline">context_edit</code> 这种新机制而不用改存储格式，正是因为消息从来不是存储的一等公民，投影才是；运行状态别混进上下文，它是独立的值或独立的状态条目，读写便宜、恢复即得；扩展点宁少而稳——一个 async projector（核心线）就够覆盖「注入/隐藏/改写」，给用户改「结构」的自由，往往意味着压缩策略失效。
+    </div>
   </section>
 
   <div class="arrow-nav">
@@ -409,7 +540,7 @@ AgentMessage[] ──transformContext（transform_context 钩子链，可改 mes
 </div>
 
 <footer>
-  Pi Agent Harness · 05 上下文构建 Context · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 05 上下文构建 Context · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

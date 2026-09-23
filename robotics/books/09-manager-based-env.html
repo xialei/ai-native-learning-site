@@ -35,12 +35,12 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 Manager-Based 环境内核</div>
     <h1>Manager-Based 环境内核：step() 的八步心跳</h1>
-    <div class="subtitle">第 8 章说「任务 = 配置类」，但配置只是剧本——真正让世界转起来的是 ManagerBasedRLEnv.step()：一个被 RL 训练循环按控制节拍调用的心跳。它按固定顺序调度八个 Manager（动作→记录→物理→终止→奖励→重置→指令→观测），顺序错一步，梯度就错。本章逐行走读这八步，并把 Lift 任务的每一份配置对号入座。</div>
+    <div class="subtitle">第 8 章说「任务 = 配置类」，但配置只是剧本——真正让世界转起来的是 ManagerBasedRLEnv.step()：一个被 RL 训练循环按控制节拍调用的心跳。本章问下去：<strong>八个 Manager 怎么装配、顺序凭什么？step() 的八步各做什么？重置为什么顺序敏感？一集 episode 从头到尾怎么走？Manager 式和直接式环境怎么选？</strong>9.1 从装配讲起，9.2–9.4 走读心跳，9.5 对比取舍，9.6 收尾。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">9.1</span>八大 Manager 与装配顺序</h2>
-    <p><code class="inline">ManagerBasedRLEnv.__init__</code> 做的第一件实事是 <code class="inline">load_managers</code>（isaaclab/envs/manager_based_rl_env.py:110）。装配顺序不是随意的：</p>
+    <h2><span class="num">9.1</span>① 八大 Manager 与装配顺序</h2>
+    <p>先问「零件怎么装」。<code class="inline">ManagerBasedRLEnv.__init__</code> 做的第一件实事是 <code class="inline">load_managers</code>（isaaclab/envs/manager_based_rl_env.py:110）。装配顺序不是随意的：</p>
     <div class="code-title">isaaclab/envs/manager_based_rl_env.py:110 — load_managers 的顺序即依赖</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">load_managers</span>(self):
     <span class="cmt"># command manager 先建：observation manager 计算时要读它的术语</span>
@@ -69,7 +69,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.2</span>step() 八步流程总览</h2>
+    <h2><span class="num">9.2</span>② step() 八步流程总览</h2>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t14 d14">
         <title id="t14">ManagerBasedRLEnv.step() 八步泳道图</title>
@@ -137,12 +137,12 @@
       </div>
       <div class="fig-cap">图 9.1：step() 八步。①-② 是「世界推进」，③-⑤ 是「评价」，⑥ 是「局部重生」，⑦-⑧ 是「下一轮感知」。顺序不可交换——比如 reward 若在 termination 前算，就看不到死前最后一步的信息。</div>
     </div>
-    <div class="annotation"><b>对照源码：</b>上面 ② 的两个分支是 3.0 的重构——经典实现是 <code class="inline">for _ in range(decimation)</code> 循环里每拍 <code class="inline">apply_action + sim.step</code>；新分支当 <code class="inline">_physics_handles_decimation</code> 为真时改为「一次 apply + write_data_to_sim，循环内仅 sim.step(render=False)」，物理侧自行复用动作，省去 N−1 次 Python 侧调用。计数器多了一条轴：reset 模式的 event 改看 _sim_step_counter（物理步），除以 decimation 得到「环境步数」再传进去；common_step_counter 仍然每步自增（:249），课程术语 modify_reward_weight 读的也仍是它（envs/mdp/curriculums.py:43）。两条路径的对外语义一致：控制节拍 = 物理 dt × decimation。RecorderManager 的钩子（pre_step / 每物理步 post / pre_reset / post_reset）让「录制数据」与「训练推进」解耦——第 11 章用它生成 VLA 微调数据。⑥ 里还有一个容易漏看的开关：<code class="inline">compute_final_obs</code>（cfg 项）开启时，重置前会先算一帧观测塞进 extras["final_obs"]——「终止时刻的观测」对 credit assignment 和 Same-Step 自动重置都重要。</div>
+    <div class="annotation"><b>对照源码：</b>上面 ② 的两个分支是 3.0 的重构——经典实现是 <code class="inline">for _ in range(decimation)</code> 循环里每拍 <code class="inline">apply_action + sim.step</code>；新分支当 <code class="inline">_physics_handles_decimation</code> 为真时改为「一次 apply + write_data_to_sim，循环内仅 sim.step(render=False)」，物理侧自行复用动作，省去 N−1 次 Python 侧调用。计数器多了一条轴：reset 模式的 event 改看 _sim_step_counter（物理步），除以 decimation 得到「环境步数」再传进去；common_step_counter 仍然每步自增（:249），课程术语 modify_reward_weight 读的也仍是它（envs/mdp/curriculums.py:45）。两条路径的对外语义一致：控制节拍 = 物理 dt × decimation。RecorderManager 的钩子（pre_step / 每物理步 post / pre_reset / post_reset）让「录制数据」与「训练推进」解耦——第 11 章用它生成 VLA 微调数据。⑥ 里还有一个容易漏看的开关：<code class="inline">compute_final_obs</code>（cfg 项）开启时，重置前会先算一帧观测塞进 extras["final_obs"]——「终止时刻的观测」对 credit assignment 和 Same-Step 自动重置都重要。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>_reset_idx：顺序敏感的八连 reset</h2>
-    <p>重置不是「一键复原」。_reset_idx（manager_based_rl_env.py:406）里八个调用各管一摊，<strong>顺序错了会互相污染</strong>：</p>
+    <h2><span class="num">9.3</span>③ _reset_idx：顺序敏感的八连 reset</h2>
+    <p>step 会让环境终止，终止就要重置。重置不是「一键复原」。_reset_idx（manager_based_rl_env.py:406）里八个调用各管一摊，<strong>顺序错了会互相污染</strong>：</p>
     <div class="code-title">isaaclab/envs/manager_based_rl_env.py:406 — _reset_idx（节选，注释保留）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_reset_idx</span>(self, env_ids):
     <span class="cmt"># curriculum 先行：根据当前平均 reward 调整课程（可能改变随机化范围）</span>
@@ -159,8 +159,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.4</span>LiftCube 一轮 episode 走查</h2>
-    <p>把第 8 章的配置对号入座，跟一集 5 秒的 episode（500 物理步 / 250 控制步）：</p>
+    <h2><span class="num">9.4</span>④ LiftCube 一轮 episode 走查</h2>
+    <p>八步流程与重置都看过了，把它们串成一集完整 episode——把第 8 章的配置对号入座，跟一集 5 秒的 episode（500 物理步 / 250 控制步）：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t15 d15">
         <title id="t15">LiftCube episode 时间线</title>
@@ -228,7 +228,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.5</span>Manager vs 直接式环境：何时自己写 step()</h2>
+    <h2><span class="num">9.5</span>⑤ Manager vs 直接式环境：何时自己写 step()</h2>
     <p>Isaac Lab 还有 DirectRLEnv 风格任务（direct_rl_env.py）：自己写 step/reset、自己算 reward。两者取舍：</p>
     <table class="tbl">
       <tr><th>维度</th><th>ManagerBasedRLEnv</th><th>DirectRLEnv</th></tr>
@@ -244,7 +244,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.6</span>小结</h2>
+    <h2><span class="num">9.6</span>收尾：八步心跳的完整回路</h2>
+    <p>9.1 开头的五个问题，答案收拢：① 装配顺序即依赖——command 先建（obs 要读它）、reward 晚于 termination（要读 done）、curriculum 收尾；② step() 八步：action → 物理×decimation → 计数 → termination → reward → 局部重置 → command → observation，terminated 与 time_out 分开返回；③ 重置顺序 curriculum → scene.reset → event(reset) → 各 manager，错了互相污染；④ 一集 episode 是「随机化起步 → 密集奖励引导 → 稀疏达标」的完整闭环；⑤ 练手/研究用 Manager 式（改配置换任务），追求极致性能用 Direct 式。一张表带走：</p>
     <table class="tbl">
       <tr><th>要点</th><th>一句话</th></tr>
       <tr><td>装配顺序即依赖</td><td>command → obs/action → termination → reward → curriculum，startup event 收尾</td></tr>
@@ -266,7 +267,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 09 Manager-Based 环境内核 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ 694dbf45d）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 09 Manager-Based 环境内核 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ d7cf4f111）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

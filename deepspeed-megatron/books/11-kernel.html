@@ -37,12 +37,14 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Kernel 层</div>
     <h1>Kernel 层：并行框架底下的算子竞赛</h1>
-    <div class="subtitle">前面章节讲的都是「怎么切」；切完之后每个小 GEMM 的效率由算子决定。两库都在框架底下维护了自己的 kernel 层：Megatron 走「融合算子 + TransformerEngine fp8」，DeepSpeed 走「csrc 自研 kernel（transformer/adam/aio）」。这一章盘点两边的家底，并给出「哪些值得自研抄、哪些直接用现成」的判断。</div>
+    <div class="subtitle">融合省的到底是什么——计算还是显存往返？哪些算子值得融合、哪些永远不值得？Megatron 的 fusions 目录和 DS 的 csrc 各自补谁的短板，fp8 为什么直接用 TE 不自己写？自研到什么程度该收手？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">11.1</span>为什么融合：内存带宽的账</h2>
-    <p>一个 bias+GELU 若分开算，读两遍写两遍中间张量；融合后只读写一遍。激活函数融合省的不是计算，是<strong>显存往返</strong>：</p>
+    <h2><span class="num">11.1</span>融合省的是哪一段</h2>
+    <p>前面章节讲的都是「怎么切」；切完之后每个小 GEMM 的效率由算子决定。一个 bias+GELU 若分开算，读两遍写两遍中间张量；融合后只读写一遍。先给一句结论放在这：<strong>融合省的是显存往返，甜点区是「带宽密集的小算子」；GEMM 和注意力直接用厂商库，自研全部收益在元素级算子的那 40% 时间里。</strong></p>
+    <h3>为什么融合：内存带宽的账</h3>
+    <p>激活函数融合省的不是计算，是<strong>显存往返</strong>：</p>
     <ul>
       <li>LLM 的 GEMM 是计算密集（tensor core 打满）；其间的 LN/激活/dropout 是<strong>带宽密集</strong>——kernel 启动 + 显存往返占比高。</li>
       <li>融合的甜点区：把「带宽密集的小算子」并进相邻计算或彼此并成一个大 kernel，减少 launch 次数与中间张量。</li>
@@ -56,6 +58,7 @@
 
   <section class="block">
     <h2><span class="num">11.2</span>Megatron：core/fusions/ 与 TransformerEngine</h2>
+    <p>11.1 的判断标准落到目录上，就是 Megatron 的一份融合算子清单——</p>
     <div class="code-title">megatron/core/fusions/ — 融合算子清单（目录盘点）</div>
     <pre class="code"><span class="lang-tag">text</span>megatron/core/fusions/
 ├── fused_softmax.py            <span class="cmt"># 缩放+mask+softmax 一体（scale_mask_softmax）</span>
@@ -63,9 +66,11 @@
 ├── fused_bias_gelu.py          <span class="cmt"># bias + gelu 融合（forward/backward 各一 kernel）</span>
 ├── fused_cross_entropy.py      <span class="cmt"># 词表投影后的并行 cross-entropy，不落地全量 logits</span>
 ├── fused_layer_norm.py         <span class="cmt"># LN 融合（TE 之外的非 TE 路径）</span>
-├── fused_bias_dropout_add.py   <span class="cmt"># 残差段三合一：bias+dropout+residual add</span>
+├── fused_bias_dropout.py       <span class="cmt"># 残差段三合一：bias+dropout+residual add</span>
+├── fused_gated_norm.py         <span class="cmt"># 门控 + RMSNorm 融合（GDN 线性注意力路径）</span>
+├── fused_pre_gated_delta_rule.py <span class="cmt"># 门控 delta-rule 前置融合（SSM/MoE 混合架构）</span>
 └── __init__.py</pre>
-    <div class="annotation"><b>清单读法：</b>七个文件全在「带宽密集区」——softmax、激活、LN、残差、cross-entropy，没有一个 GEMM。这就是 11.1 判断标准的落地。每个融合算子都是 forward/backward 两个 kernel + autograd 配对（与第 3 章 f/g 的做法同构：通信/融合进 autograd，用户层无感）。<strong>TransformerEngine（TE）是更外的一层</strong>：NVIDIA 维护的库，提供 TEColumnParallelLinear 等「并行感知 + fp8 管理」的算子族（第 5 章 5.1 的 TELayerNormColumnParallelLinear 就来自它）。TE 的 fp8 路径做三件事：当前 scale 的动态调整、GEMM 输入输出量化、与延迟缩放的联调（fp8 需要按张量尺度管理，比 fp16 的全局 loss scale 细得多）。</div>
+    <div class="annotation"><b>清单读法：</b>文件全在「带宽密集区」——softmax、激活、LN、残差、cross-entropy，没有一个 GEMM，正好印证 11.1 的判断标准。每个融合算子都是 forward/backward 两个 kernel + autograd 配对（与第 3 章 f/g 的做法同构：通信/融合进 autograd，用户层无感）。除了 transformer 主线的算子，2026-09 后还出现了服务混合架构的门控融合（<code class="inline">fused_gated_norm</code> / <code class="inline">fused_pre_gated_delta_rule</code>，服务 gated delta net 线性注意力路线）——融合清单跟着模型架构走，不只服务经典 transformer。<strong>TransformerEngine（TE）是更外的一层</strong>：NVIDIA 维护的库，提供 TEColumnParallelLinear 等「并行感知 + fp8 管理」的算子族（第 5 章 5.2 的 TELayerNormColumnParallelLinear 就来自它）。TE 的 fp8 路径做三件事：当前 scale 的动态调整、GEMM 输入输出量化、与延迟缩放的联调（fp8 需要按张量尺度管理，比 fp16 的全局 loss scale 细得多）。</div>
 
     <div class="code-title">megatron/core/extensions/transformer_engine.py — TE 接入方式（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Megatron 的 TE 扩展：把自家并行语义接进 TE 算子</span>
@@ -77,7 +82,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.3</span>DeepSpeed：csrc/ 的三大家当</h2>
+    <h2><span class="num">11.3</span>DeepSpeed：csrc/ 都有些什么</h2>
+    <p>DS 的家底形态与 Megatron 不同——fusions 服务训练热路径，csrc 服务训练周边（optimizer、IO、offload）+ 推理 kernel：</p>
     <div class="code-title">deepspeed/csrc/ — 自研 kernel 盘点</div>
     <pre class="code"><span class="lang-tag">text</span>deepspeed/csrc/
 ├── transformer/               <span class="cmt"># 推理/训练 transformer kernel：attn/ln/gelu 融合</span>
@@ -88,11 +94,60 @@
 ├── aio/                       <span class="cmt"># 第 9 章的 DeepNVMe 异步 IO</span>
 ├── quantizer/                 <span class="cmt"># 量化搬运（低精度 offload 的带宽减半）</span>
 └── csrc 通用（cpu_lion, ragged 等）</pre>
-    <div class="annotation"><b>两库家底的形态对比：</b>Megatron 的 fusions 服务「训练前向/反向的热路径」，DS 的 csrc 服务「训练周边（optimizer、IO、offload）+ 推理 kernel」——各自补自己主打场景的短板。共同点：<strong>multi-tensor / multi-param 的 batch 化</strong>（一次 kernel 处理多个参数张量，减少 launch 开销）——DS 的 fused Adam 与 Megatron 的分布式 optimizer 步进都受益于此思路。</div>
+    <div class="annotation"><b>家底形态对比：</b>Megatron 的 fusions 服务「训练前向/反向的热路径」，DS 的 csrc 服务「训练周边（optimizer、IO、offload）+ 推理 kernel」——各自补自己主打场景的短板。共同点只有一条：<strong>multi-tensor / multi-param 的 batch 化</strong>（一次 kernel 处理多个参数张量，减少 launch 开销）——DS 的 fused Adam 与 Megatron 的分布式 optimizer 步进都受益于此思路。</div>
+
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t111 d111">
+        <title id="t111">bias + GELU：分开算与融合算的显存往返</title>
+        <desc id="d111">上行：分开算三个 kernel（GEMM 输出写显存 → bias kernel 读一遍写一遍 → GELU kernel 再读一遍写一遍），四次数往返。下行：融合成一个 kernel，GEMM 输出直接在片上做完 bias+GELU 写回一次。省的是中间张量的全量读写。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="28" font-weight="bold">分开算（4 次全量往返）</text>
+        <rect class="node core" x="20" y="42" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="95" y="60" text-anchor="middle">GEMM</text>
+        <text class="lbl sm" x="95" y="78" text-anchor="middle">(tensor core 满)</text>
+        <rect class="node" x="250" y="42" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="325" y="68" text-anchor="middle">bias kernel</text>
+        <rect class="node" x="480" y="42" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="555" y="68" text-anchor="middle">GELU kernel</text>
+        <rect class="node" x="710" y="42" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="785" y="68" text-anchor="middle">下一个算子</text>
+
+        <line class="edge" x1="170" y1="64" x2="248" y2="64"></line>
+        <line class="edge" x1="400" y1="64" x2="478" y2="64"></line>
+        <line class="edge" x1="630" y1="64" x2="708" y2="64"></line>
+
+        <text class="lbl sm" x="209" y="108" text-anchor="middle" fill="#8f2d2d">写 HBM</text>
+        <text class="lbl sm" x="439" y="108" text-anchor="middle" fill="#8f2d2d">读+写 HBM</text>
+        <text class="lbl sm" x="669" y="108" text-anchor="middle" fill="#8f2d2d">读 HBM</text>
+        <rect x="170" y="92" width="480" height="24" rx="4" class="node warn"></rect>
+        <text class="lbl sm" x="410" y="132" text-anchor="middle" fill="#8f2d2d">中间张量 s×b×h×层 每层走一遍显存往返——launch gap + 带宽双重浪费</text>
+
+        <text class="lbl" x="20" y="176" font-weight="bold">融合后（1 次写 + 1 次读）</text>
+        <rect class="node core" x="20" y="190" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="95" y="208" text-anchor="middle">GEMM</text>
+        <rect class="node ok" x="250" y="190" width="330" height="44" rx="6"></rect>
+        <text class="lbl sm" x="415" y="208" text-anchor="middle">bias + GELU（一个 kernel，片上完成）</text>
+        <rect class="node" x="660" y="190" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="735" y="216" text-anchor="middle">下一个算子</text>
+
+        <line class="edge" x1="170" y1="212" x2="248" y2="212"></line>
+        <line class="edge" x1="580" y1="212" x2="658" y2="212"></line>
+
+        <text class="lbl sm" x="20" y="266" fill="#2e8b57" font-weight="bold">省的不是计算：GEMM 时间没变，省的是中间张量的全量显存往返与 kernel launch</text>
+        <text class="lbl sm" x="20" y="286">两库的融合清单（softmax/LN/激活/残差/cross-entropy）全部落在这个「带宽密集区」，没有一个 GEMM</text>
+      </svg>
+      <div class="fig-cap">图 11.1：融合的收益来源。判断标准就是 11.1 的一句话——算子是否拉满 tensor core；没拉满的元素级算子，融合是把「多次显存往返」折成一次。</div>
+    </div>
   </section>
 
   <section class="block">
     <h2><span class="num">11.4</span>哪些值得抄，哪些直接用</h2>
+    <p>两库家底盘点完，就轮到自研的边界了——哪类抄、哪类直接用：</p>
     <table class="tbl">
       <tr><th>类别</th><th>建议</th><th>理由</th></tr>
       <tr><td>GEMM</td><td>直接用 cuBLAS/cuBLASLt 或 TE</td><td>自研打不过厂商库</td></tr>
@@ -102,6 +157,11 @@
       <tr><td>异步 IO / offload</td><td>直接用 DS 的 DeepNVMe</td><td>调优过的 libaio 封装，重写不经济</td></tr>
       <tr><td>fp8 量化调度</td><td>直接用 TE</td><td>scale 管理的状态机深，别自己碰</td></tr>
     </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>小结 + 自研启示</h2>
+    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「是否拉满 tensor core」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、quantizer）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8 都直接用现成。把自研纪律归拢：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
       kernel 层的自研纪律：<strong>先 profile 再动手</strong>——nsight 里看到 launch gap 或带宽打满才值得写融合；GEMM 与注意力的时间占比决定了自研 kernel 的天花板（通常 < 40% 时间在元素级算子上，融合的全部收益在这 40% 里）。最容易错的三点：融合 kernel 的 backward 忘了与 forward 配对（autograd 断链静默错）、用了 fp16 累加（元素级 kernel 应 fp32 累加）、融合边界跨了 TP 通信（第 10 章同款坑）。
@@ -115,7 +175,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

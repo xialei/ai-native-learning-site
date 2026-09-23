@@ -35,22 +35,23 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 工具系统</div>
     <h1>工具系统与并行调度：一次调用的完整管线</h1>
-    <div class="subtitle">模型说「调用 read(file.txt)」之后发生了什么？走 pre-execute 审批、通过单调守卫、被包装派发、执行、再走 post-execute 与内容定稿——最后按模型顺序结算。这一章拆开这条五段管线，并看 dsh 如何安全地把多个工具调用并行化。</div>
+    <div class="subtitle">问题：模型说「调用 read(file.txt)」之后发生了什么？这条链要回答四个问题——管线有几段、策略挂在哪（①）？多个工具调用怎么并行才安全，结果会不会乱序（②）？用户中止时，跑了一半的调用怎么收场（③）？模型想批量操作文件时，能不能不靠 N 次往返（④）？6.1 把问题摆出来，6.2–6.3 作答①，6.4–6.5 作答②③，6.6 作答④，6.7 收尾回收。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>一分钟版本</h2>
+    <h2><span class="num">6.1</span>问题：一次调用的完整链路</h2>
+    <p>工具系统的一切都为了回答：怎么让「模型发号施令」这件事既自由又受控。四个具体问题：</p>
     <ul>
-      <li>工具 = <code class="inline">ToolDefinition</code>：schema + <strong>强制的 canonical output 声明</strong> + <code class="inline">execute(args, exec)</code> + 可选 finalize/timeout/并发分类/呈现回调。</li>
-      <li>管线五段：<code class="inline">tools/pre-execute</code>（waterfall 决定放行）→ 单调守卫（<strong>同步注册项，不是事件</strong>）→ <code class="inline">tools/execute</code>（around 包装：超时、信号替换）→ 工具体 → <code class="inline">tools/post-execute</code> → finalizeContent → 冻结的 <code class="inline">tool/result</code>。除守卫外都是事件。</li>
-      <li>并发模型：每个调用被分类为 <strong>parallel-safe</strong>（<code class="inline">isConcurrencySafe(args) === true</code>）或 <strong>exclusive</strong>；同组 parallel-safe 调用进滚动窗口池（默认 <code class="inline">maxParallelToolCalls = 10</code>），exclusive 是栅栏。</li>
-      <li>结算与追加永远按<strong>模型顺序</strong>提交——即使完成顺序乱序，日志里结果顺序与模型请求一致。</li>
-      <li>中止：已开始的调用排空并提交，未开始的补合成错误结果（<code class="inline">TOOL_ABORTED_BEFORE_DISPATCH</code>）。</li>
+      <li>① <strong>一次调用走几段、策略挂在哪</strong>——审批、超时、沙箱决策，是写在工具体里还是外置？</li>
+      <li>② <strong>并行怎么才安全</strong>——N 个调用同时跑，日志里结果顺序跟谁走？</li>
+      <li>③ <strong>中止/失败怎么收场</strong>——已派发的、未派发的各归哪里？</li>
+      <li>④ <strong>批量操作要不要 N 次模型往返</strong>——有没有一次往返完成整段程序的办法？</li>
     </ul>
+    <p>速览答案：① 五段管线（pre-execute → 守卫 → execute → 工具体 → post-execute → finalize），策略全部外置为监听器/注册项，工具体零策略（6.2–6.3）；② parallel-safe 进滚动窗口池、exclusive 成栅栏、结算永远按模型顺序（6.4）；③ 已开始的排空提交、未开始的补合成错误结果，全部落日志（6.5）；④ PTC：一个 run_code 程序在代码里编排所有工具调用，子调用走完整管线（6.6）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>用代码看：defineTool 与一个真实工具</h2>
+    <h2><span class="num">6.2</span>① 用代码看：defineTool 与一个真实工具</h2>
     <p><code class="inline">read</code> 工具（<code class="inline">packages/fs/tool-fs/src/read.ts</code>）是定义样板的范本——注意输出 schema 是强制的、<code class="inline">isConcurrencySafe</code> 是纯同步分类器：</p>
     <div class="code-title">packages/fs/tool-fs/src/read.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** 默认与单次 read 调用返回的最大行数（readLimit 配置）。 */</span>
@@ -87,11 +88,11 @@ ctx.tools.<span class="fn">register</span>(<span class="fn">defineTool</span>({
     <span class="cmt">//   （读观察被记录，供 write/edit 前的 read-before-write 策略校验）</span>
   },
 }))</pre>
-    <div class="annotation"><b>ToolDefinition 的可选成员</b>（<code class="inline">packages/core/tools/src/index.ts:241</code>）：① <code class="inline">finalizeContent(exec, result)</code> ——模型可见内容的同步末段变换，即使管线失败路径也恰被调用一次；② <code class="inline">timeoutMs</code> ——协作超时预算，由独立的 tool-call-timeout-policy 插件经 <code class="inline">tools/execute</code> around 包装强制，<strong>永不发给模型</strong>（schemas() 白名单只有 name/description/parameters）；③ <code class="inline">isConcurrencySafe(args)</code> ——只有返回 <code class="inline">true</code> 才加入并行组，省略/异常/非 true 一律独占；④ <code class="inline">presentCall/presentResult</code> ——UI 卡片渲染，纯函数、可在流式与重放两处调用。</div>
+    <div class="annotation"><b>ToolDefinition 的可选成员</b>（<code class="inline">packages/core/tools/src/index.ts</code>）：① <code class="inline">finalizeContent(exec, result)</code>（:258）——模型可见内容的同步末段变换，注册表在执行开始时快照回调，即使管线失败路径也恰被调用一次；② <code class="inline">projectContent(exec, result)</code>（:246）——新于 finalize 的一级：在<strong>进入 post-execute 之前</strong>跑（finalizeContent 在其后、恰在无损物化前），管线失败绕过 post-execute 时 projection 被跳过而 finalize 仍被调用；③ <code class="inline">timeoutMs</code> ——协作超时预算，由独立的 tool-call-timeout-policy 插件经 <code class="inline">tools/execute</code> around 包装强制，<strong>永不发给模型</strong>（schemas() 白名单只有 name/description/parameters）；④ <code class="inline">isConcurrencySafe(args)</code> ——只有返回 <code class="inline">true</code> 才加入并行组，省略/异常/非 true 一律独占；⑤ <code class="inline">presentCall/presentResult</code> ——UI 卡片渲染，纯函数、可在流式与重放两处调用。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>五段管线</h2>
+    <h2><span class="num">6.3</span>① 五段管线</h2>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -130,11 +131,11 @@ ctx.tools.<span class="fn">register</span>(<span class="fn">defineTool</span>({
       <div class="fig-cap">图 6-1 — 工具调用管线。pre-execute 与 post-execute 是 waterfall，execute 是 around 中间件；失败与拒绝都终到同一种持久事实：tool/result。</div>
 <div class="svg-legend"><span class="lg-item"><span class="sw node"></span>输入 / 工具体</span><span class="lg-item"><span class="sw core"></span>管线阶段（单调守卫是同步注册项，其余为事件缝）</span><span class="lg-item"><span class="sw acc"></span>持久化终点</span><span class="lg-item"><span class="sw" style="border-style:dashed"></span>异常路径（虚线）</span></div>
     </div>
-    <div class="annotation"><b>PreToolDecision</b>：pre-execute 的监听器（审批 UI、沙箱策略）返回决策；拒绝发生在这一段。决策是封闭四元联合（<code class="inline">packages/core/tools/src/index.ts:589</code>）：<code class="inline">allow</code> / <code class="inline">deny{reason, info?}</code> / <code class="inline">cancel</code> / <code class="inline">ask</code>——<code class="inline">cancel</code> 与 <code class="inline">deny</code> 不同：它不携带拒绝理由，落成规范的中止结果 <code class="inline">toolAbortedBeforeDispatchResult()</code>（工具体从未派发，但没有 policy-denial 的呈现语义——取消不是拒绝）。通过后由<strong>单调守卫</strong>（monotonic guards，<code class="inline">packages/core/tools/src/index.ts:713</code>）做注册层拒绝——守卫是 scope 层上的<strong>同步注册项</strong>（<code class="inline">ToolGuard</code>，不是事件），在扩展性 policy 全部跑完之后、工具体之前评估；它只能返回拒绝理由或 <code class="inline">undefined</code>，没有「允许」这个返回值，所以监听器顺序无法把拒绝翻回放行，第一个拒绝生效且不可被后续注册复活。<code class="inline">tools/execute</code> 是 around：<code class="inline">next()</code> 返回下一段结果，监听器可替换信号（超时策略就是这样融合 abort 的）。</div>
+    <div class="annotation"><b>PreToolDecision</b>：pre-execute 的监听器（审批 UI、沙箱策略）返回决策；拒绝发生在这一段。决策是封闭四元联合（<code class="inline">packages/core/tools/src/index.ts:606</code>）：<code class="inline">allow</code> / <code class="inline">deny{reason, info?}</code> / <code class="inline">cancel</code> / <code class="inline">ask</code>——<code class="inline">cancel</code> 与 <code class="inline">deny</code> 不同：它不携带拒绝理由，落成规范的中止结果 <code class="inline">toolAbortedBeforeDispatchResult()</code>（工具体从未派发，但没有 policy-denial 的呈现语义——取消不是拒绝）。通过后由<strong>单调守卫</strong>（monotonic guards，<code class="inline">packages/core/tools/src/index.ts:730</code>）做注册层拒绝——守卫是 scope 层上的<strong>同步注册项</strong>（<code class="inline">ToolGuard</code>，不是事件），在扩展性 policy 全部跑完之后、工具体之前评估；它只能返回拒绝理由或 <code class="inline">undefined</code>，没有「允许」这个返回值，所以监听器顺序无法把拒绝翻回放行，第一个拒绝生效且不可被后续注册复活。<code class="inline">tools/execute</code> 是 around：<code class="inline">next()</code> 返回下一段结果，监听器可替换信号（超时策略就是这样融合 abort 的）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>调度器：并行组与独占栅栏</h2>
+    <h2><span class="num">6.4</span>② 调度器：并行组与独占栅栏</h2>
     <p>核心在 <code class="inline">packages/core/agent-loop/src/tool-calls.ts</code> 的 <code class="inline">executeToolCalls</code>。分组规则只有三行：</p>
     <div class="code-title">packages/core/agent-loop/src/tool-calls.ts — 分组</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">let</span> next = <span class="nu">0</span>
@@ -207,7 +208,7 @@ ctx.tools.<span class="fn">register</span>(<span class="fn">defineTool</span>({
   </section>
 
   <section class="block">
-    <h2><span class="num">6.5</span>中止时的合成结果</h2>
+    <h2><span class="num">6.5</span>③ 中止时的合成结果</h2>
     <div class="code-title">packages/core/agent-loop/src/tool-calls.ts:250</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">appendSkippedToolCall</span>(session: <span class="cl">Session</span>, turn: <span class="kw">number</span>, step: <span class="kw">number</span>, block: <span class="cl">ToolCallBlock</span>): <span class="kw">void</span> {
   <span class="kw">const</span> callSeq = <span class="fn">appendToolCall</span>(session, turn, step, block)
@@ -224,8 +225,8 @@ ctx.tools.<span class="fn">register</span>(<span class="fn">defineTool</span>({
   </section>
 
   <section class="block">
-    <h2><span class="num">6.6</span>PTC：程序化工具调用</h2>
-    <p>dsh 最有特色的模式之一：<code class="inline">mode: 'native' | 'ptc' | 'both'</code>（<code class="inline">packages/core/tools/src/index.ts:653</code>）。PTC 模式下模型不再直接调用工具，而是调用<strong>唯一的</strong> <code class="inline">run_code</code>，在代码里编排所有工具：</p>
+    <h2><span class="num">6.6</span>④ PTC：程序化工具调用</h2>
+    <p>dsh 最有特色的模式之一：<code class="inline">mode: 'native' | 'ptc' | 'both'</code>（<code class="inline">packages/core/tools/src/index.ts:670</code>）。PTC 模式下模型不再直接调用工具，而是调用<strong>唯一的</strong> <code class="inline">run_code</code>，在代码里编排所有工具：</p>
     <div class="code-title">packages/core/tools/src/index.ts — PTC 约束</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">PTC_ONLY_INSTRUCTION</span> = `\`${RUN_CODE_NAME}\` is the only tool you can call directly
 — a tool call naming any other tool fails. Reach every tool the SDK declares
@@ -233,7 +234,7 @@ below from inside the program.`</pre>
     <table class="tbl">
       <tr><th>要素</th><th>事实</th></tr>
       <tr><td>保留传输</td><td><code class="inline">run_code</code>（RUN_CODE_NAME）是保留名，参数 {code, description}；不受任何可过滤层（scope/restrict）影响</td></tr>
-      <tr><td>逐程序控制</td><td>每次 run_code 可带三个可选控制参数（<code class="inline">ptc.ts:101</code> RUN_CODE_CONTROLS）：<code class="inline">timeoutMs</code>（整个程序的耗时预算，覆盖 runtime.timeout 默认/上限才暴露）、<code class="inline">sandbox_permissions</code> + <code class="inline">justification</code>（本程序一次性更宽的沙箱模式，走 approveEscalation 审批，subject 是 <code class="inline">'program'</code>——与 bash 的 'command'、fs 的 'operation' 并列）。输出 schema 带 <code class="inline">sandbox{mode, denied, enforcement:'full'|'partial'}</code>，denied 时附加升级提示文本（「approves this complete program for one execution only… Programs are never replayed automatically」）</td></tr>
+      <tr><td>逐程序控制</td><td>每次 run_code 可带三个可选控制参数（<code class="inline">ptc.ts:108</code> RUN_CODE_CONTROLS）：<code class="inline">timeoutMs</code>（整个程序的耗时预算，覆盖 runtime.timeout 默认/上限才暴露）、<code class="inline">sandbox_permissions</code> + <code class="inline">justification</code>（本程序一次性更宽的沙箱模式，走 approveEscalation 审批，subject 是 <code class="inline">'program'</code>——与 bash 的 'command'、fs 的 'operation' 并列）。输出 schema 带 <code class="inline">sandbox{mode, denied, enforcement:'full'|'partial'}</code>，denied 时附加升级提示文本（「approves this complete program for one execution only… Programs are never replayed automatically」）</td></tr>
       <tr><td>子调用全管线</td><td>run_code 里的每次工具调用都走完整五段管线（含审批），携带 <code class="inline">parent</code> 令牌标记为子派发</td></tr>
       <tr><td>持久事件</td><td><code class="inline">tool/ptc-dispatch-start</code> 与 <code class="inline">tool/ptc-dispatch</code>（两者是独立事件，由 <code class="inline">subCallId</code> 配对）；子调用 id 形如 <code class="inline">&lt;parent&gt;:ptc:&lt;n&gt;</code></td></tr>
       <tr><td>并发上限</td><td>maxParallelSubCalls（默认 10），代码里的并行派发进有界队列</td></tr>
@@ -246,10 +247,10 @@ below from inside the program.`</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.7</span>要点</h2>
+    <h2><span class="num">6.7</span>收尾：四个问题的答案</h2>
     <div class="callout warn">
-      <b class="tag">要点</b>
-      ① 工具定义的 output schema 是强制的——「无损 JSON 结果 + 渲染」分离让日志、UI、模型各取所需；② 五段管线把审批/超时外置为事件监听器、把守卫做成只能拒绝不能放行的注册项，工具体本身零策略；③ 并行调度的全部智慧浓缩为「parallel-safe 进池、exclusive 成栅栏、按模型序结算」；④ 中止与失败的合成结果都是持久事件，模型永远面对完整的调用-结果配对。下一步进入 <a href="07-llm.html">第 7 章：LLM 适配层与流式</a>。
+      <b class="tag">答案回收</b>
+      ① 五段管线：pre-execute（waterfall，PreToolDecision 四元决策）→ 单调守卫（同步注册项，只能拒绝）→ execute（around，超时融合）→ 工具体 → post-execute → finalizeContent → 冻结 tool/result；策略全部外置，工具体零策略；projectContent（post-execute 前）与 finalizeContent（物化前）两级内容变换分工明确（6.2–6.3）。② 并行：parallel-safe 进滚动窗口池（默认 10）、exclusive 成栅栏、结算只沿连续模型序推进——慢调用挡结算但不乱序（6.4）。③ 中止/失败：已开始的排空提交，未开始的补 TOOL_ABORTED_BEFORE_DISPATCH 合成结果，全部持久化（6.5）。④ PTC：一个 run_code 程序一次往返完成整段程序，子调用走完整管线，权限模型不变（6.6）。下一步进入 <a href="07-llm.html">第 7 章：LLM 适配层与流式</a>。
     </div>
   </section>
 
@@ -261,7 +262,7 @@ below from inside the program.`</pre>
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 06 工具系统 · 版本 dsh-v0.1.6-alpha.2 (HEAD ddefc45fbc) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 06 工具系统 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

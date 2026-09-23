@@ -37,18 +37,19 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 ZeRO-3</div>
     <h1>ZeRO-3：参数也切了，前向怎么算</h1>
-    <div class="subtitle">ZeRO-1/2 切优化器状态和梯度，参数本身各卡仍有完整副本。ZeRO-3 把参数也按 DP 切——每卡只剩 16/DP 字节。代价：前向时参数不在本地，要用之前现场 all-gather、用完立刻释放。本章看三件事：参数怎么在 __init__ 里就被切走、前向时怎么 fetch/prefetch、step 时怎么做子组步进。</div>
+    <div class="subtitle">参数也按 DP 切掉之后，前向要用参数时怎么办？借还循环怎么做到不改一行模型代码，prefetch 怎么把 all-gather 的通信藏进计算？step 时「子组逐个更新」的写法在省什么显存？哪些模型写法会让 ZeRO-3 静默出错？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">8.1</span>一分钟版本</h2>
-    <p>ZeRO-3 的生命周期是一个「借还循环」：</p>
+    <h2><span class="num">8.1</span>参数不在本地，前向怎么算</h2>
+    <p>ZeRO-1/2 切优化器状态和梯度，参数本身各卡仍有完整副本。ZeRO-3 把参数也按 DP 切——每卡只剩 16/DP 字节。代价立刻出现：<strong>前向时参数不在本地，要用之前现场 all-gather、用完立刻释放</strong>。整个 ZeRO-3 就建立在这个「借还循环」上。一分钟版本：</p>
     <ul>
       <li><strong>init 时</strong>：模型构造完成后，参数立刻被切走（每卡只留 1/N 的分片，记作 <code class="inline">ds_tensor</code>），原 param 换成空壳（metadata）。</li>
       <li><strong>前向时</strong>：算到哪一层，就把该层参数 all-gather 成完整形状，算完<strong>立刻归还</strong>（除非在 prefetch 队列里要留着）。</li>
       <li><strong>反向时</strong>：同样 fetch → 算 → 梯度留在本地分片（梯度归约成 reduce-scatter）。</li>
       <li><strong>step 时</strong>：优化器状态也分片，子组逐个更新、逐个写回。</li>
     </ul>
+    <p>循环本身不难理解，难的是工程细节：借还的总管是谁、prefetch_bucket_size / max_reuse_distance / max_live_parameters 这几个旋钮各管什么；参数是在哪一刻被切走的、借还动作挂在哪里才能做到用户模型代码一行不改；step 时怎么进一步压显存峰值；以及哪些模型写法会让这一整套静默出错。先把答案放在这：<strong>ZeRO-3 是「借还循环」+ hook 自动化——通信量随模型大小线性涨，靠 prefetch 和子组步进把显存峰值和通信代价同时压住。</strong></p>
     <div class="callout info">
       <b class="tag">与 TP 的本质区别</b>
       TP 切参数是<strong>永久的计算切分</strong>（每卡永久持有固定一半，输出也是分片）；ZeRO-3 切参数是<strong>临时的存储分片</strong>（前向一凑就是完整的，凑是全量 all-gather，通信量 = 参数全量）。DP 内的卡跑的是完整模型——所以 ZeRO-3 后面不能再挂 TP 语义的东西（同一段模型所有 DP 卡一起算）。TP 便宜是因为算子级通信小且固定；ZeRO-3 的通信随模型大小线性涨，靠 prefetch 和重叠把代价藏进计算。
@@ -56,7 +57,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.2</span>用代码看｜PartitionedParameterCoordinator：借还的总管</h2>
+    <h2><span class="num">8.2</span>借还的总管：PartitionedParameterCoordinator</h2>
+    <p>借还循环需要一个总管——谁登记借出、谁控制同时借出的上限、谁决定提前多久发通信？答案是 PartitionedParameterCoordinator：</p>
     <div class="code-title">deepspeed/runtime/zero/partitioned_param_coordinator.py — 核心配置（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PartitionedParameterCoordinator</span>:
     <span class="st">"""Handles borrowing and returning parameters."""</span>
@@ -66,7 +68,7 @@
                  max_reuse_distance,        <span class="cmt"># 距离内会再用的参数用完不还（省重复 fetch）</span>
                  max_live_parameters,       <span class="cmt"># 同一时刻最多借出的参数量（显存上限）</span>
                  prefetch_nvme, ...):</pre>
-    <div class="annotation"><b>三个旋钮的语义：</b>① <code class="inline">prefetch_bucket_size</code>：本层还在算，下一层的 all-gather 已经发出去——通信躲在计算后面；② <code class="inline">max_reuse_distance</code>：参数复用（如 tied embedding 与 output layer 共享权重）时，距离近就先不还，省一次 fetch；③ <code class="inline">max_live_parameters</code>：借出的总量上限，防止「要的太多同时借出」把显存挤爆——这是 ZeRO-3 显存峰值的主要决定项。三者默认值都是「层大小 × 若干倍」量级，通常不用动；改变它们的行为就是改变 ZeRO-3 的性能曲线。</div>
+    <div class="annotation"><b>三个旋钮各管一件事：</b><code class="inline">prefetch_bucket_size</code>：本层还在算，下一层的 all-gather 已经发出去——通信躲在计算后面；<code class="inline">max_reuse_distance</code>：参数复用（如 tied embedding 与 output layer 共享权重）时，距离近就先不还，省一次 fetch；<code class="inline">max_live_parameters</code>：借出的总量上限，防止「要的太多同时借出」把显存挤爆——这是 ZeRO-3 显存峰值的主要决定项。三者默认值都是「层大小 × 若干倍」量级，通常不用动；改变它们的行为就是改变 ZeRO-3 的性能曲线。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t81 d81">
@@ -118,10 +120,15 @@
         <span class="cmt"># 全部 done 后才返回——fetch 是同步屏障，prefetch 是异步提交</span>
         ...</pre>
     <div class="annotation"><b>fetch 与 prefetch 的区别：</b>fetch（forward/backward hook 触发）是<strong>同步的</strong>——参数必须到位才能算；prefetch（前一层开始算时提前触发）是<strong>异步提交</strong>，等计算需要时再等待完成。事件名（FORWARD_FETCH_SUBMIT / FORWARD_FETCH_WAIT 等）是 DS 性能分析时的锚点。独立 allgather_stream 是为了不让通信阻塞计算 stream 的 kernel 排队。</div>
+    <div class="callout warn">
+      <b class="tag">演化痕迹（2026-09 修复）</b>
+      合批路径 <code class="inline">_allgather_params_coalesced</code>（partition_parameters.py:2004）曾有一个隐蔽 bug：逐参数发起异步 all-gather 后<strong>只等最后一个 handle</strong> 就把 <code class="inline">param.data</code> 指向结果缓冲——前面的 all-gather 还在飞行，读到的就是未初始化内存（表现为 denormal 垃圾值、参数莫名 NaN）。修复（#8539）是等完全部 <code class="inline">launch_handles</code> 再改指向。教训值得记一辈子：提交了 N 个异步操作、只同步最后一个，其余 N−1 个处于无主状态——「异步提交、同步等待点要数清楚」这句话在 DS 源码里是有尸检报告的。
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.3</span>用代码看｜参数在 __init__ 里就被切走</h2>
+    <h2><span class="num">8.3</span>参数在 __init__ 里就被切走</h2>
+    <p>总管的借还动作最终要挂到模型上——挂在哪里才能做到用户模型代码一行不改？答案是 PyTorch 的模块 hook：</p>
     <div class="code-title">deepspeed/runtime/zero/parameter_offload.py — hook 注册（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">setup_zero_stage3_hooks</span>(self, module):
     <span class="cmt"># 对每个叶子 sub_module 挂 pre/post forward/backward 四个 hook</span>
@@ -148,17 +155,23 @@
         self.<span class="fn">_optimizer_step</span>(sub_group)             <span class="cmt"># 更新 fp32 分片</span>
         self.<span class="fn">_reassign_or_swap_out_partitioned_parameters</span>(sub_group)  <span class="cmt"># 写回 fp16</span>
         self.<span class="fn">_release_sub_group</span>(sub_group)          <span class="cmt"># 释放，下一组</span></pre>
-    <div class="annotation"><b>子组循环的意义：</b>不是「全部参数取回 → 一次 step → 全部还回」，而是<strong>每组取回→更新→写回→释放</strong>——任一时刻 GPU 上最多只有一组的完整参数。显存峰值进一步压低，代价是更多次小 all-gather（幸好子组间还能与通信重叠）。<code class="inline">unscale_and_clip_grads</code> 同时做两件事：去 loss scale、除 GAS（两库在这一步的语义一致——scale 与 GAS 均值都在优化器侧撤销，第 6 章 6.2 的边界在引擎侧）。</div>
+    <div class="annotation"><b>子组循环的意义：</b>不是「全部参数取回 → 一次 step → 全部还回」，而是<strong>每组取回→更新→写回→释放</strong>——任一时刻 GPU 上最多只有一组的完整参数。显存峰值进一步压低，代价是更多次小 all-gather（幸好子组间还能与通信重叠）。<code class="inline">unscale_and_clip_grads</code> 同时做两件事：去 loss scale、除 GAS（两库在这一步的语义一致——scale 与 GAS 均值都在优化器侧撤销，第 6 章 6.3 的边界在引擎侧）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>疑难杂症：persistent 参数与 unsupported dtype</h2>
+    <h2><span class="num">8.4</span>哪些模型写法会出事</h2>
+    <p>子组循环的 step 写法见上一节——它把「同时借出的参数量」从全模型压到一组；但 hook 自动化有前提，<strong>模型的写法必须让 hook 找得到参数</strong>。四个疑难场景：</p>
     <ul>
       <li><strong>参数没被切到</strong>（显存异常高）：参数没挂进 <code class="inline">register_parameter</code>，hook 漏掉 → 检查模型写法。</li>
       <li><strong>fp32 小参数</strong>：极小的参数（如若干 bias）逐个 all-gather 不划算，DS 允许保留不分片（<code class="inline">stage3_max_parameters_per_partition</code> 不适用，看 <code class="inline">prescale_unscale</code> 相关分支），过小参数留在 fp32。</li>
       <li><strong>tied weights</strong>：两处引用同一 Parameter，切分时只认一个 owner；reuse distance 之内不还，否则两边各自 fetch。</li>
       <li><strong>非训练参数（buffers）</strong>：不参与切分，各卡全量——模型大 buffer 多时这里反而是浪费。</li>
     </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.5</span>FSDP 对照</h2>
+    <p>ZeRO-3 的 hook 自动化路线不是唯一解，PyTorch FSDP 把同样的思想做进了原生——两者对比：</p>
     <div class="callout info">
       <b class="tag">对照 FSDP</b>
       PyTorch FSDP 与 ZeRO-3 思想相同（参数分片 + all-gather），差异在工程边界：FSDP 把逻辑做进 torch 原生（wrap 粒度 = FSDP unit），ZeRO-3 靠 hook + 模块遍历（粒度 = 有参数的叶子）。FSDP 与 ZeRO-3 各自适合自家的生态；DS 的优势在 offload（第 9 章）与 ZeRO 家族的一体化配置。
@@ -166,7 +179,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.5</span>小结 + 自研启示</h2>
+    <h2><span class="num">8.6</span>小结 + 自研启示</h2>
+    <p>到这里，ZeRO-3 的全貌可以串起来了：借还总管是 PartitionedParameterCoordinator，三个旋钮分别控制 prefetch 提前量、复用不还的临界距离、同时借出的显存上限；参数在 __init__ 里就被切走，借还挂在 forward pre/post hook 上，模型代码零改动；step 用子组循环把「同时借出的参数」从全模型压到一组，显存峰值随子组大小下降。而这套自动化有个前提——参数必须挂进 register_parameter，藏在 list/dict 里的参数 hook 找不到，会以 NaN 或显存异常的方式静默出错。生命周期归拢成一张表：</p>
     <table class="tbl">
       <tr><th>阶段</th><th>动作</th><th>代码位置</th></tr>
       <tr><td>init</td><td>遍历叶子模块，参数切分、留 ds_tensor 分片</td><td>InsertPostInitMethodToModuleSubClasses</td></tr>
@@ -176,7 +190,7 @@
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>
-      自研 ZeRO-3 的最小正确路径：① 不用 hook，先用<strong>显式上下文管理器</strong>（with gather(params): ...）手写借还——语义清楚、方便调试，跑通后再自动化成 hook；② prefetch 做成「提前一层」而非「提前一层+复用分析」，先跑对再跑快；③ 显存峰值盯 <code class="inline">max_live_parameters</code>，通信时长盯 all-gather 完成事件。最容易错的三点：借出参数忘记释放（显存线性涨到 OOM）、梯度写到了壳 param 的 .grad 上（应该在分片缓冲）、leaf 参数在 hook 外被直接访问（拿到的是空壳，静默产出 NaN）。
+      自研 ZeRO-3 的最小正确路径：不用 hook，先用<strong>显式上下文管理器</strong>（with gather(params): ...）手写借还——语义清楚、方便调试，跑通后再自动化成 hook；prefetch 做成「提前一层」而非「提前一层+复用分析」，先跑对再跑快；显存峰值盯 <code class="inline">max_live_parameters</code>，通信时长盯 all-gather 完成事件。最容易错的三点：借出参数忘记释放（显存线性涨到 OOM）、梯度写到了壳 param 的 .grad 上（应该在分片缓冲）、leaf 参数在 hook 外被直接访问（拿到的是空壳，静默产出 NaN）。
     </div>
   </section>
 
@@ -187,7 +201,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 08 ZeRO-3 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 08 ZeRO-3 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

@@ -35,29 +35,38 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 内存</div>
-    <h1>内存规划与 KV 预算：GPU 显存怎么分、KV 能塞多少</h1>
-    <div class="subtitle">启动一个 vLLM 实例时，它要先回答一个问题：<strong>权重占了多少，还剩多少能给 KV cache，够几个请求同时跑？</strong>这一章讲清楚显存划分、内存 profile/warm-up、KV 预算公式、batch 上限，以及前缀缓存为什么能省掉大量重复 prefill。</div>
+    <h1>内存规划与 KV 预算：显存从哪来，到哪去</h1>
+    <div class="subtitle">推理服务占一张卡，权重和激活之外，<strong>还剩多少能给 KV cache？这些字节换算成多少个物理块？每一步又能塞进多少请求？重复的前缀能不能共享？</strong>先看显存总量怎么圈、KV 分到多少，再一路推进到块换算、每步限额与前缀共享；末了拿 SGLang 的做法逐项对照。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">8.1</span>显存怎么分：权重 + KV cache + activation</h2>
-    <p>一张 GPU 的显存，在 vLLM 看来大致分成三大块。前两块是「常驻」的，最后一块是「每步临时」的：</p>
+    <h2><span class="num">8.1</span>一张 80 GiB 的卡，KV cache 能分到多少</h2>
+    <p>先把场景摆出来：一张 80 GiB 的数据中心卡，加载一个 7B 级 FP16 模型，权重吃掉约 14 GiB。之后每来一个请求、每生成一个 token，都要往 KV cache 里写 K 和 V——这些字节不会凭空出现，必须<strong>在启动那一刻就圈定一块专属区域</strong>。圈多大，是个两难的判断：</p>
     <ul>
-      <li><strong>模型权重</strong>：加载进显存的参数（含每层的权重），一进来就占满，不会波动。</li>
-      <li><strong>KV cache</strong>：给所有并发请求存 K/V。数量由「剩余显存 ÷ 每块字节」决定，是本章主角。</li>
-      <li><strong>activation / 临时缓冲</strong>：一次 forward 里算出来的中间激活、CUDA graph 捕获的输入输出缓冲区等，随 batch 大小波动。</li>
+      <li>圈大了，挤掉 activation 和 CUDA graph 缓冲的空间，跑到一半 OOM——那一步 forward 直接失败，已经接下的请求进退两难；</li>
+      <li>圈小了，KV 装不下几条序列，GPU 算力闲着，吞吐上不去。</li>
     </ul>
+    <p>先把两难里一笔带过的 <strong>activation</strong> 说清。它指一次 forward 里现算出来的<strong>中间激活张量</strong>——各层的 hidden states、attention 输出、FFN 的中间向量、最后的 logits（这里「激活」说的是张量，不是激活函数）。它和权重、KV 的差别在寿命：权重和 KV 都要长期占着显存——权重是模型本身，KV 是每个请求的上下文；activation 只在计算过程中被使用——进 forward 才出现，这步算完就不再需要。它占多少显存由单步塞进的 token 数决定，所以要量的是峰值。</p>
+    <p>顺着这个两难往下想，会撞见一串具体的问题，它们环环相扣：</p>
+    <ul>
+      <li><strong>总量怎么圈？</strong>显存不是只给这个进程用的——CUDA context、驱动、同卡其他进程都要占。能不能「用到 OOM 为止」？不能，OOM 来的时候没有任何商量余地。得先划一条明确的线。</li>
+      <li><strong>线内扣掉权重和 activation，剩多少给 KV？</strong>权重加载完可以量出来，activation 峰值呢？拍脑袋估一个数：估小了运行时 OOM，估大了 KV 白白少一块。得在最坏情况下实测。</li>
+      <li><strong>字节怎么变成调度单位？</strong>调度器分配的不是字节，是块。56 GiB 这样的字节数要换算一次才知道能装多少块——每块多大？公式长什么样？</li>
+      <li><strong>每一步塞多少请求？</strong>总量够不等于每步都能塞：单步 token 数决定激活峰值，序列数决定同时持有的 KV。这两个上限跟 KV 预算互相牵制。</li>
+      <li><strong>重复的前缀怎么办？</strong>对话场景里大量请求共享同一段开头，naive 引擎各自 prefill 一遍、各存一份，费算力也费显存。能不能共享？</li>
+    </ul>
+    <p>把这五个问题和它们依附的显存区域画在一张图上：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
         </defs>
-        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">一块 80 GiB 的 GPU（示意比例），按 gpu_memory_utilization 圈出总预算</text>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">一块 80 GiB 的 GPU（示意比例）：三块显存，前两块是固定开销</text>
 
-        <!-- 总预算外框 = 0.92 总显存 -->
+        <!-- 总预算外框 = util × 总显存 -->
         <rect x="20" y="52" width="560" height="40" rx="6" fill="#dfe7ef" stroke="#5c6b7a" stroke-dasharray="5 4"></rect>
-        <text class="lbl sm" x="580" y="76">总预算 = 0.92 × 80 ≈ 74 GiB</text>
-        <text class="lbl sm" x="595" y="116" fill="#5c6b7a">剩余 ≈ 8% 留给别的进程 / 系统</text>
+        <text class="lbl sm" x="580" y="76">总预算 = 比例 × 80 GiB（比例取多少，8.2 讲）</text>
+        <text class="lbl sm" x="595" y="116" fill="#5c6b7a">线外留空：CUDA context、驱动、同卡其他进程</text>
 
         <!-- 权重 -->
         <rect class="node core" x="20" y="160" width="240" height="120" rx="8"></rect>
@@ -72,7 +81,7 @@
         <text class="lbl sm" x="390" y="225" text-anchor="middle">按块分配，随并发/长度增长</text>
         <text class="lbl sm" x="390" y="243" text-anchor="middle">= available_mem ÷ 每块字节</text>
         <text class="lbl sm" x="390" y="261" text-anchor="middle">（数 GiB ~ 十几 GiB）</text>
-        <text class="lbl sm" x="390" y="196" font-size="10" fill="#b56917" text-anchor="middle">本页预算的「变量」</text>
+        <text class="lbl sm" x="390" y="278" font-size="10" fill="#b56917" text-anchor="middle">本页预算的「变量」</text>
 
         <!-- activation / 临时 -->
         <rect class="node" x="520" y="160" width="200" height="120" rx="8"></rect>
@@ -85,16 +94,21 @@
         <rect class="node core" x="135" y="92" width="10" height="70" rx="2"></rect>
         <rect class="node acc" x="385" y="92" width="10" height="70" rx="2"></rect>
         <rect class="node" x="555" y="92" width="10" height="70" rx="2"></rect>
-        <text class="lbl sm" x="20" y="310">profile 的目标就是量出「权重 + activation 峰值」之后，把剩余显存全部给 KV → 这决定了 num_gpu_blocks</text>
+        <text class="lbl sm" x="20" y="310">本章主线：量出「权重 + activation 峰值」，把剩余显存全部给 KV——上面的五个问题就挂在这条线的五个环节上</text>
       </svg>
       <div class="svg-legend">
         <span class="lg-item"><span class="sw core"></span>模型权重（固定）</span>
         <span class="lg-item"><span class="sw acc"></span>KV cache（变量）</span>
         <span class="lg-item"><span class="sw"></span>activation / 临时</span>
       </div>
-      <div class="fig-cap">图 8.1：显存三块——权重与 activation 是固定开销，KV 用的是剩下的部分。比例仅为示意。</div>
+      <div class="fig-cap">图 8.1：显存三块——权重与 activation 是固定开销，KV 用的是剩下的部分；虚线框是本章要划出的总预算。比例仅为示意。</div>
     </div>
-    <p>划总预算的开关是 <code class="inline">CacheConfig.gpu_memory_utilization</code>：0~1 之间，表示「这份 GPU 显存的多少比例拿来给本实例」。注意：<strong>当前代码里默认值是 0.92</strong>，而不是很多人以为的 0.9，它是可配置的（<code class="inline">--gpu-memory-utilization</code>）。</p>
+    <div class="annotation"><b>五个问题的答案怎么排：</b>划线用配置声明总量上限，实测扣除靠启动时跑一遍假前向量出峰值——这两件合在 8.2 一节；换算成块是一条除法（8.3），每步上限是两个调度参数（8.4），前缀共享靠块哈希 + 引用计数（8.5）。8.6 再看 SGLang 对同一串问题给出的另一套答案。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>划线与实测：剩余显存怎么量</h2>
+    <p>vLLM 把前两个问题合成一个流程：<strong>边界用配置划，剩余用实测分</strong>。边界就是 <code class="inline">CacheConfig.gpu_memory_utilization</code>（0~1，当前默认 0.92），声明「这个实例最多占整卡显存的多少比例」。先看配置：</p>
     <div class="code-title">vllm/config/cache.py — CacheConfig（摘录；前半为官方英文注释，后半为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">CacheConfig</span>:
     <span class="cl">DEFAULT_BLOCK_SIZE</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">16</span>          <span class="cmt"># 每块 16 个 token</span>
@@ -103,40 +117,48 @@
     <span class="cmt"># The fraction of GPU memory to be used for the model executor ...</span>
     <span class="cmt"># If unspecified, will use the default value of 0.92.</span>
     <span class="cmt"># 这是 per-instance 限制：只作用于当前实例。</span></pre>
-    <div class="annotation"><b>关键理解：</b>0.92 不是「KV 占 92%」，而是「整个实例最多用 92%」。权重先吃一份，activation 再吃一份，<strong>剩下的</strong>才轮到 KV。所以比例调高 → KV 预算变大；调低 → KV 变小。</div>
-  </section>
-
-  <section class="block">
-    <h2><span class="num">8.2</span>内存 profile / warm-up：KV 预算怎么「量出来」</h2>
-    <p>vLLM 不是「猜一个 KV 大小」，而是<strong>真在 GPU 上跑一遍</strong>。启动时它用 <code class="inline">memory_profiling</code> 上下文量好权重+activation 的峰值，然后算「还能腾多少给 KV」。</p>
-    <p>实测口径在 <code class="inline">vllm/v1/worker/gpu_worker.py</code>：先记录初始空闲显存 <code class="inline">init_snapshot</code>，把「请求的总预算」记为 <code class="inline">requested_memory</code>；profile 过后量出 <code class="inline">non_kv_cache_memory</code>（权重 + activation），相减就是可给 KV 的字节数：</p>
+    <div class="annotation"><b>关键理解：</b>0.92 不是「KV 占 92%」，而是「整个实例最多用 92%」。它回答的是「总量怎么圈」：权重先吃一份，activation 再吃一份，<strong>剩下的</strong>才轮到 KV。要算出「剩下」具体是多少字节，就得先量出前两项——这是第二个问题。</div>
+    <p>「权重 14 GiB、激活大概 2 GiB」这种估算能起步，但离生产差得远：不同 batch 形状下激活峰值差好几倍，CUDA graph 缓冲更是只有捕获时才知道。vLLM 的做法是<strong>把「量」做成启动流程的一部分</strong>：加载权重后，用一个顶满 batch 的假前向（第 5 章讲过的 <code class="inline">_dummy_run</code>）把 activation 的峰值顶出来，前后各拍一次显存快照，差值就是实测占用。</p>
+    <p>整个过程在 <code class="inline">vllm/v1/worker/gpu_worker.py</code> 的 <code class="inline">determine_available_memory</code> 里。先在启动时记下初始快照，并按配置算出「本实例申请的总预算」：</p>
+    <div class="code-title">vllm/v1/worker/gpu_worker.py — 启动快照与总预算（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># take current memory snapshot</span>
+self.init_snapshot = init_snapshot = <span class="cl">MemorySnapshot</span>(device=self.device)
+self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, self.cache_config)</pre>
+    <div class="annotation"><b>读懂 <code class="inline">request_memory</code>（vllm/v1/worker/utils.py:533）：</b>它就是 <code class="inline">ceil(总显存 × gpu_memory_utilization)</code>——上面 CacheConfig 里那个 0.92 在这里变成具体字节数。如果当前空闲显存连这个数都不到，直接抛错让你调低比例。</div>
+    <p>然后是关键的量测段：</p>
+    <div class="code-title">vllm/v1/worker/gpu_worker.py — profile 假前向（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Execute a forward pass with dummy inputs to profile the memory usage</span>
+<span class="cmt"># of the model.</span>
+<span class="kw">with</span> <span class="fn">memory_profiling</span>(
+    self.init_snapshot,
+    weights_memory=<span class="fn">int</span>(self.model_runner.model_memory_usage),
+) <span class="kw">as</span> profile_result:
+    self.model_runner.profile_run()</pre>
+    <div class="annotation"><b>这段的重点在「顶满」二字：</b><code class="inline">profile_run</code> 内部就是 <code class="inline">_dummy_run(max_num_tokens)</code>——按 <code class="inline">max_num_batched_tokens</code> 顶满的假输入跑一次完整前向（V2 实现在 <code class="inline">vllm/v1/worker/gpu/model_runner.py:934</code>）。顶满而不是随便跑，量出来的才是 activation 的<strong>峰值</strong>；之后运行时无论 batch 怎么变，都不会超过这个数。<code class="inline">memory_profiling</code> 上下文负责前后快照相减，把权重（显式传入）和激活峰值分开记账。</div>
+    <p>量完之后，KV 预算就是三行减法：</p>
     <div class="code-title">vllm/v1/worker/gpu_worker.py — KV 预算计算（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span>self.total_consumed = profile_result.total_consumed
-<span class="cmt"># 权重 + activation 峰值（profile 中实测出的占用）</span>
-self.peak_activation_memory = (...)
-...
-self.available_kv_cache_memory_bytes = (
-    self.requested_memory                <span class="cmt"># 0.92 × 初始空闲显存</span>
-    - profile_result.non_kv_cache_memory <span class="cmt"># 减掉权重 + activation</span>
+    <pre class="code"><span class="lang-tag">python</span>self.available_kv_cache_memory_bytes = (
+    self.requested_memory                <span class="cmt"># 0.92 × 总显存</span>
+    - profile_result.non_kv_cache_memory <span class="cmt"># 减掉权重 + activation 峰值</span>
     - cudagraph_memory_estimate_applied  <span class="cmt"># CUDA graph 缓冲也要留</span>
-)
-<span class="cmt"># 之后据这个字节数算 num_blocks，见 8.3</span></pre>
-    <p>公式看着抽象，代进一张具体的卡算一遍就清楚了。设定：单张 80 GiB 数据中心卡，跑一个 7B 级 FP16 模型，<code class="inline">gpu_memory_utilization</code> 取默认 0.92，块大小 16，KV 每 token 128 KiB（8.1 里那个 2 × 32 层 × 8 KV 头 × 128 head_dim × 2 字节的例子）。一步步扣：</p>
+)</pre>
+    <div class="annotation"><b>三项都有出处：</b>第一项来自启动时的 <code class="inline">request_memory</code>；第二项是 profile 实测（权重显式传入 + 激活峰值快照差）；第三项在启用 CUDA graph 时按捕获计划估算（<code class="inline">profile_cudagraph_memory</code>，gpu_worker.py:624），捕获前就得给它留位。这个减法是 vLLM 显存管理的全部秘密：<strong>KV 拿到的不是「总显存减权重」，而是「预算减去所有实测占用」</strong>——谁的峰值涨了，KV 就让位。</div>
+    <p>代进一张具体的卡算一遍就清楚了。设定：单张 80 GiB 数据中心卡，跑一个 7B 级 FP16 模型，<code class="inline">gpu_memory_utilization</code> 取默认 0.92，块大小 16，KV 每 token 128 KiB（8.3 推这个数）。一步步扣：</p>
     <table class="tbl">
       <thead><tr><th style="width:6%">步</th><th style="width:34%">算什么</th><th style="width:22%">结果</th><th>依据</th></tr></thead>
       <tbody>
-        <tr><td>1</td><td>总预算 = 80 GiB × 0.92</td><td><code class="inline">≈ 73.6 GiB</code></td><td><code class="inline">requested_memory</code>（留给系统与其他进程约 8%）</td></tr>
+        <tr><td>1</td><td>总预算 = 80 GiB × 0.92</td><td><code class="inline">≈ 73.6 GiB</code></td><td><code class="inline">request_memory</code>（留给系统与其他进程约 8%）</td></tr>
         <tr><td>2</td><td>扣权重：7B 参数 × 2 字节</td><td><code class="inline">−14 GiB → 余 59.6</code></td><td>profile 实测的 non_kv_cache_memory 的大头</td></tr>
         <tr><td>3</td><td>扣 activation 峰值（<code class="inline">_dummy_run</code> 顶出来的最大 batch 假前向）</td><td><code class="inline">−2 GiB → 余 57.6</code></td><td>同上，profile 的另一部分</td></tr>
         <tr><td>4</td><td>扣 CUDA graph 缓冲估计值</td><td><code class="inline">−1.6 GiB → 余 56.0</code></td><td><code class="inline">cudagraph_memory_estimate_applied</code></td></tr>
-        <tr><td>5</td><td>得到 KV 总字节 56 GiB ≈ 6.0 × 10¹⁰ B</td><td><code class="inline">available_kv_cache_memory_bytes</code></td><td>gpu_worker.py:626 的减法结果</td></tr>
-        <tr><td>6</td><td>÷ 每 token 128 KiB → 再 ÷ 块 16 token</td><td><code class="inline">≈ 28 600 块</code></td><td>8.3 的除法（每块 2 MiB）</td></tr>
+        <tr><td>5</td><td>得到 KV 总字节 56 GiB ≈ 6.0 × 10¹⁰ B</td><td><code class="inline">available_kv_cache_memory_bytes</code></td><td>gpu_worker.py:660 的减法结果</td></tr>
+        <tr><td>6</td><td>56 GiB 换算成块：÷ 每块 2 MiB</td><td><code class="inline">≈ 28 700 块</code></td><td>8.3 的除法（图 8.2 画出换算过程）</td></tr>
         <tr><td>7</td><td>÷ 每请求块数（如 4K token 序列 ÷ 16 = 256 块）</td><td><code class="inline">≈ 110 并发请求</code></td><td>理论上限，未计 watermark</td></tr>
-        <tr><td>8</td><td>预留 watermark（默认 0.0 关闭；按 1% 举例，约 286 块）——只对 WAITING/PREEMPTED 请求的准入生效，给它们留出免于反复抢占的余量</td><td><code class="inline">运行中可用 ≈ 28 314 块</code></td><td><code class="inline">kv_cache_manager.py:513</code> 的 <code class="inline">watermark_blocks</code>（config/scheduler.py:188 默认 0.0）</td></tr>
+        <tr><td>8</td><td>预留 watermark（默认 0.0 关闭；按 1% 举例，约 287 块）——只对 WAITING/PREEMPTED 请求的准入生效，给它们留出免于反复抢占的余量</td><td><code class="inline">运行中可用 ≈ 28 385 块</code></td><td><code class="inline">kv_cache_manager.py:513</code> 的 <code class="inline">watermark_blocks</code>（config/scheduler.py:191 默认 0.0）</td></tr>
       </tbody>
     </table>
     <p>注意第 4 步和第 8 步是纯预留：CUDA graph 缓冲和水印块平时都闲着，但前者保证回放时不会 OOM，后者让新请求和被抢占的请求恢复时「总有一个块可拿」。反过来读这张表也成立：线上问「为什么并发上不去」，答案就藏在哪一行扣掉了多少——权重超预期？activation 峰值没量准？还是 watermark 留多了。</p>
-    <p>而「怎么把能用的显存试出来」靠两大段 warm-up。其一：<code class="inline">GPUModelRunner.profile_run()</code> 在 profile 期间用一个 <code class="inline">_dummy_run(max_num_tokens)</code> 的假前向把 weights + activation 的<strong>峰值</strong>顶出来（第 5 章讲过这个假前向）。其二：<code class="inline">vllm/v1/worker/gpu/warmup.py</code> 里跑一批真实的 <code class="inline">warmup_kernels</code>，把要用的 kernel 都先执行一遍，并用 <code class="inline">run_mixed_prefill_decode_warmup</code> 专门验证「KV 块够不够塞下我准备调的 batch」：</p>
+    <p>量出来之后还有最后一道保险。第 5 步的 56 GiB 换成块、<code class="inline">num_gpu_blocks</code> 写回配置之后，vLLM 会跑一整段 warm-up（<code class="inline">compile_or_warm_up_model</code>，gpu_worker.py:807）：先把要用的 kernel 都真实执行一遍（<code class="inline">warmup_kernels</code>，gpu_worker.py:849 调入），其中专门有一段<strong>拿 KV 块数反推 warmup 批大小</strong>——如果块不够塞下我准备调的 batch，就把批改小，而不是硬调到 OOM：</p>
     <div class="code-title">vllm/v1/worker/gpu/warmup.py — 用 KV 块数决定 warmup 批大小（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>num_reqs = <span class="fn">min</span>(
     model_runner.scheduler_config.max_num_seqs,
@@ -150,12 +172,12 @@ self.available_kv_cache_memory_bytes = (
         <span class="fn">max</span>(<span class="nu">1</span>, (model_runner.kv_cache_config.num_blocks - <span class="nu">1</span>)
             // max_blocks_per_req),
     )</pre>
-    <div class="annotation"><b>读懂这段：</b>warm-up 不只是热身——它把 <code class="inline">num_blocks</code> 和 <code class="inline">max_num_seqs / max_num_batched_tokens</code> 绑在了一起：如果 KV 块不够放下我要调的 batch，它<strong>不会硬调</strong>，而是把批改小。KV 预算直接决定了你能扛多大的并发。对自研引擎而言，「profile → 算剩余 → 定 KV 预算」这一整套流程，是引擎从能跑到可靠的分界线。</div>
+    <div class="annotation"><b>warm-up 不只是热身：</b>它把 <code class="inline">num_blocks</code> 和 <code class="inline">max_num_seqs / max_num_batched_tokens</code> 绑在了一起：KV 块不够放要调的 batch，就<strong>不硬调</strong>。KV 预算直接决定了你能扛多大的并发。对自研引擎而言，「profile → 算剩余 → 定 KV 预算」这一整套流程，是引擎从能跑到可靠的分界线。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.3</span>KV 预算公式：每 token 多少字节，能分几块</h2>
-    <p>KV cache 的大小可以直接算出来。每个 token 要存 K 和 V 两组向量，层数以外还有「每组 KV 头」这个关键参数（<strong>num_kv_heads</strong>——GQA/MLA 下它比 query heads 小很多，是省显存的关键）：</p>
+    <h2><span class="num">8.3</span>换算：字节数变成多少个块</h2>
+    <p>第三个问题：8.2 算出的 56 GiB 还是一笔「字节账」，调度器没法用——它分配的单位是块。换算要先知道<strong>每 token 占多少字节</strong>。每个 token 要存 K 和 V 两组向量，层数以外还有「每组 KV 头」这个关键参数（<strong>num_kv_heads</strong>——GQA/MLA 下它比 query heads 小很多，是省显存的关键）：</p>
     <p><strong>每 token 字节 ≈ 2（K 和 V 两份）× num_layers × num_kv_heads × head_dim × dtype 字节</strong></p>
     <p>例如一个 32 层、kv_heads=8、head_dim=128、bf16（2 字节）的模型：<br>
     2 × 32 × 8 × 128 × 2 = <strong>131,072 字节 ≈ 128 KiB / token</strong>。<br>
@@ -171,12 +193,72 @@ self.available_kv_cache_memory_bytes = (
     num_blocks = <span class="fn">may_override_num_blocks</span>(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
     <span class="kw">return</span> <span class="cl">KVCacheConfig</span>(num_blocks=num_blocks, kv_cache_tensors=[...], ...)</pre>
-    <div class="annotation"><b>读懂 <code class="inline">num_blocks = available_memory // bytes_per_block</code>：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值，即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
+    <div class="annotation"><b>读懂 <code class="inline">num_blocks = available_memory // bytes_per_block</code>（kv_cache_utils.py:1762）：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值（写入点在 <code class="inline">vllm/v1/engine/core.py:337</code>），即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
+    <p>回到 8.2 表格第 6 步——「÷ 每 token 128 KiB → 再 ÷ 块 16 token」两次除法，和代码里「只除一次」的 <code class="inline">bytes_per_block</code> 是同一件事：源码不做两次除，它先把「每 token 128 KiB × 16 token」合算成「每块 2 MiB」，再拿可用显存一次除到位。两种算法结果相同，图 8.2 把这条对应关系画出来：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">两种算法殊途同归：代码把「每 token 字节 × 16」预乘成每块字节，只除一次</text>
+
+        <!-- 一块的内部结构 -->
+        <text class="lbl sm" x="20" y="56" font-weight="bold" fill="#165a7b">一块里面装着什么</text>
+        <rect class="node acc" x="20" y="68" width="560" height="92" rx="8"></rect>
+        <text class="lbl sm" x="300" y="88" text-anchor="middle" font-weight="bold">1 个物理块 = 16 个 token 槽</text>
+        <rect x="40" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="72" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="104" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="136" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="168" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="200" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="232" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="264" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="296" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="328" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="360" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="392" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="424" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="456" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="488" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <rect x="520" y="118" width="28" height="22" rx="2" fill="#fdf2e3" stroke="#b56917"></rect>
+        <text class="lbl sm" x="300" y="152" text-anchor="middle">…共 16 槽 · 每槽放该 token 的 K 和 V（所有层 × 所有 KV 头）</text>
+
+        <!-- 两条计算路径 -->
+        <text class="lbl sm" x="20" y="186" font-weight="bold" fill="#165a7b">表 8.2 第 6 步：两次除</text>
+        <rect class="node" x="20" y="200" width="300" height="54" rx="8"></rect>
+        <text class="lbl sm" x="170" y="222" text-anchor="middle">56 GiB ÷ 128 KiB/token ≈ 459 000 个 token 位</text>
+        <text class="lbl sm" x="170" y="242" text-anchor="middle">459 000 ÷ 16 ≈ 28 700 块</text>
+
+        <text class="lbl sm" x="470" y="186" font-weight="bold" fill="#165a7b">代码 kv_cache_utils.py：一次除</text>
+        <rect class="node ok" x="470" y="200" width="380" height="54" rx="8"></rect>
+        <text class="lbl sm" x="660" y="222" text-anchor="middle">bytes_per_block = 128 KiB × 16 = 2 MiB</text>
+        <text class="lbl sm" x="660" y="242" text-anchor="middle">56 GiB ÷ 2 MiB ≈ 28 700 块</text>
+
+        <!-- 等价连线 -->
+        <line class="edge" x1="320" y1="227" x2="470" y2="227" stroke-dasharray="6 4"></line>
+        <text class="lbl sm" x="395" y="218" text-anchor="middle" fill="#2e8b57">= 同一个答案</text>
+
+        <!-- 得到 num_blocks 之后 -->
+        <line class="edge" x1="660" y1="254" x2="660" y2="288"></line>
+        <rect class="node core" x="470" y="290" width="380" height="52" rx="8"></rect>
+        <text class="lbl sm" x="660" y="312" text-anchor="middle" font-weight="bold">num_blocks ≈ 28 700 → 写入 cache_config</text>
+        <text class="lbl sm" x="660" y="330" text-anchor="middle">BlockPool 一次性预分配这么多物理块</text>
+
+        <text class="lbl sm" x="20" y="386">源码里没有「÷ 每 token 再 ÷ 16」这两步——表格那样拆是为了和上面的每 token 公式对上；代码只用合好的 bytes_per_block</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw acc"></span>物理块内的 token 槽</span>
+        <span class="lg-item"><span class="sw core"></span>每 token 字节（上面公式）</span>
+        <span class="lg-item"><span class="sw ok"></span>代码的实际除法</span>
+      </div>
+      <div class="fig-cap">图 8.2：两次除（先 token 后块）与一次除（bytes_per_block）是同一道算术，代码把「128 KiB × 16」预乘成每块 2 MiB。</div>
+    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.4</span>max_num_seqs / max_num_batched_tokens：每步能跑多少</h2>
-    <p>KV 预算回答了「显存够不够」，但每一步实际跑多少请求、多少个 token，由 <code class="inline">SchedulerConfig</code> 的两个上限管着：</p>
+    <h2><span class="num">8.4</span>限额：每一步塞多少请求</h2>
+    <p>第四个问题：块数管的是「总量」，但每一步 forward 还受两个更细的上限管着——这也是显存问题：<code class="inline">SchedulerConfig</code> 的两个字段。</p>
     <div class="code-title">vllm/config/scheduler.py — SchedulerConfig（摘录；前半为官方英文注释，后半为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cl">DEFAULT_MAX_NUM_BATCHED_TOKENS</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">2048</span>
 <span class="cl">DEFAULT_MAX_NUM_SEQS</span>: <span class="cl">ClassVar</span>[<span class="cl">int</span>] = <span class="nu">128</span>
@@ -189,20 +271,57 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
       <li><strong>max_num_batched_tokens</strong>（默认 2048）：一步 ≤ 多少个 token。它决定单次 forward 的激活峰值——预分配 <code class="inline">max_num_tokens = max_num_batched_tokens</code> 的中间缓冲，是 activation 显存的主要来源。</li>
       <li><strong>max_num_seqs</strong>（默认 128）：一步 ≤ 多少个序列（请求）。防止 decode 步里一堆只出 1 个 token 的序列把 batch 撑爆。</li>
     </ul>
+    <p>把这条链放回 8.2 就能看到因果闭合：这两个上限决定 activation 峰值 → 峰值进 <code class="inline">non_kv_cache_memory</code> → 挤小 KV 预算 → KV 块数变少 → 8.2 末尾 warmup 又拿块数反过来封顶批大小。三个「显存变量」（预算、上限、块数）互相咬合，谁动了另外两个都得跟着动：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 900 250" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
+        </defs>
+        <text class="lbl" x="20" y="24" font-weight="bold" fill="#165a7b">三个显存变量互相咬合：调任何一个，另外两个都会跟着动</text>
+
+        <rect class="node" x="40" y="60" width="240" height="80" rx="8"></rect>
+        <text class="lbl sm" x="160" y="88" text-anchor="middle" font-weight="bold">max_num_batched_tokens</text>
+        <text class="lbl sm" x="160" y="108" text-anchor="middle">每步 token 数上限</text>
+        <text class="lbl sm" x="160" y="126" text-anchor="middle">决定 activation 峰值</text>
+
+        <rect class="node core" x="330" y="60" width="240" height="80" rx="8"></rect>
+        <text class="lbl sm" x="450" y="88" text-anchor="middle" font-weight="bold">KV 预算</text>
+        <text class="lbl sm" x="450" y="108" text-anchor="middle">= 预算 − 权重 − 激活 − graph</text>
+        <text class="lbl sm" x="450" y="128" text-anchor="middle">激活涨 → 预算缩</text>
+
+        <rect class="node acc" x="620" y="60" width="240" height="80" rx="8"></rect>
+        <text class="lbl sm" x="740" y="88" text-anchor="middle" font-weight="bold">num_gpu_blocks</text>
+        <text class="lbl sm" x="740" y="108" text-anchor="middle">= KV 预算 ÷ 每块字节</text>
+        <text class="lbl sm" x="740" y="128" text-anchor="middle">块少 → 并发天花板低</text>
+
+        <line class="edge" x1="280" y1="100" x2="328" y2="100"></line>
+        <text class="lbl sm" x="304" y="90" text-anchor="middle">峰值顶进</text>
+        <line class="edge" x1="570" y1="100" x2="618" y2="100"></line>
+        <text class="lbl sm" x="594" y="90" text-anchor="middle">换算成块</text>
+
+        <line class="edge back" x1="740" y1="142" x2="740" y2="182"></line>
+        <line class="edge back" x1="740" y1="182" x2="160" y2="182"></line>
+        <line class="edge back" x1="160" y1="182" x2="160" y2="142"></line>
+        <text class="lbl sm" x="450" y="200" text-anchor="middle" fill="#165a7b">块不够 → warmup 把批改小（8.2 末尾的 min 三连），相当于反过来压低前两个变量</text>
+
+        <text class="lbl sm" x="20" y="238">所以「调大 --max-num-batched-tokens」不是免费的：激活峰值高了，KV 预算缩水，块数变少，并发天花板跟着降</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw"></span>批上限（activation 来源）</span>
+        <span class="lg-item"><span class="sw core"></span>KV 预算（减法结果）</span>
+        <span class="lg-item"><span class="sw acc"></span>物理块数（除法结果）</span>
+      </div>
+      <div class="fig-cap">图 8.3：预算、上限、块数三者咬合——批上限抬升激活峰值挤小预算，块数又反过来封顶批大小。</div>
+    </div>
     <div class="callout warn">
       <b class="tag">注意：默认值随硬件动态变化</b>
       上面 ClassVar 里的 2048 / 128 只是<strong>最底层的 fallback</strong>。真实启动时，<code class="inline">EngineArgs</code>（<code class="inline">vllm/engine/arg_utils.py</code> 的 <code class="inline">_set_default_max_num_seqs_and_batched_tokens_args</code>）会按 <strong>GPU 显存档位 + 用途（离线 LLM / 在线 API server）</strong>覆盖它们：≥70GB 的非 A100 卡（如 H100/H200）上 <code class="inline">max_num_batched_tokens</code> 默认开到 8192～16384、<code class="inline">max_num_seqs</code> 开到 1024；TPU/CPU 又是另一套表。所以你在 H100 上跑会看到与 2048 不同的默认值——以实际为准，别死记 2048/128。
     </div>
-    <p>这两个值和 KV 预算的关系非常直接：batch 越大 → 同时跑的序列越长/越多 → 需要的 KV 块越多。8.2 里 warmup 那行 <code class="inline">min(max_num_seqs, max_num_batched_tokens // ...)</code> 又在 KV 块够的前提下把这些上限封顶。所以：</p>
-    <div class="callout info">
-      <b class="tag">留白</b>
-      <strong>特意留出 activation 显存：</strong>profile 量出来的是 activation 的<strong>峰值</strong>（按 max_num_batched_tokens 顶满），所以 KV 拿到的永远比「总显存 − 权重」更少——多出来的那一段是留给 activation 的「安全余量」。这也是为什么调大 <code class="inline">--max-num-batched-tokens</code> 后 KV 往往会被挤小：激活峰值高了，<code class="inline">non_kv_cache_memory</code> 变大，KV 预算变少。
-    </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.5</span>前缀缓存 prefix caching：相同开头 → 复用已算 KV</h2>
-    <p>对话应用里，很多请求有<strong>相同的开头</strong>（system prompt、历史、few-shot 例子都一模一样）。naive 引擎每个请求都要从头 prefill 一遍，纯属浪费。vLLM 的前缀缓存的关键：<strong>块满后，把块的「内容」算一个哈希，同一个哈希的物理块只算一次、让多个请求共用一个物理块</strong>。</p>
+    <h2><span class="num">8.5</span>共享：前缀缓存让同样的块装更多对话</h2>
+    <p>最后一个问题：对话应用里有个现成的优化机会——很多请求<strong>共享同一段开头</strong>（system prompt、历史、few-shot 例子都一模一样）。naive 引擎每个请求都要从头 prefill 一遍这段重复内容，算一遍、存一份。vLLM 的做法：<strong>块满后把块的「内容」算一个哈希，同一个哈希的物理块只算一次、让多个请求共用一个物理块</strong>——省一份 prefill 计算，也省一份显存。</p>
     <p>哈希与查找都落在 <code class="inline">vllm/v1/core/block_pool.py</code> 的 <code class="inline">BlockHashToBlockMap</code>——一个 <code class="inline">{block_hash: KVCacheBlock(s)}</code> 的映射。只有<strong>满块</strong>才进这个缓存；而每个块用自己的引用计数 <code class="inline">ref_cnt</code> 记录「有几个请求在用它」。复用逻辑由 <code class="inline">BlockPool.get_cached_block</code> 查询、<code class="inline">cache_full_blocks</code> 登记、<code class="inline">ref_cnt</code> 归零后再 <code class="inline">evict_blocks</code> 回收。</p>
     <div class="code-title">vllm/v1/core/kv_cache_utils.py — KVCacheBlock 字段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">KVCacheBlock</span>:
@@ -245,8 +364,6 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
         <line class="edge" x1="660" y1="150" x2="185" y2="112"></line>
         <line class="edge" x1="720" y1="150" x2="300" y2="112"></line>
 
-        <!-- 分歧后各自新建物理块（引用计数归 1） -->
-
         <!-- 分叉后的物理块 -->
         <line class="edge" x1="130" y1="200" x2="470" y2="216"></line>
         <rect class="node acc" x="450" y="216" width="110" height="50" rx="6"></rect>
@@ -265,18 +382,19 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
         <span class="lg-item"><span class="sw acc"></span>分歧后各自新建块（ref=1）</span>
         <span class="lg-item"><span class="sw"></span>请求</span>
       </div>
-      <div class="fig-cap">图 8.5：前缀命中让第二个请求跳过整段重复 prefill，物理块引用计数体现共享。</div>
+      <div class="fig-cap">图 8.4：前缀命中让第二个请求跳过整段重复 prefill，物理块引用计数体现共享。</div>
     </div>
     <div class="annotation"><b>为什么「块哈希」是关键：</b>一样的 token 序列一定算出一样的块哈希，所以 <code class="inline">BlockHashToBlockMap</code> 一查即中。默认 <code class="inline">enable_prefix_caching = True</code> 且哈希算法为 <code class="inline">"sha256"</code>（见 <code class="inline">CacheConfig</code>，可用 xxhash 提速）。命中率越高，省下的 prefill 越多——而省下的 prefill 本身就是省显存省时间。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">8.6</span>小结与自研启示</h2>
+    <h2><span class="num">8.6</span>SGLang 的另一套答案与自研启示</h2>
+    <p>回到 8.1 摆出的五个问题，vLLM 的答案是「配置划线 → profile 实测 → 除法换算 → 双上限 → 块哈希」。回到最初那条减法和那条除法：profile 量出权重与激活的峰值，<strong>预算减去实测占用</strong>得到 KV 的字节数；字节<strong>除以每块字节</strong>得到物理块数。批上限决定激活峰值，块数反过来封顶批大小——三个变量咬合成一个闭环。前缀缓存则不改变这个闭环，只是让同一个块服务更多请求。</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以先做</th></tr>
       <tr><td>总预算</td><td>gpu_memory_utilization=0.92</td><td>先写成「总显存 × 比例 − 权重 − 激活」的公式</td></tr>
       <tr><td>KV 预算来源</td><td>profile 实测 non_kv_cache_memory 后取剩余</td><td>先用估值算 KV，<strong>不用一开始就做 profile 回退</strong></td></tr>
-      <tr><td>KV 块数</td><td>available_memory // block_stride</td><td>固定 block 数 + 简单统计即可起步</td></tr>
+      <tr><td>KV 块数</td><td>available_memory // bytes_per_block</td><td>固定 block 数 + 简单统计即可起步</td></tr>
       <tr><td>每步上限</td><td>max_num_batched_tokens / max_num_seqs</td><td>先做「每步最多 N token」这一个上限</td></tr>
       <tr><td>前缀缓存</td><td>BlockHashToBlockMap + ref_cnt</td><td>先跳过；这是吞吐优化，不是正确性要求</td></tr>
     </table>
@@ -291,6 +409,16 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
       最小可用公式：<br>
       <code class="inline">num_blocks = (total_gpu_mem × util − weights_bytes − activation_est) // (bytes_per_token × block_size)</code>
     </div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      同样一圈「显存从哪来、按什么单位记账」，SGLang 给出了不同的答案，逐项对照：
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>预算参数</td><td><code class="inline">gpu_memory_utilization</code>：总量占比，profile 实测出非 KV 开销（8.2 节）后，剩余全给 KV</td><td><code class="inline">mem_fraction_static</code>：划出「权重 + KV 池」静态区，池大小启动时现场 profiling 量出（<code class="inline">python/sglang/srt/mem_cache/kv_cache_configurator.py</code>）</td></tr>
+        <tr><td>记账单位</td><td>块：KVCacheManager.allocate_slots 按块发号（3.4 节）</td><td>槽位：ReqToTokenPool 一张「请求 × token → 槽位」目录表，MHATokenToKVPool 按槽位存每层 K/V（<code class="inline">python/sglang/srt/mem_cache/memory_pool.py</code>）；「页」只是发号粒度</td></tr>
+      </table>
+      单位选择牵连调度：以块记账，前缀缓存天然按块对齐；以槽位记账，KV 目录直接就是调度器要填的表。前缀缓存的对照见第 3 章。详见 <a href="../../sglang/books/05-memory.html">深入浅出SGLang · 05 内存池与显存预算</a>。
+    </div>
   </section>
 
   <div class="arrow-nav">
@@ -300,7 +428,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 </div>
 
 <footer>
-  深入浅出vLLM · 08 内存 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 08 内存 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

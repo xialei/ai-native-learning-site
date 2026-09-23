@@ -37,12 +37,17 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 DeepSpeed 引擎</div>
     <h1>DeepSpeedEngine：三行训练循环背后的三百个分支</h1>
-    <div class="subtitle">从这一章进入 DeepSpeed 半场。用户写的循环只有三行：forward、backward、step。DeepSpeedEngine 把这三行展开成：GAS 边界判断、loss 缩放、梯度分区归约、优化器子组步进。这一章先看引擎骨架，第 7、8 章再深入 ZeRO 各 stage 在这三行里的挂点。</div>
+    <div class="subtitle">一行 initialize() 背后引擎装配了什么？用户的三行训练循环（forward/backward/step）每行被展开成什么，梯度累积边界由谁判定？为什么光有引擎还不够——每参数 16 字节的显存账逼出了 ZeRO？全部行为怎么用一个 json 驱动？</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>initialize()：一行调用背后的装配线</h2>
-    <p>用户入口是一行 <code class="inline">deepspeed.initialize()</code>：</p>
+    <h2><span class="num">6.1</span>三行代码背后发生了什么</h2>
+    <p>从这一章进入 DeepSpeed 半场。用户写的循环只有三行：forward、backward、step，入口再加一行 <code class="inline">deepspeed.initialize()</code>。但 DeepSpeedEngine 把这四行展开成：装配线、GAS 边界判断、loss 缩放、梯度分区归约、优化器子组步进。这一章把展开过程拆开看：initialize() 背后装配了什么、<code class="inline">mpu</code> 参数为什么是与 Megatron 融合的关键；三行循环每行展开成什么，backward 里除 GAS 和乘 loss scale 的次序为什么重要，step 被调 N 次怎么只执行 1 次；以及为什么光有引擎还不够——混合精度下每参数 16 字节，7B 模型 112 GB 单卡放不下，这笔账逼出了 ZeRO。最后看全部行为怎么用一个 json 驱动。一句话先行：<strong>用户契约只有五件事（initialize/forward/backward/step/config），全部节拍收拢在一个边界判定上。</strong></p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>initialize()：一行调用背后的装配线</h2>
+    <p>一行 <code class="inline">deepspeed.initialize()</code>，engine 对象从哪来？</p>
     <div class="code-title">deepspeed/__init__.py — initialize()（签名摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">initialize</span>(args=None,
                 model,
@@ -51,39 +56,50 @@
                 config=None, config_params=None,
                 mpu=None,                  <span class="cmt"># 外部并行信息注入点（Megatron-DeepSpeed 融合）</span>
                 dist_init_required=None, ...):</pre>
-    <div class="annotation"><b>装配顺序（engine.py 里逐步展开）：</b>① 解析 config json → ② distributed_init（若进程组未初始化）→ ③ 用 <code class="inline">mpu</code> 参数接入外部并行信息（第 2 章 2.2 节的插头——Megatron-DeepSpeed 融合走这里）→ ④ 按 zero_stage 选择优化器包装（stage 0/1/2/3 对应不同的 ZeroOptimizer 类）→ ⑤ 注册 hook 与梯度累积器。返回的 <code class="inline">engine</code> 才是后续训练的主角：<code class="inline">engine.backward(loss)</code> / <code class="inline">engine.step()</code> 是<strong>引擎的方法，不是 torch 原生</strong>——这是所有 DS 用户代码的统一姿势，也是容易出 bug 的地方（绕过引擎直接 loss.backward() 会跳过全部缩放与归约逻辑）。</div>
+    <div class="annotation"><b>装配顺序（engine.py 里逐步展开）：</b>解析 config json → distributed_init（若进程组未初始化）→ 用 <code class="inline">mpu</code> 参数接入外部并行信息（第 2 章 2.2 节的插头——Megatron-DeepSpeed 融合走这里）→ 按 zero_stage 选择优化器包装（stage 0/1/2/3 对应不同的 ZeroOptimizer 类）→ 注册 hook 与梯度累积器。返回的 <code class="inline">engine</code> 才是后续训练的主角：<code class="inline">engine.backward(loss)</code> / <code class="inline">engine.step()</code> 是<strong>引擎的方法，不是 torch 原生</strong>——这是所有 DS 用户代码的统一姿势，也是容易出 bug 的地方（绕过引擎直接 loss.backward() 会跳过全部缩放与归约逻辑）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>forward / backward / step 三部曲</h2>
+    <h2><span class="num">6.3</span>forward / backward / step 三部曲</h2>
+    <p>用户的三行循环，每行进引擎后展开成什么？先看 backward 和 step 的真实代码：</p>
     <div class="code-title">deepspeed/runtime/engine.py — 三部曲（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># backward（engine.py:3286 附近）</span>
-<span class="kw">def</span> <span class="fn">backward</span>(self, loss, allreduce_gradients=True, release_loss=False):
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># backward（engine.py:3297，省略图跟踪等细节）</span>
+<span class="kw">def</span> <span class="fn">backward</span>(self, loss, retain_graph=False, scale_wrt_gas=True):
     <span class="cmt"># ① GAS：microbatch 间的 loss 先除以累积步数（平均而非求和）</span>
-    loss = self.<span class="fn">scale_loss</span>(loss)
-    <span class="kw">if</span> not self.is_gradient_accumulation_boundary():
-        <span class="kw">return</span>  <span class="cmt"># 不会走到这里——除法总是做的，见下文</span>
-    <span class="cmt"># ② 反传（scale 内部已乘 loss scale）</span>
+    loss = loss / self.gradient_accumulation_steps() <span class="kw">if</span> scale_wrt_gas <span class="kw">else</span> loss
+    <span class="cmt"># ② fp16/bf16 下补乘 loss scale（ZeRO 优化器内部处理）</span>
+    loss = self.optimizer.<span class="fn">scale_if_loss</span>(loss)
+    <span class="cmt"># ③ 反传</span>
     loss.backward()
-    <span class="cmt"># ③ 收尾：ZeRO-1/2 的梯度分桶归约挂在 epilogue</span>
+    <span class="cmt"># ④ 收尾：ZeRO-1/2 的梯度分桶归约挂在 epilogue</span>
     self.<span class="fn">_backward_epilogue</span>()
 
-<span class="cmt"># step（engine.py:3471 附近）</span>
-<span class="kw">def</span> <span class="fn">step</span>(self):
-    <span class="kw">if</span> not self.is_gradient_accumulation_boundary():
-        <span class="kw">return</span>              <span class="cmt"># 非边界：no-op，继续累积</span>
-    self.<span class="fn">_take_model_step</span>() <span class="cmt"># 边界处：真正执行</span></pre>
-    <div class="annotation"><b>逐行读：</b>backward 里最关键的一行在 scale_loss 内部：<code class="inline">loss = loss / self.gradient_accumulation_steps()</code>——<strong>除法必须在 backward 之前</strong>，因为 fp16 下还有 loss scale 乘回来，除和乘的次序决定最终梯度是「平均」还是「平均后再缩放」。实际代码把「除 GAS」与「乘 loss scale」都放进 scale_loss 链条里一次完成。<b>step 的关键</b>：非边界直接 return——「step 被调 N 次、真正执行 1 次」由 GAS 边界决定，用户循环里每 microbatch 调 step 也完全正确，正确性不依赖用户数对步数。<code class="inline">_take_model_step</code> 里依次是：overflow 检查 → optimizer.step()（ZeRO 语义在这一步，第 7/8 章）→ 更新 lr schedule → zero grad buffer。</div>
+<span class="cmt"># step（engine.py:3482，省略计时器与检查）</span>
+<span class="kw">def</span> <span class="fn">step</span>(self, lr_kwargs=None):
+    <span class="cmt"># 更新模型只在梯度累积边界发生</span>
+    <span class="kw">if</span> self.is_gradient_accumulation_boundary():
+        self.<span class="fn">_take_model_step</span>(lr_kwargs)</pre>
+    <div class="annotation"><b>先盯住最关键的一行：</b><code class="inline">loss = loss / self.gradient_accumulation_steps()</code>——<strong>除法必须在 backward 之前</strong>，因为 fp16 下还有 loss scale 乘回来，除和乘的次序决定最终梯度是「平均」还是「平均后再缩放」。实际代码里除 GAS 直接内联在 backward 开头，乘 loss scale 则委托给优化器的 <code class="inline">scale_if_loss</code>（base_optimizer.py:413），两步分工。<b>step 的关键</b>：边界判定不靠用户数对步数——「step 被调 N 次、真正执行 1 次」由下面的 is_gradient_accumulation_boundary 决定，用户循环里每 microbatch 调 step 也完全正确。<code class="inline">_take_model_step</code> 里依次是：overflow 检查 → optimizer.step()（ZeRO 语义在这一步，第 7/8 章）→ 更新 lr schedule → zero grad buffer。</div>
 
-    <div class="code-title">deepspeed/runtime/engine.py — is_gradient_accumulation_boundary（摘录）</div>
+    <div class="code-title">deepspeed/runtime/engine.py:3357 — is_gradient_accumulation_boundary（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">is_gradient_accumulation_boundary</span>(self):
-    <span class="kw">return</span> self.global_steps % self.gradient_accumulation_steps() == <span class="nu">0</span> <span class="kw">or</span> self.is_last_step()</pre>
-    <div class="annotation"><b>一切节拍的总开关：</b>microsteps 计数器到 GAS 即边界。GAS、数据 dataloader 步进、梯度归约、优化器 step 全部挂在这一个判定上——引擎替用户管理「什么时候真的 step」，这是 DS 相对裸 PyTorch 最省心的地方。</div>
+    <span class="kw">if</span> self._is_gradient_accumulation_boundary <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">if</span> <span class="kw">not</span> self.managed_gradient_accumulation():
+            <span class="cmt"># 非托管模式：step() 本身就是累积边界</span>
+            <span class="kw">return</span> self._running_engine_step
+        <span class="kw">if</span> self.zenflow:
+            <span class="kw">return</span> self._is_zenflow_update_boundary()
+        <span class="kw">else</span>:
+            <span class="cmt"># 默认（托管模式）：内部 micro 计数器到 GAS 即边界</span>
+            <span class="kw">return</span> (self.micro_steps + <span class="nu">1</span>) % self.gradient_accumulation_steps() == <span class="nu">0</span>
+    <span class="kw">else</span>:
+        <span class="kw">return</span> self._is_gradient_accumulation_boundary</pre>
+    <div class="annotation"><b>一切节拍的总开关：</b>注意计的是 <code class="inline">micro_steps</code>（每 backward 一次 +1）而非 <code class="inline">global_steps</code>（每优化器 step +1）——GAS、数据 dataloader 步进、梯度归约、优化器 step 全部挂在这一个判定上——引擎替用户管理「什么时候真的 step」，这是 DS 相对裸 PyTorch 最省心的地方。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>16 字节/参数的显存账</h2>
-    <p>为什么需要 ZeRO？先把账摆出来。混合精度训练（Adam）下每个参数占的显存：</p>
+    <h2><span class="num">6.4</span>16 字节/参数的显存账</h2>
+    <p>引擎骨架到这就讲完了，但你可能已经在想那个问题：显存怎么办？混合精度训练（Adam）下每个参数占的显存：</p>
     <table class="tbl">
       <tr><th>存储</th><th>精度</th><th>字节</th><th>说明</th></tr>
       <tr><td>参数（前向用）</td><td>fp16/bf16</td><td>2</td><td>Float16Module cast 的目标</td></tr>
@@ -135,8 +151,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>配置与启动器</h2>
-    <p>DS 的全部行为由一个 json 驱动，启动器负责多进程：</p>
+    <h2><span class="num">6.5</span>配置与启动器</h2>
+    <p>以上全部行为——GAS、stage、精度——怎么告诉引擎？DS 的答案是全部收进一个 json，启动器负责多进程：</p>
     <div class="code-title">deepseek 融合配置示例（ds_config.json，示意）</div>
     <pre class="code"><span class="lang-tag">json</span>{
   <span class="st">"train_batch_size"</span>: 1024,          <span class="cmt">// = micro_batch × DP × GAS，引擎反推各值</span>
@@ -145,11 +161,12 @@
   <span class="st">"optimizer"</span>: { <span class="st">"type"</span>: <span class="st">"Adam"</span>, <span class="st">"params"</span>: { <span class="st">"lr"</span>: 3e-4 } },
   <span class="st">"fp16"</span>: { <span class="st">"enabled"</span>: true, <span class="st">"loss_scale_window"</span>: 1000 }
 }</pre>
-    <div class="annotation"><b>三个必懂的键：</b>① <code class="inline">train_batch_size</code> 与 GAS/micro_batch 互相约束——给两个引擎推第三个，冲突直接报错（很多新手在这报错里打转）；② <code class="inline">zero_optimization.stage</code> 是第 7/8 章的全部内容；③ <code class="inline">fp16.enabled</code> 决定 scaler 类型（动态 vs 静态，第 7 章对比 Megatron 的选择器）。启动用 <code class="inline">deepspeed --num_gpus=8 train.py</code>——launcher 负责把 rank/env 立起来，用户脚本里 <code class="inline">deepspeed.init_distributed()</code> 或 initialize() 隐式完成。</div>
+    <div class="annotation"><b>json 里有三个键必须懂：</b><code class="inline">train_batch_size</code> 与 GAS/micro_batch 互相约束——给两个引擎推第三个，冲突直接报错（很多新手在这条报错里耗掉一下午）；<code class="inline">zero_optimization.stage</code> 是第 7/8 章的全部内容；<code class="inline">fp16.enabled</code> 决定 scaler 类型（动态 vs 静态，第 7 章对比 Megatron 的选择器）。启动用 <code class="inline">deepspeed --num_gpus=8 train.py</code>——launcher 负责把 rank/env 立起来，用户脚本里 <code class="inline">deepspeed.init_distributed()</code> 或 initialize() 隐式完成。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.5</span>小结 + 自研启示</h2>
+    <h2><span class="num">6.6</span>小结 + 自研启示</h2>
+    <p>本章内容有点密，归拢一下：initialize() 是五步装配线——config 解析、分布式初始化、mpu 插头接外部并行信息、按 zero_stage 选 optimizer 包装、注册 hook；三行循环展开为——backward 里先除 GAS 再经 scale_if_loss 补 scale 后反传，epilogue 挂梯度归约，step 被 is_gradient_accumulation_boundary 挡住，只在 micro_steps 到 GAS 时真步进；16B/参数的四份存储是 ZeRO 的动机，stage 1/2/3 依次切走优化器状态、梯度、参数；最后，一个 json 驱动全部行为，train_batch_size 与 GAS/micro_batch 互相约束。用户契约归拢成一张表：</p>
     <table class="tbl">
       <tr><th>用户代码</th><th>引擎内部展开</th><th>对应章节</th></tr>
       <tr><td>initialize(model, ...)</td><td>装配 config/mpu/optimizer 包装/hook</td><td>本章</td></tr>
@@ -171,7 +188,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 06 DS 引擎 · 版本锚点 v0.19.7-28-g43c53e9b / core_v0.15.0rc7-2630-g64d15673
+  深入浅出 DeepSpeed · Megatron · 06 DS 引擎 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
 </footer>
 
 </body>

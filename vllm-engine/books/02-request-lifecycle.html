@@ -36,11 +36,20 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 请求全生命周期</div>
     <h1>一条请求的完整路径：从 generate() 到输出 token</h1>
-    <div class="subtitle">把第 1 章的静态分层「跑起来」：一次调用如何穿过全部层级，每一步谁在处理、传了什么。看懂这条链，你的引擎主循环就有雏形了。</div>
+    <div class="subtitle">第 1 章认了部件，这一章把它们「跑起来」。跟着一次调用问下去：<strong>文本进引擎前后发生了什么？一个请求在引擎里长什么样？每一步由谁推进、传了什么？</strong>先摆出整条路径，再逐站走读，末了用这条路径反推你的引擎主循环。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">2.1</span>生命周期总览（泳道图）</h2>
+    <p>先立起这次走读要回答的问题。从你在客户端写下 <code class="inline">LLM.generate("你好")</code> 到屏幕上出现第一个字，中间有五个问题：</p>
+    <ul>
+      <li><strong>文本怎么进引擎？</strong>GPU 和模型只认 token id，你给的是字符串。谁来做「文本 → token」这道转换、在哪一站做？</li>
+      <li><strong>请求长什么样？</strong>进了引擎，这次调用变成引擎里的一个什么对象？它要带哪些信息才能在后续几十步里一直被正确处理？</li>
+      <li><strong>每一步谁来跑？</strong>引擎「跑」起来指的到底是什么？主循环的每一步做了哪几件事，循环点在哪？</li>
+      <li><strong>CPU 和 GPU 空等怎么办？</strong>CPU 做调度时 GPU 闲着，GPU 前向时 CPU 闲着——这个空档 vLLM 怎么填掉？</li>
+      <li><strong>prefill 和 decode 有区别吗？</strong>算完整段 prompt 和续写一个 token，在引擎里是两条流程还是一条？</li>
+    </ul>
+    <p>下面这张泳道图先给出整条路径的全貌——分词和入队在最左上，主循环在中部，「空档」是 vLLM 的隐藏浪费点（2.5 展开），prefill/decode 之问在右下。看不懂具体节点没关系，先记住「文本 → add_request → 循环 → GPU 前向 → 回传」这五个节点，后面逐站走读：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t2 d2">
         <title id="t2">请求全生命周期泳道图</title>
@@ -126,10 +135,11 @@
       </div>
       <div class="fig-cap">图 2.1：一次生成调用的关键路径（单 worker、单步视角）。真实实现里 <code class="inline">step()</code> 会并行处理一整个 batch 的请求，而不是一条。</div>
     </div>
+    <div class="annotation"><b>带着这五个问题往下走：</b>文本怎么进引擎 → 2.2（入口分词）；请求长什么样 → 2.3（Request 工作单元）；每一步谁来跑 → 2.4（主循环 step()）；空等怎么办 → 2.5（重叠执行）；prefill/decode → 2.6。2.7 把这条链减到最小，就是你的引擎雏形。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.2</span>第 1 步：入口把「文本」变「token」</h2>
+    <h2><span class="num">2.2</span>文本怎么进引擎：入口把「文本」变「token」</h2>
     <p>调用 <code class="inline">generate()</code> 后，<code class="inline">_run_completion()</code>（定义在 <code class="inline">vllm/entrypoints/offline_utils.py</code>）先把用户给出的 prompt 处理成引擎能用的形式：<strong>文本 → prompt_token_ids</strong>。</p>
     <div class="code-title">vllm/entrypoints/offline_utils.py — 摘录，注释为译注</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_run_completion</span>(self, prompts, params, output_type, ...):
@@ -137,11 +147,11 @@
     self._add_completion_requests(prompts=prompts, params=params, ...)
     <span class="cmt"># 2) 跑引擎主循环，返回所有输出</span>
     <span class="kw">return</span> self._run_engine(use_tqdm=use_tqdm, output_type=output_type)</pre>
-    <div class="annotation"><b>读懂这段：</b>两个阶段分工清晰——「<em>准备</em>（_add_*，把外部输入变成内部 Request）」和「<em>执行</em>（_run_engine，阻塞直到所有请求完成）」。做引擎时建议就采用这种「准备/执行」两阶段 API。</div>
+    <div class="annotation"><b>两个阶段分工清晰</b>——「<em>准备</em>（_add_*，把外部输入变成内部 Request）」和「<em>执行</em>（_run_engine，阻塞直到所有请求完成）」。做引擎时建议就采用这种「准备/执行」两阶段 API。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.3</span>第 2 步：Request 是引擎的「工作单元」</h2>
+    <h2><span class="num">2.3</span>请求长什么样：Request 是引擎的「工作单元」</h2>
     <p>v1 取消了旧版的 <code class="inline">Sequence</code>，改用统一的 <code class="inline">Request</code>（<code class="inline">vllm/v1/request.py</code>）。引擎、调度器、KV cache 各环节看到的都是同一个 Request 对象。</p>
     <div class="code-title">vllm/v1/request.py — 关键字段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Request</span>:
@@ -157,7 +167,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">2.4</span>第 3 步：引擎主循环 step()</h2>
+    <h2><span class="num">2.4</span>每一步谁来跑：引擎主循环 step()</h2>
     <p>所有请求被 add 进引擎后，进入核心循环。循环每步「跑谁、各算多少」由 Scheduler 决定（算法见<a href="04-scheduler.html">第 4 章</a>）；本节看这条循环在引擎侧的代码长什么样。</p>
     <div class="code-title">vllm/v1/engine/llm_engine.py — step（概念化，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">step</span>(self) <span class="kw">-&gt;</span> <span class="cl">list</span>[<span class="cl">RequestOutput</span>]:
@@ -169,12 +179,12 @@
     outputs = self.engine_core.<span class="fn">get_output</span>()   <span class="cmt"># 见 core_client.py：取回 EngineCore 的输出</span>
     processed = self.output_processor.<span class="fn">process_outputs</span>(outputs.outputs, ...)
     <span class="kw">return</span> processed</pre>
-    <div class="annotation"><b>读懂这段：</b>批处理的前端在 Engine，决策在 Core/Scheduler，执行在 Worker。这三段分工，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
+    <div class="annotation"><b>分工一句话：</b>批处理的前端在 Engine，决策在 Core/Scheduler，执行在 Worker。这三段，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
     <div class="annotation"><b>一张图别当真：</b>上面的泳道图和本节代码为了易懂，把循环画成了<strong>纯串行</strong>——调度完、等 GPU 算完、回传、再调度。真实引擎不会傻等，见下一节。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.5</span>第 3 步½：重叠执行——CPU 调度 step N+1 时，GPU 在算 step N</h2>
+    <h2><span class="num">2.5</span>空档怎么填：重叠执行——CPU 调度 step N+1 时，GPU 在算 step N</h2>
     <p>2.4 的串行图里有个隐藏浪费：<strong>CPU 做调度（选 batch、分配 KV 块）时，GPU 闲着；GPU 在前向时，CPU 闲着。</strong>而这两件事用的是不同资源——CPU 调度只碰 dict 和 list，GPU 前向才是重计算。vLLM v1 的解法是<strong>异步调度（async scheduling）</strong>：GPU 算第 N 步时，CPU 已经在为第 N+1 步做调度，两件事重叠进行，GPU 的空档就被填掉了。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
@@ -203,17 +213,17 @@
       </svg>
       <div class="fig-cap">图 2.5：async scheduling 把「下一步的 CPU 调度」与「本步的 GPU 前向」重叠，消除 GPU 等待调度的空档。</div>
     </div>
-    <p>开关在 <code class="inline">vllm/config/scheduler.py:200</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
-    <div class="code-title">vllm/config/scheduler.py:200 — async_scheduling 配置（摘录）</div>
+    <p>开关在 <code class="inline">vllm/config/scheduler.py:203</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
+    <div class="code-title">vllm/config/scheduler.py:203 — async_scheduling 配置（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>async_scheduling: <span class="cl">bool</span> | <span class="kw">None</span> = <span class="kw">None</span>
 <span class="st">"""If set to False, disable async scheduling. Async scheduling helps to
 avoid gaps in GPU utilization, leading to better latency and throughput.
 """</span></pre>
-    <div class="annotation"><b>为什么要「占位符」：</b>重叠的代价是<strong>信息滞后</strong>——CPU 为第 N+1 步调度时，第 N 步还没算完，它不知道每请求会产出几个 token。v1 的解法是让请求先持有 <code class="inline">num_output_placeholders</code>（<code class="inline">vllm/v1/request.py:160</code>）这样的「预计产出数」，按占位符预留 KV 与预算，等真实 token 回来再校正（第 4 章调度代码里 <code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> 里那一项，正是为重叠模式准备的）。结构化输出（grammar bitmask）在异步模式下也同理用 <code class="inline">pending_structured_output_tokens</code> 占位（见 <code class="inline">async_scheduler.py</code>）。自研启示：<strong>MVP 用串行循环完全够，等 profile 显示 CPU 调度成为 GPU 之间的可见空档时，再上重叠——这与第 11 章「先对再快」的顺序一致。</strong></div>
+    <div class="annotation"><b>为什么要「占位符」：</b>重叠的代价是<strong>信息滞后</strong>——CPU 为第 N+1 步调度时，第 N 步还没算完，它不知道每请求会产出几个 token。v1 的解法是让请求先持有 <code class="inline">num_output_placeholders</code>（<code class="inline">vllm/v1/request.py:162</code>）这样的「预计产出数」，按占位符预留 KV 与预算，等真实 token 回来再校正（第 4 章调度代码里 <code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> 里那一项，正是为重叠模式准备的）。结构化输出（grammar bitmask）在异步模式下也同理用 <code class="inline">pending_structured_output_tokens</code> 占位（见 <code class="inline">async_scheduler.py</code>）。自研启示：<strong>MVP 用串行循环完全够，等 profile 显示 CPU 调度成为 GPU 之间的可见空档时，再上重叠——这与第 11 章「先对再快」的顺序一致。</strong></div>
   </section>
 
   <section class="block">
-    <h2><span class="num">2.6</span>第 4 步：prefill vs decode</h2>
+    <h2><span class="num">2.6</span>prefill 和 decode：是两条流程还是一条</h2>
     <p>一个请求的一生只有两种「模式」：</p>
     <ul>
       <li><strong>prefill（预填充/首 token）</strong>：一次前向算出 <em>整个 prompt</em> 的 KV cache，并产出第一个 token。计算量大但只发生一次。</li>
@@ -234,7 +244,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
 
   <section class="block">
     <h2><span class="num">2.7</span>从生命周期反向看你的引擎</h2>
-    <p>把这条链减到最小，就是一个能跑的引擎（第 11 章从这个起点开始搭）：</p>
+    <p>五个问题走完，把答案串起来：分词在入口做完、Request 带着计数器进引擎、step() 是唯一的循环点、空档用重叠执行填掉、prefill 和 decode 是同一循环的两个瞬间。回到自研视角——把这条链减到最小，就是一个能跑的引擎（第 11 章从这个起点开始搭）：</p>
     <div class="code-title">一个最小引擎的主循环（伪代码）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 伪代码：单请求、无批处理的最小引擎</span>
 <span class="kw">def</span> <span class="fn">generate</span>(prompt: <span class="cl">str</span>, max_tokens=<span class="nu">16</span>) -&gt; <span class="cl">str</span>:
@@ -247,6 +257,17 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
         out_ids.append(tok); tokens.append(tok)
     <span class="kw">return</span> tokenizer.decode(out_ids)          <span class="cmt"># 5. token→文本</span></pre>
     <div class="annotation"><b>下一步：</b>上面的 <code class="inline">kv_cache</code> 是「整个序列一次性分配」，浪费且限制了并发。第 3 章的 PagedAttention 教你把它改成分页、按需分配——这正是 vLLM 每秒吞吐量高的关键，也让你理解为什么它在合适的模型、显存与上下文长度配置下能支撑大量并发请求。</div>
+    <div class="callout info">
+      <b class="tag">与 SGLang 对照</b>
+      SGLang 的链路：<code class="inline">/generate</code> → TokenizerManager（主进程，分词）→ Scheduler 子进程排 batch → 输出 token id 走「id 通道」→ DetokenizerManager（第三个进程）反分词 → 「文本通道」回主进程 → SSE。逐站对照：<br>
+      <table class="tbl">
+        <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
+        <tr><td>反分词在哪</td><td>前端进程内部（output_processor）</td><td>独立进程 DetokenizerManager——调度层只传 token id，流式协议不牵连调度逻辑</td></tr>
+        <tr><td>重叠调度</td><td>async scheduling（AsyncScheduler，2.5 节）</td><td><code class="inline">event_loop_overlap</code>，默认开启</td></tr>
+        <tr><td>客户端断连</td><td>经输出处理发现后回环 abort（9 章 stop string 同路数）</td><td>一等消息 AbortReq，走与生成请求同一条 ZMQ 通道</td></tr>
+      </table>
+      中间一行思路相同、名字不同；头尾两行是真正的结构差异。详见 <a href="../../sglang/books/02-request-lifecycle.html">深入浅出SGLang · 02 请求全生命周期</a>。
+    </div>
   </section>
 
   <div class="arrow-nav">
@@ -256,7 +277,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
 </div>
 
 <footer>
-  深入浅出vLLM · 02 请求全生命周期 · 版本 proto-v0.3.0-141-g4cc15f2121 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 02 请求全生命周期 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

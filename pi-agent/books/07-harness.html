@@ -36,11 +36,11 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 Harness 运行时骨架</div>
     <h1>Harness 运行时骨架：谁在驱动这一切</h1>
-    <div class="subtitle">★ 本站在意的另一半。第 3 章的循环只是一台「跑完就丢」的吞吐机；<code class="inline">AgentHarness</code> 是把它装进「可恢复、可分叉、可观察」的运行时。这一页看清 Pi 的<strong>契约 + 它的官方运行时实现</strong>——两者如今同住一个包。</div>
+    <div class="subtitle">★ 本站在意的另一半。第 3 章的循环只是一台「跑完就丢」的吞吐机；<code class="inline">AgentHarness</code> 是把它装进「可恢复、可分叉、可观察」的运行时。它把「对会话做什么」归成三种操作，accept 准入、drive 推进，现场拆成 13 个持久化状态叶子——进程崩在任何一步，都能从盘上续跑。本章从分层位置讲起，把操作、驱动、韧性、能力面、钩子逐层拆开，末尾说清它和第 8 章 AgentSession 的关系。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">7.1</span>定位：Harness 在哪一层</h2>
+    <h2><span class="num">7.1</span>Harness 在哪一层</h2>
     <p>先把 Harness 摆回整张图里。Pi 是三层包：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t71 d71">
@@ -184,7 +184,7 @@
       <tr><td><strong><code class="inline">ok</code> → <code class="inline">SuspendedRun</code></strong></td><td><code class="inline">{ status: "suspended", deferred }</code></td><td><strong>主动挂起，等外部输入后再 <code class="inline">resume()</code></strong>，携带 <code class="inline">DeferredHandle</code>（仅 run 会挂起）</td></tr>
       <tr><td><code class="inline">err</code></td><td><code class="inline">LaneBusy / NothingToCompact / NothingToResume / InvalidMessage / UnknownSkill / UnknownTemplate / InvalidNavigation / UnknownTarget / Closed</code></td><td>带 <code class="inline">_tag</code> 的类型化错误（可 <code class="inline">matchError</code> 分发），不抛异常</td></tr>
     </table>
-    <div class="annotation"><b>读懂这段：</b> 两个设计点。其一，<strong>「suspended」不在结算记录里</strong>——挂起时操作还没有 terminal status，返回的是独立的 <code class="inline">SuspendedRun</code> 观察（<code class="inline">status: "suspended"</code> + <code class="inline">DeferredHandle</code>），之后 <code class="inline">resume()</code> 接着跑；结算记录只在真正终态（completed/declined/aborted/failed）时产生。其二，compaction/navigation 的成功值还带一个 <code class="inline">run?</code>——结构性操作完成后可以<strong>顺带续跑一轮 run</strong>（runtime 的 <code class="inline">continueAfterStructural</code>），所以一次 <code class="inline">compact()</code> 可能同时结算出压缩记录和一轮 run 记录。这些 Result 类型描述的是"结果"；"为什么崩溃了也能拿到结果"，靠的是 7.4 的持久化状态。</div>
+    <div class="annotation"><b>有两处容易看漏。</b>其一，<strong>「suspended」不在结算记录里</strong>——挂起时操作还没有 terminal status，返回的是独立的 <code class="inline">SuspendedRun</code> 观察（<code class="inline">status: "suspended"</code> + <code class="inline">DeferredHandle</code>），之后 <code class="inline">resume()</code> 接着跑；结算记录只在真正终态（completed/declined/aborted/failed）时产生。其二，compaction/navigation 的成功值还带一个 <code class="inline">run?</code>——结构性操作完成后可以<strong>顺带续跑一轮 run</strong>（runtime 的 <code class="inline">continueAfterStructural</code>），所以一次 <code class="inline">compact()</code> 可能同时结算出压缩记录和一轮 run 记录。这些 Result 类型描述的是"结果"；"为什么崩溃了也能拿到结果"，靠的是 7.4 的持久化状态。</div>
   </section>
 
   <section class="block">
@@ -256,7 +256,7 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
   | { kind: <span class="st">"settled"</span>; outcome: <span class="cl">OperationResultRecord</span> }
   | { kind: <span class="st">"waiting"</span>; operationId: <span class="cl">string</span>; reason: <span class="st">"retry"</span>; notBefore: <span class="cl">number</span> }
   | { kind: <span class="st">"waiting"</span>; operationId: <span class="cl">string</span>; reason: <span class="st">"deferred"</span>; deferred: <span class="cl">DeferredHandle</span> };</pre>
-    <div class="annotation"><b>读懂这段：</b> 把「申请」和「施工」拆成两个方法，换来的是<strong>任意一点都能安全停下来</strong>：accept 之后进程死了，恢复时看到 <code class="inline">pi.op.state = "starting"</code>，照常从这续跑（甚至可以在创建 harness 时把所有未结算的 <code class="inline">open</code> 操作列出来，由外部决定谁续跑）；drive 每完成一个阶段就把下一个状态叶子写盘，所以重试等待、deferred 挂起都不需要内存里的任何东西活着。<code class="inline">prompt()/skill()/compact()/navigateTree()</code> 只是帮 accept+drive 拼好参数的糖（run 走 <code class="inline">waitForRetry: true</code>，resume 走 <code class="inline">pollDeferred: true</code>）。对自研者：这是比"手动步进"更实用的韧性模型——<strong>状态存盘 + 幂等推进，而不是暴露每一步的控制权</strong>。</div>
+    <div class="annotation">把「申请」和「施工」拆成两个方法，换来的是<strong>任意一点都能安全停下来</strong>：accept 之后进程死了，恢复时看到 <code class="inline">pi.op.state = "starting"</code>，照常从这续跑（甚至可以在创建 harness 时把所有未结算的 <code class="inline">open</code> 操作列出来，由外部决定谁续跑）；drive 每完成一个阶段就把下一个状态叶子写盘，所以重试等待、deferred 挂起都不需要内存里的任何东西活着。<code class="inline">prompt()/skill()/compact()/navigateTree()</code> 只是帮 accept+drive 拼好参数的糖（run 走 <code class="inline">waitForRetry: true</code>，resume 走 <code class="inline">pollDeferred: true</code>）。对自研者：这是比"手动步进"更实用的韧性模型——<strong>状态存盘 + 幂等推进，而不是暴露每一步的控制权</strong>。</div>
   </section>
 
   <section class="block">
@@ -321,7 +321,7 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
       </svg>
       <div class="fig-cap">图 7.4：编排现场 = 一个可覆写的单值 <code class="inline">pi.op.state</code>（13 叶状态机）。drive 是「读叶子 → 执行阶段 → 写下一叶」的循环；恢复不是日志重放，而是<strong>直接读回单值</strong> + <code class="inline">stateMatchesIntent()</code> 一致性校验。快照消费侧另有一个 <code class="inline">reduceLaneSnapshot()</code> 把事件流归约成 <code class="inline">LaneSnapshot</code>（7.5）。</div>
     </div>
-    <div class="annotation"><b>读懂这段：</b> 这才是 <code class="inline">suspended → resume()</code> 能成立的真正原因——挂起就是盘上的 <code class="inline">deferred.suspended</code> 叶子（含 <code class="inline">DeferredHandle</code>），<code class="inline">resume()</code> 从盘上读回它接着跑，内存里什么都不需要有。还有一个容易忽略的细节：<strong>effect_pending 家族</strong>（assistant/deferred/summary 各一）专门表达「效果做了、但账没落稳」——比如 LLM 响应已收到、条目已写入，但用量/结算还没核完；重启后 drive 会先走 recover* 路径核账再前进，<strong>宁可重查也不重复扣</strong>。对自研者：这是整个 harness 最应当照着做的一条——<strong>把编排现场做成可从盘上精确重建的值 + 显式的"效果未落稳"状态，而不是在内存里维护易失状态</strong>。第 8 章的 <code class="inline">AgentSession</code> 是另一条实现线，不共用这套状态机。</div>
+    <div class="annotation"><b>这才说到了 <code class="inline">suspended → resume()</code> 能成立的真正根子——</b>挂起就是盘上的 <code class="inline">deferred.suspended</code> 叶子（含 <code class="inline">DeferredHandle</code>），<code class="inline">resume()</code> 从盘上读回它接着跑，内存里什么都不需要有。还有一个容易忽略的细节：<strong>effect_pending 家族</strong>（assistant/deferred/summary 各一）专门表达「效果做了、但账没落稳」——比如 LLM 响应已收到、条目已写入，但用量/结算还没核完；重启后 drive 会先走 recover* 路径核账再前进，<strong>宁可重查也不重复扣</strong>。对自研者：这是整个 harness 最应当照着做的一条——<strong>把编排现场做成可从盘上精确重建的值 + 显式的"效果未落稳"状态，而不是在内存里维护易失状态</strong>。第 8 章的 <code class="inline">AgentSession</code> 是另一条实现线，不共用这套状态机。</div>
   </section>
 
   <section class="block">
@@ -364,7 +364,7 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
 <span class="cmt">// 注意：hooks / events / getTools / setTools 不在 AgentLane 上，</span>
 <span class="cmt">// 它们是 AgentHarness 接口的成员（7.7）。Lane 没有 session 属性——</span>
 <span class="cmt">// 会话的原始访问要经 harness 持有的 Session。</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 这是「一个对象一把抓」的实用主义接口，30 余个成员。对自研者而言，不必拘泥每条，但要抓住主干：<strong>两段式操作（accept/drive）+ 高阶糖（prompt/compact/navigate）+ 队列类（steer/followUp/nextRun）+ 配置类（model/thinking/tools）+ 韧性类（resume/abort）+ 观察类（watch）</strong>。和常见 OO 设计不同的是它<strong>没有 session 暴露、没有手动步进</strong>——lane 只给你盘上事实的读取口和操作入口，不给内存对象的直通引用；这正是状态全部持久化之后的自然结果。这些方法全部由同包 <code class="inline">runtime/lane.ts</code> 的 <code class="inline">Lane</code> 类实现。</div>
+    <div class="annotation"><b>接口有点大，30 余个成员——但主干抓得住：</b>对自研者而言，不必拘泥每条，但要抓住主干：<strong>两段式操作（accept/drive）+ 高阶糖（prompt/compact/navigate）+ 队列类（steer/followUp/nextRun）+ 配置类（model/thinking/tools）+ 韧性类（resume/abort）+ 观察类（watch）</strong>。和常见 OO 设计不同的是它<strong>没有 session 暴露、没有手动步进</strong>——lane 只给你盘上事实的读取口和操作入口，不给内存对象的直通引用；这正是状态全部持久化之后的自然结果。这些方法全部由同包 <code class="inline">runtime/lane.ts</code> 的 <code class="inline">Lane</code> 类实现。</div>
   </section>
 
   <section class="block">
@@ -398,7 +398,7 @@ drive(options: <span class="cl">DriveOptions</span>, context): Promise&lt;<span 
 <span class="kw">export interface</span> <span class="cl">Events</span> {
   on&lt;TType <span class="kw">extends</span> <span class="cl">HarnessEventType</span>&gt;(type, listener): () =&gt; <span class="kw">void</span>;
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 对自研者：<strong>钩子是"策略注入点"</strong>，把可变策略（上下文改写、工具拦截、压缩触发）从主循环里抽出来。两个实现细节值得照着做：其一，钩子的 event/result 都是<strong>带类型的映射表</strong>（<code class="inline">HookMap</code>），<code class="inline">Hooks.on</code> 按名字自动推导 handler 签名——比 <code class="inline">(payload: any)</code> 强得多；其二，<code class="inline">before_drive</code> 挂在 drive 循环的第一步（7.3），是「操作就要开始推了」的统一哨口。<code class="inline">events</code> 则是被动观察（run_start / tool_end / compaction_end…），不干预、只广播；订阅回调收到的每个事件都带 <code class="inline">lane</code> 与可选 <code class="inline">recovery</code> 标记（recovery = 恢复路径重发的历史事件）。第 5 章见过的 <code class="inline">transform_context</code> 就接在 <code class="inline">buildSessionContext</code> 产出之后、发给模型之前。</div>
+    <div class="annotation"><b>值得照着做的地方有两处。</b><strong>钩子是"策略注入点"</strong>，把可变策略（上下文改写、工具拦截、压缩触发）从主循环里抽出来。两个实现细节值得照着做：其一，钩子的 event/result 都是<strong>带类型的映射表</strong>（<code class="inline">HookMap</code>），<code class="inline">Hooks.on</code> 按名字自动推导 handler 签名——比 <code class="inline">(payload: any)</code> 强得多；其二，<code class="inline">before_drive</code> 挂在 drive 循环的第一步（7.3），是「操作就要开始推了」的统一哨口。<code class="inline">events</code> 则是被动观察（run_start / tool_end / compaction_end…），不干预、只广播；订阅回调收到的每个事件都带 <code class="inline">lane</code> 与可选 <code class="inline">recovery</code> 标记（recovery = 恢复路径重发的历史事件）。第 5 章见过的 <code class="inline">transform_context</code> 就接在 <code class="inline">buildSessionContext</code> 产出之后、发给模型之前。</div>
   </section>
 
   <section class="block">
@@ -420,14 +420,14 @@ steeringMode ?? <span class="st">"all"</span>;      <span class="cmt">// steer �
 followUpMode ?? <span class="st">"all"</span>;
 toolExecution ?? <span class="st">"parallel"</span>;
 toProviderMessages ?? convertToLlm;</pre>
-    <div class="annotation"><b>读懂这段：</b> 「契约与实现同包」是个值得注意的仓库演化信号：agent-harness.ts 曾经只有类型（连 <code class="inline">create</code> 都是抛 <code class="inline">SliceNotImplemented</code> 的占位），如今 runtime/ 目录把接口逐条兑现——<strong>唯一的残留是 <code class="inline">watchSession</code></strong>，它仍抛 <code class="inline">SliceNotImplemented</code>（session 级快照流尚未切开，lane 级的 <code class="inline">watch()</code> 已可用）。注意实现侧默认值和第 6 章之前讲的旧默认不同：<strong>重试默认开启</strong>（enabled: true, maxRetries: 3），且每轮退避延迟有 <code class="inline">maxAgentDelayMs</code>（默认 60 秒）封顶——没有这个上限，<code class="inline">baseDelayMs * 2^(attempt-1)</code> 在长时间故障里会指数膨胀到分钟级、小时级的等待。steering/followUp 默认 <code class="inline">"all"</code>（全部插队）而不是 <code class="inline">"one-at-a-time"</code>。另一个容易忽视的返回值是 <code class="inline">open</code>——创建 harness 时盘上若有上辈子没跑完的操作，会以 <code class="inline">OpenOperation[]</code> 形式交给你决定续跑与否（配合 7.3 的 accept/drive 模型）。L2 的 <code class="inline">AgentSession</code>（第 8 章）不在这条线上：它直接组合 <code class="inline">Agent</code> 类 + SessionManager，是<strong>并行于 runtime/ 的另一条实现</strong>，experimental 里只有两个客户端走 <code class="inline">AgentHarness.create</code>——session-worker（coding-agent 的服务化外壳）和 mini 的 worker（单进程精简 Agent 的后台）。</div>
+    <div class="annotation"><b>最后看一个仓库演化信号：</b>「契约与实现同包」不是一开始就设计好的——agent-harness.ts 曾经只有类型（连 <code class="inline">create</code> 都是抛 <code class="inline">SliceNotImplemented</code> 的占位），如今 runtime/ 目录把接口逐条兑现——<strong>唯一的残留是 <code class="inline">watchSession</code></strong>，它仍抛 <code class="inline">SliceNotImplemented</code>（session 级快照流尚未切开，lane 级的 <code class="inline">watch()</code> 已可用）。注意实现侧默认值和第 6 章之前讲的旧默认不同：<strong>重试默认开启</strong>（enabled: true, maxRetries: 3），且每轮退避延迟有 <code class="inline">maxAgentDelayMs</code>（默认 60 秒）封顶——没有这个上限，<code class="inline">baseDelayMs * 2^(attempt-1)</code> 在长时间故障里会指数膨胀到分钟级、小时级的等待。steering/followUp 默认 <code class="inline">"all"</code>（全部插队）而不是 <code class="inline">"one-at-a-time"</code>。另一个容易忽视的返回值是 <code class="inline">open</code>——创建 harness 时盘上若有上辈子没跑完的操作，会以 <code class="inline">OpenOperation[]</code> 形式交给你决定续跑与否（配合 7.3 的 accept/drive 模型）。L2 的 <code class="inline">AgentSession</code>（第 8 章）不在这条线上：它直接组合 <code class="inline">Agent</code> 类 + SessionManager，是<strong>并行于 runtime/ 的另一条实现</strong>，experimental 里只有两个客户端走 <code class="inline">AgentHarness.create</code>——session-worker（coding-agent 的服务化外壳）和 mini 的 worker（单进程精简 Agent 的后台）。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.8</span>对自研与使用的启示</h2>
+    <h2><span class="num">7.8</span>收尾：对自研与使用的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      <strong>① 定义显式的操作状态机</strong>（run/compaction/navigation 三种操作 + TerminalStatus 四种结算），胜过模糊的"处理请求"。<strong>② 错误是返回值，不是异常</strong>——<code class="inline">Result&lt;T, E&gt;</code> + 带 <code class="inline">_tag</code> 的类型化错误，让"lane 忙/没东西可压缩/目标不存在"都成为调用方要显式处理的值。<strong>③ 编排现场持久化为带类型的单值状态</strong>（13 个 <code class="inline">pi.op.state</code> 叶子 + effect_pending 核账家族），崩溃恢复 = 读回单值 + 一致性校验，不需要日志重放。<strong>④ accept 与 drive 分离</strong>——意向先落盘、施工按状态推进，任意点可死可续。<strong>⑤ 用钩子做策略注入</strong>（<code class="inline">HookMap</code> 带类型的 event/result），把可变逻辑移出主循环；钩子抛错降级为 <code class="inline">handler_error</code> 事件而非炸主流程。<strong>⑥ 快照走事件归约</strong>（<code class="inline">reduceLaneSnapshot</code>），观察者与执行者共享同一套事实。下一步看第 8 章——Pi 的生产 Agent 怎么在 Harness 之外<strong>直接组合 Agent + SessionManager</strong> 跑起来。
+      <strong>定义显式的操作状态机</strong>（run/compaction/navigation 三种操作 + TerminalStatus 四种结算），胜过模糊的"处理请求"。<strong>错误是返回值，不是异常</strong>——<code class="inline">Result&lt;T, E&gt;</code> + 带 <code class="inline">_tag</code> 的类型化错误，让"lane 忙/没东西可压缩/目标不存在"都成为调用方要显式处理的值。<strong>编排现场持久化为带类型的单值状态</strong>（13 个 <code class="inline">pi.op.state</code> 叶子 + effect_pending 核账家族），崩溃恢复 = 读回单值 + 一致性校验，不需要日志重放。<strong>accept 与 drive 分离</strong>——意向先落盘、施工按状态推进，任意点可死可续。<strong>用钩子做策略注入</strong>（<code class="inline">HookMap</code> 带类型的 event/result），把可变逻辑移出主循环；钩子抛错降级为 <code class="inline">handler_error</code> 事件而非炸主流程。<strong>快照走事件归约</strong>（<code class="inline">reduceLaneSnapshot</code>），观察者与执行者共享同一套事实。下一步看第 8 章——Pi 的生产 Agent 怎么在 Harness 之外<strong>直接组合 Agent + SessionManager</strong> 跑起来。
     </div>
   </section>
 
@@ -438,7 +438,7 @@ toProviderMessages ?? convertToLlm;</pre>
 </div>
 
 <footer>
-  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v0.86.1-5-g890f92088 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

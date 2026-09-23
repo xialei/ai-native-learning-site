@@ -35,12 +35,12 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 SmolVLA</div>
     <h1>SmolVLA：当 VLM 学会动手</h1>
-    <div class="subtitle">第 5 章的策略「看」到的是像素，但不「理解」语言——你说「把杯子放到盘子上」，ACT 听不懂。VLA（Vision-Language-Action）把预训练 VLM 的语言与视觉理解嫁接到动作生成上，让机器人第一次真正「听指令」。SmolVLA 是其中最小而全的一个：SmolVLM2-500M 主干 + ×0.75 宽度的动作专家 + 流匹配，单张消费级显卡可训。本章把它的双塔架构与流匹配细节读透。</div>
+    <div class="subtitle">第 5 章的策略「看」到的是像素，但不「理解」语言——你说「把杯子放到盘子上」，ACT 听不懂。VLA（Vision-Language-Action）把预训练 VLM 的语言与视觉理解嫁接到动作生成上。本章以 SmolVLA（最小而全：SmolVLM2-500M 主干 + ×0.75 动作专家 + 流匹配）为标本问下去：<strong>双塔怎么搭？一次前向怎么撑起十步去噪？流匹配的训练与推理各长什么样？单卡微调的经济学靠哪几个开关？</strong>6.1 总览作答，6.2–6.4 逐层拆解，6.5 收尾。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>总览：VLM 主干 + 动作专家 + 流匹配</h2>
-    <p><code class="inline">SmolVLAPolicy</code> 是包在 <code class="inline">VLAFlowMatching</code> 外面的一层皮，后者才是网络本体。源码里自带的架构注释说明了全部结构：</p>
+    <h2><span class="num">6.1</span>① 总览：VLM 主干 + 动作专家 + 流匹配</h2>
+    <p>一个 VLA 要回答的问题是：语言指令进来、机器人动作出去，中间的知识从哪来、动作怎么生成。SmolVLA 的答案是三件套——VLM 主干供理解、动作专家出动作、流匹配当生成器。先看结构。<code class="inline">SmolVLAPolicy</code> 是包在 <code class="inline">VLAFlowMatching</code> 外面的一层皮，后者才是网络本体。源码里自带的架构注释说明了全部结构：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:466 — VLAFlowMatching 结构注释（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">VLAFlowMatching</span>(nn.Module):
     <span class="cmt">"""
@@ -138,8 +138,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>prefix 与 suffix：一次前向，十步去噪</h2>
-    <p><code class="inline">embed_prefix</code> 把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code> 把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
+    <h2><span class="num">6.2</span>② prefix 与 suffix：一次前向，十步去噪</h2>
+    <p>知道整体是双塔，接下来该问：十步去噪每步都要跑一次网络，为什么 VLM 主干不会被算十遍？答案在 prefix 与 suffix 的切分。<code class="inline">embed_prefix</code> 把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code> 把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:744 — sample_actions：KV cache 复用（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Prefix 只前向一次，缓存 KV</span>
 prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
@@ -176,8 +176,8 @@ _, past_key_values = self.vlm_with_expert.forward(
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>流匹配：训练一行公式，推理一个欧拉循环</h2>
-    <p>流匹配（Flow Matching）比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向只有两行核心公式：</p>
+    <h2><span class="num">6.3</span>③ 流匹配：训练一行公式，推理一个欧拉循环</h2>
+    <p>去噪十步，每一步「噪声怎么变动作」的规则就是流匹配要学的东西。它比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向只有两行核心公式：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:693 — forward：流匹配目标（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> noise <span class="kw">is</span> <span class="kw">None</span>:
     noise = self.sample_noise(actions.shape, actions.device)      <span class="cmt"># x₁：标准正态噪声</span>
@@ -251,7 +251,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>训练侧：冻结、缺相机补位、processor 链</h2>
+    <h2><span class="num">6.4</span>④ 训练侧：冻结、缺相机补位、processor 链</h2>
     <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数；专家宽度是 VLM 的 0.75 倍、参数量不与其宽度成正比）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:371 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Create image features not present in the batch as fully 0 padded images.</span>
@@ -276,7 +276,8 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.5</span>本章小结</h2>
+    <h2><span class="num">6.5</span>收尾：小 VLA 的完整标本</h2>
+    <p>6.1 开头的三个问题，答案收拢：双塔是「VLM 塔供理解、专家塔出动作」，专家经 cross-attn 读 VLM 的 KV cache；推理靠 prefix 一次前向 + KV 缓存复用，十步去噪只跑 suffix；流匹配训练一行速度场公式、推理一个欧拉积分循环；单卡微调的经济学靠 freeze_vision_encoder / train_expert_only 两个开关，缺相机时补黑帧 + mask=0 让行为平滑退化。一张表带走：</p>
     <table class="tbl">
       <tr><th>概念</th><th>要点</th><th>源码锚点</th></tr>
       <tr><td>双塔架构</td><td>VLM 塔（SmolVLM2 500M，前 16 层）+ 动作专家塔（宽度 ×0.75）；专家 cross-attn 读 VLM KV cache</td><td>smolvla/modeling_smolvla.py:466; smolvlm_with_expert.py:74,110</td></tr>
@@ -300,7 +301,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
 </div>
 
 <footer>
-  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（89236ea0）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（9a6bb610）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>
