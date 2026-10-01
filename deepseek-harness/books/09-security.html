@@ -35,23 +35,16 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 安全</div>
     <h1>沙箱与审批：fail-closed 的两种形态</h1>
-    <div class="subtitle">问题：模型要动手，沙箱与审批怎么 fail-closed？具体拆成四个——政策在哪解析、优先级怎么排（①）？执行缝怎么做到「不出包过的 argv 就不许跑」（②）？审批结果怎么保证唯一授权、审计对怎么不被重放误判（③）？被沙箱拒绝的调用怎么升级（④）？9.1 把问题摆出来，9.2–9.7 逐个作答，9.8 收尾回收。</div>
+    <div class="subtitle">模型要动手，dsh 的安全模型由两条正交的轴组成：文件沙箱（进程能写哪里）与审批（人是否点头）。本章沿两条轴各走一遍 fail-closed 的设计：政策之家与执行缝、审批的授权与留痕、被拒之后的同轮升级。</div>
   </div>
 
   <section class="block">
-    <h2><span class="num">9.1</span>问题：模型能写哪里、谁能点头，两条轴怎么 fail-closed</h2>
-    <p>dsh 的安全模型由两条正交的轴组成：文件沙箱（进程能写哪里）与审批（人是否点头）。四个具体问题：</p>
-    <ul>
-      <li>① <strong>政策之家在哪</strong>——同一会话里部署默认、会话历史、本次请求各想定一个沙箱模式，听谁的？</li>
-      <li>② <strong>执行缝怎么收口</strong>——confine 不出 enforcing argv 的进程，怎么保证不会静默拿到原样 argv？</li>
-      <li>③ <strong>审批怎么授权与留痕</strong>——「只授权本次调用」靠什么结构保证？审计对在重放时怎么不被误判？</li>
-      <li>④ <strong>拒绝之后怎么升级</strong>——模型可以带着什么重试？哪些加宽直接放行、哪些必须人点头？</li>
-    </ul>
-    <p>速览答案：① <code class="inline">ctx.sandboxPolicy</code> 唯一政策之家，resolve() 三层优先级（显式批准 &gt; 日志最后 sandbox/mode &gt; 部署默认），三种模式只管文件效果（9.2）；② <code class="inline">ctx.sandbox</code> 执行缝 confine() fail-closed 抛错，探针仲裁多后端链，Windows rung 上报 partial（9.3–9.4）；③ <code class="inline">ctx.approval</code> 结果封闭联合，唯一授权 allowed-once，audit 对 approval/asked + approval/decided 必须在 open turn 内，'never' 在派发前短路（9.5）；④ 拒绝统一标记 + 同轮升级：模型带 <code class="inline">sandbox_permissions + justification</code> 原样重试一次，approveEscalation 判定——重复已生效模式直接放行，严格加宽才审批（9.6–9.7）。</p>
+    <h2><span class="num">9.1</span>模型能写哪里、谁能点头，两条轴怎么 fail-closed</h2>
+    <p>dsh 的安全模型由两条正交的轴组成：文件沙箱（进程能写哪里）与审批（人是否点头）。两条轴上各有一批要回答的问题：同一会话里部署默认、会话历史、本次请求各想定一个沙箱模式，听谁的（9.2）？confine 不出 enforcing argv 的进程，怎么保证不会静默拿到原样 argv（9.3–9.4）？「只授权本次调用」靠什么结构保证、审计对在重放时怎么不被误判（9.5）？被沙箱拒绝的调用，模型可以带着什么重试、哪些加宽必须人点头（9.6–9.7）？</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.2</span>① 政策之家：resolve() 的三层优先级</h2>
+    <h2><span class="num">9.2</span>政策之家：resolve() 的三层优先级</h2>
     <div class="code-title">packages/sandbox/sandbox-policy/src/index.ts:164 — SandboxPolicyService.resolve()</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="fn">resolve</span>(request: <span class="cl">SandboxPolicyRequest</span> = {}): <span class="cl">SandboxExecutionPolicy</span> {
   <span class="kw">const</span> { session } = request
@@ -75,8 +68,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.3</span>② 执行缝：confine() 返回 argv，不许静默放行</h2>
-    <div class="code-title">packages/sandbox/sandbox/src/index.ts:158 — SandboxProvider 抽象类</div>
+    <h2><span class="num">9.3</span>执行缝：confine() 返回 argv，不许静默放行</h2>
+    <div class="code-title">packages/sandbox/sandbox/src/index.ts:159 — SandboxProvider 抽象类</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export abstract class</span> <span class="cl">SandboxProvider</span> <span class="kw">extends</span> <span class="cl">Service</span> {
   <span class="cmt">/**
    * Wrap `argv` so it executes confined under `policy` on this host; the
@@ -86,7 +79,7 @@
   <span class="kw">abstract</span> <span class="fn">confine</span>(argv: <span class="kw">readonly</span> <span class="kw">string</span>[], policy: <span class="cl">SandboxPolicy</span>, signal?: <span class="cl">AbortSignal</span>): <span class="cl">Promise</span>&lt;<span class="cl">ConfinedArgv</span>&gt;
 }</pre>
     <p><code class="inline">ConfinedArgv</code> 不只返回 argv，还返回<strong>三条自描述事实</strong>：</p>
-    <div class="code-title">packages/sandbox/sandbox/src/index.ts:95 — ConfinedArgv（节选）</div>
+    <div class="code-title">packages/sandbox/sandbox/src/index.ts:96 — ConfinedArgv（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">ConfinedArgv</span> {
   argv: <span class="kw">string</span>[]                            <span class="cmt">// runner, profile, 分隔符, 原始 argv</span>
   <span class="cmt">/** full | partial —— partial 不得当作 full 用 */</span>
@@ -100,7 +93,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.4</span>② 后端链：探针仲裁，fail-closed 兜底</h2>
+    <h2><span class="num">9.4</span>后端链：探针仲裁，fail-closed 兜底</h2>
     <p>dsh-sandbox-local 按平台选择 runner 链（<code class="inline">packages/sandbox/sandbox-local/src/index.ts</code> 模块注释）：Linux 先 bwrap 后 Landlock；macOS 用 Seatbelt（sandbox-exec）；Windows 用 ACL restricted-token runner。两个关键行为：</p>
     <ul>
       <li><strong>功能探针</strong>：候选后端先跑一次真实探针（如 bwrap 用 read-only profile 跑 <code class="inline">true</code>；Seatbelt 通过 <code class="inline">sandbox-exec -p</code> 应用真实 profile），结果有界缓存——「Functional probes arbitrate multi-runner chains and may be skipped for a sole candidate, whose own refusal remains the fail-closed end」。</li>
@@ -110,7 +103,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">9.5</span>③ 审批：政策 → answerer 瀑布 → 审计对</h2>
+    <h2><span class="num">9.5</span>审批：政策 → answerer 瀑布 → 审计对</h2>
     <div class="code-title">packages/interaction/user-approval/src/index.ts:215 — ApprovalService.request()</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">async</span> <span class="fn">request</span>(req: <span class="cl">ApprovalRequest</span>): <span class="cl">Promise</span>&lt;<span class="cl">ApprovalOutcome</span>&gt; {
   <span class="kw">const</span> session = req.agent.session
@@ -140,11 +133,11 @@
     outcome =&gt; OUTCOMES.<span class="fn">includes</span>(outcome) ? outcome : <span class="st">'unavailable'</span>,  <span class="cmt">// 野值归一化</span>
     () =&gt; <span class="st">'unavailable'</span>,                                              <span class="cmt">// 抛错也归 unavailable</span>
   )</pre>
-    <div class="annotation"><b>四个 fail-closed 细节</b>：① 'never' 政策在派发前短路——注释点明这是为了防 prepend 监听器抢跑，把「never 必然拒绝」的承诺保留在服务自己的路径上；② 无 answerer 时 waterfall 默认值就是 unavailable；③ answerer 返回词汇表之外的野值归一化为 unavailable；④ answerer 抛错同样归 unavailable（「A throwing answerer must fail the QUESTION closed, not the caller's tool call open — the seam contains its callbacks」）。另外两个实现细节值得学：审计对必须在 open turn 内（否则重载时被当成 crash-tail 丢弃）；先进入 Promise 链再派发，同步抛错的监听器也落进同一收容路径。</div>
+    <div class="annotation"><b>四个 fail-closed 细节</b>：'never' 政策在派发前短路——注释点明这是为了防 prepend 监听器抢跑，把「never 必然拒绝」的承诺保留在服务自己的路径上；无 answerer 时 waterfall 默认值就是 unavailable；answerer 返回词汇表之外的野值归一化为 unavailable；answerer 抛错同样归 unavailable（「A throwing answerer must fail the QUESTION closed, not the caller's tool call open — the seam contains its callbacks」）。另外两个实现细节值得学：审计对必须在 open turn 内（否则重载时被当成 crash-tail 丢弃）；先进入 Promise 链再派发，同步抛错的监听器也落进同一收容路径。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.6</span>④ 图 9-1：一次被拒的 bash 调用如何升级</h2>
+    <h2><span class="num">9.6</span>图 9-1：一次被拒的 bash 调用如何升级</h2>
     <div class="figure">
       <div class="svg-box">
         <svg viewBox="0 0 960 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="升级流程">
@@ -202,7 +195,7 @@
       </div>
       <div class="svg-legend">图 9-1 · 拒绝 → 标记 + 升级提示 → 带 sandbox_permissions 重试 → approveEscalation 严格加宽 + 审批 → 审计对落日志</div>
     </div>
-    <div class="code-title">packages/sandbox/sandbox/src/escalation.ts:153 — approveEscalation 的判定顺序</div>
+    <div class="code-title">packages/sandbox/sandbox/src/escalation.ts:171 — approveEscalation 的判定顺序</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export async function</span> <span class="fn">approveEscalation</span>&lt;<span class="cl">A</span>, <span class="cl">C</span>&gt;(request: <span class="cl">EscalationRequest</span>, approval: <span class="cl">EscalationApproval</span>&lt;A, C&gt;): <span class="cl">Promise</span>&lt;<span class="cl">SandboxMode</span>&gt; {
   <span class="kw">const</span> { requestedMode: mode, effectiveMode, justification, subject } = request
   <span class="cmt">// ⓪ 重复本次调用的生效模式不需要审批，直接返回</span>
@@ -223,33 +216,30 @@
     <span class="cmt">// rejected / cancelled / unavailable 各有逐字错误文本，什么都没执行</span>
   }
 }</pre>
-    <div class="annotation"><b>结构学但不依赖</b>：EscalationApprover 是<strong>最小结构形状</strong>（只有 request 方法），不是 ApprovalService 类型——「the tool layer … closes over <code class="inline">ctx.approval.request(...)</code> and hands the closure down, so this package never depends on the approval or agent packages」。WIDER_MODES 阶梯是 read-only→{workspace-write, danger-full-access}、workspace-write→{danger-full-access}；schema enum 固定为完整 ESCALATION_TARGETS 而非按默认模式裁剪——否则一个 danger-full-access 默认部署会让窄模式会话失去升级杠杆。</div>
+    <div class="annotation"><b>结构学但不依赖</b>：EscalationApprover 是<strong>最小结构形状</strong>（只有 request 方法），不是 ApprovalService 类型——「the tool layer … closes over <code class="inline">ctx.approval.request(...)</code> and hands the closure down, so this package never depends on the approval or agent packages」。WIDER_MODES 阶梯是 read-only→{workspace-write, danger-full-access}、workspace-write→{danger-full-access}；schema enum 固定为完整 ESCALATION_TARGETS 而非按默认模式裁剪——否则一个 danger-full-access 默认部署会让窄模式会话失去升级路径（schema 注释的理由：schemas 是 registry-global 的，而 effective mode 是 per-call truth）。</div>
     <div class="annotation"><b>同模式为什么放行</b>：函数体第一行 <code class="inline">if (mode === effectiveMode) return effectiveMode</code> 是后来加的捷径——工具带 <code class="inline">sandbox_permissions</code> 重试时，请求的模式可能恰好等于本次调用已生效的模式（比如宿主已经按会话政策把这次调用放在 workspace-write 里）。这不算加宽，走审批只会让人重复点一次头。只有<strong>严格更宽</strong>的模式才需要审批，且授权只对这一次调用生效。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>④ 权限预设：两个旋钮一个选择器</h2>
+    <h2><span class="num">9.7</span>权限预设：两个旋钮一个选择器</h2>
     <p>dsh-permission-presets（<code class="inline">packages/interaction/permission-presets</code>）把两个独立旋钮打包成命名预设：</p>
     <table class="tbl">
       <tr><th>预设</th><th>sandbox 模式</th><th>approval 政策</th></tr>
       <tr><td><code class="inline">workspace-write</code></td><td>workspace-write</td><td>ask</td></tr>
       <tr><td><code class="inline">danger-full-access</code></td><td>danger-full-access</td><td>never</td></tr>
-      <tr><td><code class="inline">auto</code>（实验）</td><td>danger-full-access</td><td>never（逐调用由 auto-review 分类把关）</td></tr>
+      <tr><td><code class="inline">auto</code>（实验）</td><td>danger-full-access</td><td>ask（v0.2.0 起从 never 改来——reviewer 拒绝时改问用户；见下方说明）</td></tr>
       <tr><td><code class="inline">custom</code></td><td colspan="2">不匹配任何预设的组合<strong>只读回</strong>为派生状态 custom——README 现在的说法是「clients show the derived <code class="inline">custom</code> state, but users cannot select or persist it」：它只在当前命中时出现在选项列表里，可以切走，不能选中，也不能被命名成表项</td></tr>
     </table>
     <div class="annotation"><b>bundler 不是 owner</b>：README 明说「It bundles the knobs; execution and approval keep their own values, so removing the package later leaves the last selection in effect」——预设包只是把两件事写进各自的事件，它不拥有任何执行语义；卸掉它，最后的模式与政策原样生效。它就是第 1 章判别法的应用：打包面（UI 概念）与能力面（enforcement）分开。</div>
     <div class="callout info">
       <b class="tag">auto 预设的例外位置</b>
-      <code class="inline">auto</code>（AUTO_PRESET，index.ts:80）目前是实验性预设，参数表里也是 danger-full-access + never——但它是唯一一个固定搭配之外还有<strong>运行时把关者</strong>的：宿主集成用 <code class="inline">registerAuto(admit)</code>（index.ts:313）发布当前会话有效的 auto 能力（重复注册抛错），持久身份仍是普通的 <code class="inline">permission/preset</code> 事件。选择 auto 后，experimental 的 dsh-auto-review 在每次工具调用前用独立 reviewer 调用按<strong>实际效果</strong>分类：low（项目内读写/分析/格式化/测试/构建/非破坏性 Git/本会话创建对象的精确清理）直接放行，medium（不可逆删除既有状态、force push、生产读写/部署、外部发送）只在带明确授权（动作+目标+范围）时放行，high（越信任边界的敏感数据外泄等硬拒效果）连显式请求也拒绝；歧义与超范围一律 fail-closed。委派时 <code class="inline">captureDelegatedPolicyOverrides</code>（subagent/child-agent.ts）只把 <code class="inline">'auto'|'danger-full-access'</code> 写进子的 permission/preset 事件——窄预设的子代理各自继承沙箱而不是复制审批政策。
+      <code class="inline">auto</code>（AUTO_PRESET，index.ts:82）是实验性预设，也是唯一一个经历 v0.2.0 语义修正的：AUTO_PRESET_SPEC（index.ts:89）的 approval 从 <code class="inline">never</code> 改成 <code class="inline">ask</code>——reviewer 的拒绝原来直接生效，现在转给人裁决（注释原话「<code class="inline">ask</code> routes reviewer denials to the user」）。但 never 语义没有消失，而是退到了一个特例里：派生逻辑（derive，index.ts:355）仍然接受「已有存储 Auto 身份 + approval === 'never'」的组合显示为 auto 预设——注释解释这是给<strong>受委派的子 agent</strong> 用的，它钉死 never 让自己的 reviewer 拒绝保持终局性。宿主集成用 <code class="inline">registerAuto(admit)</code>（index.ts:307）发布当前会话有效的 auto 能力（重复注册抛错），持久身份仍是普通的 <code class="inline">permission/preset</code> 事件。选择 auto 后，experimental 的 dsh-auto-review 在每次工具调用前用独立 reviewer 调用按<strong>实际效果</strong>分类：low（项目内读写/分析/格式化/测试/构建/非破坏性 Git/本会话创建对象的精确清理）直接放行，medium（不可逆删除既有状态、force push、生产读写/部署、外部发送）只在带明确授权（动作+目标+范围）时放行，high（越信任边界的敏感数据外泄等硬拒效果）连显式请求也拒绝；歧义与超范围一律 fail-closed。委派时 <code class="inline">captureDelegatedPolicyOverrides</code>（subagent/child-agent.ts）只把 <code class="inline">'auto'|'danger-full-access'</code> 写进子的 permission/preset 事件——窄预设的子代理各自继承沙箱而不是复制审批政策。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.8</span>收尾：四个问题的答案</h2>
-    <div class="callout warn">
-      <b class="tag">答案回收</b>
-      ① 政策与执行分家：resolve() 三层优先级（显式批准 &gt; 会话事件 &gt; 部署默认），confine() 只认完全指定的政策；词汇表刻意小——沙箱只管文件效果，网络/进程可见性排除在外（9.2）。② 执行缝不许静默放行：confine() 不出 enforcing argv 就 fail-closed 抛错；探针仲裁多后端链；Windows rung 上报 partial 且边界逐条说明（9.3–9.4）。③ 审批唯一授权是 allowed-once（且 always 一次调用）；'never' 在派发前短路防 prepend 抢跑；审计对必须 turn-enclosed，否则重放时被当 crash-tail 丢弃（9.5）。④ 升级是共享编排：同模式重复免审批、严格加宽 + 结构化审批接口 + 逐字错误文本，两个执行家族（bash/fs）共用同一套（9.6–9.7）。下一步看其他能力缝的实例：<a href="10-seams.html">第 10 章：能力缝实战</a>。
-    </div>
+    <h2><span class="num">9.8</span>收尾：两条轴的答案</h2>
+    <p>两条轴各自 fail-closed，但共享同一套纪律。政策与执行分家：resolve() 三层优先级（显式批准 &gt; 会话事件 &gt; 部署默认），confine() 只认完全指定的政策；词汇表刻意小——沙箱只管文件效果，网络/进程可见性排除在外。执行缝不许静默放行：confine() 不出 enforcing argv 就抛错，探针仲裁多后端链，Windows rung 上报 partial 且边界逐条说明。审批的唯一授权是 allowed-once（且 always 一次调用）；'never' 在派发前短路防 prepend 抢跑；审计对必须 turn-enclosed，否则重放时被当 crash-tail 丢弃。升级则是共享编排：同模式重复免审批、严格加宽 + 结构化审批接口 + 逐字错误文本，两个执行家族（bash/fs）共用同一套——v0.2.0 又给它添了中英双语的 displayReason 与「拒绝即终局」的明确措辞（the user rejected… it stays denied, so stop and explain instead of working around it）。下一步看其他能力缝的实例：<a href="10-seams.html">第 10 章：能力缝实战</a>。</p>
   </section>
 
   <div class="arrow-nav">
@@ -260,7 +250,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 09 安全 · 版本 dsh-v0.1.7-alpha.2 (HEAD 00102833df) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 09 安全 · 版本 dsh-v0.2.0-rc.1 (HEAD 4878cdabd8) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

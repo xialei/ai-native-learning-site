@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
     <h1>生产 Harness：裸循环到稳定会话之间缺什么</h1>
-    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是 <code class="inline">AgentHarness</code> 契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4000 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
+    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是 <code class="inline">AgentHarness</code> 契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4100 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
   </div>
 
   <section class="block">
@@ -111,11 +111,11 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">8.2</span>一次 prompt 的完整旅程</h2>
+    <h2><span class="num">8.2</span>一次 prompt 的完整流水线</h2>
     <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间要过十几个环节。全程时序如下：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
-        <title id="t8b">AgentSession.prompt 完整旅程</title>
+        <title id="t8b">AgentSession.prompt 完整流水线</title>
         <desc id="d8b">从用户输入到 agent 运行，经过命令、钩子、展开、队列/校验、压缩预检、before_agent_start，最后进 _runAgentPrompt</desc>
         <defs>
           <marker id="arrow8b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
@@ -204,36 +204,32 @@
         <text class="lbl" x="490" y="496" font-size="12" fill="#1f2937" text-anchor="middle">8 _runAgentPrompt</text>
         <text class="lbl sm" x="490" y="515" text-anchor="middle">agent.prompt → continue 循环</text>
       </svg>
-      <div class="fig-cap">图 8.2：<code class="inline">prompt()</code> 是一条<strong>固定顺序</strong>的流水线（命令 → 钩子 → 展开 → 流式则入队，否则 flush/校验/压缩预检 → before_agent_start → _runAgentPrompt）。三处可短路返回：扩展命令 handled、input 钩子 handled、流式入队。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#eaf2f9;border-color:#2563eb"></span>内部步骤</span><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#0f7d7a"></span>压缩/Agent 调用</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#b45309"></span>入队与拦截</span></div><div class="fig-cap">图 8.2：<code class="inline">prompt()</code> 是一条<strong>固定顺序</strong>的流水线（命令 → 钩子 → 展开 → 流式则入队，否则 flush/校验/压缩预检 → before_agent_start → _runAgentPrompt）。三处可短路返回：扩展命令 handled、input 钩子 handled、流式入队。</div>
     </div>
     <p>看真实代码。第 1 步扩展命令是最快的短路——以 <code class="inline">/</code> 开头的指令若命中注册命令，直接执行并返回，根本不进 LLM：</p>
     <div class="code-title">agent-session.ts · prompt() 前半段（扩展命令 + input 钩子 + 技能展开）</div>
     <pre class="code"><code><span class="cmt">// 1. 优先执行扩展命令（流式中也立即执行，命令自管 LLM 交互）</span>
 <span class="kw">if</span> (expandPromptTemplates && text.startsWith(<span class="st">"/"</span>)) {
   <span class="kw">const</span> handled = <span class="kw">await</span> <span class="fn">this</span>._tryExecuteExtensionCommand(text);
-  <span class="kw">if</span> (handled) { preflightResult?.(<span class="nu">true</span>); <span class="kw">return</span>; }
+  <span class="kw">if</span> (handled) { preflightResult?.(<span class="st">"handled"</span>); <span class="kw">return</span>; }
 }
+<span class="cmt">// 压缩进行中不许提交新 prompt——等它做完再试</span>
+<span class="kw">if</span> (<span class="fn">this</span>._compactionAbortController !== <span class="kw">undefined</span>) <span class="kw">throw</span> <span class="kw">new</span> <span class="cl">Error</span>(...);
 
-<span class="kw">let</span> currentText = text;
-<span class="kw">let</span> currentImages = options?.images;
 <span class="cmt">// 2. input 事件：扩展可完全接管（handled）或改写（transform）</span>
-<span class="kw">if</span> (<span class="fn">this</span>._extensionRunner.hasHandlers(<span class="st">"input"</span>)) {
-  <span class="kw">const</span> inputResult = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.<span class="fn">emitInput</span>(
-    currentText, currentImages, options?.source ?? <span class="st">"interactive"</span>,
-    <span class="fn">this</span>.isStreaming ? options?.streamingBehavior : <span class="kw">undefined</span>,
-  );
-  <span class="kw">if</span> (inputResult.action === <span class="st">"handled"</span>) { preflightResult?.(<span class="nu">true</span>); <span class="kw">return</span>; }
-  <span class="kw">if</span> (inputResult.action === <span class="st">"transform"</span>) {
-    currentText = inputResult.text;
-    currentImages = inputResult.images ?? currentImages;
-  }
-}
+<span class="kw">const</span> processedInput = <span class="kw">await</span> <span class="fn">this</span>._runInputHandlers(
+  text, options?.images, options?.source ?? <span class="st">"interactive"</span>,
+  <span class="fn">this</span>.isStreaming ? options?.streamingBehavior : <span class="kw">undefined</span>,
+);
+<span class="kw">if</span> (!processedInput) { preflightResult?.(<span class="st">"handled"</span>); <span class="kw">return</span>; }
+<span class="kw">const</span> { text: currentText, images: currentImages } = processedInput;
 
 <span class="cmt">// 3. 技能 /skill:name 与 prompt 模板展开为完整文本</span>
-<span class="fn">this</span>._expandSkillCommand(expandedText);
+<span class="kw">let</span> expandedText = currentText;
+expandedText = <span class="fn">this</span>._expandSkillCommand(expandedText);
 expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<span class="fn">this</span>.promptTemplates]);</code></pre>
     <div class="callout">
-      <strong>读懂三个「短路」：</strong>扩展命令（1）、input 钩子（2）都能<strong>完全吞掉</strong>这一次输入（handled），不让它进 LLM；技能/模板（3）则把一句话<strong>展开成一大段</strong>塞进上下文。三者顺序固定——先给最高优先级、最便宜的拦截机会。
+      <strong>读懂三个「短路」与一个回执：</strong>扩展命令（1）、input 钩子（2）都能<strong>完全吞掉</strong>这一次输入（handled），不让它进 LLM；技能/模板（3）则把一句话<strong>展开成一大段</strong>塞进上下文。三者顺序固定——先给最高优先级、最便宜的拦截机会。而 <code class="inline">preflightResult</code> 回调（RPC 模式挂进来观察 prompt 去向的内部钩子，不拒绝就一定会被调用）如今收到的不再是布尔的「有没有被处理」，而是一个三值处置：<code class="inline">PromptDisposition = "handled" | "queued" | "started"</code>——扩展命令吞掉或 input 钩子接管是 <code class="inline">"handled"</code>；流式入队是 <code class="inline">"queued"</code>；真正开跑前一刻是 <code class="inline">"started"</code>。RPC 的 prompt 响应把该值放进 <code class="inline">data.disposition</code>，客户端由此能区分「这条输入被本地消化了」和「它已经在模型面前跑起来了」。
     </div>
     <p>流水线的后半段（before_agent_start 事件之后）有个容易误读的顺序决定——<strong>消息数组的构建被刻意推迟到钩子跑完之后</strong>：</p>
     <div class="code-title">agent-session.ts · prompt() 中段：钩子之后才归一化图片、才 build messages（节选，注释为译注）</div>
@@ -258,29 +254,60 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
 
   <section class="block">
     <h2><span class="num">8.2b</span>模型面前的上下文：四根接管钩子</h2>
-    <p>裸 <code class="inline">Agent</code> 循环把四个边界留成了公开钩子（第 3 章）；生产 harness 在构造函数里<strong>把四根全部接管</strong>（<code class="inline">_installAgentNextTurnRefresh</code> / <code class="inline">_installAgentRequestProjection</code> / <code class="inline">_installAgentBoundaryHooks</code>，再加 8.5 提到的 <code class="inline">_installAgentForcedPromptProjection</code> 包 <code class="inline">transformContext</code>）。其中最根本的一根是 v0.87 新装的 <code class="inline">prepareRequest</code> 投影——它让 <strong>SessionManager 的投影成为模型上下文的唯一来源</strong>：</p>
-    <div class="code-title">agent-session.ts · _installAgentRequestProjection（行号 608 起；注释为译注）</div>
+    <p>裸 <code class="inline">Agent</code> 循环把四个边界留成了公开钩子（第 3 章）；生产 harness 在构造函数里<strong>把四根全部接管</strong>（<code class="inline">_installAgentNextTurnRefresh</code> / <code class="inline">_installAgentRequestProjection</code> / <code class="inline">_installAgentBoundaryHooks</code>，再加 8.5 提到的 <code class="inline">_installAgentForcedPromptProjection</code> 包 <code class="inline">transformContext</code>）。其中最根本的一根是 <code class="inline">prepareRequest</code> 投影——它让 <strong>SessionManager 的投影成为模型上下文的唯一来源</strong>，如今还兼任虚拟模型路由的执行点：</p>
+    <div class="code-title">agent-session.ts · _installAgentRequestProjection（注释为译注）</div>
     <pre class="code"><code><span class="kw">private</span> <span class="fn">_installAgentRequestProjection</span>(): void {
   <span class="kw">const</span> previousPrepareRequest = <span class="kw">this</span>.agent.prepareRequest;
-  <span class="kw">this</span>.agent.prepareRequest = async (request, signal) =&gt; {
-    <span class="cmt">// 每次会话请求（含第一次）前，用 SessionManager 的投影替换 agent 手里的消息</span>
-    <span class="kw">const</span> canonicalContext = {
-      ...request.context,
-      messages: <span class="kw">this</span>.sessionManager.<span class="fn">buildSessionProjection</span>().messages,
-      <span class="cmt">// 消息声明 provider 看得见的 loadout；context.tools 保留可执行的实现</span>
-      tools: <span class="kw">this</span>.agent.state.tools.slice(),
+  <span class="fn">this</span>.agent.prepareRequest = async (request, signal) =&gt; {
+    <span class="kw">const</span> failed = <span class="fn">this</span>._failedResponse;          <span class="cmt">// 自动重试/溢出恢复留的「上次失败响应」</span>
+    <span class="fn">this</span>._failedResponse = <span class="kw">undefined</span>;              <span class="cmt">// 取走即清，只喂给下一次请求</span>
+    <span class="kw">const</span> prepare = async () =&gt; {
+      <span class="kw">const</span> projection = <span class="fn">this</span>.sessionManager.<span class="fn">buildSessionProjection</span>();
+      <span class="kw">const</span> canonicalContext = {
+        ...request.context,
+        messages: projection.messages,
+        <span class="cmt">// 消息声明 provider 看得见的 loadout；context.tools 保留可执行的实现</span>
+        tools: <span class="fn">this</span>.agent.state.tools.slice(),
+      };
+      <span class="cmt">// 再链上既有的 prepareRequest（比如强制 prompt 投影），以它返回值为准</span>
+      <span class="kw">const</span> previous = <span class="kw">await</span> previousPrepareRequest?.({ ...request, context: canonicalContext, ... }, signal);
+      <span class="kw">return</span> { previous, context: previous?.context ?? canonicalContext, projection };
     };
-    <span class="cmt">// 再链上既有的 prepareRequest（比如强制 prompt 投影），以它返回值为准</span>
-    <span class="kw">const</span> previous = <span class="kw">await</span> previousPrepareRequest?.({ ...request, context: canonicalContext, ... }, signal);
-    <span class="kw">return</span> {
-      ...previous,
-      context: previous?.context ?? canonicalContext,
-      model: previous?.model ?? <span class="kw">this</span>.agent.state.model,
-      thinkingLevel: previous?.thinkingLevel ?? <span class="kw">this</span>.agent.state.thinkingLevel,
-    };
+    <span class="kw">let</span> { previous, context, projection } = <span class="kw">await</span> prepare();
+    <span class="kw">const</span> model = previous?.model ?? <span class="fn">this</span>.agent.state.model;
+    <span class="kw">const</span> thinkingLevel = previous?.thinkingLevel ?? <span class="fn">this</span>.agent.state.thinkingLevel;
+    <span class="cmt">// 物理模型到此为止——直接放行</span>
+    <span class="kw">if</span> (!<span class="fn">isVirtualModel</span>(model)) <span class="kw">return</span> { ...previous, context, model, thinkingLevel };
+
+    <span class="cmt">// 虚拟选择只留在 agent 状态里；只有这一次请求真正用被路由到的物理模型。</span>
+    <span class="cmt">// 只有用户亲写的消息才开启一个 turn；扩展消息（如 before_agent_start 的）只是跟随。</span>
+    <span class="kw">const</span> lastResponse = context.messages.<span class="fn">findLastIndex</span>((m) =&gt; m.role === <span class="st">"assistant"</span>);
+    <span class="kw">const</span> userTurn = context.messages.<span class="fn">slice</span>(lastResponse + <span class="nu">1</span>).<span class="fn">some</span>((m) =&gt; m.role === <span class="st">"user"</span>);
+    <span class="kw">const</span> state = <span class="fn">getVirtualModelState</span>(<span class="fn">this</span>.sessionManager.getBranch(), model.provider, model.id);
+    <span class="kw">const</span> route = <span class="kw">await</span> <span class="fn">this</span>._modelRuntime.<span class="fn">resolveModel</span>(model, <span class="fn">convertToLlm</span>(context.messages), {
+      reason: failed ? <span class="st">"retry"</span> : userTurn ? <span class="st">"user"</span> : <span class="st">"continuation"</span>,
+      thinkingLevel, signal, failed, state,
+    });
+    <span class="cmt">// 路由器给了新状态 → 追加一条自定义条目存到当前分支上</span>
+    <span class="kw">if</span> (route.state !== <span class="kw">undefined</span> &amp;&amp; route.state !== state) {
+      <span class="fn">this</span>.sessionManager.<span class="fn">appendCustomEntry</span>(VIRTUAL_MODEL_STATE_ENTRY, { provider: ..., state: route.state });
+    }
+    <span class="cmt">// 路由已定，不推翻；但若被路由到的模型也超压缩阈值，先压一轮再重建请求</span>
+    <span class="kw">if</span> (<span class="fn">this</span>._exceedsCompactionThreshold(route.model, projection)) {
+      <span class="kw">await</span> <span class="fn">this</span>._runAutoCompaction(<span class="st">"threshold"</span>, <span class="kw">false</span>);
+      ({ previous, context } = <span class="kw">await</span> prepare());
+    }
+    <span class="kw">return</span> { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
   };
 }</code></pre>
     <div class="annotation">这根钩子回答了 8.1 的第二个问题。它的位置选得很准：<code class="inline">prepareRequest</code> 在<strong>每次 provider 请求前</strong>触发、且此时 pending 消息（steering/follow-up）已经写入 agent 状态——所以投影永远包含最新内容；它能整体替换 context/model/thinkingLevel，所以换模型、改 thinking 都不需要循环知情。另一根 <code class="inline">prepareNextTurnWithContext</code> 接管则负责「turn 之间的重活」：先 <code class="inline">_compactBeforeNextAssistantResponse</code>（token 过阈值就先压缩），再重算系统提示 + 工具 loadout（<code class="inline">_preparePromptAndToolLoadout</code>），有变化就产出一条 patch system 消息随下轮注入。两根钩子各管一头——<strong>投影管「每次请求发什么」，prepareNextTurn 管「turn 之间要不要先动手术」</strong>。</div>
+    <p>这段摘录的后半截（<code class="inline">isVirtualModel</code> 判断以下）是后来长出来的第二职责，值得单独拆解。<strong>虚拟模型</strong>是目录里的一条特殊条目（<code class="inline">api === "pi-virtual"</code>）：它从不抵达 provider，每个请求都先经路由函数映射到某个物理模型再发送——「用户选了什么」（选择）与「这次实际问谁」（分发）就此分成两对概念。路由需要的上下文有三样：</p>
+    <ul>
+      <li><strong>理由（reason）</strong>：<code class="inline">"retry" | "user" | "continuation"</code>——上次失败要重发（<code class="inline">failed</code> 有值）算 retry；最后一条 assistant 之后存在用户写的消息算 user（steering/follow-up 也算，因为它们都是用户亲笔）；其余一律 continuation。路由器据此决定「换档」还是「延续原路由」——比如某路由器只在用户开启新话题时才换物理模型，循环内的续跑和重试就不该触发它。</li>
+      <li><strong>路由状态（state）</strong>：路由器可以是无状态的纯函数，也可以跨请求记账。状态不放在内存里，而是<strong>作为自定义条目（<code class="inline">pi.virtual-model-state</code>）写进会话树</strong>——于是它天然随分支分叉、随压缩存活、回放即恢复，与第 5 章「状态即条目」的哲学一脉相承。直接请求（循环外的 streamSimple，如压缩摘要）不携带状态。</li>
+      <li><strong>失败现场（failed）</strong>：自动重试与溢出恢复在重试前把失败的 assistant 消息存进 <code class="inline">_failedResponse</code>——因为省略编辑已经把它从上下文里隐去了，路由器看不见它，只能显式递过去。重试因此可以被路由器区别对待（比如「同一物理模型连续失败就换一家」）。这个字段在 <code class="inline">_runAgentPrompt</code> 开头清一次、finally 再清一次：新 prompt 会取代压缩前安排好的重试，谁都不该消费到陈旧的失败现场。</li>
+    </ul>
+    <p>选中的物理模型不入会话的 <code class="inline">model_change</code>——选择（虚拟条目）不动，只有分发（每条响应自报家门用的是哪个物理模型）随之流动。于是「会话当前在用什么」出现了一个投影态：<code class="inline">routedModel</code> getter 从最近一条<strong>成功</strong>响应里读出物理模型与当轮档位（错误/中断的响应不算），TUI 底栏也据此显示成 <code class="inline">auto • high → gpt-5.6-luna • medium</code> 这样的两段式；上下文用量与压缩阈值同样按<strong>被路由到的物理模型</strong>的窗口算（<code class="inline">_limitsModel()</code> 优先返回 <code class="inline">routedModel</code>）——路由器把你切到了小窗口模型，压缩就得立刻按新窗口预算，哪怕会话还没写回一条 model_change。若路由结果也超阈值，就先压缩再重建请求，路由结论原样保留。</p>
   </section>
 
   <section class="block">
@@ -297,7 +324,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   } <span class="kw">else</span> {
     <span class="kw">await</span> <span class="fn">this</span>._queueSteer(expandedText, currentImages);
   }
-  preflightResult?.(<span class="nu">true</span>);
+  preflightResult?.(<span class="st">"queued"</span>);
   <span class="kw">return</span>;
 }</code></pre>
     <p>两种入队的差别，看底层实现（AgentSession 维护两条数组，再转发给基础包的 Agent）：</p>
@@ -326,7 +353,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
       </tbody>
     </table>
     <p>基础包的 <code class="inline">Agent</code> 类实际维护着这些队列，并提供两种投递模式；v0.87 还补了一个不消费的预览口：</p>
-    <div class="code-title">packages/agent/src/agent.ts · peekQueuedMessages（行号 327 起）</div>
+    <div class="code-title">packages/agent/src/agent.ts · peekQueuedMessages</div>
     <pre class="code"><code><span class="cmt">// 队列模式 QueueMode: "all" 或 "one-at-a-time"（默认每次只投最旧一条）</span>
 <span class="cmt">// 预览：下一个 turn 将送出哪条排队消息，但不消费它（UI 展示用）</span>
 <span class="fn">peekQueuedMessages</span>(): AgentMessage[] {
@@ -404,7 +431,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
     </div>
     <h3>上下文转换事件的拆分：context 与 context_with_system</h3>
     <p>扩展挂进请求前的最后一道转换 <code class="inline">context</code>，v0.87 把它的可见范围收紧了：<strong>handler 只看得到对话消息，看不到 system（prompt + 工具声明）</strong>。pi 在每个 handler 跑完后把 prompt 状态恢复回去；只有需要完整转写的场景才走另一扇门 <code class="inline">context_with_system</code>：</p>
-    <div class="code-title">extensions/runner.ts · emitContext 两段派发（行号约 1192；摘录，注释为译注）</div>
+    <div class="code-title">extensions/runner.ts · emitContext 两段派发（摘录，注释为译注）</div>
     <pre class="code"><code><span class="cmt">// 第一段：context handler 只看对话</span>
 <span class="kw">const</span> visibleMessages = currentMessages.filter((m) =&gt; m.role !== <span class="st">"system"</span>);
 <span class="kw">const</span> returned = <span class="kw">await</span> handler({ type: <span class="st">"context"</span>, messages: visibleMessages }, ctx);
@@ -425,7 +452,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
       绝大多数动态上下文（RAG、注入记忆、过滤历史）只关心对话，走 <code class="inline">context</code>——pi 替你把 prompt 状态保护起来，返回未改动时还能保住缓存前缀。只有「请求级、必须拿到完整转写」的转换（如导出审计、转写级重排）才走 <code class="inline">context_with_system</code>，且结果原样采用，你得自己保证 index 0 是 system 消息。
     </div>
     <p>除了这种「转换流」事件，扩展还有两个<strong>可操作边界</strong>：<code class="inline">turn_end</code> 与 <code class="inline">agent_before_settle</code>。它们能链式提出要写入会话的条目（custom / custom_message / context_edit / compaction 四种草稿）并请求一次续跑。写入安全由 <code class="inline">emitBoundary</code> 保证：</p>
-    <div class="code-title">extensions/runner.ts · emitBoundary（行号 928 起；摘录，注释为译注）</div>
+    <div class="code-title">extensions/runner.ts · emitBoundary（摘录，注释为译注）</div>
     <pre class="code"><code><span class="kw">async</span> <span class="fn">emitBoundary</span>(baseEvent, buildContext): Promise&lt;BoundaryDispatchResult&gt; {
   <span class="kw">let</span> entries = [], shouldContinue = false, valid = true;
   <span class="kw">let</span> context = <span class="kw">await</span> buildContext(entries);     <span class="cmt">// 用「当前草稿集」预览上下文</span>
@@ -450,7 +477,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
   <section class="block">
     <h2><span class="num">8.5</span>运行后收敛：重试 → 压缩 → 续跑 → 结算</h2>
     <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有消息吗？能结算了吗？</strong>看 <code class="inline">_runAgentPrompt</code> 的主循环：</p>
-    <div class="code-title">agent-session.ts · _runAgentPrompt 主循环（行号约 1470；注释为译注）</div>
+    <div class="code-title">agent-session.ts · _runAgentPrompt 主循环（注释为译注）</div>
     <pre class="code"><code><span class="kw">await</span> <span class="fn">this</span>.agent.prompt(messages);
 <span class="kw">while</span> (!<span class="fn">this</span>._agentRunAbortRequested) {
   <span class="kw">if</span> (<span class="kw">await</span> <span class="fn">this</span>._handlePostAgentRun()) {          <span class="cmt">// 重试/压缩/队列有活 → 续跑</span>
@@ -493,7 +520,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
     </div>
     <h3>结算的最后两站：agent_before_settle 与 agent_settled</h3>
     <p><code class="inline">_handlePostAgentRun</code> 全部说「不用续」之后，循环不立即退出——先过 <code class="inline">_runBeforeSettleBoundary</code>：</p>
-    <div class="code-title">agent-session.ts · _runBeforeSettleBoundary（行号 1531 起；摘录，注释为译注）</div>
+    <div class="code-title">agent-session.ts · _runBeforeSettleBoundary（摘录，注释为译注）</div>
     <pre class="code"><code><span class="kw">private async</span> <span class="fn">_runBeforeSettleBoundary</span>(): Promise&lt;boolean&gt; {
   <span class="kw">if</span> (!<span class="fn">this</span>._extensionRunner.hasHandlers(<span class="st">"agent_before_settle"</span>)) <span class="kw">return this</span>.agent.hasQueuedMessages();
   <span class="kw">const</span> result = <span class="kw">await this</span>._extensionRunner.<span class="fn">emitBoundary</span>(
@@ -578,7 +605,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
     <h2><span class="num">8.7</span>收尾：四问的答案</h2>
     <ul>
       <li><strong>输入怎么进？</strong><code class="inline">prompt()</code> 一条固定流水线：扩展命令 → input 钩子 → 技能/模板展开 → 流式则强制入 steer/followUp 队列 → flush bash → 模型/鉴权校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>。三个可短路点（命令、钩子、入队），一个「钩子之后才归一化」的顺序决定。</li>
-      <li><strong>上下文从哪来？</strong>四根接管钩子把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt。</li>
+      <li><strong>上下文从哪来？</strong>四根接管钩子把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源；选中虚拟模型时同一根钩子还执行路由——按 user/continuation/retry 理由分发到物理模型）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt。</li>
       <li><strong>扩展在哪能改写会话？</strong>转换流两扇门（context 只看对话 / context_with_system 拥有完整转写）；可操作边界（turn_end / agent_before_settle）四种草稿链式累积、沙盘预演、失败整体作废，continue 需过 canContinue 校验。</li>
       <li><strong>跑完谁收敛？</strong>重试→压缩→续跑的 while 循环，配三类压缩守卫与一次性的溢出恢复；收敛到头后 agent_before_settle 仍可追加条目续跑一次，最终 agent_settled 纯通知——集成方由此知道 Pi 不会再动。</li>
     </ul>
@@ -604,7 +631,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

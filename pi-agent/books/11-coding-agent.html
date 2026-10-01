@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 编码 Agent</div>
     <h1>编码 Agent：把前面所有碎片拼成一个「能跑的产品」</h1>
-    <div class="subtitle">十章攒下的碎片——循环、会话、上下文、压缩、harness、工具、AI 层——靠哪条装配线拼成可运行的产品？模型怎么选、key 怎么验？工具集在装配时怎么定？同一个内核怎么服务 TUI、脚本、RPC 三种外壳？外壳又怎么在不碰内核的前提下长出新能力？</div>
+    <div class="subtitle">十章攒下的碎片——循环、会话、上下文、压缩、harness、工具、AI 层——靠哪条装配线拼成可运行的产品？模型怎么选、key 怎么验？目录里那些「从不抵达 provider 的虚拟模型」又是怎么接进这条线的？工具集在装配时怎么定？同一个内核怎么服务 TUI、脚本、RPC 三种外壳？外壳又怎么在不碰内核的前提下长出新能力？</div>
   </div>
 
   <div class="epigraph">
@@ -62,20 +62,25 @@
     <pre class="code"><code><span class="cmt">// 1. 调用者显式给了 → 就用它</span>
 <span class="kw">let</span> model = options.model;
 
-<span class="cmt">// 2. 有既有会话数据 → 尝试从会话里恢复上次用的模型</span>
-<span class="kw">if</span> (!model &amp;&amp; hasExistingSession &amp;&amp; existingSession.model) {
-  <span class="kw">const</span> restoredModel = modelRuntime.<span class="fn">getModel</span>(existingSession.model.provider, existingSession.model.modelId);
+<span class="cmt">// 2. 有既有会话数据 → 从会话分支上恢复上次用的模型。</span>
+<span class="cmt">// Assistant 消息只报「答话的物理模型」，所以虚拟选择只存在 model_change 条目里</span>
+<span class="kw">const</span> sessionModel = <span class="fn">getBranchSelection</span>(
+  sessionManager.<span class="fn">getBranch</span>(),
+  (provider, modelId) =&gt; modelRuntime.<span class="fn">getModel</span>(provider, modelId),
+);
+<span class="kw">if</span> (!model &amp;&amp; hasExistingSession &amp;&amp; sessionModel) {
+  <span class="kw">const</span> restoredModel = modelRuntime.<span class="fn">getModel</span>(sessionModel.provider, sessionModel.modelId);
   <span class="kw">if</span> (restoredModel &amp;&amp; modelRuntime.<span class="fn">hasConfiguredAuth</span>(restoredModel.provider)) {
     model = restoredModel;
   }
   <span class="kw">if</span> (!model) {
-    modelFallbackMessage = <span class="st">`Could not restore model ${provider}/${modelId}`</span>;
+    modelFallbackMessage = <span class="st">`Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`</span>;
   }
 }
 
 <span class="cmt">// 3. 都没有 → 用 findInitialModel（settings 默认值 → Provider 默认）</span>
 <span class="kw">if</span> (!model) {
-  <span class="kw">const</span> result = <span class="fn">findInitialModel</span>(...);
+  <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">findInitialModel</span>(...);
   model = result.model;
   <span class="kw">if</span> (!model) modelFallbackMessage = formatNoModelsAvailableMessage();
 }
@@ -83,7 +88,7 @@
 <span class="cmt">// 4. 思考级别按模型能力钳制（别让不支持的模型背不动）</span>
 thinkingLevel = <span class="fn">clampThinkingLevel</span>(model, thinkingLevel) <span class="kw">as</span> ThinkingLevel;</code></pre>
     <div class="callout">
-      <strong>「会话即状态」的再一次体现：</strong>模型选择不是每次从零猜，而是<strong>优先记住上次用的</strong>。恢复失败（比如换了 Provider、key 没了）则给出 <code class="inline">modelFallbackMessage</code> 提示，再优雅降级到默认。这把「连续性」和「可诊断性」同时给了用户——你不会不明不白地换个模型，也不会被卡死。
+      <strong>「会话即状态」的再一次体现：</strong>模型选择不是每次从零猜，而是<strong>优先记住上次用的</strong>。恢复失败（比如换了 Provider、key 没了）则给出 <code class="inline">modelFallbackMessage</code> 提示，再优雅降级到默认。这把「连续性」和「可诊断性」同时给了用户——你不会不明不白地换个模型，也不会被卡死。恢复读的是<strong>分支上的选择条目</strong>而不是「最后一条 model_change」：树导航可能把最新的 model_change 留在另一条分支上；而虚拟模型的选择永不写进 assistant 消息（消息只报物理模型），所以虚拟选择要靠 model_change 条目才恢复得出来——细节见下面 11.1c。
     </div>
   </section>
 
@@ -106,7 +111,42 @@ thinkingLevel = <span class="fn">clampThinkingLevel</span>(model, thinkingLevel)
     <div class="callout">
       <strong>可注入 = 可测、可换：</strong>医疗诊断的模型、私有部署的网关、临时 mock——都能通过传入自己的 ModelRuntime 接入，而 <code class="inline">createAgentSession</code> 一行不改。这是「依赖注入」在组装层的直接收益。
     </div>
-    <p>扩展也有一条接入模型的路径，且粒度到「单个请求」：<code class="inline">pi.registerProvider(name, config)</code> 注册一个自定义 Provider——给 <code class="inline">baseUrl</code>/<code class="inline">apiKey</code>/<code class="inline">models</code> 就是标准厂商；给一个 <code class="inline">streamSimple(model, context, options)</code> 回调则是自定义协议：pi 把归一化后的 TranscriptContext 交给你（prompt 和工具声明要从 system 消息里读：<code class="inline">getCurrentSystemPrompt(context.messages)</code>、<code class="inline">getCurrentTools(context.messages)</code>），你返回标准的 AssistantMessageEventStream，此后这个 provider 的请求全部走你的代码。注册在扩展初始加载时排队、之后立即生效，命令处理器里调用也无需 <code class="inline">/reload</code>。这是第 10 章「Provider 契约」的扩展侧出口：契约定义在 pi-ai，而实现者不限于内置的几十家。</p>
+    <p>扩展也有一条接入模型的路径，且粒度到「单个请求」：<code class="inline">pi.registerProvider(name, config)</code> 注册一个自定义 Provider——给 <code class="inline">baseUrl</code>/<code class="inline">apiKey</code>/<code class="inline">models</code> 就是标准厂商；给一个 <code class="inline">streamSimple(model, context, options)</code> 回调则是自定义协议：pi 把归一化后的 TranscriptContext 交给你（prompt 和工具声明要从 system 消息里读：<code class="inline">getCurrentSystemPrompt(context.messages)</code>、<code class="inline">getCurrentTools(context.messages)</code>），你返回标准的 AssistantMessageEventStream，此后这个 provider 的请求全部走你的代码。注册在扩展初始加载时排队、之后立即生效，命令处理器里调用也无需 <code class="inline">/reload</code>。这是第 10 章「Provider 契约」的扩展侧出口：契约定义在 pi-ai，而实现者不限于内置的几十家。模型清单也跟上了第 10 章的三分型：条目按 <code class="inline">type</code> 判别（缺省 <code class="inline">"chat"</code>），图片/分类模型各自声明 <code class="inline">api</code> 并在 <code class="inline">images</code>/<code class="inline">classifiers</code> 字段挂上对应实现；省略 <code class="inline">models</code> 则内置目录的所有能力原样保留。一个细节：<code class="inline">streamSimple</code> 的文档要求自定义协议实现<strong>手动转发</strong> <code class="inline">options.onProviderStreamEvent</code>——内置 provider 会发归一化前的原始流事件，你的自定义协议不发的话，下面 11.4 的事件在这家 provider 上就是哑的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.1c</span>虚拟模型：选择与分发的分离</h2>
+    <p>模型体系最新的演化是 <code class="inline">packages/coding-agent/src/core/virtual-models.ts</code>（约 230 行，配套 <code class="inline">docs/virtual-models.md</code>）：目录里可以出现一类<strong>从不抵达 provider 的条目</strong>——<code class="inline">api === "pi-virtual"</code> 的「虚拟模型」。用户选中它之后，每个请求先经一个<strong>路由函数</strong>映射到某个物理模型，再真正发出去。「用户选了谁」与「这次实际问谁」就此拆成两对概念——前者是选择（selection），后者是分发（dispatch）。</p>
+    <div class="code-title">core/virtual-models.ts · 路由请求与路由结论（节选，注释为译注）</div>
+    <pre class="code"><code><span class="kw">export interface</span> <span class="cl">ModelRouteRequest</span> {
+  model: <span class="cl">Model</span>;                  <span class="cmt">// 被选中的虚拟模型</span>
+  thinkingLevel: <span class="cl">ModelThinkingLevel</span>;  <span class="cmt">// 其含义由路由器自行解释</span>
+  reason: <span class="cl">ModelRouteReason</span>;   <span class="cmt">// 这次请求为什么发生（见下表）</span>
+  previous?: { model; thinkingLevel? };  <span class="cmt">// messages 里最近一条成功响应的物理模型</span>
+  failed?: { model; thinkingLevel?; message: AssistantMessage };  <span class="cmt">// retry 时的失败请求，messages 已不含它</span>
+  state?: TState;                <span class="cmt">// 本分支上一次路由返回的状态；direct 请求没有</span>
+  messages: <span class="kw">readonly</span> <span class="cl">Message</span>[];   <span class="cmt">// 本次请求的完整对话，含 system 消息</span>
+  signal?: <span class="cl">AbortSignal</span>;
+}
+<span class="kw">export interface</span> <span class="cl">ModelRoute</span> {
+  model: <span class="cl">Model</span>;                  <span class="cmt">// 必须是有凭据的物理模型，否则请求以错误收场</span>
+  thinkingLevel: <span class="cl">ModelThinkingLevel</span>;
+  state?: TState;                <span class="cmt">// 新路由状态，存到会话分支；返回 request.state 或 undefined 即不变</span>
+}</code></pre>
+    <p><code class="inline">reason</code> 是契约里最见功力的部分——它告诉路由器「这次请求处在对话的什么位置」，路由器据此决定「要不要换档」：</p>
+    <table class="tbl">
+      <thead><tr><th>reason</th><th>何时发生</th><th>路由器该做什么</th></tr></thead>
+      <tbody>
+        <tr><td><code class="inline">"user"</code></td><td>用户亲写的消息开启的请求（steering / follow-up 也算）</td><td>可以重新评估、换物理模型</td></tr>
+        <tr><td><code class="inline">"continuation"</code></td><td>循环内的其余请求（工具轮次、续跑）</td><td>沿用上轮路由——中途换模型会打断思维连续性</td></tr>
+        <tr><td><code class="inline">"retry"</code></td><td>自动重试（含溢出压缩后的重试），携带 <code class="inline">failed</code></td><td>可对失败作出反应，比如换一家重发</td></tr>
+        <tr><td><code class="inline">"direct"</code></td><td>循环外的直接调用（压缩摘要、扩展 streamSimple）</td><td>无路由状态、不写状态条目</td></tr>
+      </tbody>
+    </table>
+    <p>三个注册与执行口子把这套机制接进已有的层：<strong>(a)</strong> <code class="inline">ModelRuntime.registerVirtualModel(def)</code> 把定义挂上目录（与物理模型 id 冲突会直接抛错），扩展侧对应 <code class="inline">pi.registerVirtualModel()</code>，其 <code class="inline">route(request, ctx)</code> 就是一个异步函数；<strong>(b)</strong> 第 8 章 8.2b 看过 <code class="inline">prepareRequest</code> 投影里的路由块——每次请求前发现选中的是虚拟模型，就探测 userTurn、读状态、按 reason 调 <code class="inline">resolveModel</code>，把返回的物理模型换进本次请求；<strong>(c)</strong> <code class="inline">withVirtualModels()</code> 给目录加载收尾：注册过的虚拟模型合并进模型列表，且若某虚拟模型与物理 chat 模型同 id，物理的会被隐藏——同名时用户面对的是唯一入口。路由器的状态不进内存：它作为 <code class="inline">pi.virtual-model-state</code> 自定义条目追加到当前分支，跟随会话树分叉、在压缩中存活；每次路由结论变了就写一条新条目（第 5 章「状态即条目」的又一次应用）。路由器拿到的 <code class="inline">ctx.modelRegistry</code> 能反查其他模型并调用分类器——官方示例 <code class="inline">examples/extensions/jev-router.ts</code> 就是用一个分类器模型给「这个请求有多复杂」打分，复杂过阈值路由到大模型、首次编辑/写文件之后路由到快模型，把「阶段」本身作为路由状态。</p>
+    <div class="callout">
+      <strong>为什么物理模型不写回 model_change？</strong>恢复会话时（11.1 的 <code class="inline">getBranchSelection</code>），assistant 消息只报「答话的物理模型」——若把分发结果当成选择写回去，一次路由就会被永久固化成用户的选择，下次会话不再路由。所以：物理响应<strong>不覆盖</strong>分支上的虚拟选择，分支上没写过虚拟选择时物理选择照常记录，未注册的虚拟模型回退到最后一个物理模型。<code class="inline">routedModel</code>（8.2b）与 TUI 底栏的 <code class="inline">auto • high → gpt-5.6-luna • medium</code> 两段式显示，都是这个「选择不变、分发在流」的投影态。
+    </div>
   </section>
 
   <section class="block">
@@ -180,11 +220,13 @@ createAllToolDefinitions(cwd, options)</code></pre>
       <li><strong><code class="inline">/thinking</code> 命令</strong>：slash 命令表里新增 <code class="inline">{ name: "thinking", argumentHint: "&lt;level&gt;" }</code>，让用户直接切思考级别（档位 <code class="inline">off/minimal/low/medium/high/xhigh/max</code>，即 <code class="inline">THINKING_LEVEL_OPTIONS</code>）。它最终调用第 8 章的 <code class="inline">setThinkingLevel()</code>。</li>
       <li><strong>模型 / 思考级别改默认「会话级」</strong>：切模型或调思考级别时，<code class="inline">setModel</code> / <code class="inline">setThinkingLevel</code> 现在带一个 <code class="inline">{ persist?: boolean }</code> 选项。默认 <strong>只写进当前会话的 transcript</strong>、不动全局默认；只有显式持久化（如 <kbd>Ctrl+S</kbd>）才写回 <code class="inline">settings</code>。这把「我这次想用别的模型」与「以后都用这个模型」分开了——临时实验不再污染全局配置。</li>
       <li><strong>压缩用量提示（compaction cost）</strong>：压缩和分支摘要会消耗 token，TUI 现在把这条用量从 transcript 里抽出来，渲染成 <code class="inline">compaction_cost</code> 提示行，让用户看见「这次压缩花了多少」。这是第 6 章那条「压缩有 usage」在交互层上的可见化。</li>
-      <li><strong>prompt cache 保温（cache warming）</strong>：provider 的 prompt cache 条目闲置一段时间就过期，暂停后再发请求要重付全价输入。生产层为此装了一个 <code class="inline">CacheWarmer</code>（<code class="inline">core/cache-warmer.ts</code>）：真实请求发出后，在缓存条目到期前（取该模型 <code class="inline">promptCache</code> 画像上对应档位的存活时长，90% 处刷新并留 10 秒余量）把<strong>同一个请求重发一遍，但 <code class="inline">maxTokens: 1</code></strong>——上下文原样进来，只吐一个 token，钱花在缓存读上，条目就续上了。发不发由一笔账决定：<code class="inline">continuationProbability × missCost − warmCost ≥ $0.05</code> 才值得保温（运行中概率算 1，空闲时用实测常数 0.15）。模式三档 <code class="inline">off/streaming/idle</code>，默认 <code class="inline">streaming</code>（agent 运行期间保温、结算即停；<code class="inline">idle</code> 连空闲时也续，30 分钟封顶）。每次成功刷新落成一条 <code class="inline">{ type: "usage", kind: "cache_warm" }</code> 会话条目——计入 token 与费用总额，但不进模型上下文。扩展可在 <code class="inline">cache_warming_decision</code> 事件上改判（最后说话的算数），<code class="inline">/session</code> 能看到下一次决策与账目。第 10 章的 <code class="inline">Model.promptCache</code> 画像（10.2 节）就是这条策略的前提：没填存活时长的模型一律不保温。还有个容易漏的反直觉细节：定时器可能因系统休眠或事件循环阻塞而<strong>晚点</strong>——条目可能已经过期了。此时刷新不再是「保温」而是<strong>全价的缓存写</strong>，比不刷还亏。所以每次刷新前查一道 <code class="inline">refreshDeadlineAt</code>（计划时刻 + 剩余 TTL 的一半）：迟到过头就干脆停掉，别花冤枉钱。</li>
+      <li><strong>prompt cache 保温（cache warming）</strong>：provider 的 prompt cache 条目闲置一段时间就过期，暂停后再发请求要重付全价输入。生产层为此装了一个 <code class="inline">CacheWarmer</code>（<code class="inline">core/cache-warmer.ts</code>）：真实请求发出后，在缓存条目到期前（取该模型 <code class="inline">promptCache</code> 画像上对应档位的存活时长，90% 处刷新并留 10 秒余量）把<strong>同一个请求重发一遍，但 <code class="inline">maxTokens: 1</code></strong>——上下文原样进来，只吐一个 token，钱花在缓存读上，条目就续上了。发不发由一笔账决定：<code class="inline">continuationProbability × missCost − warmCost ≥ $0.05</code> 才值得保温（运行中概率算 1，空闲时用实测常数 0.15）。模式三档 <code class="inline">off/streaming/idle</code>，默认 <code class="inline">streaming</code>（agent 运行期间保温、结算即停；<code class="inline">idle</code> 连空闲时也续，30 分钟封顶）。每次成功刷新落成一条 <code class="inline">{ type: "usage", kind: "cache_warm" }</code> 会话条目——计入 token 与费用总额，但不进模型上下文。扩展可在 <code class="inline">cache_warming_decision</code> 事件上改判（最后说话的算数），<code class="inline">/session</code> 能看到下一次决策与账目。第 10 章的 <code class="inline">Model.promptCache</code> 画像（10.2 节）就是这条策略的前提：没填存活时长的模型一律不保温。还有个容易漏的反直觉细节：定时器可能因系统休眠或事件循环阻塞而<strong>晚点</strong>——条目可能已经过期了。此时刷新不再是「保温」而是<strong>全价的缓存写</strong>，比不刷还亏。所以每次刷新前查一道 <code class="inline">refreshDeadlineAt</code>（计划时刻 + 剩余 TTL 的一半）：迟到过头就干脆停掉，别花冤枉钱。另一个后到的门卫管「这份请求还作不作数」：保温的不是请求本身，而是它写下的缓存条目，若下一次请求<strong>不会重复这份上下文</strong>（虚拟选择路由去了别的模型、或扩展在 <code class="inline">context</code> 事件里重写了消息），重发就是白花钱。于是每次启动保温时闭包捕获「当时的选中模型 + 消息列表」，到期要刷时先验一道 <code class="inline">isCurrent()</code>——模型变了或消息列表被改写，保温静默作废。</li>
       <li><strong>会话共享改走 Radius</strong>：<code class="inline">/share</code> 不再只靠 gist，而是优先通过 Radius provider 上传成 artifact、拿回 <code class="inline">canonical_url</code>。未登录 Radius 时退回 gist。共享链路与鉴权也收敛进 AI 层的 provider 体系，而不是另起一套。共享内容也不再只是消息流水：导出时会追加一条 <code class="inline">pi.share</code> 自定义条目，把当时的 <code class="inline">systemPrompt</code> 与工具清单（名称/描述/参数）一并带上，让接收方看到 Agent 运行时的完整上下文。</li>
+      <li><strong>原始流事件开放给扩展（<code class="inline">provider_stream_event</code>）</strong>：provider 返回的每条 SSE 事件在<strong>归一化之前</strong>就以扩展事件的形式透传——<code class="inline">provider_stream_event</code> 带 <code class="inline">provider/api/model</code> 和原始事件负载（<code class="inline">data</code>），文档点明这是 pi 能拿到的<strong>最早结构化值</strong>，不是原始 HTTP 字节，且只读（改了会影响归一化）。三个纪律值得记：通知性质、不落盘；处理器按流的顺序 await——写慢了会拖慢整个流消费；处理器抛错只上报、不影响 provider 响应（但内置适配器会把它从「传输层失败」里摘出来，不让一次回调手滑触发 SSE 回退重连）。官方示例 <code class="inline">debug-provider.ts</code> 用它做了个 <code class="inline">/debug-provider</code> 查看器：按 assistant 消息分组展示原始事件，排查「provider 到底吐了什么」时不用再抓包。内核侧则是 pi-ai 的 <code class="inline">StreamOptions.onProviderStreamEvent</code> 一路传到 Agent——链路上任何一层都能旁观原始事件，而不必等归一化抹平之后。</li>
+      <li><strong>扩展打包的依赖纪律（防双运行时）</strong>：宿主提供的包（<code class="inline">@earendil-works/pi-ai</code>、pi-coding-agent、pi-tui、typebox……）必须声明在 <code class="inline">peerDependencies</code> 且范围 <code class="inline">"*"</code>，不能写进 <code class="inline">dependencies</code>——扩展若自带一份物理拷贝，编译后的 ESM 会绕过宿主的模块映射，产生两套类、两个注册表、两份初始化。ResourceLoader 现在会扫描包清单检测这种配置并发出警告（与错误并列出现在 TUI 诊断里）。这其实是 Node 生态「peer dependencies 用来共享单例」的老规矩在扩展体系里的落点：宿主注入的模块，宿主负责给，扩展只声明兼容范围。</li>
     </ul>
     <div class="callout">
-      <strong>共同模式：</strong>这几项都遵循「<strong>内核不动，外壳做策略</strong>」——<code class="inline">/thinking</code> 只是 <code class="inline">setThinkingLevel</code> 的入口；会话级持久化靠 <code class="inline">persist</code> 选项分流；压缩提示复用 transcript 里已有的 <code class="inline">usage</code>；共享复用 Radius provider；缓存保温则把「这条缓存值不值得续」做成扩展可改判的事件。这正是分层架构的红利：产品迭代可以很快，因为不必每次都下沉到内核。
+      <strong>共同模式：</strong>这几项都遵循「<strong>内核不动，外壳做策略</strong>」——<code class="inline">/thinking</code> 只是 <code class="inline">setThinkingLevel</code> 的入口；会话级持久化靠 <code class="inline">persist</code> 选项分流；压缩提示复用 transcript 里已有的 <code class="inline">usage</code>；共享复用 Radius provider；缓存保温和原始流事件则都是「内核放出一个只读/可改判的口子，外壳决定怎么用」。这正是分层架构的红利：产品迭代可以很快，因为不必每次都下沉到内核。
     </div>
     <div class="callout">
       <strong>扩展 API 顺带补两个后来长出来的点：</strong><code class="inline">pi.on()</code> 现在返回<strong>退订函数</strong>——事件处理器可以随用随拆，与 <code class="inline">unregisterProvider</code> 之类的注销 API 一起补全扩展的生命周期；另外，<strong>在事件分发过程中增删处理器是安全的</strong>（分发前拍快照，变更只影响下一次分发），不会碰到「边遍历边改」的经典坑。
@@ -208,7 +250,7 @@ createAllToolDefinitions(cwd, options)</code></pre>
       </tbody>
     </table>
     <div class="callout">
-      <strong>收尾——四个问题的答案：</strong>装配线是 <code class="inline">createAgentSession</code>：模型运行时初始化 → 会话发现 → 模型三级回退（显式指定 → 会话恢复 → findInitialModel）→ 载体选择 → 工具装配，鉴权由可注入的 ModelRuntime 统一验收。工具集是装配时的一次性决策：只读/编码/全量三套 + noTools 会话级抑制，写操作经 withFileMutationQueue 串行化——能力边界启动即确定。三种外壳共用无头内核：外壳只订阅事件流、调用方法，内核一行不改。外壳长能力的套路是「内核不动，外壳做策略」：/thinking 走 setThinkingLevel，persist 选项分流临时与持久，compaction_cost 复用 transcript 用量，缓存保温做成扩展可改判的事件。
+      <strong>收尾——四个问题的答案：</strong>装配线是 <code class="inline">createAgentSession</code>：模型运行时初始化 → 会话发现 → 模型三级回退（显式指定 → 会话恢复 → findInitialModel）→ 载体选择 → 工具装配，鉴权由可注入的 ModelRuntime 统一验收；虚拟模型让「选择」与「分发」分离——选中的条目从不到 provider，每次请求由路由函数按 user/continuation/retry 分发到物理模型，路由状态落在会话分支上。工具集是装配时的一次性决策：只读/编码/全量三套 + noTools 会话级抑制，写操作经 withFileMutationQueue 串行化——能力边界启动即确定。三种外壳共用无头内核：外壳只订阅事件流、调用方法，内核一行不改。外壳长能力的套路是「内核不动，外壳做策略」：/thinking 走 setThinkingLevel，persist 选项分流临时与持久，compaction_cost 复用 transcript 用量，缓存保温做成扩展可改判的事件，原始流事件则是内核递给扩展的只读旁观口。
     </div>
     <div class="callout">
       <strong>发现没有？</strong>你在第 1 章看到的「分层」，在本章的 <code class="inline">createAgentSession</code> 里被<strong>一条装配线</strong>串了起来。理解 Pi 的全部 = 理解这条装配线每一层「为什么」存在。下一章，我们把整条线翻译成「你自己造一个 Runtime」的施工图。
@@ -221,7 +263,7 @@ createAllToolDefinitions(cwd, options)</code></pre>
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 11 编码 Agent（组装成产品） · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 11 编码 Agent（组装成产品） · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

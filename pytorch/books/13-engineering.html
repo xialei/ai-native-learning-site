@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · 训练工程 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a class="active" href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 13 训练工程</div>
+    <h1>训练工程：存档、流水线、弹性，以及定位慢在哪</h1>
+    <div class="subtitle">训练跑通之后的工程问题按出现顺序是：checkpoint 怎么存（几百 GB 的状态、几十个 rank 各存各的）、流水线怎么排（气泡占多少）、进程挂了怎么重启、以及整体慢在哪里。这章四节各答一个问题，对象分别是 DCP、pipelining 调度器、torchrun 和 profiler。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">13.1</span>DCP：检查点的「计划-执行」两层</h2>
+    <p>大模型 checkpoint 的难点不在「写文件」，而在协调：几十上百个 rank，每个 rank 只持有部分状态（FSDP2 分片参数、DTensor 分片梯度），存的文件必须让「任意数量、任意拓扑的新进程」都能读回来。分布式检查点 DCP（torch/distributed/checkpoint/）把这件事拆成两层：状态怎么读写的策略（SavePlanner），和实际写盘的动作。</p>
+    <p>入口是两个函数：save（<code class="inline">state_dict_saver.py</code>）同步执行；<code class="inline">async_save</code>先把状态拷到暂存缓冲立刻返回，落盘交给后台——训练循环不为一轮存档停顿。save_state_dict 的核心动作是走一遍 planner 协议：先问 planner「全局该存什么」，再问「我这个 rank 负责哪几片」，然后各 rank 写各自的分片，元数据单独落一份。读回时 load 同样走 planner，所以「8 卡存的 64 卡读」只是 planner 的去重逻辑变了，文件格式不变。</p>
+    <div class="annotation"><b>和 06 章 state_dict 的衔接：</b>Module 的 state_dict（名字拼装）是「单机视角」的契约，DCP 是「分布式视角」的升级——get_state_dict（<code class="inline">torch/distributed/checkpoint/state_dict.py</code>）在两者之间转换，处理 FSDP2 分片参数到全量逻辑视图的映射。存档代码里常见的坑（分片 tensor 直接 torch.save 会存成本地分片形状）就出在跳过这层接口。</div>
+    <div class="callout info">
+      <b class="tag">关联</b>
+      async_save 的「先拷贝后落盘」与 07 章 GradScaler 的「先放大后缩放」结构相同：都是把一个语义动作拆成「立即做的部分」和「延迟做的部分」，前半段在热路径上，后半段能拖就拖。热路径上少做事，是训练工程反复出现的主题。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.2</span>流水线：气泡在哪， schedule 怎么填</h2>
+    <p>流水线并行把模型按层切成 stage，每张卡一个。朴素做法（GPipe）是「所有 microbatch 全部前向完，再全部反向」——fill-drain。好处是简单，代价是前向后段和反向初段设备空转，这段空转叫气泡。调度的全部文章都在怎么排「前向（F）和反向（B）」的顺序上：</p>
+    <table class="tbl">
+      <tr><th>调度类</th><th>行号</th><th>排法</th><th>气泡</th></tr>
+      <tr><td>ScheduleGPipe</td><td><code class="inline">schedules.py</code></td><td>fill-drain：全部前向再全部反向</td><td>最大</td></tr>
+      <tr><td>Schedule1F1B</td><td><code class="inline">schedules.py</code></td><td>稳态下一次前向一次反向交替</td><td>小；要求 microbatch 数 ≥ stage 数</td></tr>
+      <tr><td>ScheduleInterleaved1F1B</td><td>:3413</td><td>每卡持有多个不连续 stage，前向交叠</td><td>更小；通信次数变多</td></tr>
+      <tr><td>ScheduleInterleavedZeroBubble</td><td>:3542</td><td>用「backward for weights」填气泡（ZB1P，arXiv 2401.10241）</td><td>趋近于零</td></tr>
+    </table>
+    <p>1F1B 类的 docstring 说明白：「Will perform one forward and one backward on the microbatches in steady state」——稳态下每设备一个前向接一个反向，活跃 microbatch 数被压到常数，显存不再随 microbatch 总数线性涨（GPipe 要存所有 microbatch 的激活）。ZeroBubble 再进一步：把反向拆成「算输入梯度」和「算权重梯度」两半（源码原话 uses the backward for weights to fill in the pipeline bubble），后者不阻塞下一个前向，拿去填原本的气泡。</p>
+    <div class="annotation"><b>气泡多少怎么估：</b>稳态 1F1B 的气泡约为 (stage 数 − 1) 个 microbatch 的时间，与深度成正比——所以流水线并行天然偏爱把 stage 切少切大，或用 interleave 把每卡的多个 stage 错开。这也是为什么流水线很少单独用，总与数据并行组合（13 章 torchrun 的任务就是把这些组合跑起来）。</div>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      n_microbatches &lt; num_stages 时 Schedule1F1B 直接 raise ValueError（<code class="inline">schedules.py</code>）——不是防御式编程的癖好，是数学上 1F1B 排不下：每个 stage 至少要有一个 microbatch 可供「一前一后」交替。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.3</span>torchrun：弹性从哪来</h2>
+    <p>torchrun（torch/distributed/run.py）解决「几台机器怎么各自拉起同一份脚本」：读 rendezvous 参数，在每台机器上起 agent，每个 agent 按配置起若干 worker 进程。弹性是它的卖点——worker 挂了，agent 能在剩余节点上重新拉起（配合 rendezvous 重新议定新 world size），训练从最近的 checkpoint 继续。</p>
+    <p>代码结构三层：entrypoint 从 launcher.api 导入 elastic_launch（<code class="inline">run.py</code>），launch_agent（<code class="inline">launcher/api.py</code>）是 agent 侧主逻辑——起 worker、监控、失败时决定重启还是放弃。图省事可以直接用 torchrun 命令行；自己写启动器（调度器集成、容器环境）时读的就是 launcher/api.py 这几个函数。</p>
+    <p>失败重启的语义要知道边界：弹性恢复的是「进程」不是「状态」。节点掉电后重跑，模型参数从 checkpoint 读回，优化器动量、数据读取进度、随机数状态——凡是没进 checkpoint 的都丢了。所以 DCP（13.1）常和 torchrun 配套出现：前者保证恢复点足够全，后者保证恢复动作足够自动。</p>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      torch.distributed.launch 是旧启动器，torchrun（elastic）是它的替代——文档里标注 launch 已弃用多年。两者最核心的差别是弹性语义：launch 的失败处理是全体退出，torchrun 的 agent 会尝试重拉。一段启动脚本的迁移，往往只需要改命令行，但容错行为完全不同。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">13.4</span>profiler：先定位再动手</h2>
+    <p>前几章都在讲「每条路径上有什么开销」，但轮到自己优化时，第一步永远是测量。torch.profiler 的输出（trace）里能看到：每个 CPU 算子的 dispatch 耗时、每个 CUDA kernel 的执行时间、两者之间的 launch 间隔。前文各章的机制都能在 trace 里对号入座：</p>
+    <table class="tbl">
+      <tr><th>trace 里的现象</th><th>对应章节的机制</th></tr>
+      <tr><td>kernel 之间大段空隙（GPU 利用率低）</td><td>Python/dispatch 开销没被掩盖（10 章融合、09 章编译的目标）</td></tr>
+      <tr><td>同一算子反复出现且都在等 CPU</td><td>小算子过多，launch 开销占主导</td></tr>
+      <tr><td>显存高但 allocated 低</td><td>缓存分配器的 reserved（11 章，账面差异）</td></tr>
+      <tr><td>backward 前段长时间无 kernel</td><td>反向引擎的依赖等待（05 章，可能是图宽度过小）</td></tr>
+      <tr><td>数据加载间隙 GPU 空闲</td><td>8 章 prefetch 不足，worker 数不够</td></tr>
+    </table>
+    <p>这张表的用法是反过来的：先看 trace 找到最大的一块空隙或最长的一串 kernel，再对照左列定位机制，最后决定动哪一层。跳过测量直接猜优化方向，是训练工程里最常见的时间浪费。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      存档（DCP 的计划-执行两层）、调度（气泡用排程压）、弹性（agent 重拉 worker）、测量（trace 对号入座）——四件事都是「跑得起来」和「跑得久、跑得快」之间的距离。下一章是最后一章：把这本书里读到的每一层，变成一份自研清单。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="12-distributed.html">← 上一章：分布式</a>
+    <a href="14-build-own.html">下一步：自研路线 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 13 训练工程 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

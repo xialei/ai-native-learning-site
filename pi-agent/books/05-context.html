@@ -113,7 +113,7 @@
         <text class="lbl sm" x="685" y="194" text-anchor="middle" fill="#92500a">⚠ 消息会被压缩，运行状态不会「跟着丢」——</text>
         <text class="lbl sm" x="685" y="214" text-anchor="middle" fill="#92500a">config 是独立于树的值，压缩/裁剪动不了它</text>
       </svg>
-      <div class="fig-cap">图 5.1：Context 构建两级管线。<code class="inline">pathEntries → contextEntries → messages</code> 是主轴；核心线的运行状态（模型/思考级/工具）独立存放在 <code class="inline">pi.lane.config/{lane}</code> 簿记值里。输出的 <code class="inline">messages</code> 再经第 3 章 <code class="inline">convertToLlm</code> 发往 LLM。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#eaf2f9;border-color:#2563eb"></span>会话文件数据</span><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#0f7d7a"></span>本章核心步骤</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#b45309"></span>产出的消息序列</span></div><div class="fig-cap">图 5.1：Context 构建两级管线。<code class="inline">pathEntries → contextEntries → messages</code> 是主轴；核心线的运行状态（模型/思考级/工具）独立存放在 <code class="inline">pi.lane.config/{lane}</code> 簿记值里。输出的 <code class="inline">messages</code> 再经第 3 章 <code class="inline">convertToLlm</code> 发往 LLM。</div>
     </div>
     <div class="code-title">packages/agent/src/harness/session/context.ts — 总装（async，只出消息）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export async function</span> <span class="fn">buildSessionContext</span>(
@@ -298,6 +298,10 @@
 }</pre>
     <div class="annotation"><b>两种答案怎么选：</b> 关键差异是「分支语义」。Lane 线天生多分支（每 lane 一棵子树 + 自己的 config），值必须带地址隔离；canonical 线是单主会话（分叉即造新文件），沿路径扫条目既拿到现值、又免费拿到「切换历史」（哪一轮换的模型，UI 回放时可见）。共同点更重要：<strong>状态都不混进「投影出的消息内容」</strong>——压缩/裁剪动得了消息，动不了「现在该用什么模型」。核心线先看 lane 写入（演示），再看两线对比。</div>
 
+    <div class="callout">
+      <strong>顺带一提：会话文件本身也是「迟到」的。</strong>canonical 线的会话文件不是 <code class="inline">new SessionManager()</code> 时就建——落盘前有一道 <code class="inline">_hasConversation()</code> 检查（session-manager.ts）：只有分支上出现了 user 或 assistant 消息，条目才批量落盘、文件才创建。在那之前，模型选择、思考级别、系统提示这些 setup 条目都只活在内存里——打开 pi 又关掉、一句话没说，盘上不会留下一堆只有配置的空文件。而「从用户消息开始算对话」而不是「从第一条 assistant 回复开始」，是修 #10000：万一第一轮没跑完（网络断、进程被杀），你的 prompt 也已经在盘上了，重开能续。
+    </div>
+
     <div class="code-title">packages/agent/src/harness/runtime/lane.ts — 配置就是一次 value 写入（核心线）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private async</span> <span class="fn">setConfiguration</span>(
   update: (configuration: LaneState[<span class="st">"configuration"</span>]) =&gt; LaneState[<span class="st">"configuration"</span>],
@@ -388,7 +392,7 @@
 }</pre>
     <div class="annotation"><b>读懂这个类型：</b> 三个设计决定值得留意。<strong>其一</strong>，<code class="inline">replacement</code> 是「内容替换」而非「整条替换」——消息的 id、role、timestamp 等元数据原样保留，只换 <code class="inline">content</code>；<strong>其二</strong>，<code class="inline">null</code> 有专门语义「从模型上下文省略」——这正是第 6 章溢出恢复用来「隐去失败尝试」的手段（<code class="inline">appendContextEdit(targetId, null)</code>）；<strong>其三</strong>，可编辑范围用类型收窄到四种角色（user/assistant/toolResult/custom）——<code class="inline">system</code> 消息不在其列，prompt 状态不受追加式编辑影响。API 侧是 <code class="inline">SessionManager.appendContextEdit(targetId, replacement)</code>：只追加、不回改，同一 targetId 可以被编辑多次——<strong>同分支上最后一条生效</strong>。</div>
     <p>这些编辑在哪一步生效？在 <code class="inline">buildSessionProjection</code>——v0.87 把它立为 canonical 线的<strong>唯一投影入口</strong>，返回值从裸消息数组升级成带来源的结构：</p>
-    <div class="code-title">session-manager.ts · buildSessionProjection（行号 543 起；节选，注释为译注）</div>
+    <div class="code-title">session-manager.ts · buildSessionProjection（节选，注释为译注）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">buildSessionProjection</span>(
   entries: <span class="cl">SessionEntry</span>[], leafId?: string | <span class="kw">null</span>, byId?: Map&lt;string, <span class="cl">SessionEntry</span>&gt;,
 ): <span class="cl">SessionProjection</span> {
@@ -487,18 +491,18 @@
     <pre class="code"><span class="lang-tag">text</span>核心线（runtime/Lane，每轮生成前主动取）：
 lane 状态.tipId ──scanBranch({stopAtType:"compaction", order:"newestFirst"})──&gt; 原始 Entry[]
       └─ .reverse() ──&gt; 旧→新的 pathEntries
-            └─ buildSessionContext(entries, {entryProjectors}, context)   ← transcript.ts:69 readBoundedContext
+            └─ buildSessionContext(entries, {entryProjectors}, context)   ← transcript.ts readBoundedContext
                  ├─ buildContextEntries（① 裁剪：最近 compaction 前置）
                  └─ sessionEntryToContextMessages / entryProjectors（② 投影）
                       └─&gt; AgentMessage[] ──transform_context 钩子──&gt; LLM
 
 生产 canonical 线（AgentSession，prepareRequest 被动接管）：
 每次 provider 请求前（含第一次，第 8 章 8.2b）
-      └─ this.sessionManager.buildSessionProjection()    ← session-manager.ts:543
+      └─ this.sessionManager.buildSessionProjection()    ← session-manager.ts
            ├─ buildSessionPath → 裁剪 → 收集 context_edit → projectContextEntry
            └─&gt; { entries, messages, thinkingLevel, model }
       └─ 用投影的 messages 整体替换请求 context；model/thinkingLevel 同步刷新</pre>
-    <div class="annotation"><b>两条线的分工：</b> 核心线是「生成入口主动调投影」（<code class="inline">readBoundedContext</code>，generation.ts:101），扩展点在 <code class="inline">entryProjectors</code>（异步 custom 投影）；生产线是「钩子被动接管请求」——<code class="inline">prepareRequest</code> 每次请求前用 <code class="inline">buildSessionProjection().messages</code> 整体替换上下文，让 SessionManager 成为唯一事实来源。共同的后半程也一样：<code class="inline">AgentMessage[]</code> → <code class="inline">convertToLlm</code> → provider <code class="inline">Message[]</code>（第 3 章），再由 pi-ai 的 <code class="inline">normalizeContext</code> 折叠（第 10 章）。</div>
+    <div class="annotation"><b>两条线的分工：</b> 核心线是「生成入口主动调投影」（readBoundedContext（generation.ts）），扩展点在 <code class="inline">entryProjectors</code>（异步 custom 投影）；生产线是「钩子被动接管请求」——<code class="inline">prepareRequest</code> 每次请求前用 <code class="inline">buildSessionProjection().messages</code> 整体替换上下文，让 SessionManager 成为唯一事实来源。共同的后半程也一样：<code class="inline">AgentMessage[]</code> → <code class="inline">convertToLlm</code> → provider <code class="inline">Message[]</code>（第 3 章），再由 pi-ai 的 <code class="inline">normalizeContext</code> 折叠（第 10 章）。</div>
   </section>
 
   <section class="block">
@@ -540,7 +544,7 @@ lane 状态.tipId ──scanBranch({stopAtType:"compaction", order:"newestFirst"
 </div>
 
 <footer>
-  Pi Agent Harness · 05 上下文构建 Context · 版本 v0.87.1-4-g898ab8040 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 05 上下文构建 Context · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · 分布式 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a class="active" href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 分布式</div>
+    <h1>分布式：把多台机器藏进一个 Tensor 子类</h1>
+    <div class="subtitle">分布式并行先回答「设备怎么分组」（DeviceMesh），再回答「数据怎么切」（Placement），然后让一个 Tensor 子类 DTensor 把切分逻辑藏进 dispatch——上层代码写的还是单机程序。这章按这三层往下讲，最后落到 FSDP2：它现在不是 wrapper 类，而是一个每次前向自动 all-gather、反向自动 reduce-scatter 的模块装饰。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>DeviceMesh：先给设备排座次</h2>
+    <p>训练规模一大，并行就不是单一维度了：数据并行一个组、张量并行一个组、流水线又一个组。DeviceMesh（<code class="inline">torch/distributed/device_mesh.py</code>）把这些组织成一个 n 维数组——每个维度对应一种并行，每个格子里是全局 rank 号。一个 2×4 的 mesh，「按第 0 维通信」和「按第 1 维通信」就是两个独立的 ProcessGroup，互不干扰。</p>
+    <div class="code-title">torch/distributed/device_mesh.py — DeviceMesh 类自述（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">class</span> <span class="fn">DeviceMesh</span>(CustomClassBase):
+        <span class="st">"""
+        DeviceMesh represents a mesh of devices, where layout of devices could be
+        represented as a n-d dimension array, and each value of the n-d dimensional
+        array is the global id of the default process group ranks.
+
+        DeviceMesh could be used to setup the N dimensional device connections
+        across the cluster, and manage the ProcessGroups for N dimensional
+        parallelisms. Communications could happen on each dimension of the
+        DeviceMesh separately.
+
+        .. note::
+            DeviceMesh follows SPMD programming model, which means the same
+            PyTorch Python program is running on all processes/ranks in the
+            cluster. Therefore, users need to make sure the `mesh` array
+            (which describes the layout of devices) should be identical across
+            all ranks. Inconsistent `mesh` will lead to silent hang.
+    """</span></pre>
+    <p>两个信息值得圈出来。其一，SPMD 模型：所有 rank 跑同一份 Python 代码，mesh 声明不一致不会报错，而是静默挂死——分布式调试的第一课。其二，mesh 是 DeviceMesh 的构造参数，所以「哪些 GPU 组成哪组」在程序里是一行声明，不像早期需要手工 init_process_group 再手工分组。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>DTensor：切分状态长在 Tensor 上</h2>
+    <p>有了设备拓扑，还要说清「一个逻辑张量在每台设备上长什么样」。DTensor（<code class="inline">torch/distributed/tensor/_api.py</code>）是 torch.Tensor 的子类，每个实例只有两个私有字段——本地分片 _local_tensor 和描述切分布局的 <code class="inline">_spec</code>（__slots__ 只此两项）。布局用三种 Placement 描述：</p>
+    <table class="tbl">
+      <tr><th>Placement</th><th>含义</th><th>典型用途</th></tr>
+      <tr><td>Shard(dim)</td><td>按第 dim 维切开，每 rank 持一片</td><td>参数分片（FSDP 的核心）</td></tr>
+      <tr><td>Replicate()</td><td>每 rank 持完整副本</td><td>权重、输入 batch</td></tr>
+      <tr><td>Partial()</td><td>每 rank 持部分和，待归约</td><td>梯度（reduce 前的状态）</td></tr>
+    </table>
+    <p>关键机制在 dispatch：DTensor 覆写 <code class="inline">__torch_dispatch__</code>，任何算子作用在它上面都会被截住，先按 placements 重排输入（ redistribute，需要时发起通信），再在本地分片上执行真正的 kernel，最后为新输出推导 placements。这个模式眼熟吗？03 章 Dispatcher 的扩展位正好留在这里——DTensor 就是通过 __torch_dispatch__ 这个 Python 侧挂钩接入的。注释里还有一条演进痕迹：基类 DTensor 的常规算子如今走 C++ 快速路径（#167051），Python 的 __torch_dispatch__ 仅为子类兜底保留。</p>
+    <div class="annotation"><b>为什么「藏进 dispatch」重要：</b>张量并行曾需要为每个模型手写「哪层怎么切、切完怎么通信」。DTensor 之后，切分规则跟着算子语义走——mm 的输入是 Shard(1) 输出就是 Partial，这条规则写一次，所有模型受益。上层训练框架从「手写通信」转向「声明布局」，底层依据就是这一层。</div>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t121 d121">
+        <title id="t121">DTensor 算子执行流程</title>
+        <desc id="d121">一次 DTensor 算子调用：用户代码 op(W, x) 进入 __torch_dispatch__；由 placements 判断需要通信时先 redistribute（如 Shard 参数 all-gather 成 Replicate、或 Partial 梯度 reduce-scatter 成 Shard/Replicate）；对本地分片执行 ATen 算子得到本地输出；由算子语义推导输出 placements（如 Shard(0)×Shard(0)→Partial），包成新 DTensor 返回。通信被藏在 dispatch 内，用户视角始终是单机程序。</desc>
+        <defs>
+          <marker id="arrow12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="30" y="40" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="115" y="65" text-anchor="middle">用户代码 op(W, x)</text>
+        <text class="lbl sm" x="115" y="83" text-anchor="middle">看起来是单机调用</text>
+
+        <rect class="node core" x="250" y="40" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="340" y="65" text-anchor="middle">__torch_dispatch__</text>
+        <text class="lbl sm" x="340" y="83" text-anchor="middle">读 W._spec 的 placements</text>
+
+        <rect class="node warn" x="480" y="20" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="580" y="45" text-anchor="middle">redistribute（必要时）</text>
+        <text class="lbl sm" x="580" y="63" text-anchor="middle">Shard→Replicate: all-gather</text>
+        <text class="lbl sm" x="580" y="77" text-anchor="middle">Partial→Shard: reduce-scatter</text>
+
+        <rect class="node" x="480" y="110" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="580" y="135" text-anchor="middle">本地分片执行 ATen 算子</text>
+        <text class="lbl sm" x="580" y="153" text-anchor="middle">与单机路径共用（03 章）</text>
+
+        <rect class="node ok" x="730" y="70" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="820" y="95" text-anchor="middle">推导输出 placements</text>
+        <text class="lbl sm" x="820" y="113" text-anchor="middle">包成新 DTensor 返回</text>
+
+        <line class="edge" x1="200" y1="70" x2="248" y2="70"></line>
+        <line class="edge" x1="430" y1="70" x2="478" y2="55"></line>
+        <line class="edge" x1="580" y1="80" x2="580" y2="108"></line>
+        <line class="edge" x1="680" y1="140" x2="728" y2="110"></line>
+
+        <text class="lbl sm" x="115" y="180" text-anchor="middle">例：前向 W Shard(0)</text>
+        <text class="lbl sm" x="115" y="198" text-anchor="middle">→ all-gather 成完整参数</text>
+        <text class="lbl sm" x="115" y="216" text-anchor="middle">→ 算完在 pre-forward 之外</text>
+        <text class="lbl sm" x="115" y="234" text-anchor="middle">按 reshard_after_forward</text>
+        <text class="lbl sm" x="115" y="252" text-anchor="middle">再切回去省显存（12.4）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>dispatch 内部</span>
+        <span class="lg-item"><span class="sw warn"></span>通信发生处</span>
+        <span class="lg-item"><span class="sw ok"></span>产物</span>
+      </div>
+      <div class="fig-cap">图 12.1：DTensor 的算子路径。通信时机由 placements 差异驱动——从「框架替你决定何时通信」变成「布局声明 + 算子语义自动推导」，这是分布式 API 从手写走向声明的分水岭。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>FSDP2：全分片数据并行，这一次没有 wrapper</h2>
+    <p>FSDP 的思想一句话讲完：训练时每张卡只持 1/N 份参数，前向用到某层时临时 all-gather 拼完整份，用完立刻切回去——显存占用从「完整参数+完整梯度+优化器状态」降到约 1/N。这套机制与 DeepSpeed ZeRO-3 等价（07 章优化器在单卡省的是优化器状态，FSDP 连参数和梯度一起省）。</p>
+    <p>新版 FSDP（社区称 FSDP2）的 API 是一个装饰函数 fully_shard（<code class="inline">torch/distributed/fsdp/_fully_shard/_fully_shard.py</code> 起，@overload 重载两个签名：单模块或模块列表），不包 wrapper、不改 module 类型层次——只是往 module 上挂一个状态对象，并在前向/反向挂自动 unshard/reshard 的钩子：</p>
+    <div class="code-title">torch/distributed/fsdp/_fully_shard/_fully_shard.py — fully_shard 第一个重载签名（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="nd">@overload</span>
+<span class="kw">def</span> <span class="fn">fully_shard</span>(
+    module: nn.Module,
+    *,
+    mesh: DeviceMesh | None = ...,
+    reshard_after_forward: bool | int | None = ...,
+    shard_placement_fn: Callable[[nn.Parameter], ShardPlacementFnResult] | None = ...,
+    mp_policy: MixedPrecisionPolicy = ...,
+    offload_policy: OffloadPolicy = ...,
+    ignored_params: set[nn.Parameter] | None = ...,
+    dp_mesh_dims: DataParallelMeshDims | None = ...,
+) -&gt; FSDPModule: ...</pre>
+    <p>对照旧版 FSDP（FSDP1）的 wrapper 模式，FSDP2 的区别看得见摸得着：旧版包成 FSDP(model)，model 的类型链变了、state_dict 的 key 前缀也要适配；新版直接在原 module 上生效，model.walk() 之类按层遍历的代码不受影响。逐层控制也是 FSDP2 的设计目标——每个模块单独 fully_shard，就能给不同层配不同策略（比如只对中间大层分片）。</p>
+    <p>参数收集的实现在 <code class="inline">_fsdp_collectives.py</code> 的 foreach_all_gather：把一组参数的本地分片拼成一维大缓冲，一次 all-gather 全部取回，再按尺寸切开还原各参数——「把小通信合成大通信」的批处理思想，和 07 章 fused optimizer 把多个小 kernel 合成一个，是同一条原则在不同层的应用。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      reshard_after_forward=True 时参数在前向后就切回去了，反向岂不是要再 all-gather 一遍？正是如此——这是「显存换通信量」的显式开关：设 True 反向多一次 all-gather，但参数峰值显存减半；设 False 参数常驻。文档建议对「只在前向用、反向不用」的层（如 embedding）设 True，逐层权衡。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>FSDPModule：分片状态挂哪儿</h2>
+    <p>fully_shard 返回的 <code class="inline">FSDPModule</code>不是包装类，而是混进原类 MRO 的一个混入（注释里写明：[FSDP&lt;Orig&gt;, FSDPModule, Orig, ...]，索引 2 处取回原类构造）。它对外暴露两个手工控制方法——unshard 和 reshard，平时自动调用，需要手动预取参数时才用：</p>
+    <div class="code-title">torch/distributed/fsdp/_fully_shard/_fully_shard.py — reshard 的自述（摘录，unshard 在 :345）</div>
+    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">reshard</span>(<span class="kw">self</span>) -&gt; None:
+        <span class="st">"""
+        Reshards the module's parameters, freeing the unsharded
+        parameters if they are allocated and registering the sharded
+        parameters to the module. This method is *not* recursive.
+        """</span></pre>
+    <p>通信落地的三个层次也顺带看一眼：默认走 ProcessGroup 的 NCCL 后端；同机型高速互联时可用 SymmMem（对称内存）分配路径（<code class="inline">_fsdp_collectives.py</code> 的 SymmMemAllocMixin）减少一次拷贝。FSDP2 的「自动策略选路 + 允许手动换」与 11 章 SDPA 的「自动优先级 + 手动限定」结构一致——PyTorch 处理可替换机制的惯用形态。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      这章的三层模型：DeviceMesh 管拓扑，Placement 管布局，DTensor 把两者塞进 Tensor 的 dispatch 里。FSDP2 是这套基础设施上最重的用户——读它的源码，实际上是在读 DTensor 怎么被用成并行框架。张量并行（torch.nn.parallel 下的 TP API）、上下文并行也建在同一层上，机制相通。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="11-memory.html">← 上一章：显存</a>
+    <a href="13-engineering.html">下一步：训练工程 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 12 分布式 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

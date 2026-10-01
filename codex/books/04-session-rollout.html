@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ bb054a2b03</span>
+    <span class="version-badge">openai/codex @ fbc169827e</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 会话与 Rollout</div>
     <h1>会话与 Rollout：Codex 怎么记住、怎么重生</h1>
     <div class="subtitle">一个 Agent 跑了几十轮，中途崩溃了——重开后怎么接着干？答案在两个 crate 里：<code class="inline">core/src/session/</code> 维护内存中的会话状态，<code class="inline">rollout</code> + <code class="inline">history</code> 把会话以 JSONL 追加式持久化、并能回放重建。本章拆开这套「会话即日志」的设计。</div>
@@ -51,13 +51,13 @@ sess.capture_step_context(...)        <span class="cmt">// 快照模型可见状
 sess.record_context_updates_and_set_reference_context_item(...)  <span class="cmt">// 记录上下文更新并设参考 item</span>
 sess.build_world_state_for_step(...)  <span class="cmt">// 为当前 step 构建 world state</span>
 sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span></pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">Session</code> 不直接持久化——它只管「这一轮内存里会话长什么样」。持久化交给 <code class="inline">RolloutRecorder</code>（见 4.3）。<strong>这种分离让内存模型与磁盘格式解耦</strong>：你可以换持久化后端而不动内核逻辑。注意 <code class="inline">clone_history</code>——每次采样前克隆历史，保证流式产出期间历史的一致性。</div>
+    <div class="annotation"><b>内存与磁盘的分界线：</b> <code class="inline">Session</code> 不直接持久化——它只管「这一轮内存里会话长什么样」。持久化交给 <code class="inline">RolloutRecorder</code>（见 4.3）。<strong>这种分离让内存模型与磁盘格式解耦</strong>：你可以换持久化后端而不动内核逻辑。注意 <code class="inline">clone_history</code>——每次采样前克隆历史，保证流式产出期间历史的一致性。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.2</span>会话条目的信封：ResponseItemEnvelope</h2>
     <p>持久化时，每个 <code class="inline">ResponseItem</code> 被包进一个「信封」，附带 harness 自己的元数据：</p>
-    <div class="code-title">codex-rs/history/src/lib.rs:43 — ResponseItemEnvelope</div>
+    <div class="code-title">codex-rs/history/src/lib.rs:55 — ResponseItemEnvelope</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 带 history-only 元数据的模型历史条目。
 /// 持久化保持 response item 完整，元数据单独存储。</span>
 <span class="kw">#[derive(Debug, Clone, PartialEq)]</span>
@@ -68,23 +68,29 @@ sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span
 
 <span class="cmt">/// harness 拥有、随 response item 一起持久化的元数据</span>
 <span class="kw">pub struct</span> CodexHarnessMetadata {
+    <span class="kw">pub</span> guardian_sources: Vec&lt;RetainedSource&gt;,  <span class="cmt">// 该 Guardian 消息实际送达的完整保留记录（仅主机侧）</span>
+    <span class="kw">pub</span> guardian_source_order_guidance: bool,  <span class="cmt">// 该完整消息是否传达了保留证据的顺序语义</span>
+    <span class="kw">pub</span> retained_source: <span class="kw">Option</span>&lt;RetainedSource&gt;,  <span class="cmt">// 本条历史所代表的原始保留证据</span>
     <span class="kw">pub</span> client_authored: bool,   <span class="cmt">// 是否由 app-server 客户端提供的 developer 消息</span>
     <span class="cmt">// 字段名 history_truncation_token_limit，serde 名保留 fallback_token_limit_override：</span>
     <span class="cmt">// 原始历史截断预算（含逐工具余量），回放持久化历史时复用</span>
     <span class="kw">pub</span> history_truncation_token_limit: <span class="kw">Option</span>&lt;<span class="kw">usize</span>&gt;,
+    <span class="kw">pub</span> delivered_assistant_message: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,  <span class="cmt">// 经消息工具结果确认的有界助手文本（不可信上下文）</span>
     <span class="kw">pub</span> harness_authored_configuration: bool,  <span class="cmt">// ConfigurationUpdate 是否由 harness 自己写入</span>
     <span class="kw">pub</span> compaction_model_hash: <span class="kw">Option</span>&lt;<span class="kw">String</span>&gt;,  <span class="cmt">// 压缩条目的生产者模型兼容性（非当前所选模型）</span>
     <span class="kw">pub</span> user_input_order: <span class="kw">Option</span>&lt;<span class="kw">u64</span>&gt;,  <span class="cmt">// 用户输入的接受顺序（与进入模型历史的时机无关）</span>
     <span class="kw">pub</span> inherited_user_message: bool,  <span class="cmt">// 从父上下文复制来的消息：模型可见，但不构成本地授权</span>
+    <span class="kw">pub</span> mcp_attribution: <span class="kw">Option</span>&lt;McpAttribution&gt;,  <span class="cmt">// 累计 MCP tools/call 归因检查点（模型不可见）</span>
     <span class="kw">pub</span> sender_user_messages: <span class="kw">Option</span>&lt;<span class="kw">Box</span>&lt;SenderUserMessages&gt;&gt;,  <span class="cmt">// 主机在接受该任务消息时捕获的发件方上下文（评审证据）</span>
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">Envelope</code> 模式（信封）是持久化的常见手法：<strong>保持原始 <code class="inline">ResponseItem</code> 不被污染</strong>，把 harness 私有的元数据挂在旁边。这样回放时既能拿到纯净的会话内容，又能读到附带的上下文。注意它实现了 <code class="inline">Deref&lt;Target=ResponseItem&gt;</code>——大多数地方可以当 <code class="inline">ResponseItem</code> 直接用。其中 <code class="inline">SenderUserMessages</code>（<code class="inline">history/src/sender_user_messages.rs:12</code>）是有界的主机渲染发件方证据（receiver_turn_id / receiver_message_id / text 三个字段，text 上限 3600 字节），供 Guardian 委派评审回放与回滚使用。</div>
+    <div class="annotation"><b>原始数据穿信封：</b> <code class="inline">Envelope</code> 模式（信封）是持久化的常见手法：<strong>保持原始 <code class="inline">ResponseItem</code> 不被污染</strong>，把 harness 私有的元数据挂在旁边。这样回放时既能拿到纯净的会话内容，又能读到附带的上下文。注意它实现了 <code class="inline">Deref&lt;Target=ResponseItem&gt;</code>——大多数地方可以当 <code class="inline">ResponseItem</code> 直接用。字段分三组看：Guardian 评审链路占开头的三个（<code class="inline">guardian_sources</code> 记录这条 Guardian 消息送达了哪些完整保留记录，<code class="inline">retained_source</code> 标记本条就是某份保留证据的替身，两者配合 Guardian 的证据保留/合并机制）；<code class="inline">delivered_assistant_message</code> 与 <code class="inline">mcp_attribution</code> 分别服务多 Agent 消息回执与 MCP 工具归因；其余字段管压缩与回放兼容性。所有可选字段都带 <code class="inline">skip_serializing_if</code>，旧 rollout 不受影响。其中 <code class="inline">SenderUserMessages</code>（<code class="inline">history/src/sender_user_messages.rs:12</code>）是有界的主机渲染发件方证据（receiver_turn_id / receiver_message_id / text 三个字段，text 上限 3600 字节），供 Guardian 委派评审回放与回滚使用。</div>
+    <p>信封里还有一类容易看漏的条目——<strong>心跳消息</strong>。定时自动化任务向线程投递的输入不走普通用户消息的形态，而是带着特殊标记的文本：内容种类被标成 <code class="inline">user.heartbeat</code>（<code class="inline">HEARTBEAT_CONTENT_KIND</code>，history/src/heartbeat.rs:10），正文是一个有界的 XML 信封——<code class="inline">&lt;heartbeat&gt;</code> 包着 <code class="inline">automation_id</code>、<code class="inline">current_time_iso</code> 和 <code class="inline">instructions</code> 三段。写入侧，Session 在持久化用户消息时检查输入来源（session/mod.rs:4980）：origin 为心跳就把 content_item_kinds 改写成这个种类；判定来源的依据是 turn trigger 是否为 <code class="inline">automation_heartbeat_scheduled</code>（<code class="inline">UserInputOrigin::from_turn_trigger</code>，heartbeat.rs:24，<code class="inline">User</code>/<code class="inline">Heartbeat</code> 两值枚举）。回读侧 <code class="inline">Heartbeat::from_message</code>（heartbeat.rs:63）再从消息里解析回结构——automation_id 限 128 字节字母数字、timestamp 限 64 字节时间字符、整包算上转义余量不超过 3600 字节，超限或字段陌生就整个按普通消息对待。为什么要单独标记？Guardian 保留上下文与根 handoff 依赖「最近用户消息」的位置语义，而心跳是机器定时触发的——<code class="inline">selected_message_indices</code>（core/src/agent/control/root_handoff.rs:22-30）发现最近一条授权消息是心跳时直接放弃本次 handoff 窗口，避免定时任务的痕迹顶掉真实用户的上下文；Guardian 证据归集（<code class="inline">history_user_authorization.rs:60</code>）也用 <code class="inline">UserInputOrigin::from_message</code> 区分两种来源。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">4.3</span>Rollout：追加式 JSONL 日志</h2>
     <p>「rollout」是 Codex 对会话持久化文件的称呼。它的格式是 <strong>JSONL（每行一个 JSON）</strong>，<strong>追加写入</strong>——每发生一件值得记录的事，就 append 一行。这等价于一个事件溯源日志（event sourcing）。</p>
-    <div class="code-title">codex-rs/history/src/lib.rs:272 — 一行 rollout 的结构</div>
+    <div class="code-title">codex-rs/history/src/lib.rs:350 — 一行 rollout 的结构</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[derive(Serialize, Clone, JsonSchema)]</span>
 <span class="kw">pub struct</span> RolloutLine {
     <span class="kw">pub</span> timestamp: String,
@@ -92,7 +98,7 @@ sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span
     <span class="kw">#[serde(flatten)]</span>
     <span class="kw">pub</span> item: RolloutItem,        <span class="cmt">// 真正的内容（展开进同一层 JSON）</span>
 }</pre>
-    <div class="code-title">codex-rs/history/src/rollout_payload.rs:24 — RolloutItem 能记什么</div>
+    <div class="code-title">codex-rs/history/src/rollout_payload.rs:33 — RolloutItem 能记什么</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">#[serde(tag = </span><span class="st">"type"</span><span class="kw">, rename_all = </span><span class="st">"snake_case"</span><span class="kw">)]</span>
 <span class="kw">enum</span> RolloutItemWire&lt;<span class="st">'a</span>&gt; {
     SessionMeta { payload },                 <span class="cmt">// 会话元信息（id、cwd、forked_from...）</span>
@@ -108,7 +114,7 @@ sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span
     EventMsg { payload },                    <span class="cmt">// 原始事件（用于完整回放）</span>
     RealtimeItem { payload },                <span class="cmt">// 实时对话条目</span>
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> rollout 不只记 <code class="inline">ResponseItem</code>，还记 <code class="inline">SessionMeta</code>（会话 id、工作目录、从谁 fork 的）、<code class="inline">WorldState</code>（世界状态变更）、<code class="inline">Compacted</code>（压缩发生）、甚至原始 <code class="inline">EventMsg</code>。<strong>这使得 rollout 既是会话历史，也是完整的运行轨迹</strong>——回放时能重建到任意时刻的完整状态。<code class="inline">#[serde(flatten)]</code> 让 item 展开进 RolloutLine 同一层，配合 <code class="inline">tag = "type"</code> 每行自描述。</div>
+    <div class="annotation"><b>日志里不止对话：</b> rollout 不只记 <code class="inline">ResponseItem</code>，还记 <code class="inline">SessionMeta</code>（会话 id、工作目录、从谁 fork 的）、<code class="inline">WorldState</code>（世界状态变更）、<code class="inline">Compacted</code>（压缩发生）、甚至原始 <code class="inline">EventMsg</code>。<strong>这使得 rollout 既是会话历史，也是完整的运行轨迹</strong>——回放时能重建到任意时刻的完整状态。<code class="inline">#[serde(flatten)]</code> 让 item 展开进 RolloutLine 同一层，配合 <code class="inline">tag = "type"</code> 每行自描述。</div>
     <div class="callout tip">
       <b class="tag">工具</b>
       注释里写了：<code class="inline">Rollouts are recorded as JSONL and can be inspected with tools such as...</code>——你可以直接 <code class="inline">cat</code> 或 <code class="inline">jq</code> 看 rollout 文件，每行就是一个事件。文件存在 <code class="inline">~/.codex/sessions/</code> 下。
@@ -138,13 +144,13 @@ recorder.list_threads(...)                      <span class="cmt">// 列出所�
 <span class="kw">pub async fn</span> apply_rollout_items(...)                        <span class="cmt">// 把 rollout 条目写进索引</span>
 <span class="kw">pub async fn</span> reconcile_rollout(...)                          <span class="cmt">// 对账：索引 vs JSONL 文件</span>
 <span class="kw">pub async fn</span> read_repair_rollout_path(...)                   <span class="cmt">// 读修复</span></pre>
-    <div class="annotation"><b>读懂这段：</b> 双层存储——<strong>JSONL 文件是事实来源（append-only，不可变），SQLite 是索引/缓存</strong>（快速列出会话、按 id 查路径）。<code class="inline">reconcile_rollout</code> 和 <code class="inline">read_repair_rollout_path</code> 负责「对账」：当索引与 JSONL 不一致时，以 JSONL 为准修复索引。这就是事件溯源 + 物化视图的组合。</div>
+    <div class="annotation"><b>一份事实、一份索引：</b> 双层存储——<strong>JSONL 文件是事实来源（append-only，不可变），SQLite 是索引/缓存</strong>（快速列出会话、按 id 查路径）。<code class="inline">reconcile_rollout</code> 和 <code class="inline">read_repair_rollout_path</code> 负责「对账」：当索引与 JSONL 不一致时，以 JSONL 为准修复索引。这就是事件溯源 + 物化视图的组合。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.5</span>回放与重建：InitialHistory</h2>
     <p>重启后恢复会话，就是把 rollout 文件回放成内存历史。这由 <code class="inline">InitialHistory</code> 表达：</p>
-    <div class="code-title">codex-rs/history/src/lib.rs:288 — 会话的初始历史来源</div>
+    <div class="code-title">codex-rs/history/src/lib.rs:366 — 会话的初始历史来源</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> InitialHistory {
     New,                              <span class="cmt">// 全新会话</span>
     Cleared,                          <span class="cmt">// 已清空</span>
@@ -157,12 +163,12 @@ recorder.list_threads(...)                      <span class="cmt">// 列出所�
     <span class="kw">pub</span> history: Arc&lt;Vec&lt;RolloutItem&gt;&gt;,   <span class="cmt">// 回放出的历史条目</span>
     <span class="kw">pub</span> rollout_path: Option&lt;PathBuf&gt;,     <span class="cmt">// rollout 文件路径（继续追加）</span>
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 恢复会话时 <code class="inline">ThreadManager::resume_thread_from_rollout</code> 先经 thread store 按 <code class="inline">rollout_path</code> 读回持久化历史（内部同样以 <code class="inline">RolloutRecorderParams::resume(path)</code> → <code class="inline">RolloutRecorder::new_with_writer_lock(..)</code> 打开文件续写；<code class="inline">RolloutRecorder::get_rollout_history(path)</code> 也能直接把 JSONL 逐行反序列化成 <code class="inline">InitialHistory</code>）→ 包成 <code class="inline">ResumedHistory</code> → 喂给 <code class="inline">Session</code>。<strong>关键在于：恢复后 rollout 文件继续追加</strong>（<code class="inline">rollout_path</code> 还在），所以恢复的会话和原会话是同一个文件。<code class="inline">Forked</code> 变体支持「从某历史点分叉」——类似 git 的分支，<code class="inline">forked_from_id</code> 记录了来源。</div>
+    <div class="annotation"><b>恢复走的是索引：</b> 恢复会话时 <code class="inline">ThreadManager::resume_thread_from_rollout</code> 先经 thread store 按 <code class="inline">rollout_path</code> 读回持久化历史（内部同样以 <code class="inline">RolloutRecorderParams::resume(path)</code> → <code class="inline">RolloutRecorder::new_with_writer_lock(..)</code> 打开文件续写；<code class="inline">RolloutRecorder::get_rollout_history(path)</code> 也能直接把 JSONL 逐行反序列化成 <code class="inline">InitialHistory</code>）→ 包成 <code class="inline">ResumedHistory</code> → 喂给 <code class="inline">Session</code>。<strong>关键在于：恢复后 rollout 文件继续追加</strong>（<code class="inline">rollout_path</code> 还在），所以恢复的会话和原会话是同一个文件。<code class="inline">Forked</code> 变体支持「从某历史点分叉」——类似 git 的分支，<code class="inline">forked_from_id</code> 记录了来源。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">4.6</span>World State：会话追踪的真实世界</h2>
-    <p>除了消息历史，Session 还追踪一个 <strong>world state（世界状态）</strong>——本轮生效的运行时状态（指令、权限、可用工具、环境等）的快照。注意它<b>不是从消息历史派生的</b>：<code class="inline">build_world_state_for_step</code>（<code class="inline">core/src/session/world_state.rs:35</code>）从 turn context、会话配置与模型信息现场构建，每轮 turn 开始时刷新：</p>
+    <p>除了消息历史，Session 还追踪一个 <strong>world state（世界状态）</strong>——本轮生效的运行时状态（指令、权限、可用工具、环境等）的快照。注意它<b>不是从消息历史派生的</b>：<code class="inline">build_world_state_for_step</code>（<code class="inline">core/src/session/world_state.rs:40</code>）从 turn context、会话配置与模型信息现场构建，每轮 turn 开始时刷新：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t46 d46">
         <title id="t46">World State 的构建与注入</title>
@@ -197,7 +203,7 @@ recorder.list_threads(...)                      <span class="cmt">// 列出所�
 
   <section class="block">
     <h2><span class="num">4.7</span>回滚：扔掉最近几轮</h2>
-    <p>早期版本的 Codex 支持会话回滚——扔掉最近 N 个用户 turn——通过 <code class="inline">Op::ThreadRollback { num_turns }</code> 触发。这个 Op <strong>已被移除</strong>（#44915），现在没有触发回滚的 live 入口；<code class="inline">EventMsg::ThreadRolledBack</code> 仅保留为<strong>旧 rollout 的回放标记</strong>（协议注释原话："Retained for replay of existing rollouts; live rollback operations are unsupported"）。为什么还要处理它？因为 rollout 是 append-only 的历史文件，里面可能已经写入了当年的回滚标记。重建历史时（<code class="inline">rollout_reconstruction.rs:417</code>）遇到这个标记就 <code class="inline">drop_last_n_user_turns</code> 截断掉最近的 N 个用户 turn；rollout 截断索引（<code class="inline">thread_rollout_truncation.rs</code>）同样会在定位用户消息边界时应用这些标记。想「回到过去」现在的正路是 thread fork / revert——从旧点分叉出新会话，另写一个 rollout 文件。</p>
+    <p>早期版本的 Codex 支持会话回滚——扔掉最近 N 个用户 turn——通过 <code class="inline">Op::ThreadRollback { num_turns }</code> 触发。这个 Op <strong>已被移除</strong>（#44915），现在没有触发回滚的 live 入口；<code class="inline">EventMsg::ThreadRolledBack</code> 仅保留为<strong>旧 rollout 的回放标记</strong>（协议注释原话："Retained for replay of existing rollouts; live rollback operations are unsupported"）。为什么还要处理它？因为 rollout 是 append-only 的历史文件，里面可能已经写入了当年的回滚标记。重建历史时（<code class="inline">rollout_reconstruction.rs:461</code>）遇到这个标记就 <code class="inline">drop_last_n_user_turns</code> 截断掉最近的 N 个用户 turn；rollout 截断索引（<code class="inline">thread_rollout_truncation.rs</code>）同样会在定位用户消息边界时应用这些标记。想「回到过去」现在的正路是 thread fork / revert——从旧点分叉出新会话，另写一个 rollout 文件。</p>
     <div class="callout info">
       <b class="tag">设计</b>
       append-only + fork 的设计借鉴了 git：历史不可变，新进展是新行，想「回到过去」就从过去某点 fork。这让会话天然支持分支探索，且崩溃恢复时不会因部分写入损坏（最多丢最后半行）。
@@ -223,7 +229,7 @@ recorder.list_threads(...)                      <span class="cmt">// 列出所�
 </div>
 
 <footer>
-  Codex CLI · 04 会话与 Rollout · 源码锚点 openai/codex @ bb054a2b03 · 所有引用代码路径以仓库最新为准
+  Codex CLI · 04 会话与 Rollout · 源码锚点 openai/codex @ fbc169827e · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

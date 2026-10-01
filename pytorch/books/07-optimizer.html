@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 优化器与 AMP — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a class="active" href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 07 优化器与 AMP</div>
+    <h1>优化器与 AMP：一亿个参数怎么更新才不慢</h1>
+    <div class="subtitle">优化器的数学公式人人都会写，源码里值得读的是另一件事：AdamW 同一套数学有三种实现路径（单张量、foreach、fused），覆盖从一亿参数到千亿参数的规模。这章把三条路径的分工讲清，顺带看 LRScheduler 和 AMP 的 GradScaler。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">7.1</span>基类的分工：Optimizer 管什么</h2>
+    <p>torch/optim/optimizer.py 的 Optimizer 基类不实现任何数学，它管四件「账务」事：param group（把参数分组、每组一套超参）、state（每个参数的动量等状态字典）、zero_grad、以及 state_dict/load_state_dict（checkpoint 里优化器状态的格式，续训时它必须和模型一起恢复）。真正更新参数的 <code class="inline">step()</code> 在基类里是空的，由子类填。</p>
+    <div class="annotation"><b>一个 API 细节的历史：</b>用户常被提醒「要写 <code class="inline">optimizer.step(closure=None)</code> 而不是 <code class="inline">optimizer.step(loss)</code>」。基类的 _patch_step_function（<code class="inline">optimizer.py</code>）会给 step 套一层 profiler 包装（profile_hook_step）并在类上打 .hooked 标记防重复包装。老签名 step(loss) 是兼容期遗物，新代码一律 step(closure)——这种签名演化在 optimizer.py 里留了好几处，读的时候留意 @deprecated 系列装饰器即可，不必深究。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.2</span>三条实现路径</h2>
+    <p>AdamW 的数学每步要做：更新动量 m、二阶矩 v、偏差修正、参数更新。当参数总量是一亿、每步都对每个参数来一遍时，瓶颈不是数学而是 kernel 启动次数。PyTorch 的解法是同一数学的三种打包方式，dispatch 在 adam() 函数尾部：</p>
+    <div class="code-title">torch/optim/adam.py — 三路径分发（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">if</span> fused <span class="kw">and not</span> torch.jit.is_scripting():
+        func = _fused_adam
+    <span class="kw">elif</span> foreach <span class="kw">and not</span> torch.jit.is_scripting():
+        func = _multi_tensor_adam
+    <span class="kw">else</span>:
+        func = _single_tensor_adam</pre>
+    <table class="tbl">
+      <tr><th>路径</th><th>组织方式</th><th>kernel 次数/步</th><th>适用</th></tr>
+      <tr><td><code class="inline">_single_tensor_adam</code></td><td>逐参数循环，每个参数每个数学步骤一次小 kernel</td><td>参数量 × 数</td><td>参数少、调试友好</td></tr>
+      <tr><td><code class="inline">_multi_tensor_adam</code></td><td>整组参数按 dtype 拼成大列表，每步骤一次多张量算子</td><td>≈ 数学步骤数</td><td>默认；参数多时快一个量级</td></tr>
+      <tr><td><code class="inline">_fused_adam</code></td><td>整组参数交一个 CUDA kernel，所有数学步骤融合</td><td>1</td><td>超大模型；步进时间占比高时</td></tr>
+    </table>
+    <p>fused 路径按设备分组后，最后一跳直接落到 C++ 扩展（_fused_adam 内部，<code class="inline">adam.py</code>）：</p>
+    <div class="code-title">torch/optim/adam.py — fused 的最后一跳（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>        func = torch._fused_adam_ <span class="kw">if not</span> decoupled_weight_decay <span class="kw">else</span> torch._fused_adamw_</pre>
+    <div class="annotation"><b>选型默认值怎么来的：</b>不显式传 foreach 也不传 fused 时，adam() 会调 _default_to_fused_or_foreach（<code class="inline">optimizer.py</code>）：参数全部属于 foreach 支持的类型（Tensor/Parameter，<code class="inline">optimizer.py</code>）且设备在支持列表里（cuda、xpu、mtia 及 privateuse1，<code class="inline">_foreach_utils.py</code>）就自动开 foreach，fused 则一律不自动开（<code class="inline">adam.py</code> 注释写明 fused 要「bake-in time」）。注意 CPU 参数两者都不支持——CPU 上永远走单张量路径。经验法则是：step 时间在 profile 里超过总时间 5% 时才需要 fused，其余情况 foreach 已经够。第 13 章的 profiler 怎么量这一项。</div>
+    <p>顺带钉一个名字：AdamW 与 Adam 的差别只有 weight decay 的位置——W 把衰减从梯度里拿出来直接乘参数（decoupled），Adam 把它混进梯度（会被动量平均稀释）。<code class="inline">adamw.py</code> 里 <code class="inline">class AdamW(Adam)</code> 继承自 Adam，全部差异浓缩在 <code class="inline">decoupled_weight_decay=True</code> 这一个默认值的传递上。这行继承关系比论文摘要更直接地说明了两者的关系。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.3</span>LRScheduler：不是优化器的一部分</h2>
+    <p>常见误解是 scheduler 在优化器「内部」。实际它只是持着优化器引用的外部对象，构造时把初始 lr 写进每个 param group，<code class="inline">scheduler.step()</code> 做的事只有一件：算新 lr、写回 param_group['lr']。优化器每步读 param group 里的 lr 用，从不主动调 scheduler。</p>
+    <p>所以「scheduler 和 optimizer 的 step 顺序」问题是真实的：先 optimizer.step() 再 scheduler.step()，否则第一次更新用的就是衰减后的 lr。检查逻辑在 <code class="inline">lr_scheduler.py</code>——第一次 scheduler.step() 时，若检测到 optimizer.step 被覆写、或 optimizer 尚未执行过（_opt_called 标志），就发 UserWarning（警告原文直说「PyTorch 1.1.0 起应该反过来调」）。这个容易踩的点没有机制保证，全靠约定加一条事后警告——读源码看清两者关系后，这类「玄学警告」就变成了可以解释的规则。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.4</span>AMP 与 GradScaler：放大、检查、缩回</h2>
+    <p>混合精度的动机在第 11 章讲显存时还会出现，这里只看 autograd 侧的机制。bf16 时代 AMP 可以裸用（指数范围大，不怕下溢）；fp16 训练则必须配 GradScaler，否则小梯度直接归零、训练静默退化。三步循环的源码位置：</p>
+    <table class="tbl">
+      <tr><th>步骤</th><th>API</th><th>机制</th></tr>
+      <tr><td>放大</td><td><code class="inline">scaler.scale(loss).backward()</code></td><td>loss 乘个 scale 因子再走正常 backward，梯度全量带同样因子</td></tr>
+      <tr><td>检查</td><td><code class="inline">scaler.step(optimizer)</code></td><td>先 unscale 梯度，若发现 inf/nan 则跳过本步更新（并降 scale）</td></tr>
+      <tr><td>更新因子</td><td><code class="inline">scaler.update()</code></td><td>连续 N 步无溢出则升 scale，有溢出则降</td></tr>
+    </table>
+    <p>关键在第二步的语义：<strong>溢出时跳过的不是「这一步的梯度」，而是「这一步的参数更新」。</strong><code class="inline">grad_scaler.py</code> 的逻辑只有一行——found_inf 求和为零才调 optimizer.step()，否则返回 None；但参数绝不能带 inf 往前走，所以旧实现会把非法梯度直接清零。GradScaler 是一个纯 Python 类（<code class="inline">torch/amp/grad_scaler.py</code>），没有任何隐藏状态——它的全部价值是把这套容易写错的循环固化成三行标准代码。文件路径有个历史细节：它最早在 torch.cuda.amp 下，现在 torch/cuda/amp/grad_scaler.py 里只剩一个 @deprecated 的子类转发到 torch.amp.GradScaler（多设备通用），旧路径只是别名。</p>
+    <div class="callout warn">
+      <b class="tag">困惑点</b>
+      为什么 GradScaler 不做成 context manager 自动包住 backward？因为「检查」必须发生在 backward 完成之后、「更新因子」又在检查之后——三步横跨 backward 和 step 两个阶段，用户循环里注定要显式调三个 API。设计成自动包裹反而要引入隐式状态机，可调试性更差。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.5</span>与分布式的前奏</h2>
+    <p>单卡视角下优化器的事就这些；但有一个接口从单卡时代就是为分布式预留的——<code class="inline">add_param_group</code>（<code class="inline">optimizer.py</code>）。它在运行中往优化器加一组参数，对两种场景至关重要：按层解冻（先训头部再放开底层）和 FSDP2 这类「分片优化器」（每个 rank 只握参数分片，优化器状态跟着分片走，第 12 章展开）。</p>
+    <p>另一个埋笔是 <code class="inline">adam()</code> 上的 _disable_dynamo_if_unsupported 装饰器（<code class="inline">adam.py</code>，定义在 <code class="inline">optimizer.py</code>）：它包住整个分发函数，编译时如果参数组里的 state_step 在 cuda/xpu 且没开 capturable，就整段退回 eager（调 torch._disable_dynamo 包装的原函数），避开 foreach 算子对 CUDA state_step 的不支持。也就是说编译路径里优化器不是「默认被跳过」，而是「不支持的组合才整段退出」；Dynamo 对优化器实例本身另有专门处理（_dynamo/variables/optimizer.py 的 OptimizerVariable），把 _init_group 的慢初始化折成常量、给参数挂静态地址 guard。第 9 章讲 Dynamo 的捕获边界时会回到这里。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      优化器一章的三个落点：三条实现路径按规模选择（fused 只在 step 占比高时值得）；scheduler 与优化器是「外部持引用」关系，次序靠约定；GradScaler 三步是 fp16 的固定搭配，bf16 可省。这些选择都是可 profile 的工程决策，不是教条。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="06-module.html">← 上一章：nn.Module</a>
+    <a href="08-dataloader.html">下一步：DataLoader →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 07 优化器与 AMP · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

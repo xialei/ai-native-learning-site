@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ bb054a2b03</span>
+    <span class="version-badge">openai/codex @ fbc169827e</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 上下文压缩</div>
     <h1>上下文压缩 Compaction：历史太长怎么办</h1>
     <div class="subtitle">一个长会话很快就会超出模型的上下文窗口。Codex 的解法是 <strong>compaction（压缩）</strong>：在采样前检测 token 预算，超限时把旧历史摘要成一条 compaction summary，腾出空间继续。本章拆开触发条件、本地 vs 远程压缩、token 预算模式三条路径。</div>
@@ -42,7 +42,7 @@
   <section class="block">
     <h2><span class="num">6.1</span>何时触发：采样前检查</h2>
     <p>第 3 章的 <code class="inline">run_turn</code> 第一步就是 <code class="inline">run_pre_sampling_compact</code>——在构建 prompt 之前先检查是否该压缩：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1274 — 采样前压缩检查</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1298 — 采样前压缩检查</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">async fn</span> run_pre_sampling_compact(
     sess: &amp;Arc&lt;Session&gt;,
     turn_context: &amp;Arc&lt;TurnContext&gt;,
@@ -66,13 +66,13 @@
     }
     Ok(())
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 触发条件是 <code class="inline">token_status.token_limit_reached</code>——由 <code class="inline">context_window_token_status</code> 计算得出，它综合了「配置的自动压缩预算」和「可用上下文窗口」两个阈值。注意 <code class="inline">CompactionReason::ContextLimit</code> 和 <code class="inline">CompactionPhase::PreTurn</code>——压缩有原因和阶段标签，方便遥测与策略分支。<strong>压缩发生在采样之前</strong>，确保发给模型的 prompt 不会超窗。</div>
+    <div class="annotation"><b>触发器在哪：</b> 触发条件是 <code class="inline">token_status.token_limit_reached</code>——由 <code class="inline">context_window_token_status</code> 计算得出，它综合了「配置的自动压缩预算」和「可用上下文窗口」两个阈值。注意 <code class="inline">CompactionReason::ContextLimit</code> 和 <code class="inline">CompactionPhase::PreTurn</code>——压缩有原因和阶段标签，方便遥测与策略分支。<strong>压缩发生在采样之前</strong>，确保发给模型的 prompt 不会超窗。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.2</span>三条压缩路径</h2>
     <p>压缩不止一种实现。<code class="inline">run_auto_compact</code> 根据功能开关和 provider 能力，分派到三条路径：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1446 — run_auto_compact 分派</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1471 — run_auto_compact 分派</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">async fn</span> run_auto_compact(sess, step_context, fallback, client_session, injection, reason, phase) {
     <span class="kw">if</span> turn_context.config.features.enabled(Feature::TokenBudget) {
         <span class="cmt">// 路径 A：token 预算压缩</span>
@@ -92,7 +92,7 @@
         }
     }
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> 三条路径按优先级：<strong>① TokenBudget（本地，开新窗口）</strong>——不调用模型做摘要，直接重置 context window，最快最省；<strong>② 远程压缩</strong>——provider 支持 <code class="inline">compaction_trigger</code> 时走流式 <code class="inline">/responses</code>，服务端帮你做摘要（OpenAI 后端能力）；<strong>③ 本地压缩</strong>——本地调模型生成摘要。选哪条只取决于 provider 能力（<code class="inline">RemoteCompactionSupport</code> 是 provider 能力枚举）+ TokenBudget 开关；早期版本还有个 <code class="inline">RemoteCompactionV2</code> 功能开关和一条走 <code class="inline">/responses/compact</code> 的旧远程压缩路径，后来都被移除（旧实现废弃于 #44273，feature 开关退役于 #44255），现在远程压缩统一走流式 v2 实现。</div>
+    <div class="annotation"><b>三条路，先走便宜的：</b> 三条路径按优先级：<strong>① TokenBudget（本地，开新窗口）</strong>——不调用模型做摘要，直接重置 context window，最快最省；<strong>② 远程压缩</strong>——provider 支持 <code class="inline">compaction_trigger</code> 时走流式 <code class="inline">/responses</code>，服务端帮你做摘要（OpenAI 后端能力）；<strong>③ 本地压缩</strong>——本地调模型生成摘要。选哪条只取决于 provider 能力（<code class="inline">RemoteCompactionSupport</code> 是 provider 能力枚举）+ TokenBudget 开关；早期版本还有个 <code class="inline">RemoteCompactionV2</code> 功能开关和一条走 <code class="inline">/responses/compact</code> 的旧远程压缩路径，后来都被移除（旧实现废弃于 #44273，feature 开关退役于 #44255），现在远程压缩统一走流式 v2 实现。</div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t62 d62">
         <title id="t62">三条压缩路径</title>
@@ -132,13 +132,13 @@
 
 <span class="cmt">// 自动触发版本（同样的内核，trigger = Auto）</span>
 <span class="kw">pub(crate) async fn</span> run_inline_auto_compact_task(sess, step_context, injection) -&gt; CodexResult&lt;()&gt;;</pre>
-    <div class="annotation"><b>读懂这段：</b> 关键在<strong>统一生命周期</strong>：即便 TokenBudget 压缩不做摘要，它仍发 <code class="inline">TurnStarted</code>、仍走 <code class="inline">run_compact_task_inner</code>、仍产生 <code class="inline">ContextCompaction</code> turn item、仍触发 compact hooks。<strong>这样无论走哪条路径，下游（遥测、hook、事件流）看到的压缩事件是一致的</strong>。<code class="inline">CompactionTrigger::Manual / Auto</code> 区分手动触发（用户调 <code class="inline">/compact</code>）和自动触发（预算耗尽）。</div>
+    <div class="annotation"><b>捷径也走全程仪仗：</b> 关键在<strong>统一生命周期</strong>：即便 TokenBudget 压缩不做摘要，它仍发 <code class="inline">TurnStarted</code>、仍走 <code class="inline">run_compact_task_inner</code>、仍产生 <code class="inline">ContextCompaction</code> turn item、仍触发 compact hooks。<strong>这样无论走哪条路径，下游（遥测、hook、事件流）看到的压缩事件是一致的</strong>。<code class="inline">CompactionTrigger::Manual / Auto</code> 区分手动触发（用户调 <code class="inline">/compact</code>）和自动触发（预算耗尽）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.4</span>压缩后的历史长什么样</h2>
     <p>压缩发生后，旧历史被一条 <strong>compaction summary</strong> 替代。它作为一个特殊的 <code class="inline">ResponseItem</code> 注入，类型是 <code class="inline">ResponseItem::Compaction</code>（serde 别名 <code class="inline">compaction_summary</code>，见第 4 章 rollout）。对应的 context fragment 是 <code class="inline">CompactionSummary</code>：</p>
-    <div class="code-title">codex-rs/core/src/context/mod.rs:64 — 压缩摘要 fragment 的 re-export</div>
+    <div class="code-title">codex-rs/core/src/context/mod.rs:72 — 压缩摘要 fragment 的 re-export</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// 压缩后，旧的历史被一条摘要替代，作为 context fragment 注入。</span>
 <span class="kw">pub(crate) use</span> compaction_summary::CompactionSummary;</pre>
     <div class="figure">
@@ -166,12 +166,26 @@
       <div class="fig-cap">图 6.4：压缩把旧历史折叠成一条摘要，尾部保留以维持近期上下文。</div>
     </div>
     <p>压缩后 <code class="inline">ContextManager</code> 的 <code class="inline">history_version</code> 递增（见第 5 章），<code class="inline">reference_context_item</code> 重置——下一轮做全量上下文重注入。前端通过 <code class="inline">ContextCompaction</code> turn item 观察到压缩；<code class="inline">EventMsg::ContextCompacted</code> 已标记废弃，仅作为兼容事件继续发给 raw-event/rollout 消费者。</p>
+
+    <p>压缩条目（<code class="inline">CompactedItem</code>，history/src/lib.rs:275）最近多了一个值得注意的字段——<code class="inline">resume_metadata: Option&lt;CompactionResumeMetadata&gt;</code>。压缩会把运行时的一些「现场」折掉：此刻选的是什么模型、多 Agent 运行时是哪个版本、上一个 turn 跑到哪。这些信息过去不在压缩记录里，冷恢复（进程重启后 thread/resume）时只能靠启发式从相邻记录重建；现在压缩发生时把三类值<strong>显式持久化</strong>：</p>
+
+    <pre class="code"><span class="lang-tag">codex-rs/history/src/compaction_resume_metadata.rs:15</span>
+<span class="kw">pub struct</span> <span class="cl">CompactionResumeMetadata</span> {
+    <span class="cmt">/// 当前多 Agent 运行时版本（含「确认没有」的 None）</span>
+    <span class="kw">pub</span> multi_agent_version: <span class="cl">Option</span>&lt;MultiAgentVersion&gt;,
+    <span class="cmt">/// 冷恢复后 admit 续跑 turn 用的 turn 身份</span>
+    <span class="kw">pub</span> last_started_turn_id: <span class="cl">Option</span>&lt;String&gt;,
+    <span class="kw">pub</span> previous_turn_settings: <span class="cl">Option</span>&lt;PreviousTurnSettings&gt;,  <span class="cmt">// model + cyber_access_program + comp_hash + realtime_active</span>
+}</pre>
+
+    <div class="annotation"><b>注释即规范：</b> 关键设计在注释原话「<strong>Presence distinguishes explicitly persisted values from legacy fallback reconstruction</strong>」——字段是 <code class="inline">Option&lt;Option&lt;_&gt;&gt;</code> 式的两层语义：外层 <code class="inline">resume_metadata</code> 存在，说明这些值是压缩时显式写下的（权威，包括「刻意记下的 None」）；不存在，则说明是旧 rollout，走启发式重建。这和第 4 章 CompactedItem 的 <code class="inline">latest_token_usage_record</code>（恢复 token 用量免扫全文件）是同一个模式：<strong>把「恢复时需要但历史里没有」的状态，在压缩这个天然断点上落盘</strong>。</div>
+    <p><code class="inline">previous_turn_settings</code> 的消费端（恢复后 admit 续跑 turn 时）值得一提。恢复后如果发现模型变了，内核要用<strong>上一个 turn 的模型</strong>重新压缩一次，把上下文投影到旧模型的预算口径；同时 <code class="inline">PreviousTurnSettings</code> 还记录了 <code class="inline">cyber_access_program</code>（该模型当时生效的访问程序）。<code class="inline">with_model</code> 会保留当前 turn 的 access program，直接组合会拼出「旧模型 + 新程序」这样的错配对——服务端可能拒绝——所以恢复路径显式把程序还原成 <code class="inline">previous_turn_settings.cyber_access_program</code>（turn.rs:1390-1394），让压缩用的「模型/程序」对与当年那个 turn 完全一致。另外有一条捷径：模型没变且 <code class="inline">comp_hash</code> 也没变时，直接 <code class="inline">return Ok(())</code> 跳过重建（turn.rs:1379-1382），这个判断现在覆盖所有会话来源，不再只对某种来源生效。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">6.5</span>采样中超窗：ContextWindowExceeded 恢复</h2>
     <p>采样前检查不能保证万无一失——模型可能在采样中途产出超长内容导致超窗。第 3 章看到 <code class="inline">run_sampling_request</code> 的 loop 里专门处理这个：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1660 — 采样中超窗的处理</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1695 — 采样中超窗的处理</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">match</span> try_run_sampling_request(...).await {
     Ok(output) =&gt; <span class="kw">return</span> Ok((output, ...)),
     Err(err) =&gt; <span class="kw">match</span> err.details() {
@@ -183,7 +197,7 @@
         _ =&gt; err,
     },
 }</pre>
-    <div class="annotation"><b>读懂这段：</b> <code class="inline">ContextWindowExceeded</code> 不在 loop 里重试，而是<strong>上抛给上层</strong>。但上抛后并非「压缩完重新进入采样」——它走通用错误分支，发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续）。压缩的真正防线在<strong>采样之前</strong>（<code class="inline">run_pre_sampling_compact</code>，见 6.1）与<strong>采样成功之后</strong>（若 token 触顶 <code class="inline">should_roll_over</code>，在 mid-turn 跑 <code class="inline">run_auto_compact</code>）。也就是说，压缩主要跑在成功路径上预防超窗，而非作为超窗错误的兜底重试。<code class="inline">set_total_tokens_full</code> 标记窗口已满，让下一轮 pre-sampling 检查能据此触发压缩。（例外：Guardian 审查预算耗尽后触发的超窗，会在 <code class="inline">run_turn</code> 的 loop 里先 <code class="inline">run_auto_compact</code> 一次再 <code class="inline">continue</code>，见 turn.rs:741-775；每步最多重试一次，防止无效压缩死循环。另一处压缩重试是 Guardian 入站证据把预算顶爆时的采样前压缩，PreTurn 阶段。）</div>
+    <div class="annotation"><b>报错不就地重试：</b> <code class="inline">ContextWindowExceeded</code> 不在 loop 里重试，而是<strong>上抛给上层</strong>。但上抛后并非「压缩完重新进入采样」——它走通用错误分支，发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续）。压缩的真正防线在<strong>采样之前</strong>（<code class="inline">run_pre_sampling_compact</code>，见 6.1）与<strong>采样成功之后</strong>（若 token 触顶 <code class="inline">should_roll_over</code>，在 mid-turn 跑 <code class="inline">run_auto_compact</code>）。也就是说，压缩主要跑在成功路径上预防超窗，而非作为超窗错误的兜底重试。<code class="inline">set_total_tokens_full</code> 标记窗口已满，让下一轮 pre-sampling 检查能据此触发压缩。（例外：Guardian 审查预算耗尽后触发的超窗，会在 <code class="inline">run_turn</code> 的 loop 里先 <code class="inline">run_auto_compact</code> 一次再 <code class="inline">continue</code>，见 turn.rs:736-792；每步最多重试一次，防止无效压缩死循环。另一处压缩重试是 Guardian 入站证据把预算顶爆时的采样前压缩，PreTurn 阶段。）</div>
   </section>
 
   <section class="block">
@@ -197,12 +211,12 @@
       <tr><th>原因 (CompactionReason)</th><th>阶段 (CompactionPhase)</th><th>说明</th></tr>
       <tr><td>ContextLimit</td><td>PreTurn</td><td>采样前发现预算耗尽</td></tr>
       <tr><td>ContextLimit</td><td>MidTurn</td><td>采样成功后 token 触顶（should_roll_over），mid-turn 开新窗口</td></tr>
-      <tr><td>ContextLimit</td><td>PostTurn</td><td>turn 正常收尾后压缩（opt-in）：<code>model_post_turn_compact_threshold_percent &gt; 0</code> 且未开 TokenBudget，token 达到窗口阈值百分比、无 pending input、未取消时，break 前跑一次压缩；失败仅记 warn，不推翻已完成的 turn（turn.rs:705-736）</td></tr>
+      <tr><td>ContextLimit</td><td>PostTurn</td><td>turn 正常收尾后压缩（opt-in）：<code>model_post_turn_compact_threshold_percent &gt; 0</code> 且未开 TokenBudget，token 达到窗口阈值百分比、无 pending input、未取消时，break 前跑一次压缩；失败仅记 warn，不推翻已完成的 turn（turn.rs:700-745）</td></tr>
       <tr><td>UserRequested</td><td>StandaloneTurn</td><td>用户显式请求压缩（<code>/compact</code>）——独立 turn，本地与远程实现各有一条</td></tr>
       <tr><td>ModelDownshift</td><td>PreTurn</td><td>模型切换为更小上下文窗的型号</td></tr>
       <tr><td>CompHashChanged</td><td>PreTurn</td><td>切换模型后 compaction 兼容性 hash 不一致（previous/current model 的 hash 不同）</td></tr>
     </table>
-    <p>压缩不只发生在轮内。上表列出的 MidTurn 之外还有一个更晚的触发点：<strong>PostTurn</strong>——一轮正常结束后若占用越过 post-turn 阈值，Codex 会在下一轮开始前悄悄压一次。此时没有输入要处理，是最安全的时机；失败了也只是记一条 warn，已完成的 turn 原样保留。注意它与超窗重试都显式排除 TokenBudget 预算模式——「Token-budget resets do not summarize」：token 预算模式靠重置而非摘要续命，超窗必须 fail closed，不能拿摘要压缩兜底。</p>
+    <p>压缩不只发生在轮内。上表列出的 MidTurn 之外还有一个更晚的触发点：<strong>PostTurn</strong>——一轮正常结束后若占用越过 post-turn 阈值，Codex 会在下一轮开始前悄悄压一次。此时没有输入要处理，是最安全的时机；失败了也只是记一条 warn，已完成的 turn 原样保留。注意它与超窗重试都显式排除 TokenBudget 预算模式——「Token-budget resets do not summarize」：token 预算模式靠重置而非摘要续命，超窗必须 fail closed，不能拿摘要压缩兜底。PostTurn 压缩失败时还有一条配套动作：若错误是用量限尽（<code class="inline">UsageLimitExceeded</code>），会先发出 turn 错误生命周期事件再保留已完成的回答——自动任务（如定时 heartbeat）看到限额事件就停，而普通用户仍能读到这轮结果（turn.rs:743-752）。</p>
   </section>
 
   <section class="block">
@@ -224,7 +238,7 @@
 </div>
 
 <footer>
-  Codex CLI · 06 上下文压缩 · 源码锚点 openai/codex @ bb054a2b03 · 所有引用代码路径以仓库最新为准
+  Codex CLI · 06 上下文压缩 · 源码锚点 openai/codex @ fbc169827e · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

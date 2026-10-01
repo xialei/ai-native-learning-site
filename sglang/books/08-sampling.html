@@ -253,6 +253,14 @@ packed_size = <span class="fn">min</span>(self.sampling_mask_max_tokens, weights
       <b class="tag">演进痕迹</b>
       这段代码完整保留了一次「Python 对象 → 设备张量」的迁移。留意 <code class="inline">SamplingBatchInfo</code> 里新加的 <code class="inline">sampling_mask_batch_indices</code>：它把「哪些请求要掩码」这个判断也从逐轮扫描 <code class="inline">return_sampling_masks</code> 的布尔列表，变成了一个预先算好的设备索引张量。capture 工作只在 <code class="inline">index_select</code> 选出的那几行上做——不设掩码的请求（绝大多数）完全不进这条路径。这类「把控制流从 Python 挪进张量」的重构，在推理引擎里几乎总发生在同一个触发点：某个分支开始出现在 TPOT 的热路径上。
     </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      <code class="inline">selected_logprobs</code> 旁边最近多了个可空的兄弟：<code class="inline">support_logprobs</code>（commit c3685dff42，#40932）。起因是一个语义缺口：掩码字段原先只返回<strong>被选中那个 token</strong> 的行为 logprob（被选中 token 的权重除以支撑集总质量，Sampler 里 <code class="inline">torch.log(selected_weight / support_mass)</code> 那行，<code class="inline">sampler.py</code>），但做重要性采样的训练侧常常要的是<strong>整个支撑集</strong>各自的 logprob——只有选中项算不了重要性权重。于是加了两种模式：<code class="inline">SamplingLogprobsMode = Literal["selected", "support"]</code>（<code class="inline">schedule_batch.py</code>），请求字段 <code class="inline">sampling_logprobs_mode</code>（<code class="inline">io_struct.py</code>，缺省时开掩码即 selected 模式）。落法沿用本章开头那套「控制流挪进张量」的思路：<code class="inline">SamplingBatchInfo</code> 里并排出现 <code class="inline">sampling_mask_batch_indices</code> 与 <code class="inline">sampling_support_logprobs_capture_indices</code> 两个设备索引张量（<code class="inline">sampling_batch_info.py</code>），后者由 <code class="inline">return_sampling_mask and sampling_logprobs_mode == "support"</code> 逐请求推出——support 模式的额外开销只落在显式要它的行上。两个构造器（贪心版与非贪心版）都多收一个 <code class="inline">support_capture_indices</code> 参数，给 None 就返回 <code class="inline">support_logprobs=None</code>，老路径一步不多走。PD 分离下这段数据还要过 decode 侧的传输队列，两种模式的形状不同：selected 是每步一个 float，support 是每步一个 list——<code class="inline">disaggregation/decode.py</code> 里按 <code class="inline">req.sampling_logprobs_mode</code> 分叉追加。与第 6 章 <code class="inline">ReturnHiddenStatesMode</code> 的「bool 扩成枚举」是同一类演化：一个布尔开关承载不了第二种合法诉求时，与其再添一个布尔，不如把字段本身升格成模式枚举。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      模式枚举落地之后，掩码的<strong>返回值形态</strong>又被推着走了一步（commit 24b6930076，#40986）：从「Python 嵌套 list」换成「每请求一块定长数组的切片」。新类型 <code class="inline">SamplingMaskChunk</code>（<code class="inline">sampling_mask.py</code>）是个 frozen 的 msgspec.Struct，三个字段全是 numpy 数组——<code class="inline">lengths</code> int32[num_rows]、<code class="inline">token_ids</code> int32[sum(lengths)] 逐行紧排、<code class="inline">logprobs</code> float32——与上面 <code class="inline">SamplingMaskOutput</code> 的定长 packing 同一套思路，只是发生在每请求一级。请求侧挂的 <code class="inline">req.sampling_mask_rows</code>（<code class="inline">schedule_batch.py</code>）是个 <code class="inline">SamplingMaskRows</code> 累加器（<code class="inline">sampling_mask.py</code>）：引擎每吐一个 token，调度器就 <code class="inline">append</code> 两段 numpy（<code class="inline">batch_result_processor.py</code>，替代原来的 <code class="inline">append(mask[i])</code> 逐行 list）；流式发送时 <code class="inline">output_streamer.py</code> 调 <code class="inline">take()</code>——它先 <code class="inline">view()</code> 出零拷贝切片再清空队列，<strong>已入队的数据原封不动交给流式通道</strong>。类型签名也随之变干净：<code class="inline">io_struct.py</code> 与 :1655 的 <code class="inline">output_token_sampling_mask</code> 从 <code class="inline">List[List[List[int]]]</code> 三层嵌套 list 收敛成 <code class="inline">List[Optional[SamplingMaskChunk]]</code>。PD 分离同日跟进：<code class="inline">decode.py</code> 那段原来内联的 <code class="inline">cpu().tolist()</code> 分支（selected/support 两路、还要先判 -1 哨兵）缩成一次 <code class="inline">append(两个 numpy 切片)</code>，num_logprobs 按 mode 取 1 或 mask_len；<code class="inline">tokenizer_manager.py</code> 消费侧才调 <code class="inline">to_lists(support_logprobs=...)</code> 把数组按模式拆成客户端要的形状。整条链的演化方向与本章开头一致：<strong>list 只活在与客户端接壤的最后一厘米，中间过程全是定长数组</strong>。
+    </div>
   </section>
 
   <section class="block">
@@ -327,7 +335,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
             ...</pre>
     <div class="annotation"><b>三个内置后端对应三种 FSM 实现：</b> xgrammar 是默认（编译快、内核级的 token mask），outlines 最老牌（保留了 jump-forward 优化——FSM 确定走的字符序列直接跳过采样，见 <code class="inline">outlines_jump_forward.py</code> 与 <code class="inline">BaseGrammarObject.jump_and_retokenize</code>，这是早期「跳过确定性前缀」路线留下的接口），llguidance 支持最复杂的语法。编译是异步的：请求先进 <code class="inline">GrammarManager.grammar_queue</code>，FSM 编好之前不进调度。</div>
 
-    <p>编译之前还有一道刚加上去的闸：<code class="inline">constrained/json_schema_validation.py</code>。有些 JSON Schema 关键字后端并不支持但也不报错——编译照常过，生成时才悄悄失效（比如 xgrammar 会无视 <code class="inline">contains</code>/<code class="inline">uniqueItems</code>/<code class="inline">multipleOf</code>）。这个模块在编译入口先扫一遍 schema（<code class="inline">validate_xgrammar_json_schema</code> / <code class="inline">validate_outlines_json_schema</code>，xgrammar_backend.py:349 与 outlines_backend.py:171 调用），碰到本后端保不住的关键字直接抛 <code class="inline">UnsupportedJSONSchemaFeature</code>，让请求在进入调度前就 400，而不是等用户拿到一份「不合法也没人告诉你」的输出。两个后端各自一张不支持清单，llguidance 没有——它语法覆盖最全，暂时不用这份体检。</p>
+    <p>编译之前还有一道刚加上去的闸：<code class="inline">constrained/json_schema_validation.py</code>。有些 JSON Schema 关键字后端并不支持但也不报错——编译照常过，生成时才悄悄失效（比如 xgrammar 会无视 <code class="inline">contains</code>/<code class="inline">uniqueItems</code>/<code class="inline">multipleOf</code>）。这个模块在编译入口先扫一遍 schema（<code class="inline">validate_xgrammar_json_schema</code> / <code class="inline">validate_outlines_json_schema</code>，<code class="inline">xgrammar_backend.py</code> 与 <code class="inline">outlines_backend.py</code> 调用），碰到本后端保不住的关键字直接抛 <code class="inline">UnsupportedJSONSchemaFeature</code>，让请求在进入调度前就 400，而不是等用户拿到一份「不合法也没人告诉你」的输出。两个后端各自一张不支持清单，llguidance 没有——它语法覆盖最全，暂时不用这份体检。</p>
 
     <p>编译期间的请求卡在 grammar 队列里，<strong>调度器每轮先放行已就绪的</strong>——这是 grammar 对调度准入的直接干预点：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — _get_new_batch_prefill_raw 开头（摘录，注释为译注）</div>
@@ -390,9 +398,9 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
         <span class="st">"pythonic"</span>: <span class="cl">PythonicDetector</span>,
         <span class="st">"qwen25"</span>: <span class="cl">Qwen25Detector</span>,
         <span class="st">"qwen3_coder"</span>: <span class="cl">Qwen3CoderDetector</span>,
-        ...  <span class="cmt"># 共 39 个模型条目，多个模型共享同一 detector 类</span>
+        ...  <span class="cmt"># 共 41 个模型条目，多个模型共享同一 detector 类</span>
     }</pre>
-    <div class="annotation"><b>39 个条目对应 35 个 detector 类：</b> 同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
+    <div class="annotation"><b>41 个条目对应 37 个 detector 类：</b> 同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
     <div class="callout info">
       <b class="tag">为什么不在 Sampler 里做</b>
       采样器工作在 token id 空间，而工具调用的边界（比如 <code class="inline">&lt;tool_call&gt;</code> 标记、JSON 的完整闭合）是<strong>文本层</strong>的概念，和分词边界不对齐——一个标记可能被切成多个 token，半个 JSON 对象在 token 序列里无法判定合法性。所以解析只能等反分词之后按文本做，位置自然落在 <code class="inline">entrypoints/openai/serving_chat.py</code>（<code class="inline">FunctionCallParser</code> 在流式与非流式两个分支里分别构造）。代价是约束不「硬」：模型输出格式坏了，解析层只能尽力恢复或报错；要硬约束得靠 8.5 节的 grammar 路线。
@@ -414,7 +422,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
 </div>
 
 <footer>
-  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

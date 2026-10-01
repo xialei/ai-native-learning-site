@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · 显存与 CUDA Graphs — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a class="active" href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 显存与 CUDA Graphs</div>
+    <h1>显存：块池、碎片，以及 CUDA Graph 为什么要求静态</h1>
+    <div class="subtitle">训练时的显存几乎全部由 PyTorch 自己的缓存分配器管理——cudaMalloc 只在池子不够时才被调用。这章先讲分配器怎么用「块 + 池」把 free/delete 变成账面操作，再看三个调参选项分别对应哪种碎片；后半章讲 CUDA Graphs：为什么回放要求形状和地址都不变，以及 PyTorch 侧为此做的两件配合工作。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>为什么需要缓存分配器</h2>
+    <p>裸用 cudaMalloc/cudaFree 有两个问题：调用本身慢（毫秒级，且可能隐式同步），反复申请释放同一批大小的缓冲会把显存切得七零八落。PyTorch 的做法是进程启动后自己管一块「批发来的」显存：cudaMalloc 拿到的大块记在池子里，上层 Tensor 的分配/释放只发生在池内——free 一个 Tensor 并不真的还给驱动，只是把块标记为可用，下一个同尺寸请求直接复用。</p>
+    <p>所以 nvidia-smi 看到的显存占用和 torch.cuda.memory_allocated 报的「真实使用」是两回事：前者是池子大小（reserved），后者是池内已分出的（allocated）。训练稳定后 reserved 常年远大于 allocated，这不是泄漏，是分配器在留着复用。</p>
+    <div class="code-title">c10/cuda/CUDACachingAllocator.cpp — 分配器行为自述（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="co">//</span>
+<span class="co">// Yet another caching allocator for CUDA device allocations.</span>
+<span class="co">//</span>
+<span class="co">// - Allocations are associated with a stream. Once freed, blocks can be</span>
+<span class="co">//   re-allocated on the same stream, but not on any other stream.</span>
+<span class="co">// - The allocator attempts to find the smallest cached block that will fit the</span>
+<span class="co">//   requested size. If the block is larger than the requested size, it may be</span>
+<span class="co">//   split. If no block is found, the allocator will delegate to cudaMalloc.</span>
+<span class="co">// - If the cudaMalloc fails, the allocator will attempt to free one cached</span>
+<span class="co">//   block of sufficient size that is not split and retry the allocation.</span>
+<span class="co">//   If this also fails, the allocator will attempt to free all cached blocks</span>
+<span class="co">//   that are not split and retry the allocation.</span>
+<span class="co">// - Large (&gt;1MB) and small allocations are stored in separate pools.</span>
+<span class="co">//   Small requests are packed into 2MB buffers. Large requests will use the</span>
+<span class="co">//   smallest available free block or allocate a new block using cudaMalloc.</span>
+<span class="co">// - To reduce fragmentation, requests between 1MB and 10MB will allocate and</span>
+<span class="co">//   split a 20MB block, if no free block of sufficient size is available.</span>
+<span class="co">// - To further reduce fragmentation, blocks &gt;= max_split_size are not allowed</span>
+<span class="co">//   to be split.</span></pre>
+    <p>这段注释是分配器的说明书，四个动作各对应一层机制：按 stream 归属块（跨 stream 复用必须先 recordStream 做同步，否则出现「别的 stream 还没算完，块就被复用了」的竞态）；best-fit 找块；放不下先试着释放再重试；大小区分池。下面这张图把一次请求的路径画出来：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t111 d111">
+        <title id="t111">CUDACachingAllocator 分配路径</title>
+        <desc id="d111">一次分配请求的判定路径：请求到达先看大小（1MB 以下走小块池，2MB 缓冲打包；1MB 以上走大块池），块池内按 stream 查最小可容纳的空闲块，找到则可能切分返回；找不到则 cudaMalloc 补货；cudaMalloc 失败则先释放一个未切分缓存块重试，再失败释放全部重试。释放只是把块归还池内同 stream 侧，不还给驱动。max_split_size 限制大块不可切，expandable_segments 用虚拟地址映射替代物理大块预留。</desc>
+        <defs>
+          <marker id="arrow11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="30" y="30" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="120" y="55" text-anchor="middle">上层请求 N 字节</text>
+        <text class="lbl sm" x="120" y="73" text-anchor="middle">Tensor storage 分配</text>
+
+        <rect class="node" x="260" y="30" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="345" y="55" text-anchor="middle">大小分诊</text>
+        <text class="lbl sm" x="345" y="73" text-anchor="middle">≤1MB → 小块池</text>
+
+        <rect class="node core" x="260" y="130" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="345" y="155" text-anchor="middle">大块池（&gt;1MB）</text>
+        <text class="lbl sm" x="345" y="173" text-anchor="middle">按 stream 归属</text>
+
+        <rect class="node core" x="480" y="30" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="580" y="55" text-anchor="middle">同 stream 空闲块</text>
+        <text class="lbl sm" x="580" y="73" text-anchor="middle">取最小可容纳（best-fit）</text>
+
+        <rect class="node ok" x="730" y="30" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="820" y="55" text-anchor="middle">命中：可切则切</text>
+        <text class="lbl sm" x="820" y="73" text-anchor="middle">剩余部分回池</text>
+
+        <rect class="node" x="480" y="130" width="200" height="60" rx="8"></rect>
+        <text class="lbl" x="580" y="155" text-anchor="middle">找不到 → cudaMalloc</text>
+        <text class="lbl sm" x="580" y="173" text-anchor="middle">向驱动补一块新的大块</text>
+
+        <rect class="node warn" x="730" y="130" width="180" height="60" rx="8"></rect>
+        <text class="lbl" x="820" y="150" text-anchor="middle">cudaMalloc 也失败</text>
+        <text class="lbl sm" x="820" y="168" text-anchor="middle">释放未切分缓存块重试</text>
+        <text class="lbl sm" x="820" y="184" text-anchor="middle">再失败释放全部</text>
+
+        <rect class="node" x="260" y="230" width="420" height="60" rx="8"></rect>
+        <text class="lbl" x="470" y="255" text-anchor="middle">free：块归还池内（不还给驱动）</text>
+        <text class="lbl sm" x="470" y="273" text-anchor="middle">跨 stream 使用过需 recordStream 等待；同 stream 侧立即可复用</text>
+
+        <line class="edge" x1="210" y1="60" x2="258" y2="60"></line>
+        <line class="edge" x1="350" y1="90" x2="350" y2="128"></line>
+        <line class="edge" x1="440" y1="60" x2="478" y2="60"></line>
+        <line class="edge" x1="680" y1="60" x2="728" y2="60"></line>
+        <line class="edge" x1="580" y1="90" x2="580" y2="128"></line>
+        <line class="edge" x1="680" y1="160" x2="728" y2="160"></line>
+
+        <text class="lbl sm" x="700" y="250" text-anchor="middle">账面数字：</text>
+        <text class="lbl sm" x="700" y="268" text-anchor="middle">reserved = 池子大小</text>
+        <text class="lbl sm" x="700" y="286" text-anchor="middle">allocated = 池内已分出</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>池内路径</span>
+        <span class="lg-item"><span class="sw acc"></span>入口</span>
+        <span class="lg-item"><span class="sw ok"></span>成功出口</span>
+        <span class="lg-item"><span class="sw warn"></span>降级路径</span>
+      </div>
+      <div class="fig-cap">图 11.1：一次分配的判定路径。释放永远是账面操作——这解释了为什么显存曲线「只涨不跌」是常态，只有 cudaMalloc 失败后的强制释放或 empty_cache 才会把 reserved 打下去。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>两个调参选项分别治什么病</h2>
+    <p>PYTORCH_CUDA_ALLOC_CONF 的两个常用选项，各自对应一种碎片来源：</p>
+    <table class="tbl">
+      <tr><th>选项</th><th>治什么</th><th>代价</th></tr>
+      <tr><td>max_split_size_mb</td><td>块切太碎：大块被切成小块后，再来一个大请求放不下。≥ 该值的块禁止切分，保住大块完整性</td><td>大块宁可闲置也不拆，利用率略降</td></tr>
+      <tr><td>expandable_segments:True</td><td>段预留过多：每个段按需增长（2MiB 粒度物理页映射），不用的页可还给驱动，OOM 时回收「空物理页」</td><td>依赖 cuMemMap 系 API；CUDA Graph 捕获期有交互限制</td></tr>
+    </table>
+    <p>expandable_segments 的思路在源码注释里写得很清楚：地址空间和物理内存分离——先预留几乎整卡显存的虚拟地址（256TiB 地址空间随便用），实际按需映射物理页。变长序列长度训练（每个 step 序列长度不同、分配模式抖动）是最受益的场景。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      OOM 报错里 「Reserved but unallocated」很大，说明池子里有大量空闲碎片，为什么还要 OOM？因为空闲块是按 stream 和大小隔离的，可能没有一块连续空间能满足当前请求。此时开 expandable_segments 比手动 empty_cache 更对症——后者的代价是全部缓存清零、下个 step 重新 cudaMalloc。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>CUDA Graphs：捕获一次，回放千百次</h2>
+    <p>每个 kernel launch 都有固定开销，而训练循环里「这组 kernel 序列」每个 step 都一样。CUDA Graphs 把一整个 step 的 kernel 序列录制下来，之后一次 CPU 调用回放整个序列——launch 开销从「每 kernel 一次」变成「每 step 一次」，小 batch 推理和短 kernel 密集的场景收益最大。</p>
+    <div class="code-title">torch/cuda/graphs.py — torch.cuda.graph 上下文管理器（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">graph</span>:
+    <span class="st">r"""Context-manager that captures CUDA work into a
+    :class:`torch.cuda.CUDAGraph` object for later replay.
+
+    Arguments:
+        cuda_graph (torch.cuda.CUDAGraph): Graph object used for capture.
+        pool (optional): Opaque token ... hinting this graph's capture
+            may share memory from the specified pool.
+        stream (torch.cuda.Stream, optional): If supplied, will be set as
+            the current stream in the context.
+        capture_error_mode (str, optional): specifies the
+            cudaStreamCaptureMode for the graph capture stream.
+            Can be "global", "thread_local" or "relaxed".
+    """</span></pre>
+    <p>捕获不是「把 CUDA 调用记录成日志」这么轻巧——捕获期间 CUDA 驱动处于特殊状态：不允许 cudaMalloc 等不安全调用（所以 capture_error_mode 默认 global，其他线程也不许乱动）。PyTorch 侧为此专门做了配合：捕获期间分配器的分配行为被改道到一个私有内存池（上面 graphs.py 里的 pool 参数），图内所有张量的地址在捕获时就定死了。</p>
+    <div class="annotation"><b>为什么回放要求静态：</b>回放时驱动按录制好的地址直接执行，输入数据必须写进「同一块地址」再回放，形状变化则意味着 kernel 序列变化，整张图作废。这就是 graphs.py docstring 花大量篇幅讲 static input 的原因——不是 PyTorch 限制多，是 CUDA 捕获机制本身如此。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>谁在用：SDPA 的后端选择</h2>
+    <p>显存一章如果不讲一个具体用户，就容易停在分配器数字上。拿 scaled_dot_product_attention（缩写 SDPA）当例子：同一个 sdpa 入口背后有五个实现，Dispatcher（03 章）在这里又一次充当了路由器——只不过这次选哪个 kernel 不看 dispatch key，看运行时的启发式与用户开关：</p>
+    <table class="tbl">
+      <tr><th>后端</th><th>数值表示</th><th>适用场景</th></tr>
+      <tr><td>math</td><td>0</td><td>万能回退：纯算术组合，无显存优化</td></tr>
+      <tr><td>flash_attention</td><td>1</td><td>主流选择，平铺 tiling 省显存</td></tr>
+      <tr><td>efficient_attention</td><td>2</td><td>memory-efficient 实现（xformers 谱系）</td></tr>
+      <tr><td>cudnn_attention</td><td>3</td><td>新硬件上 cuDNN 实现常更快</td></tr>
+      <tr><td>overrideable</td><td>4</td><td>用户自定义后端的挂钩</td></tr>
+    </table>
+    <p>枚举本身极简（<code class="inline">aten/src/ATen/SDPBackend.h</code>，num_sdp_backends = 5），真正的决策在 sdp_utils.cpp 的 <code class="inline">priority_order</code>：</p>
+    <div class="code-title">aten/src/ATen/native/transformers/cuda/sdp_utils.cpp — 后端优先级（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="co">// flash_attention V2 is universally faster than efficient_attention and Math</span>
+std::array&lt;SDPBackend, num_backends&gt; priority_order(sdp_params <span class="kw">const</span>&amp; params) {
+  <span class="kw">if</span> (!priority_order_init_) {
+    priority_order_init_ = <span class="kw">true</span>;
+    <span class="kw">if</span> (check_prefer_cudnn_attention()) {
+        <span class="kw">const</span> std::vector&lt;int64_t&gt; cudnn_order = {static_cast&lt;int64_t&gt;(at::SDPBackend::cudnn_attention),
+                                                  static_cast&lt;int64_t&gt;(at::SDPBackend::flash_attention),
+                                                  static_cast&lt;int64_t&gt;(at::SDPBackend::efficient_attention),
+                                                  static_cast&lt;int64_t&gt;(at::SDPBackend::math)};
+        at::globalContext().setSDPPriorityOrder(cudnn_order);
+    }
+  }
+  <span class="kw">return</span> at::globalContext().sDPPriorityOrder();
+}</pre>
+    <p>读法：默认优先级 flash &gt; efficient &gt; math，满足条件的设备把 cudnn 提到最前。实际执行哪个，还能被 torch.nn.attention.sdpa_kernel 上下文管理器强行限定——排查性能问题时，先确认「跑的到底是哪个后端」比调参数更有用。</p>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      这个「一个入口五个后端」的 API 形态本身值得记一笔：早期版本 attention 是 flash_sdp / mem_efficient_sdp 等分散入口，后来才收敛成 scaled_dot_product_attention 单入口加内部路由。API 收敛、实现分散，是 PyTorch 这类框架的常见演化方向——10 章 torch.compile 的「一入口多编译后端」也是同一模式。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.5</span>要点</h2>
+    <p>显存一章的三件事：分配器把 free 变成账面操作（所以显存曲线不跌）；碎片有两个治理选项，对症才有效；CUDA Graphs 用「录制-回放」换 launch 开销，代价是要求形状与地址静态。三件事背后是同一个事实——PyTorch 在 Python 层之下，对 GPU 内存和 kernel 执行各管了一层自己的机制。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      单机显存管好后，下一道坎是几台机器怎么像一个机器那样训练：梯度在设备间怎么传、参数怎么切。第 12 章从 c10d 通信层讲到 FSDP2。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="10-inductor.html">← 上一章：Inductor</a>
+    <a href="12-distributed.html">下一步：分布式 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 11 显存与 CUDA Graphs · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

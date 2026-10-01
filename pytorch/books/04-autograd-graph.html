@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · autograd 计算图 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a class="active" href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 04 autograd 计算图</div>
+    <h1>autograd 计算图：反向代码是什么时候写的</h1>
+    <div class="subtitle">PyTorch 没有单独的「建模阶段」——前向跑的时候，反向的执行计划就同步记好了。这章看这个记录过程的三个部件：节点（Node）、边（Edge）、终止符（AccumulateGrad），以及那份 696 条规则的反向公式表 derivatives.yaml。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">4.1</span>反向代码的来源：derivatives.yaml</h2>
+    <p>先回答最根本的问题：<code class="inline">x + y</code> 的梯度公式是谁写的？答案不是 C++ 代码，而是一份声明式文件。翻开 tools/autograd/derivatives.yaml，加法的规则长这样：</p>
+    <div class="code-title">tools/autograd/derivatives.yaml — add 的反向规则（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">yaml</span>- name: add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -&gt; Tensor
+  self: handle_r_to_c(self.scalar_type(), grad)
+  other: handle_r_to_c(other.scalar_type(), maybe_multiply(grad, alpha.conj()))
+  result: self_t + maybe_multiply(other_t, alpha)</pre>
+    <p>格式直白：算子签名做键，每个输入一条反向表达式。<code class="inline">self</code> 的梯度就是 grad 原样传回，<code class="inline">other</code> 的梯度乘上 alpha。构建时（tools/autograd/gen_autograd.py 读这份文件），代码生成器把这 696 条规则展开成 696 组 C++ 反向函数，再由第 3 章的机制注册到 Autograd key 的格子里。你调用 <code class="inline">loss.backward()</code> 时跑的「反向代码」，源头是这份 YAML，不是任何人手写的函数。</p>
+    <div class="annotation"><b>为什么值得强调「生成」二字：</b>读源码时搜 <code class="inline">class AddBackward</code> 是搜不到的——它叫 <code class="inline">AddBackward0</code>，住在 build 目录里，构建后才有。想知道某个算子反向长什么样，正确动作是查 derivatives.yaml 而不是猜源码文件。附带的收获是反向规则可以直接当文档读：比如 addmm 的三条梯度公式（self / mat1 / mat2 各一条，<code class="inline">derivatives.yaml</code>）就摊在那里，比任何教材都准确。</div>
+    <p>也有些算子的反向规则栏是空的——那不是遗漏，是声明「此 op 不可微」或「梯度就是 grad 本身不需要额外逻辑」。696 这个数字相对于 2590 个算子的差额，一部分就在这里。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.2</span>Node 与 Edge：图的最小单元</h2>
+    <p>前向每执行一个可导算子，autograd kernel（第 3 章那格）就做三件事：保存输入的引用、根据 derivatives.yaml 的规则确定反向函数、把一个 Node 对象连进图。Node 是所有反向函数的基类：</p>
+    <div class="code-title">torch/csrc/autograd/node.h — Node 构造（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">TORCH_API Node</span> : c10::intrusive_ptr_target {
+ <span class="kw">public</span>:
+  <span class="cmt">/// Construct a new `Node` with the given `next_edges`</span>
+  <span class="kw">explicit</span> <span class="cl">Node</span>(uint64_t sequence_nr, edge_list&amp;&amp; next_edges = edge_list())
+      : sequence_nr_(sequence_nr), next_edges_(std::move(next_edges)) {
+    <span class="kw">for</span> (<span class="kw">const</span> <span class="cl">Edge</span>&amp; edge : next_edges_) {
+      <span class="fn">update_topological_nr</span>(edge);
+    }
+
+    <span class="kw">if</span> (AnomalyMode::is_enabled()) {
+      metadata()-&gt;<span class="fn">store_stack</span>();
+
+      <span class="cmt">// If anomaly mode is enabled and graph is constructed, then assign the</span>
+      <span class="cmt">// currently evaluating node as the parent of this node.</span>
+      <span class="cmt">// A parent is a Node where this Node is created.</span>
+      <span class="cmt">// We are tracking the parents to track multiple backward operations.</span>
+      <span class="fn">assign_parent</span>();
+    }</pre>
+    <p>三个成员撑起整个图结构：<code class="inline">next_edges_</code>（指向下游节点的边列表）、<code class="inline">input_metadata_</code>（各输入的形状/dtype，反向时要用）、<code class="inline">sequence_nr_</code>（全局递增序号，标记节点创建顺序，异常检测时用来判断「图是不是被 backward 多次」）。每个具体算子的反向——<code class="inline">AddBackward0</code>、<code class="inline">MulBackward0</code>、<code class="inline">MmBackward0</code>——都是 Node 的子类，各自的 <code class="inline">apply</code> 里是生成的梯度公式。</p>
+    <p>Edge 更简单，简单到值得把整个定义看完：</p>
+    <div class="code-title">torch/csrc/autograd/edge.h — Edge 定义核心（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">Edge</span> {
+  <span class="cl">Edge</span>() noexcept : <span class="fn">function</span>(<span class="kw">nullptr</span>), input_nr(0) {}
+
+  <span class="cl">Edge</span>(c10::intrusive_ptr&lt;Node&gt; function_, uint32_t input_nr_) noexcept
+      : function(std::move(function_)), input_nr(input_nr_) {}
+
+  <span class="cmt">// （相等比较、is_valid 等辅助方法省略）</span>
+
+  <span class="cmt">/// The function this `Edge` points to.</span>
+  c10::intrusive_ptr&lt;Node&gt; function;
+
+  <span class="cmt">/// The identifier of a particular input to the function.</span>
+  uint32_t input_nr;
+};</pre>
+    <p>两个成员：下游节点是谁（function）、梯度该塞进它的第几个输入（input_nr）。第二个字段平时被忽略，但它解决的问题很实际——反向函数的多个输入（比如矩阵乘的 mat1、mat2）要各自收到正确的梯度，没有 input_nr 就得靠顺序猜。整张 autograd 图，物理形态就是 Node 持有一组 Edge，没有更多结构。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.3</span>grad_fn 与 AutogradMeta：tensor 怎么记住图</h2>
+    <p>tensor 需要一个字段指向「生成我的那个 Node」——这就是 <code class="inline">x.grad_fn</code>。它住在 AutogradMeta 里，第 2 章没展开的那块：</p>
+    <div class="code-title">torch/csrc/autograd/variable.h — AutogradMeta 字段（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">TORCH_API AutogradMeta</span> : <span class="kw">public</span> c10::AutogradMetaInterface {
+  std::string name_;
+
+  <span class="cl">Variable</span> grad_;
+  c10::intrusive_ptr&lt;Node&gt; grad_fn_;
+  c10::weak_intrusive_ptr&lt;Node&gt; grad_accumulator_;</pre>
+    <p>四个字段，两个指针类型值得盯住。grad_fn_ 是 <code class="inline">intrusive_ptr</code>（强引用）：只要中间结果活着，生成它的 Node 就活着。grad_accumulator_ 却是 <code class="inline">weak_intrusive_ptr</code>（弱引用）——它指向叶子参数的 AccumulateGrad。方向不对称的原因到第 5 章讲引擎时才完全展开，这里先给一句：参数的生命周期由用户代码管理（它要活过整个训练），图节点不该反过来攥着参数不放；而中间结果的生命周期就该由图接管，backward 完一起释放。</p>
+    <p> AutogradMeta 是懒分配的：不需要梯度的 tensor（绝大多数推理张量、常量、输入数据）身上这块内存压根不存在。头文件注释原话：「a Variable may store a nullptr, in lieu of a default constructed AutogradMeta」。这也解释了为什么 <code class="inline">requires_grad</code> 检查便宜到可以作为热路径分支。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.4</span>AccumulateGrad：叶子节点与 .grad 的写入点</h2>
+    <p>图走到叶子（也就是参数）时需要终点。参数没有下游可传，它的「下游」就是 <code class="inline">param.grad</code> 这个字段本身。承担这个角色的是 AccumulateGrad：</p>
+    <div class="code-title">torch/csrc/autograd/functions/accumulate_grad.h — AccumulateGrad（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">TORCH_API AccumulateGrad</span> : <span class="kw">public</span> Node {
+  <span class="kw">explicit</span> <span class="cl">AccumulateGrad</span>(Variable variable_);
+
+  variable_list <span class="fn">apply</span>(variable_list&amp;&amp; grads) <span class="kw">override</span>;
+
+  <span class="kw">void</span> <span class="fn">release_resources</span>() <span class="kw">override</span> {
+    variable.reset();
+    Node::release_resources();
+  }</pre>
+    <p>它的 <code class="inline">apply</code> 只干一件事：把收到的梯度累进 <code class="inline">variable.grad_</code>（累，是因为一个参数可能被多条路径使用，梯度要按路径求和——这才是 accumulate 这个名字的完整含义）。累加时还有一份 <code class="inline">Gradient Layout Contract</code>：尽量让 .grad 的内存布局（strides）与参数本身一致，优化器 kernel 和分布式梯度规约才能按最预期的路径走。平时感知不到它，一旦和某些自定义算子的输出布局对不上，最先出问题的就是这一层。</p>
+    <div class="callout info">
+      <b class="tag">关联</b>
+      第 6 章 optimizer.zero_grad() 清的正是这里写进去的 .grad。为什么默认要手动清零而不是每步自动覆盖：梯度累积（gradient accumulation）——显存放不下大 batch 时，把几个小 batch 的梯度攒起来再更新——依赖「不清零就继续加」的语义。AccumulateGrad 的「累」字，一半是设计，一半是给这个用法留的。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.5</span>图长什么样：一次真实前向的记录</h2>
+    <p>把上面三个部件拼起来，跑一个最小前向，看图的实际形状：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t43 d43">
+        <title id="t43">y = (x @ w + b).relu() 的 autograd 图</title>
+        <desc id="d43">前向表达式 y = (x @ w + b).relu() 对应的图：三个参数节点 x、w、b 各连一个 AccumulateGrad 节点；中间节点 MulBackward（x@w 的反向）和 AddBackward（加偏置的反向）、ReluBackward 依次相连，最终汇入输出 y。y 的 grad_fn 指向 ReluBackward。箭头方向是梯度回流方向。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="60" y="30" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="135" y="52" text-anchor="middle">x（叶子）</text>
+        <text class="lbl code" x="135" y="70" text-anchor="middle">AccumulateGrad</text>
+
+        <rect class="node acc" x="60" y="130" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="135" y="152" text-anchor="middle">w（叶子）</text>
+        <text class="lbl code" x="135" y="170" text-anchor="middle">AccumulateGrad</text>
+
+        <rect class="node acc" x="60" y="230" width="150" height="56" rx="8"></rect>
+        <text class="lbl" x="135" y="252" text-anchor="middle">b（叶子）</text>
+        <text class="lbl code" x="135" y="270" text-anchor="middle">AccumulateGrad</text>
+
+        <rect class="node core" x="330" y="80" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="420" y="102" text-anchor="middle">MmBackward0</text>
+        <text class="lbl sm" x="420" y="120" text-anchor="middle">x@w 的反向</text>
+
+        <rect class="node core" x="330" y="180" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="420" y="202" text-anchor="middle">AddBackward0</text>
+        <text class="lbl sm" x="420" y="218" text-anchor="middle">+b 的反向</text>
+
+        <rect class="node core" x="580" y="130" width="160" height="56" rx="8"></rect>
+        <text class="lbl" x="660" y="152" text-anchor="middle">ReluBackward0</text>
+        <text class="lbl sm" x="660" y="172" text-anchor="middle">relu 的反向</text>
+
+        <rect class="node" x="790" y="136" width="120" height="44" rx="8"></rect>
+        <text class="lbl" x="850" y="162" text-anchor="middle">y</text>
+
+        <line class="edge" x1="135" y1="86" x2="328" y2="100"></line>
+        <line class="edge" x1="210" y1="158" x2="328" y2="130"></line>
+        <line class="edge" x1="210" y1="258" x2="330" y2="222"></line>
+        <line class="edge" x1="510" y1="122" x2="578" y2="146"></line>
+        <line class="edge" x1="510" y1="196" x2="578" y2="168"></line>
+        <line class="edge" x1="740" y1="158" x2="788" y2="158"></line>
+
+        <text class="lbl sm" x="250" y="80" fill="#165a7b">梯度从 y 一路流回叶子</text>
+        <text class="lbl sm" x="250" y="98">（箭头 = backward 执行顺序）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>中间算子的反向节点</span>
+        <span class="lg-item"><span class="sw acc"></span>叶子参数的终点节点</span>
+      </div>
+      <div class="fig-cap">图 4.2：y = (x @ w + b).relu() 记下的图。前向是自左向右求值，图里箭头自右向左——backward 的执行顺序。y 的 grad_fn 指向 ReluBackward0，每个中间节点再通过 next_edges 指向更早的节点；三个参数各自的 AccumulateGrad 是终点。真实模型无非是这张小图的几十层重复。</div>
+    </div>
+    <p>两个常见的困惑在这张图上各有一句话的解释。其一，「为什么 loss 是标量也能 backward」：引擎从 y 的 grad_fn 出发沿边倒推，每个节点只关心「下游给我的梯度」和「我该给上游什么」，标量输出只是让整张图恰好只有一个起点。其二，「detach 后为什么还能继续前向但不回传」：detach 生成了没有 grad_fn 的新 TensorImpl（第 2 章那张表），对引擎来说它就是又一片叶子——叶子不需要反向函数，也就没有边指回来。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>三个控图开关的成本账</h2>
+    <p>requires_grad、no_grad、detach 都动图，但动的位置不同，成本结构也不同。训练代码的显存问题大半出在这三者的搭配上：</p>
+    <table class="tbl">
+      <tr><th>开关</th><th>动作</th><th>省了什么</th><th>代价</th></tr>
+      <tr><td><code class="inline">requires_grad=False</code></td><td>tensor 出生就不带 AutogradMeta</td><td>记图开销 + 保存中间结果</td><td>这块输入永远不回传梯度</td></tr>
+      <tr><td><code class="inline">no_grad()</code></td><td>GradMode 关闭，autograd key 直接放行</td><td>同上，但对一段代码批量生效</td><td>区域内算的任何东西都不能 backward</td></tr>
+      <tr><td><code class="inline">detach()</code></td><td>浅拷贝，切断历史</td><td>下游不再持有上游的引用链</td><td>数据仍共享（第 2 章），原地改有风险</td></tr>
+    </table>
+    <p>值得专门说的是 no_grad 的真实成本结构。它不是「让计算变慢一点的小税」，而是省去了保存中间结果的大头——推理时显存占用骤降，主要就是不再为反向存 activation。反过来，训练循环里手滑把前向包进 no_grad，症状不是报错，而是 <code class="inline">backward()</code> 时一句 "element 0 of tensors does not require grad and does not have a grad_fn"——图根本没记。调试这类问题时先查这个。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      前向记图的全部产出是：每个中间 tensor 一个 grad_fn 指针 + 每个节点一组 next_edges。反向所需的「程序」在图里，「数据」（保存的输入输出）也在图里。下一章的引擎拿到的就是这份完整材料，它的任务是调度——让这几百个 Node 在多线程下按依赖关系正确执行。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="03-dispatcher.html">← 上一章：Dispatcher</a>
+    <a href="05-autograd-engine.html">下一步：autograd 引擎 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 04 autograd 计算图 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

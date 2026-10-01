@@ -377,6 +377,11 @@
             o, _ = <span class="fn">_safe_merge_state</span>(o1, s1, o2, s2)</pre>
     <div class="annotation"><b>ragged 分叉是 prefill 的重要优化：</b> 首批请求（无共享前缀）跳过页表间接寻址，直接在连续张量上算，速度更接近普通 attention；一旦命中 RadixCache 前缀（第 3 章），就只能走 paged 路径，因为历史 KV 散布在池里。这也是「前缀缓存省的是算力，但会增加 kernel 访问模式复杂度」的一个具体体现。<br><br><b>三处演进痕迹：</b>其一，<code class="inline">use_ragged</code> 之下现在还有一层 <code class="inline">extend_no_prefix</code>——只有当<em>整个批次</em>都没有前缀时才走单次 ragged 调用，否则要用 <code class="inline">forward_return_lse</code> 拿回 log-sum-exp 统计量、再和 paged 段的结果合并（softmax 不能简单相加，必须权重化）。其二，ragged 分支开头多了 <code class="inline">k is None and v is None</code> 的兜底：调用方可以不传 KV 张量，此时从 <code class="inline">token_to_kv_pool</code> 里取本层已写入的缓存当 KV 源，省掉一次重物化。其三，注意 <code class="inline">causal=False</code> 那行——paged 段已经通过位置索引把可见性编码进去了，不能再叠一层 causal 掩码，否则短 query 会看不到自己的历史。</div>
 
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      plan 阶段也有一个 ragged 特例，而且是踩过坑才补上的（commit be495a6174，#40796）。上面 forward_extend 的分叉说的是<strong>执行</strong>侧；<code class="inline">FlashInferIndicesUpdaterPrefill.update_sliding_window</code>（<code class="inline">flashinfer_backend.py</code> 起）是<strong>plan</strong> 侧，SWA 模型按 wrapper_id 走两轮——wrapper 0 是滑动窗口段，wrapper 1 是全注意力段。修复前 wrapper 1 没有 ragged 分支：use_ragged 的批会掉进 full-attention 的兜底分支 <code class="inline">paged_kernel_lens = seq_lens</code>，把<strong>本步 extend 的新 token 也算进了 paged KV 长度</strong>。但此刻新 token 的 K/V 还没写进池子——执行顺序是 paged 段先跑、extend K/V 在其后落池（wrapper 0 的注释写得很直白："K for extend tokens is written after the paged wrapper runs, so the paged wrapper sees prefix-only"），plan 时按 seq_lens 规划等于让 kernel 去读还没落池的页。修复就是在 wrapper 1 上补一个 elif（<code class="inline">flashinfer_backend.py</code>）：<code class="inline">paged_kernel_lens = prefix_lens</code>、<code class="inline">kv_start_idx = None</code>，注释原话 "Extend K/V lands after the paged pass: plan over the prefix only."。这个 bug 的特殊性在于它是<strong>静默的</strong>——形状检查全过，错的是「读到了不该读的显存」，只在 SWA + ragged + 有前缀的组合下触发，测试补在 <code class="inline">test/registered/attention/unittests/swa/test_flashinfer.py</code> 的单测里。给后端作者的一般教训：wrapper 分片后，每片 plan 时对「KV 里到底有什么」的假设必须独立成立，不能从另一片的分支里继承。
+    </div>
+
     <p>关于 MHA 与 MLA 的分野：MHA 后端操作 <code class="inline">k_buffer/v_buffer</code> 两个张量；MLA（DeepSeek 系列）把 KV 压缩成 <code class="inline">kv_lora_rank</code> 维的 latent 向量 + 解耦的 rope 部分，decode 时可以「吸收」（absorb）进投影矩阵，用一个大 latent 头的 kernel 代替多头的 K/V。因此 MLA 有自己的一组后端（flashmla、trtllm_mla、cutedsl_mla、tokenspeed_mla），注册表里多数 MLA 工厂以 <code class="inline">if not runner.use_mla_backend: raise ValueError(...)</code> 开头。fa3（FlashAttention-3）则是 MHA 路线上 Hopper（SM90）卡的常用选择，工厂里用 <code class="inline">get_device_capability()</code> 断言算力等级。</p>
   </section>
 
@@ -409,7 +414,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

@@ -135,7 +135,7 @@
       </div>
       <div class="fig-cap">图 2.1：一次生成调用的关键路径（单 worker、单步视角）。真实实现里 <code class="inline">step()</code> 会并行处理一整个 batch 的请求，而不是一条。</div>
     </div>
-    <div class="annotation"><b>带着这五个问题往下走：</b>文本怎么进引擎 → 2.2（入口分词）；请求长什么样 → 2.3（Request 工作单元）；每一步谁来跑 → 2.4（主循环 step()）；空等怎么办 → 2.5（重叠执行）；prefill/decode → 2.6。2.7 把这条链减到最小，就是你的引擎雏形。</div>
+    <p>接下来的五节就顺着这条链走：2.2 看文本怎么进引擎（入口分词），2.3 看请求长什么样（Request 工作单元），2.4 看每一步谁来跑（主循环 step()），2.5 回答调度和计算怎么重叠，2.6 谈 prefill 和 decode；2.7 把这条链减到最小，就是你的引擎雏形。</p>
   </section>
 
   <section class="block">
@@ -179,7 +179,7 @@
     outputs = self.engine_core.<span class="fn">get_output</span>()   <span class="cmt"># 见 core_client.py：取回 EngineCore 的输出</span>
     processed = self.output_processor.<span class="fn">process_outputs</span>(outputs.outputs, ...)
     <span class="kw">return</span> processed</pre>
-    <div class="annotation"><b>分工一句话：</b>批处理的前端在 Engine，决策在 Core/Scheduler，执行在 Worker。这三段，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
+    <div class="annotation"><b>分工念一遍：</b>批处理的前端在 Engine，决策在 Core/Scheduler，执行在 Worker。这三段，你的引擎也应当照做——即使单进程时也在逻辑上分清楚。</div>
     <div class="annotation"><b>一张图别当真：</b>上面的泳道图和本节代码为了易懂，把循环画成了<strong>纯串行</strong>——调度完、等 GPU 算完、回传、再调度。真实引擎不会傻等，见下一节。</div>
   </section>
 
@@ -207,19 +207,19 @@
         <rect class="node core" x="190" y="190" width="260" height="30" rx="5"></rect>
         <text class="lbl sm" x="320" y="199" text-anchor="middle">前向 N（GPU）——不空等</text>
         <rect class="node core" x="450" y="190" width="250" height="30" rx="5"></rect>
-        <text class="lbl sm" x="575" y="199" text-anchor="middle">前向 N+1（GPU）无缝衔接</text>
+        <text class="lbl sm" x="575" y="199" text-anchor="middle">前向 N+1（GPU）紧接着开跑</text>
 
         <text class="lbl sm" x="20" y="248">代价：CPU 在第 N 步还不知道第 N+1 步的真实输出，只能按「占位符」预留——这就是 num_output_placeholders 的用途</text>
       </svg>
       <div class="fig-cap">图 2.5：async scheduling 把「下一步的 CPU 调度」与「本步的 GPU 前向」重叠，消除 GPU 等待调度的空档。</div>
     </div>
-    <p>开关在 <code class="inline">vllm/config/scheduler.py:203</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
-    <div class="code-title">vllm/config/scheduler.py:203 — async_scheduling 配置（摘录）</div>
+    <p>开关在 <code class="inline">vllm/config/scheduler.py</code>，官方注释把动机写得很直白；执行它的调度器是 <code class="inline">vllm/v1/core/sched/async_scheduler.py</code> 里的 <code class="inline">AsyncScheduler</code>（<code class="inline">Scheduler</code> 的子类，1.2 架构图里那个「Scheduler(AsyncScheduler)」说的就是它）：</p>
+    <div class="code-title">vllm/config/scheduler.py — async_scheduling 配置（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span>async_scheduling: <span class="cl">bool</span> | <span class="kw">None</span> = <span class="kw">None</span>
 <span class="st">"""If set to False, disable async scheduling. Async scheduling helps to
 avoid gaps in GPU utilization, leading to better latency and throughput.
 """</span></pre>
-    <div class="annotation"><b>为什么要「占位符」：</b>重叠的代价是<strong>信息滞后</strong>——CPU 为第 N+1 步调度时，第 N 步还没算完，它不知道每请求会产出几个 token。v1 的解法是让请求先持有 <code class="inline">num_output_placeholders</code>（<code class="inline">vllm/v1/request.py:162</code>）这样的「预计产出数」，按占位符预留 KV 与预算，等真实 token 回来再校正（第 4 章调度代码里 <code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> 里那一项，正是为重叠模式准备的）。结构化输出（grammar bitmask）在异步模式下也同理用 <code class="inline">pending_structured_output_tokens</code> 占位（见 <code class="inline">async_scheduler.py</code>）。自研启示：<strong>MVP 用串行循环完全够，等 profile 显示 CPU 调度成为 GPU 之间的可见空档时，再上重叠——这与第 11 章「先对再快」的顺序一致。</strong></div>
+    <div class="annotation"><b>为什么要「占位符」：</b>重叠的代价是<strong>信息滞后</strong>——CPU 为第 N+1 步调度时，第 N 步还没算完，它不知道每请求会产出几个 token。v1 的解法是让请求先持有 <code class="inline">num_output_placeholders</code>（<code class="inline">vllm/v1/request.py</code>）这样的「预计产出数」，按占位符预留 KV 与预算，等真实 token 回来再校正（第 4 章调度代码里 <code class="inline">num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> 里那一项，正是为重叠模式准备的）。结构化输出（grammar bitmask）在异步模式下也同理用 <code class="inline">pending_structured_output_tokens</code> 占位（见 <code class="inline">async_scheduler.py</code>）。自研启示：<strong>MVP 用串行循环完全够，等 profile 显示 CPU 调度成为 GPU 之间的可见空档时，再上重叠——这与第 11 章「先对再快」的顺序一致。</strong></div>
   </section>
 
   <section class="block">
@@ -277,7 +277,7 @@ avoid gaps in GPU utilization, leading to better latency and throughput.
 </div>
 
 <footer>
-  深入浅出vLLM · 02 请求全生命周期 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 02 请求全生命周期 · 版本 v0.30.1rc0-311-g1fde8ff7da
 </footer>
 
 </body>

@@ -51,7 +51,7 @@
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
 };</pre>
-    <p>请求进来时先选 slot。选择逻辑有明确的优先级（server-context.cpp:1553-1636）：客户端显式指定 <code class="inline">id_slot</code> 时先按 id 直选，然后才是 LCP 相似度，最后 LRU 兜底——自动调度场景下起作用的是后两级：</p>
+    <p>请求进来时先选 slot。选择逻辑有明确的优先级（server-context.cpp:1534-1617）：客户端显式指定 <code class="inline">id_slot</code> 时先按 id 直选，然后才是 LCP 相似度，最后 LRU 兜底——自动调度场景下起作用的是后两级：</p>
     <div class="code-title">tools/server/server-context.cpp — slot 选择（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// ① 按最长公共前缀（LCP）相似度选 slot</span>
 <span class="kw">const</span> size_t lcp_len = tokens.<span class="fn">get_common_prefix</span>(task.tokens);
@@ -75,7 +75,7 @@
 
   <section class="block">
     <h2><span class="num">9.2</span>前缀复用与 cache_reuse</h2>
-    <p>选中 slot 后，新 prompt 与 slot 现有 tokens 求公共前缀，KV 从前缀末端开始算（server-context.cpp:3217-3231）：</p>
+    <p>选中 slot 后，新 prompt 与 slot 现有 tokens 求公共前缀，KV 从前缀末端开始算（server-context.cpp:3198-3213）。注意外层条件在 2026-09 加上了 <code class="inline">&amp;&amp; !is_stateless_task</code>（#29556）——embedding/rerank 这类无状态任务根本不该进前缀复用分支，此前靠 cache_prompt 默认值兜着：</p>
     <div class="code-title">tools/server/server-context.cpp — 前缀复用（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// n_past = 公共前缀长度；之后的 token 才需要 prefill</span>
 n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_tokens);
@@ -88,7 +88,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 <span class="kw">const bool</span> can_cache_reuse =
     <span class="fn">llama_memory_can_shift</span>(llama_get_memory(ctx_tgt)) &amp;&amp;
     !slot.prompt.tokens.has_mtmd;</pre>
-    <p><code class="inline">n_cache_reuse</code> 参数更进一步：不求公共前缀，允许<strong>从旧 prompt 中段搬 KV 块</strong>——哪怕新 prompt 与旧 prompt 只在中段局部相似也能复用（server-context.cpp:3238-3282）：</p>
+    <p><code class="inline">n_cache_reuse</code> 参数更进一步：不求公共前缀，允许<strong>从旧 prompt 中段搬 KV 块</strong>——哪怕新 prompt 与旧 prompt 只在中段局部相似也能复用（server-context.cpp:3219-3263）：</p>
     <div class="code-title">tools/server/server-context.cpp — 块级 KV 搬移（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 双指针扫旧 cache 与新 prompt</span>
 <span class="kw">size_t</span> head_c = n_past;  <span class="cmt">// cache 指针</span>
@@ -154,7 +154,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
     <span class="kw">bool</span> <span class="fn">load</span>(server_prompt &amp; prompt, <span class="kw">const</span> server_tokens &amp; tokens_new, ...);
 };</pre>
     <div class="annotation">缓存条目 = token 序列 + KV checkpoint（common_prompt_checkpoint，投机解码那章见过同一类型）。命中时 load() 把 KV 状态直接恢复进 slot——新请求的前缀部分零计算。容量按字节数和 token 数双限。它补的正是 slot 调度的短板：LCP 选择只在「slot 内存里有」的范围内有效，prompt cache 把有效范围扩展到「曾经出现过」的 prompt。</div>
-    <div class="callout info"><b class="tag">一段代码的进化痕迹</b>上面只讲了「存档」，没讲「在哪打点」——这半边也是一行一行磨出来的。checkpoint 的打点位置不是均匀分批，而是在<strong>用户消息的开头</strong>：server 填批循环里每加一个 token 都要问一次 <code class="inline">spans.is_user_start(...)</code>（server-context.cpp:3550），是就在这里 break 掉、让这一小批单独成一个 ubatch——这样 KV 快照正好落在多轮对话的消息边界上，多轮续聊能从最近一条用户消息整段复用。但 server 怎么知道「第 N 个 token 是用户消息的开头」？靠 chat 模板解析器登记的 <code class="inline">message_delimiters</code>（common/chat.h:282）在 prompt 里搜出消息跨度。坑在这：qwen3-coder、gpt-oss、kimi-k3 等解析器早就登记了各自的分隔符，DeepSeek V3.2/V4 的解析器却一直没登记——<code class="inline">&lt;｜User｜&gt;</code>/<code class="inline">&lt;｜Assistant｜&gt;</code> 就是普通文本，checkpoint 在整个 DSv3.2/DSv4 家族上静默失效。#29008（2026-09）只加了 6 行补上这个登记。启示：一条格式约定要<strong>解析器和 server 两侧同时接上</strong>才生效——Book 里反复出现的「特性接线不全」在这个小案例上重演了一遍。</div>
+    <div class="callout info"><b class="tag">一段代码的进化痕迹</b>上面只讲了「存档」，没讲「在哪打点」——这半边也是一行一行磨出来的。checkpoint 的打点位置不是均匀分批，而是在<strong>用户消息的开头</strong>：server 填批循环里每加一个 token 都要问一次 <code class="inline">spans.is_user_start(...)</code>（server-context.cpp:3531），是就在这里 break 掉、让这一小批单独成一个 ubatch——这样 KV 快照正好落在多轮对话的消息边界上，多轮续聊能从最近一条用户消息整段复用。但 server 怎么知道「第 N 个 token 是用户消息的开头」？靠 chat 模板解析器登记的 <code class="inline">message_delimiters</code>（common/chat.h:282）在 prompt 里搜出消息跨度。坑在这：qwen3-coder、gpt-oss、kimi-k3 等解析器早就登记了各自的分隔符，DeepSeek V3.2/V4 的解析器却一直没登记——<code class="inline">&lt;｜User｜&gt;</code>/<code class="inline">&lt;｜Assistant｜&gt;</code> 就是普通文本，checkpoint 在整个 DSv3.2/DSv4 家族上静默失效。#29008（2026-09）只加了 6 行补上这个登记。启示：一条格式约定要<strong>解析器和 server 两侧同时接上</strong>才生效——Book 里反复出现的「特性接线不全」在这个小案例上重演了一遍。</div>
   </section>
 
   <section class="block">
@@ -183,7 +183,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b11243 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

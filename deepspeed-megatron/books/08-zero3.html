@@ -142,31 +142,37 @@
             sub_module.register_forward_hook(...)</pre>
     <div class="annotation"><b>hook 即借还点：</b>ZeRO-3 不改模型代码——借还挂在 PyTorch 的 forward pre/post hook 上。每个有参数的叶子模块，进之前 fetch、出之后 return。这意味着 <strong>ZeRO-3 对模型结构的要求</strong>：参数必须挂在「模块的直属 _parameters」上，用户自己把参数藏在 list/dict 里（不在 register_parameter 里）会被漏掉——这是 ZeRO-3 的经典报错来源（persistent/leaf 参数问题，见下）。</div>
 
-    <div class="code-title">deepspeed/runtime/zero/stage3.py — step()（结构摘录，译注）</div>
+    <div class="code-title">deepspeed/runtime/zero/stage3.py — step()（结构摘录，译注，:2774）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">step</span>(self, closure=None):
     <span class="cmt"># ① 梯度归约完成、参数全部归位（partition_all_parameters）</span>
     self.<span class="fn">_pre_step</span>()
     <span class="cmt"># ② 溢出检查：fp16 梯度 any NaN/Inf → 全组跳过</span>
-    <span class="kw">if</span> found_inf: <span class="kw">return</span>
-    <span class="cmt"># ③ 子组循环：每组（参数组的一段分片）单独走完全流程</span>
+    <span class="kw">if</span> self.<span class="fn">_overflow_check_and_loss_scale_update</span>(): <span class="kw">return</span>
+    <span class="cmt"># ③ 子组循环前一次性清梯度：epilogue 已把梯度拷进分区缓冲，</span>
+    <span class="cmt">#    模型梯度引用在这里清一次就够（#8625 之前是每个子组清一遍）</span>
+    <span class="kw">if</span> <span class="kw">not</span> self.offload_optimizer:
+        self.<span class="fn">zero_grad</span>(set_to_none=<span class="kw">True</span>)
+    <span class="cmt"># ④ 子组循环：每组（参数组的一段分片）单独走完全流程</span>
     <span class="kw">for</span> sub_group <span class="kw">in</span> self.fp16_groups:
-        self.<span class="fn">_prepare_sub_group</span>(sub_group)          <span class="cmt"># 取回本组分片</span>
-        self.<span class="fn">unscale_and_clip_grads</span>(...)            <span class="cmt"># 去 loss scale + GAS 均值</span>
-        self.<span class="fn">_optimizer_step</span>(sub_group)             <span class="cmt"># 更新 fp32 分片</span>
-        self.<span class="fn">_reassign_or_swap_out_partitioned_parameters</span>(sub_group)  <span class="cmt"># 写回 fp16</span>
-        self.<span class="fn">_release_sub_group</span>(sub_group)          <span class="cmt"># 释放，下一组</span></pre>
-    <div class="annotation"><b>子组循环的意义：</b>不是「全部参数取回 → 一次 step → 全部还回」，而是<strong>每组取回→更新→写回→释放</strong>——任一时刻 GPU 上最多只有一组的完整参数。显存峰值进一步压低，代价是更多次小 all-gather（幸好子组间还能与通信重叠）。<code class="inline">unscale_and_clip_grads</code> 同时做两件事：去 loss scale、除 GAS（两库在这一步的语义一致——scale 与 GAS 均值都在优化器侧撤销，第 6 章 6.3 的边界在引擎侧）。</div>
+        self.<span class="fn">_prepare_sub_group</span>(sub_group_id)          <span class="cmt"># 取回本组分片</span>
+        self.<span class="fn">unscale_and_clip_grads</span>(...)               <span class="cmt"># 去 loss scale + GAS 均值</span>
+        self.<span class="fn">_optimizer_step</span>(sub_group_id)             <span class="cmt"># 更新 fp32 分片</span>
+        self.<span class="fn">_reassign_or_swap_out_partitioned_parameters</span>(sub_group_id)  <span class="cmt"># 写回 fp16</span>
+        self.<span class="fn">_release_sub_group</span>(sub_group_id)          <span class="cmt"># 释放，下一组</span></pre>
+    <div class="annotation"><b>子组循环的意义：</b>不是「全部参数取回 → 一次 step → 全部还回」，而是<strong>每组取回→更新→写回→释放</strong>——任一时刻 GPU 上最多只有一组的完整参数。显存峰值进一步压低，代价是更多次小 all-gather（幸好子组间还能与通信重叠）。<code class="inline">unscale_and_clip_grads</code> 同时做两件事：去 loss scale、除 GAS（两库在这一步的语义一致——scale 与 GAS 均值都在优化器侧撤销，第 6 章 6.3 的边界在引擎侧）。③ 那行 zero_grad 是 2026-09 #8625 挪过来的：原先每个子组更新前都把<strong>全模型</strong>参数的梯度清一遍（G 个子组 × P 个参数的重复劳动），而梯度早已拷进分区缓冲，模型上的引用只剩被丢弃一途——于是挪到循环开始前清一次，清空次数从 G×P 降回 P。改动小得一眼能扫完，但它说明子组循环跑了很多年后，里面还藏着 O(G×P) 的无主开销。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.4</span>哪些模型写法会出事</h2>
-    <p>子组循环的 step 写法见上一节——它把「同时借出的参数量」从全模型压到一组；但 hook 自动化有前提，<strong>模型的写法必须让 hook 找得到参数</strong>。四个疑难场景：</p>
+    <p>子组循环的 step 写法见上一节——它把「同时借出的参数量」从全模型压到一组；但 hook 自动化有前提，<strong>模型的写法必须让 hook 找得到参数</strong>。五个疑难场景：</p>
     <ul>
       <li><strong>参数没被切到</strong>（显存异常高）：参数没挂进 <code class="inline">register_parameter</code>，hook 漏掉 → 检查模型写法。</li>
-      <li><strong>fp32 小参数</strong>：极小的参数（如若干 bias）逐个 all-gather 不划算，DS 允许保留不分片（<code class="inline">stage3_max_parameters_per_partition</code> 不适用，看 <code class="inline">prescale_unscale</code> 相关分支），过小参数留在 fp32。</li>
+      <li><strong>fp32 小参数</strong>：极小的参数（如若干 bias）逐个 all-gather 不划算，DS 干脆不让它们进切分流程——元素数低于 <code class="inline">stage3_param_persistence_threshold</code>（默认 1e5）的参数被 <code class="inline">mark_persistent_parameters</code> 标记为持久参数，不切分、不借还、常驻 GPU。写模型时若某层参数被该阈值兜住，注意别误判「ZeRO-3 没生效」。</li>
+      <li><strong>零元素参数</strong>：比小参数更极端的一类——<code class="inline">numel == 0</code> 的可训练参数（如 <code class="inline">nn.Linear(8, 0)</code> 这种被配置裁剪到空的层）。2026-09 #8467 之前，各优化器包装只按 <code class="inline">requires_grad</code> 挑参数，零元素参数进了平铺组之后被 torch 的 <code class="inline">unflatten_dense_tensors</code> 特殊规则（numel==0 返回一维新张量而非视图）把 <code class="inline">(0, 8)</code> 形状抹成 <code class="inline">(0,)</code>——一步 forward 就 shape mismatch。现在的规则是一条新谓词 <code class="inline">is_optimized_parameter(param)</code>（runtime/utils.py: <code class="inline">requires_grad and numel &gt; 0</code>）：零元素参数与冻结参数同待遇，不进优化器组、checkpoint 里记进 frozen 分片保住形状。</li>
       <li><strong>tied weights</strong>：两处引用同一 Parameter，切分时只认一个 owner；reuse distance 之内不还，否则两边各自 fetch。</li>
       <li><strong>非训练参数（buffers）</strong>：不参与切分，各卡全量——模型大 buffer 多时这里反而是浪费。</li>
     </ul>
+    <p>子组循环还埋着一条「分片循环里跑全量通信」的特殊路径——Muon。第 7 章说过 Muon 要看到完整矩阵才能做 Newton-Schulz；ZeRO-3 里这变成每个子组一次 all-gather、逐参数算完再分发。#8628（#8381 的后续）暴露了它的隐含假设：<strong>同一轮 all-gather 里各卡贡献的参数必须同形状</strong>。GQA 模型的投影矩阵一组的 Q/K/V 形状各异，旧代码补空张量凑齐 world_size 就发 all-gather——形状不一致时收集结果直接错位。修法是把子组参数按轮（round）切，每轮 world_sz 个：形状一致走快路（直接 all-gather），混合形状走慢路（各参数 pad 到本轮最大 numel、没有可贡献参数的卡拿 dummy 张量凑数，保证集合通信完整）。「分片世界里的全量计算」都是这个形状的问题——要么按满员轮次整齐切，要么付 padding 的带宽税。</p>
   </section>
 
   <section class="block">
@@ -176,11 +182,12 @@
       <b class="tag">对照 FSDP</b>
       PyTorch FSDP 与 ZeRO-3 思想相同（参数分片 + all-gather），差异在工程边界：FSDP 把逻辑做进 torch 原生（wrap 粒度 = FSDP unit），ZeRO-3 靠 hook + 模块遍历（粒度 = 有参数的叶子）。FSDP 与 ZeRO-3 各自适合自家的生态；DS 的优势在 offload（第 9 章）与 ZeRO 家族的一体化配置。
     </div>
+    <p>Megatron 自己也有一条 FSDP 路线（M-FSDP，<code class="inline">use_megatron_fsdp</code> 开关），2026-09 的 #6486 把它对 PP 的支持补齐了。补齐过程顺带暴露了 FSDP 与流水线的一处真实冲突，比功能清单本身更有读头：FSDP v2 在每个 FSDP 模块上注册 full-backward hook，PyTorch 送达 <code class="inline">grad_output</code> 时会把模块输出包成 autograd 视图——而 PP 调度器的 <code class="inline">deallocate_output_tensor()</code> 靠「伪释放」输出张量省显存，对视图是无效的（基张量还握着存储）。修复不是绕开，而是检测到这组配置时<strong>自动关掉伪释放</strong>——一个优化在另一个优化的存在下失效，两套系统的交互 bug 常是这种形状。共享 embedding 的跨阶段梯度 all-reduce 也补了专门路径：M-FSDP v2 用不等分 flat-buffer 切分 embedding，不同 PP 阶段持有同一逻辑切片的不同偏移，得先重建成规范布局再 all-reduce，回写时再拷回各自的分片。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">8.6</span>小结 + 自研启示</h2>
-    <p>到这里，ZeRO-3 的全貌可以串起来了：借还总管是 PartitionedParameterCoordinator，三个旋钮分别控制 prefetch 提前量、复用不还的临界距离、同时借出的显存上限；参数在 __init__ 里就被切走，借还挂在 forward pre/post hook 上，模型代码零改动；step 用子组循环把「同时借出的参数」从全模型压到一组，显存峰值随子组大小下降。而这套自动化有个前提——参数必须挂进 register_parameter，藏在 list/dict 里的参数 hook 找不到，会以 NaN 或显存异常的方式静默出错。生命周期归拢成一张表：</p>
+    <p>到这里，ZeRO-3 的全貌可以串起来了：借还总管是 PartitionedParameterCoordinator，三个旋钮分别控制 prefetch 提前量、复用不还的临界距离、同时借出的显存上限；参数在 __init__ 里就被切走，借还挂在 forward pre/post hook 上，模型代码零改动；step 用子组循环把「同时借出的参数」从全模型压到一组，显存峰值随子组大小下降。而这套自动化有个前提——参数必须挂进 register_parameter，藏在 list/dict 里的参数 hook 找不到，会以 NaN 或显存异常的方式静默出错；形状极端（零元素）或分片循环里夹全量通信（Muon 混合形状）则各有一段专用的兜底逻辑。生命周期归拢成一张表：</p>
     <table class="tbl">
       <tr><th>阶段</th><th>动作</th><th>代码位置</th></tr>
       <tr><td>init</td><td>遍历叶子模块，参数切分、留 ds_tensor 分片</td><td>InsertPostInitMethodToModuleSubClasses</td></tr>
@@ -201,7 +208,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 08 ZeRO-3 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 08 ZeRO-3 · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>

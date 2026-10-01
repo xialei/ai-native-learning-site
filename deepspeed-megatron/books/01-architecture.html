@@ -60,7 +60,7 @@
         forward_step_func=forward_step,               <span class="cmt"># 一个 micro-batch 怎么算 loss</span>
         model_type=<span class="cl">ModelType</span>.encoder_or_decoder,
     )</pre>
-    <div class="annotation"><b>pretrain() 的注释把流程写得很直白：</b>初始化 Megatron（进程组）→ 用 model_provider 造模型、包 DDP、配优化器 → 调 dataset provider 拿数据 → 用 forward_step_func 驱动 <code class="inline">train()</code> 循环。所有并行决策（TP/PP/DP/CP 多大）来自命令行参数，在 <code class="inline">initialize_model_parallel()</code> 一处定型。</div>
+    <div class="annotation"><b>pretrain() 的注释把流程写得很直白：</b>初始化 Megatron（进程组）→ 用 model_provider 造模型、包 DDP、配优化器 → 调 dataset provider 拿数据 → 用 forward_step_func 驱动 <code class="inline">train()</code> 循环。所有并行决策（TP/PP/DP/CP 多大）来自命令行参数，在 <code class="inline">initialize_model_parallel()</code> 一处定型。2026-09 的 #7635 在这条流水线的「造模型」之前插了一步 <code class="inline">warmup_training_kernels()</code>（kernel_warmup.py）：模型还没初始化，就按配置的静态形状把 fused cross-entropy、bias-activation 等融合 kernel 先编译/调优一遍——否则这些编译开销会在前几个训练 step 里逐个冒出来，把启动后的首步拖成长尾。它是「启动即同步屏障」这一节老规则的延伸：既然大家都要等最慢的 rank 初始化完，不如把编译也排进这个屏障。</div>
 
     <h3>DeepSpeed：initialize() 包裹任意模型</h3>
     <p>DeepSpeed 走了另一条路：不要求用户换主循环，而是把你的 <code class="inline">nn.Module</code> 包进 <code class="inline">DeepSpeedEngine</code>：</p>
@@ -75,12 +75,12 @@
     config=<span class="kw">None</span>,                                 <span class="cmt"># json 配置：ZeRO stage、offload、累积步数…</span>
 ) -&gt; <span class="cl">Tuple</span>[<span class="cl">DeepSpeedEngine</span>, Optimizer, DataLoader, Any]:
     <span class="st">"""Initialize the DeepSpeed Engine."""</span></pre>
-    <div class="annotation"><b>注意返回值：</b>engine 顶替了原模型——之后的 <code class="inline">engine.forward/backward/step</code> 全部走 DeepSpeed 的编排。并行切分本身 DeepSpeed 基本不管（除非用它的 pipe 引擎或 AutoTP）：模型得先被 Megatron 或其它工具切好，再交给 DeepSpeed 管「副本内显存」。这就是两个库能长期协作的结构原因——<strong>接口彼此正交</strong>。</div>
+    <div class="annotation"><b>注意返回值：</b>engine 顶替了原模型——之后的 <code class="inline">engine.forward/backward/step</code> 全部走 DeepSpeed 的编排。并行切分本身 DeepSpeed 基本不管（除非用它的 pipe 引擎或 AutoTP）：模型得先被 Megatron 或其它工具切好，再交给 DeepSpeed 管「副本内显存」。这就是两个库能长期协作的结构原因——<strong>接口彼此正交</strong>。AutoTP 这条「例外」本身也在长：2026-09 的 #8582 给它补上了词并行嵌入层（<code class="inline">VocabParallelEmbedding</code>），包括与输出头 tied 时共享同一份分片权重的处理——engine.py 的 init 里新增了一段探测逻辑：HuggingFace tp_plan 要求 rowwise embedding 且模型有 tied 词表头（lm_head 与某个 nn.Embedding 共享 weight）时，若用户没显式配 <code class="inline">vocab_parallel_lm_head</code>，自动判定为需要词并行头部；tied 结构下嵌入与输出头共享同一份分片权重，避免双重切分。另一处保守分支同样值得读：DeepCompile 的 autotp pass 尚不支持词并行嵌入，检测到该组合时宁可保持复制并打日志说明原因——切错的代价大于省下的显存。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">1.3</span>一次 train step 里两库各自的调用链</h2>
-    <p>入口看完，往下钻一层：从数据进来到参数更新，两库的代码各在哪些环节被调用。Megatron 的单步训练在 <code class="inline">megatron/training/training.py</code> 的 <code class="inline">train_step()</code>（training.py:3243）里，主干只有几行（源文件 6000+ 行，但除去日志、容错、RL 分支后核心就是下面这些）：</p>
+    <p>入口看完，往下钻一层：从数据进来到参数更新，两库的代码各在哪些环节被调用。Megatron 的单步训练在 <code class="inline">megatron/training/training.py</code> 的 <code class="inline">train_step()</code>（training.py:3292）里，主干只有几行（源文件 6000+ 行，但除去日志、容错、RL 分支后核心就是下面这些）：</p>
     <div class="code-title">megatron/training/training.py — train_step 主干（摘录+删减，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">train_step</span>(forward_step_func, data_iterator, model, optimizer,
                  opt_param_scheduler, config, forward_backward_func, ...):
@@ -101,14 +101,14 @@
 
     optimizer.<span class="fn">step</span>()
     <span class="kw">return</span> loss_dict, skipped_iter, ...</pre>
-    <div class="annotation"><b>这几行里藏着三个角色：</b><code class="inline">forward_backward_func</code> 是流水线调度器（<a href="04-pp-1f1b.html">第 4 章</a>），单卡时是普通循环，PP 时是 1F1B；<code class="inline">zero_grad_buffer</code> 证明梯度不是散在参数上的，而是住在 DDP 的连续 buffer 里（<a href="07-zero.html">第 7 章</a>）；<code class="inline">finalize_model_grads</code> 处理「梯度不是简单 all-reduce 就完事」的收尾——序列并行的 LN 梯度、TP 首尾阶段的嵌入梯度等（<a href="03-megatron-tp.html">第 3 章</a>）。</div>
+    <div class="annotation"><b>这几行里藏着三个角色：</b><code class="inline">forward_backward_func</code> 是流水线调度器（<a href="04-pp-1f1b.html">第 4 章</a>），单卡时是普通循环，PP 时是 1F1B；<code class="inline">zero_grad_buffer</code> 证明梯度不是散在参数上的，而是住在 DDP 的连续 buffer 里（<a href="07-zero.html">第 7 章</a>）；<code class="inline">finalize_model_grads</code> 处理「梯度不是简单 all-reduce 就完事」的收尾——序列并行的 LN 梯度、TP 首尾阶段的嵌入梯度等（<a href="03-megatron-tp.html">第 3 章</a>）。一处刻意的简化：摘录把 finalize 画在 train_step 尾部，实际源码里它在 forward_backward_func 内部（schedules.py 每条调度路径的收尾处）调用——位置不同，语义相同：调度器知道所有 micro-batch 何时跑完，由它收尾最自然。</div>
     <p>DeepSpeed 侧对应的是用户手里的三行：</p>
     <div class="code-title">用户训练循环 vs DeepSpeed 引擎（对比）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 普通 PyTorch              →   DeepSpeed</span>
 loss = model(batch)          →   loss = engine(batch)          <span class="cmt"># forward: 顺手挂钩子</span>
 loss.backward()              →   engine.backward(loss)         <span class="cmt"># 缩放 loss、触发 ZeRO 钩子</span>
 optimizer.step(); zero_grad()→   engine.step()                 <span class="cmt"># 只在 GAS 边界真更新</span></pre>
-    <div class="annotation"><b>逐行对应得上：</b>engine 的 <code class="inline">backward()</code> 里把 loss 除以 <code class="inline">gradient_accumulation_steps</code> 再 <code class="inline">loss.backward()</code>（<code class="inline">deepspeed/runtime/engine.py:3297</code>）；<code class="inline">step()</code>（engine.py:3482）先判断 <code class="inline">is_gradient_accumulation_boundary()</code>，非边界直接跳过更新。Megatron 的「一个 train_step 吃掉所有 micro-batch」与 DeepSpeed 的「用户自己循环调 backward、攒够 GAS 次」是同一件事的两种调度粒度。</div>
+    <div class="annotation"><b>逐行对应得上：</b>engine 的 <code class="inline">backward()</code> 里把 loss 除以 <code class="inline">gradient_accumulation_steps</code> 再 <code class="inline">loss.backward()</code>（<code class="inline">deepspeed/runtime/engine.py:3353</code>）；<code class="inline">step()</code>（engine.py:3538）先判断 <code class="inline">is_gradient_accumulation_boundary()</code>，非边界直接跳过更新。Megatron 的「一个 train_step 吃掉所有 micro-batch」与 DeepSpeed 的「用户自己循环调 backward、攒够 GAS 次」是同一件事的两种调度粒度。</div>
   </section>
 
   <section class="block">
@@ -245,7 +245,7 @@ optimizer.step(); zero_grad()→   engine.step()                 <span class="cm
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 01 总架构 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f · 所有引用代码路径以仓库最新为准
+  深入浅出 DeepSpeed · Megatron · 01 总架构 · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

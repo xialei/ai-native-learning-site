@@ -154,7 +154,7 @@
     )
     <span class="kw">return</span> block_tables, slot_mappings</pre>
     <p>到这里，每个请求的两张表都有了。还剩一步打包：把这些张量连同 <code class="inline">seq_lens</code>、区间切分等组装成 attention metadata，交给每个 attention 层。</p>
-    <p>交给谁？模型里 attention 层有几十个，但它们的 KV 布局规格并不都相同——普通全注意力的层和滑窗层块数不同，MLA 层的缓存形状也不同。vLLM 把「布局规格相同」的层归成一组（<code class="inline">kv_cache_group</code>，第 8 章会看到它是怎么分的），同一个组里的层用同一份 metadata、同一批物理块。于是 metadata 不用按层构建几十份，每个组构建一份、组内共享：</p>
+    <p>交给谁？模型里 attention 层有几十个，但它们的 KV 布局规格并不都相同——普通全注意力的层和滑窗层块数不同，MLA（Multi-head Latent Attention，DeepSeek 系把 KV 压缩到低秩潜向量再缓存的注意力，缓存形状因此与众不同）层的缓存形状也不同。vLLM 把「布局规格相同」的层归成一组（<code class="inline">kv_cache_group</code>，第 8 章会看到它是怎么分的），同一个组里的层用同一份 metadata、同一批物理块。于是 metadata 不用按层构建几十份，每个组构建一份、组内共享：</p>
     <div class="code-title">vllm/v1/worker/gpu/attn_utils.py — build_attn_metadata（每层绑定同一份 metadata 的部分）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> attn_group <span class="kw">in</span> attn_groups[i]:
     metadata = attn_metadata_builder.build(common_prefix_len=<span class="nu">0</span>,
@@ -183,24 +183,24 @@ self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} �
     <h3>限制：图的形状是死的，batch 是活的</h3>
     <p>CUDA graph 一旦录好，里面每个 kernel 的尺寸就固定了。而第 4 章的连续批处理意味着每个 step 的 batch 大小都在变——请求随时加入、退出。两件事要兼容，只有一个办法：把活 batch 补齐到某张图的尺寸再回放。</p>
     <p>具体做法：预先枚举一组「捕获尺寸」（<code class="inline">cudagraph_capture_sizes</code>，如 1、2、4、8、…直到最大批），batch 落在哪个区间，就补齐到该区间的上限。比如 50 个请求补到 56，多出来的 6 个槽位填上假 token——正是 5.2 里 <code class="inline">is_padding=True</code> 的来源。补的那几个 token 白算一点点计算，换回来的是整次前向只付一次启动开销，划算。</p>
-    <p>拿 5.2 的例子把这组尺寸和补齐算清楚。默认的捕获尺寸不是随便拍的——它是 <code class="inline">[1, 2, 4] + range(8, 256, 8) + range(256, 512 + 1, 16)</code>（源码：vllm/config/compilation.py:693 起的默认值文档，公式在 :699-700；上限默认 512，数据中心 Blackwell 卡可以到 1024）。展开开头一段就是：</p>
+    <p>拿 5.2 的例子把这组尺寸和补齐算清楚。默认的捕获尺寸不是随便拍的——它是 <code class="inline">[1, 2, 4] + range(8, 256, 8) + range(256, 512 + 1, 16)</code>（源码：vllm/config/compilation.py 的默认值文档（公式含在其中）；上限默认 512，数据中心 Blackwell 卡可以到 1024）。展开开头一段就是：</p>
     <div class="code-title">捕获尺寸数列（默认值展开）</div>
     <pre class="code"><span class="lang-tag">text</span>1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, ... , 256, 272, 288, ... , 512</pre>
     <p>于是「50 个请求」的去向一目了然：50 落在 48 和 56 之间，向上补齐到 <strong>56</strong>。这 6 个补出来的槽位：</p>
     <ul>
       <li><strong>身份</strong>：<code class="inline">is_padding=True</code>，<code class="inline">query_start_loc</code> 里相邻两个请求的起点差为 0——它们没有对应的真实请求；</li>
       <li><strong>输入</strong>：input_ids 填 0，position 填 0（5.2 的拼接规则对假 token 照样生效）；</li>
-      <li><strong>slot</strong>：分到 <code class="inline">PAD_SLOT_ID = -1</code>（源码：vllm/v1/attention/backends/utils.py:46），写入 KV 时会被后端跳过，不会污染任何真请求的缓存；</li>
-      <li><strong>输出</strong>：5.5 的 <code class="inline">logits_indices = query_start_loc[1:] - 1</code>（input_batch.py:175）只会挑出真实请求的末位——空请求长度为 0，不产生 logits，采样阶段根本看不到它们。</li>
+      <li><strong>slot</strong>：分到 <code class="inline">PAD_SLOT_ID = -1</code>（源码：vllm/v1/attention/backends/utils.py），写入 KV 时会被后端跳过，不会污染任何真请求的缓存；</li>
+      <li><strong>输出</strong>：5.5 的 <code class="inline">logits_indices = query_start_loc[1:] - 1</code>（input_batch.py）只会挑出真实请求的末位——空请求长度为 0，不产生 logits，采样阶段根本看不到它们。</li>
     </ul>
     <p>代价可以量化：56 个槽位里 6 个是假的，<strong>≈ 11% 的计算是白做的</strong>。但对比另一头——若不补齐，就得为 50 这一个形状单独录一张图，而请求数天天在 49、51、53 之间波动，等于为每种 batch 大小各录一张图，显存和启动时间都不允许。11% 的浪费买「任意 batch 都能整图回放」，这笔账是划算的。</p>
     <div class="annotation"><b>为什么 decode 单独一套尺寸：</b>decode 每步固定每请求 +1 token，形状种类少，枚举尺寸容易命中；prefill 每条请求新算的 token 数各不相同，attention 元数据每步都在变，整图录不动。所以 vLLM 给 decode 用「枚举尺寸 + 补齐」，prefill 和混合 batch 改走 PIECEWISE 分段图——机制在下面拆开。</div>
     <h3>prefill 的另一条路：PIECEWISE 分段图</h3>
-    <p>整图回放有个前提：图里每个 kernel 的尺寸和行为，录制时就定死了。uniform decode 做得到——每请求固定 +1 token，attention 要用的元数据光凭「请求数」就能构造好，捕获时照着录就行。prefill 和混合 batch 不行：每条请求新算的 token 数各不相同，元数据每步都在变。vLLM 的解法是把 attention 挪出图外：默认模式 <code class="inline">FULL_AND_PIECEWISE</code>（枚举定义在 vllm/config/compilation.py:53-59，:614 的文档写明它是 v1 默认值）让 decode 照旧录整图，prefill 和混合 batch 走分段图——用 torch.compile 把 forward 按 attention 算子切成几段，段内录小图，attention 留在段与段之间。整个过程一步一步看：</p>
+    <p>整图回放有个前提：图里每个 kernel 的尺寸和行为，录制时就定死了。uniform decode 做得到——每请求固定 +1 token，attention 要用的元数据光凭「请求数」就能构造好，捕获时照着录就行。prefill 和混合 batch 不行：每条请求新算的 token 数各不相同，元数据每步都在变。vLLM 的解法是把 attention 挪出图外：默认模式 <code class="inline">FULL_AND_PIECEWISE</code>（枚举定义在 vllm/config/compilation.py）让 decode 照旧录整图（枚举文档写明 v1 默认值），prefill 和混合 batch 走分段图——用 torch.compile 把 forward 按 attention 算子切成几段，段内录小图，attention 留在段与段之间。整个过程一步一步看：</p>
     <ul>
-      <li><strong>先编译</strong>：模型类挂 <code class="inline">@support_torch_compile</code>（vllm/compilation/decorators.py:120），torch.compile 拿着 <code class="inline">fullgraph=True</code> 把整条 forward 抓成一张计算图（vllm/compilation/wrapper.py:147）。</li>
-      <li><strong>再切段</strong>：torch.compile 的后端是 vLLM 自己写的，它在图上按 <code class="inline">splitting_ops</code> 切开（<code class="inline">split_graph</code>，vllm/compilation/backends.py:549，调用点 :1175）。默认切分点是一组 attention 自定义算子——第 7 章拆过的 <code class="inline">vllm::unified_attention_with_output</code> 就在名单里（<code class="inline">_attention_ops</code>，vllm/config/compilation.py:764，缺省在 :1160 生效）。attention 之间的普通计算（GEMM、归一化、激活）形状只由 token 总数决定，各自成段；attention 本体不编译、不录图，每次真跑。</li>
-      <li><strong>后录段</strong>：每个编译好的段包一层 <code class="inline">CUDAGraphWrapper</code>（vllm/compilation/backends.py:629），启动捕获时按 token 数逐段录成小图。段图的 key 只有 token 数、没有请求数——源码注释原话：「回放时不限制请求数，无需请求维度的补齐」（vllm/v1/worker/gpu/cudagraph_utils.py:347）。</li>
+      <li><strong>先编译</strong>：模型类挂 <code class="inline">@support_torch_compile</code>（vllm/compilation/decorators.py），torch.compile 拿着 <code class="inline">fullgraph=True</code> 把整条 forward 抓成一张计算图（vllm/compilation/wrapper.py）。</li>
+      <li><strong>再切段</strong>：torch.compile 的后端是 vLLM 自己写的，它在图上按 <code class="inline">splitting_ops</code> 切开（<code class="inline">split_graph</code>，vllm/compilation/backends.py，调用点在文件后段）。默认切分点是一组 attention 自定义算子——第 7 章拆过的 <code class="inline">vllm::unified_attention_with_output</code> 就在名单里（<code class="inline">_attention_ops</code>，vllm/config/compilation.py，缺省生效点在配置归一化）。attention 之间的普通计算（GEMM、归一化、激活）形状只由 token 总数决定，各自成段；attention 本体不编译、不录图，每次真跑。</li>
+      <li><strong>后录段</strong>：每个编译好的段包一层 <code class="inline">CUDAGraphWrapper</code>（vllm/compilation/backends.py），启动捕获时按 token 数逐段录成小图。段图的 key 只有 token 数、没有请求数——源码注释原话：「回放时不限制请求数，无需请求维度的补齐」（vllm/v1/worker/gpu/cudagraph_utils.py）。</li>
     </ul>
     <div class="code-title">一次 PIECEWISE 前向的执行序列（示意）</div>
     <pre class="code"><span class="lang-tag">text</span>model(**model_inputs)                <span class="cmt">← 编译后的 callable，本节开头的 else 分支</span>
@@ -212,7 +212,7 @@ self.graphs[desc] = graph              <span class="cmt"># {batch形状: 图} �
   └─ 段图 #N  最后的归一化 + 输出投影        <span class="cmt">← 回放</span></pre>
     <p>回头再看本节开头 else 分支那句「直接调 <code class="inline">model()</code>」——它不等于没有图。命中 PIECEWISE 时，<code class="inline">model()</code> 内部的小段照样回放，段与段之间各跑一次 attention。真正两级都落空的只剩一种情况：batch 的 token 数超过最大捕获尺寸（默认 512，Blackwell 数据中心卡 1024），段图也命中不了，才逐 kernel 启动——不过这时跑的已是 Inductor 编译优化过的 kernel，不是裸 eager。</p>
     <div class="annotation"><b>段图为什么不用按请求数枚举：</b>段里没有 attention，所有张量形状都由「token 总数」一个数决定；变长的部分被隔离在段与段之间，交给 eager 的 metadata 构建现算（就是 5.3 那两张表）。代价是每步要回放几十上百个段、每段之间再启动一次 attention——没省干净，但比逐算子 eager 快得多，而且只要 token 总数不超捕获上限，什么组合都接得住。</div>
-    <p>切段这件事还有一条实验路线：不在编译期切，而是录整图录到 attention 算子就地断开，让 attention eager 跑完，再接着录下一段（vllm/compilation/breakable_cudagraph.py:9-13，开关 VLLM_USE_BREAKABLE_CUDAGRAPH，默认关闭）。这个做法学的是 SGLang，源码注明 inspired by sgl-project/sglang#19102。</p>
+    <p>切段这件事还有一条实验路线：不在编译期切，而是录整图录到 attention 算子就地断开，让 attention eager 跑完，再接着录下一段（vllm/compilation/breakable_cudagraph.py，开关 VLLM_USE_BREAKABLE_CUDAGRAPH，默认关闭）。这个做法学的是 SGLang，源码注明 inspired by sgl-project/sglang#19102。</p>
   </section>
 
   <section class="block">
@@ -275,7 +275,7 @@ logits = self.model.<span class="fn">compute_logits</span>(sample_hidden_states)
 </div>
 
 <footer>
-  深入浅出vLLM · 05 Model Runner · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 05 Model Runner · 版本 v0.30.1rc0-311-g1fde8ff7da
 </footer>
 
 </body>

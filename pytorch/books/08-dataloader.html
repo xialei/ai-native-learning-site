@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · DataLoader — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a class="active" href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 DataLoader</div>
+    <h1>DataLoader：GPU 等数据的账，多进程怎么还</h1>
+    <div class="subtitle">训练慢的常见原因排第一的是数据供给。DataLoader 的多进程机制不复杂——worker 进程、几条队列、一个 pin 内存线程——但「为什么乱序不会发生」「为什么 num_workers 设错反而更慢」「shutdown 为什么慢」这三个问题的答案都在源码里。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>一笔账：不预取时 GPU 在干什么</h2>
+    <p>设一个 batch 的 GPU 计算是 100ms，数据准备（读图、解码、增广、拼接）也是 100ms。单进程同步加载的循环是：CPU 备数据 100ms → GPU 算 100ms → CPU 备下一份……GPU 一半时间在空转。DataLoader 的多进程 + 预取把这两段流水化：worker 进程提前备好若干 batch，主进程取的时候数据是现成的，理想情况 GPU 利用率翻倍。预取量就是 <code class="inline">prefetch_factor × num_workers</code> 个 batch（默认 factor=2）。</p>
+    <p>这个账同时给出了 <code class="inline">num_workers</code> 的调法：它决定的是「并行备数据的深度」，不是「数据准备的总速度」。数据准备本身是 CPU 密集的，worker 太多在 CPU 核数少的机器上互相争抢，反而拉长每个 batch 的就绪时间——「设错反而慢」的机制原因。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>进程结构与队列：一张图</h2>
+    <p>开 num_workers 后的完整结构，dataloader.py 里有一段 ASCII 注释画过，这里画成图：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t82 d82">
+        <title id="t82">DataLoader 多进程数据流</title>
+        <desc id="d82">主进程持有 _MultiProcessingDataLoaderIter，给每个 worker 一条 index_queue 发 batch 索引；每个 worker 跑 _worker_loop，取数据、collate 成 batch，把结果放进共享的 worker_result_queue。主进程若开 pin_memory，还有一个 pin_memory 线程从 worker_result_queue 取数据、拷进锁页内存、放入 data_queue；迭代器 next 从 data_queue 取出返回，按 rcvd_idx 序号消费。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="st" x="20" y="16" width="900" height="110" rx="10" stroke-dasharray="6 4"></rect>
+        <text class="lbl sm" x="36" y="38" font-weight="bold" fill="#165a7b">主进程</text>
+        <rect class="node acc" x="40" y="52" width="250" height="56" rx="8"></rect>
+        <text class="lbl" x="165" y="74" text-anchor="middle">训练循环 next(...)</text>
+        <text class="lbl code" x="165" y="92" text-anchor="middle">_MultiProcessingDataLoaderIter</text>
+
+        <rect class="node" x="620" y="52" width="280" height="56" rx="8"></rect>
+        <text class="lbl" x="760" y="74" text-anchor="middle">pin_memory 线程（可选）</text>
+        <text class="lbl sm" x="760" y="92" text-anchor="middle">结果拷进锁页内存再给 data_queue</text>
+
+        <line class="edge" x1="290" y1="80" x2="618" y2="80"></line>
+        <text class="lbl sm" x="455" y="70" text-anchor="middle">data_queue</text>
+
+        <rect class="st" x="20" y="180" width="900" height="200" rx="10" stroke-dasharray="6 4"></rect>
+        <text class="lbl sm" x="36" y="202" font-weight="bold" fill="#165a7b">worker 进程 × num_workers（各自独立）</text>
+
+        <rect class="node core" x="40" y="220" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="130" y="242" text-anchor="middle">worker 0</text>
+        <text class="lbl code" x="130" y="262" text-anchor="middle">_worker_loop</text>
+
+        <rect class="node core" x="380" y="220" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="470" y="242" text-anchor="middle">worker 1</text>
+        <text class="lbl code" x="470" y="262" text-anchor="middle">_worker_loop</text>
+
+        <rect class="node core" x="40" y="300" width="180" height="56" rx="8"></rect>
+        <text class="lbl" x="130" y="322" text-anchor="middle">worker 2</text>
+        <text class="lbl code" x="130" y="342" text-anchor="middle">_worker_loop</text>
+
+        <rect class="node" x="660" y="230" width="220" height="60" rx="8"></rect>
+        <text class="lbl" x="770" y="254" text-anchor="middle">worker_result_queue</text>
+        <text class="lbl sm" x="770" y="270" text-anchor="middle">共享结果队列（谁先算完谁先放）</text>
+
+        <line class="edge" x1="220" y1="248" x2="658" y2="255"></line>
+        <line class="edge" x1="220" y1="268" x2="658" y2="262"></line>
+        <line class="edge" x1="220" y1="330" x2="658" y2="280"></line>
+        <line class="edge back" x1="330" y1="178" x2="330" y2="120"></line>
+        <text class="lbl sm" x="345" y="140">index_queues：每个 worker 一条，发 batch 索引</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>worker 进程</span>
+        <span class="lg-item"><span class="sw acc"></span>主进程消费侧</span>
+        <span class="lg-item"><span class="sw"></span>线程</span>
+      </div>
+      <div class="fig-cap">图 8.1：num_workers=3 时的数据流。队列方向相反：index_queues 主进程 → worker（发任务，每个 worker 一条），worker_result_queue worker → 主进程（交结果，共享一条）；开 pin_memory 时中间再加一跳。worker 完成顺序和派发顺序无关，所以还需要乱序整理（8.3 节）。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>乱序怎么办：主进程怎么保证顺序</h2>
+    <p>worker 各自独立干活，谁先完成看运气，但训练必须按原 dataset 顺序消费（shuffle 的随机性在「发索引前」已经定了，worker 不能再改顺序）。解决方式是把「乱序生产」和「有序消费」拆开：派发的每个任务自带一个递增序号（_send_idx），worker 结果连同序号一起回来；主进程的 _next_data（<code class="inline">dataloader.py</code>）维护两个指针——<code class="inline">_send_idx</code>（下一个要派发的序号）和 <code class="inline">_rcvd_idx</code>（下一个要交付的序号）。先到的结果若序号不等于 _rcvd_idx，就暂存在 <code class="inline">_task_info</code> 字典里（源码注释原话「store out-of-order samples」，<code class="inline">dataloader.py</code>）；等于时才真正交给训练循环。所以即使 worker 1 比 worker 0 先完成，训练循环拿到的「第 k 个 batch」确实就是第 k 个。（构造参数里还有个 <code class="inline">in_order=False</code>会把这套等待关掉，换吞吐、牺牲顺序，docstring 明说可能影响可复现性。）</p>
+    <p>这条机制直接解释了一个高频问题：<strong>多 worker 时如何保证随机种子一致。</strong>worker 进程是 fork/spawn 出来的，随机状态若不处理，每个 worker 的增广序列会相同或错乱。DataLoader 的做法：迭代器启动时从 loader 的 generator 抽一个 <code class="inline">base_seed</code>，连同 worker_id 传进 _worker_loop；worker 侧（<code class="inline">_utils/worker.py</code>）执行 <code class="inline">seed = base_seed + worker_id</code>，给 random、torch、numpy 各设一份独立种子。「每个 epoch 换一次种子」靠的是每次新建迭代器时 base_seed 重新随机。用户侧的怪现象——「num_workers>0 时增广结果和单进程不一样」——九成是自己的 dataset 在 __getitem__ 里用了全局随机源而不是 per-worker 生成器。</p>
+    <div class="annotation"><b>为什么会乱序在先：</b>预取意味着「还没被消费的 batch 已在半路」。迭代器按 prefetch_factor × num_workers 控制在途任务量上限（_try_put_index，<code class="inline">dataloader.py</code>），完成顺序天然不确定。乱序不是缺陷而是并行的必然结果，消费端的「按序号暂存重排」才是设计。理解这一点后，「DataLoader 输出顺序错乱」类 bug 的排查方向就清楚了：先看是不是自定义 sampler 或 collate 打破了序号契约。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>关停为什么慢：shutdown 的设计</h2>
+    <p>训练结束或中断时，DataLoader 的收尾常被抱怨「卡几秒」。这不是意外，是刻意设计——dataloader.py 里有一大段 <code class="inline">NOTE [ Data Loader Multiprocessing Shutdown Logic ]</code>专门讲进程关停的取舍，核心约束抄一句：</p>
+    <div class="code-title">torch/utils/data/dataloader.py — shutdown 的首要目标（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt">#   1. The iterator gracefully exits the workers when its last reference is</span>
+<span class="cmt">#      gone or it is depleted.</span>
+<span class="cmt">#</span>
+<span class="cmt">#      In this case, the workers should be gracefully exited because the</span>
+<span class="cmt">#      main process may still need to continue to run, and we want cleaning</span>
+<span class="cmt">#      up code in the workers to be executed (e.g., releasing GPU memory).</span>
+<span class="cmt">#      Naturally, we implement the shutdown logic in `__del__` of</span>
+<span class="cmt">#      DataLoaderIterator.</span></pre>
+    <p>「优雅退出」意味着 worker 里的清理代码（释放 CUDA 上下文、关文件句柄）必须跑完；实现放在迭代器的 <code class="inline">__del__</code> 里，靠引用计数触发。三个后果：训练循环里 epoch 之间不重建迭代器能省下这收尾（值得做）；强制 kill 会有僵尸 worker 风险（队列里的半成品）；调试时卡在收尾，先看是不是某个 worker 卡在 I/O 上等主进程收尸。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      DataLoader 一章的三个落点：多进程买的是「数据准备与 GPU 计算重叠」，num_workers 是预取深度不是吞吐；乱序靠序号契约在消费端重排，随机行为要靠 per-worker 种子治理；shutdown 的慢是「优雅退出」的代价，epoch 间复用迭代器可以绕开。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="07-optimizer.html">← 上一章：优化器与 AMP</a>
+    <a href="09-dynamo.html">下一步：Dynamo →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 08 DataLoader · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

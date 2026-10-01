@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a class="active" href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <h1>整体架构：import torch 之后，你拿到的是什么</h1>
+    <div class="subtitle">每天敲 <code class="inline">import torch</code>，几秒后拿到一个会算梯度、能上 GPU 的库。这章拆开这几秒：Python 层加载了什么、真正的本体住在哪、torch / ATen / c10 三个目录怎么分工，以及为什么一个库要养出 1500 万行 C++。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">1.1</span>先说结论：Python 只是前厅</h2>
+    <p><code class="inline">torch/__init__.py</code> 有 3588 行，但它不是 PyTorch 的本体。本体是编译产物 <code class="inline">torch._C</code>——一个几十 MB 的 C++ 扩展模块，里面装着 tensor、算子、自动求导引擎的全部实现。<code class="inline">__init__.py</code> 干的核心事情只有一件：把这个扩展整个导进来，再往上面包一层 Python 皮。</p>
+    <div class="code-title">torch/__init__.py — import 时的加载路径（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>    old_flags = sys.getdlopenflags()
+    sys.setdlopenflags(os.RTLD_GLOBAL | os.RTLD_LAZY)
+
+    <span class="kw">from</span> torch._C <span class="kw">import</span> *  <span class="cmt"># noqa: F403</span>
+
+    sys.setdlopenflags(old_flags)
+    <span class="kw">del</span> old_flags
+
+<span class="kw">else</span>:
+    <span class="cmt"># Easy way.  You want this most of the time, because it will prevent</span>
+    <span class="cmt"># C++ symbols from libtorch clobbering C++ symbols from other</span>
+    <span class="cmt"># libraries, leading to mysterious segfaults.</span>
+    <span class="kw">if</span> USE_GLOBAL_DEPS:
+        _load_global_deps()
+    <span class="kw">from</span> torch._C <span class="kw">import</span> *  <span class="cmt"># noqa: F403</span></pre>
+    <p><code class="inline">from torch._C import *</code> 之后，你的 Python 进程里多出了几千个 C 函数和 C++ 类的绑定。<code class="inline">torch.add</code>、<code class="inline">torch.Tensor</code>、<code class="inline">torch.nn.functional.linear</code> 之下的实现，全在这个命名空间里。Python 文件后来做的都是包装：<code class="inline">torch/nn/</code> 在 <code class="inline">Module</code> 上加注册树和 hook，<code class="inline">torch/optim/</code> 在 C++ 更新算子外加参数分组，<code class="inline">torch/autograd/</code> 给 <code class="inline">backward()</code> 递参数。层数不深，但每层都有存在理由，后面各章挨个进。</p>
+    <div class="annotation"><b>为什么加载要动 dlopen flags：</b>torch 的 C++ 扩展依赖一堆第三方库（MKL、libstdc++……）。<code class="inline">RTLD_GLOBAL</code> 分支把这些符号提前以全局可见的方式装好，否则某些环境下 MKL 链接不上或出现重复加载。注释里两次提到 <em>mysterious segfaults</em>——这是加载顺序问题的典型症状，官方把两种模式都留着，默认走安全的那条。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.2</span>加载失败的报错，暴露了目录结构</h2>
+    <p>如果扩展没编好，<code class="inline">import torch</code> 会先试着导入一个哨兵符号，失败后给出一段很具体的报错。这段报错值得整段抄下来，因为它顺手指出了 PyTorch 仓库的一个坑：</p>
+    <div class="code-title">torch/__init__.py — 加载失败的引导（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Check to see if we can load C extensions, and if not provide some guidance</span>
+<span class="cmt"># on what the problem might be.</span>
+<span class="kw">try</span>:
+    <span class="cmt"># _initExtension is chosen (arbitrarily) as a sentinel.</span>
+    <span class="kw">from</span> torch._C <span class="kw">import</span> _initExtension
+<span class="kw">except</span> <span class="cl">ImportError</span>:
+    <span class="kw">import</span> torch._C <span class="kw">as</span> _C_for_compiled_check
+
+    <span class="kw">if</span> _C_for_compiled_check.__file__ <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">raise</span> <span class="cl">ImportError</span>(
+            textwrap.dedent(
+                <span class="st">"""
+                Failed to load PyTorch C extensions:
+                    It appears that PyTorch has loaded the `torch/_C` folder
+                    of the PyTorch repository rather than the C extensions which
+                    are expected in the `torch._C` namespace. ...
+                """</span>
+            ).strip()
+        ) <span class="kw">from</span> <span class="kw">None</span></pre>
+    <div class="annotation"><b>报错在防什么：</b>torch 的源码目录里真有个 <code class="inline">torch/_C/</code> 文件夹（存 C++ 辅助源码和声明）。如果你在仓库根目录下直接 <code class="inline">import torch</code>，Python 会把那个文件夹当成 <code class="inline">torch._C</code> 模块——一个没有 <code class="inline">__file__</code> 的命名空间包，随后所有功能全部失灵。于是 <code class="inline">__init__.py</code> 特意检查 <code class="inline">__file__ is None</code> 来识别这种情形。<strong>读源码的第一课：别站在仓库根目录跑 Python。</strong></div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.3</span>三层目录：c10、ATen、torch</h2>
+    <p>进到 C++ 侧，仓库顶层两个目录撑起了全部核心代码，第三个 <code class="inline">torch/csrc/</code> 是 Python 绑定层。它们是三层，不是三份平行代码——下层不知道上层存在，上层依赖下层。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t13 d13">
+        <title id="t13">PyTorch 三层核心结构</title>
+        <desc id="d13">四层结构：L1 用户 API（torch.Tensor、nn.Module、optim、dataloader）；L2 Python 绑定（torch/csrc，把 C++ 类包成 Python 对象）；L3 算子库 ATen（aten/src/ATen：native_functions.yaml 声明约 2600 个算子，Dispatcher 分发，各后端 kernel 实现，autograd 生成反向）；L4 基础库 c10（TensorImpl/StorageImpl 元信息、DispatchKey、设备抽象）。依赖只向上：c10 不依赖任何人，ATen 依赖 c10，绑定层依赖 ATen。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="20" y="20" width="900" height="86" rx="10"></rect>
+        <text class="lbl" x="40" y="46" font-weight="bold" fill="#165a7b">L1 · 用户 API（Python）</text>
+        <rect class="node acc" x="40" y="56" width="180" height="36" rx="6"></rect>
+        <text class="lbl" x="130" y="79" text-anchor="middle">torch.Tensor</text>
+        <rect class="node acc" x="234" y="56" width="180" height="36" rx="6"></rect>
+        <text class="lbl" x="324" y="79" text-anchor="middle">nn.Module / optim</text>
+        <rect class="node acc" x="428" y="56" width="180" height="36" rx="6"></rect>
+        <text class="lbl" x="518" y="79" text-anchor="middle">DataLoader / compile</text>
+        <text class="lbl sm" x="630" y="79">torch/ 目录下的 Python 包装</text>
+
+        <rect class="node" x="20" y="126" width="900" height="96" rx="10"></rect>
+        <text class="lbl" x="40" y="152" font-weight="bold" fill="#165a7b">L2 · Python 绑定（torch/csrc/）</text>
+        <rect class="node" x="40" y="160" width="260" height="46" rx="6"></rect>
+        <text class="lbl" x="170" y="184" text-anchor="middle">Module.cpp：模块初始化</text>
+        <rect class="node" x="314" y="160" width="270" height="46" rx="6"></rect>
+        <text class="lbl" x="449" y="178" text-anchor="middle">python_variable.cpp</text>
+        <text class="lbl sm" x="449" y="194" text-anchor="middle">TensorImpl ↔ PyObjects</text>
+        <rect class="node" x="598" y="160" width="302" height="46" rx="6"></rect>
+        <text class="lbl" x="749" y="184" text-anchor="middle">代码生成的 python_* 绑定</text>
+
+        <rect class="node core" x="20" y="242" width="900" height="110" rx="10"></rect>
+        <text class="lbl" x="40" y="268" font-weight="bold" fill="#165a7b">L3 · 算子库（aten/src/ATen/）</text>
+        <rect class="node core" x="40" y="276" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="140" y="294" text-anchor="middle">native_functions.yaml</text>
+        <text class="lbl sm" x="140" y="310" text-anchor="middle">~2600 个算子声明</text>
+        <rect class="node core" x="254" y="276" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="354" y="294" text-anchor="middle">Dispatcher</text>
+        <text class="lbl sm" x="354" y="310" text-anchor="middle">选实现（03 章）</text>
+        <rect class="node core" x="468" y="276" width="200" height="46" rx="6"></rect>
+        <text class="lbl" x="568" y="294" text-anchor="middle">native/ 各后端 kernel</text>
+        <text class="lbl sm" x="568" y="310" text-anchor="middle">CPU / CUDA / Meta…</text>
+        <rect class="node core" x="682" y="276" width="218" height="46" rx="6"></rect>
+        <text class="lbl" x="791" y="294" text-anchor="middle">autograd（生成代码）</text>
+        <text class="lbl sm" x="791" y="310" text-anchor="middle">图记录 + 反向（04/05）</text>
+
+        <rect class="node" x="20" y="372" width="900" height="78" rx="10"></rect>
+        <text class="lbl" x="40" y="398" font-weight="bold" fill="#165a7b">L4 · 基础库（c10/）— 不依赖任何上层</text>
+        <text class="lbl sm" x="40" y="416">TensorImpl / StorageImpl（02 章）· DispatchKey（03 章）· Device / Stream / Allocator 接口</text>
+
+        <line class="edge" x1="470" y1="106" x2="470" y2="124"></line>
+        <line class="edge" x1="470" y1="222" x2="470" y2="240"></line>
+        <line class="edge" x1="470" y1="352" x2="470" y2="370"></line>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>核心机制（书的前五章）</span>
+        <span class="lg-item"><span class="sw acc"></span>Python 可见面</span>
+        <span class="lg-item"><span class="sw"></span>支撑组件</span>
+      </div>
+      <div class="fig-cap">图 1.3：三层 C++ 结构。c10 = core tensor library 的缩写，最底下、最薄、被所有人依赖；ATen = "A Tensor library"，算子全在这；torch/csrc 做的事只有一件——把 C++ 对象包成 Python 能摸的东西。依赖方向单一向上，所以读源码可以从 c10 开始一路向上，不会被反向依赖打断。</div>
+    </div>
+    <p>三层里最出人意料的是最底下那层有多小。c10 全目录不过几万行 C++，装的都是「tensor 是什么」这类定义；ATen 占大头，算子实现和调度机制全在这；torch/csrc 是粘合层，Python 看到的每一个类都是从这里 <code class="inline">PyTypeObject</code> 出来的。也就是说，整个 PyTorch 的「难」，集中在 ATen 这一层——而它恰恰是 Python 用户完全看不见的那层。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.4</span>1500 万行代码，从哪读起</h2>
+    <p>pytorch/pytorch 仓库现在约 1500 万行代码（含第三方与生成文件），核心目录大致 600 万行。听起来没法下手的体量，但有三个事实会大幅缩小实际需要读的范围。</p>
+    <p><strong>第一，一大半是生成物。</strong>很多文件在仓库里存在，却不是人写的——构建时由模板生成。最大的源头是两份 YAML：</p>
+    <div class="annotation"><b>先看两个生成源头：</b>仓库里有两份 YAML 是最多生成代码的源头，规模如下（2026-09-29，trunk 5eb6d3d36b2 实测）：</div>
+    <table class="tbl">
+      <tr><th>文件</th><th>行数</th><th>内容</th><th>生成什么</th></tr>
+      <tr><td>aten/src/ATen/native/native_functions.yaml</td><td>16261 行</td><td>2590 个算子的签名声明</td><td>Python 绑定、dispatcher 注册、各后端的代码生成</td></tr>
+      <tr><td>tools/autograd/derivatives.yaml</td><td>3307 行</td><td>696 条反向规则</td><td>autograd 的反向函数代码（04 章）</td></tr>
+    </table>
+    <div class="annotation"><b>生成物怎么读：</b>遇到 <code class="inline">build/aten/src/ATen/…</code> 之类的路径不用点进去，那里都是机器产物。要找某个算子的真实实现，去 <code class="inline">aten/src/ATen/native/</code> 下按名字搜；要问「这个算子的反向怎么算」，去 derivatives.yaml 搜算子名。第 3、4 章会分别拆这两条生成链。</div>
+    <p><strong>第二，Python 层只有薄薄一层。</strong>所有 <code class="inline">.py</code> 加起来不到 C++ 的零头，而且大多是包装：真正的数学没有一个字节在 Python 里发生。</p>
+    <p><strong>第三，目录就是依赖图。</strong>第 1.3 节那张图反过来就是阅读顺序——c10 的 tensor 定义（第 2 章）→ ATen 的 dispatch（第 3 章）→ torch/csrc 的绑定 → Python 侧的 nn/optim（第 6、7 章）。顺着依赖方向走，每一步都有前面打好的底。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">1.5</span>张量、算子、图：三个词的定义先立住</h2>
+    <p>后面所有章节都建立在这三个概念上，先把它们用一句话立住，细节留到各章。</p>
+    <table class="tbl">
+      <tr><th>概念</th><th>一句话定义</th><th>细节在哪</th></tr>
+      <tr><td>Tensor（张量）</td><td>一个多维数组，拆成三块存：元信息（TensorImpl）、数据（StorageImpl）、版本号（VariableVersion）</td><td>第 2 章</td></tr>
+      <tr><td>op（算子）</td><td>一个可调用的数学操作，声明在 native_functions.yaml，按 tensor 的能力标签分发到具体实现</td><td>第 3 章</td></tr>
+      <tr><td>graph（计算图）</td><td>前向执行时自动记录的「反向执行计划」，每个算子贡献一个节点</td><td>第 4 章</td></tr>
+    </table>
+    <p>有一个顺序值得强调：PyTorch 是「动态图」框架，这句话在源码里对应一个非常具体的动作——<strong>图不是先定义后执行，而是在算子执行的那一瞬间，由 dispatcher 顺手记录的。</strong>理解了这一点，「eager 模式」「define-by-run」这些词就都有了着落：第 3 章看 dispatch 怎么顺手挂上记录，第 4 章看记录下来的是什么，第 5 章看记录的东西怎么被多线程执行。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      import 只是把 C++ 扩展抬进 Python；之后你敲的每行张量代码都走同一条路——Python 绑定 → dispatcher → ATen kernel。第 2 章从这条路的尽头开始：tensor 本身长什么样。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a class="dim" href="index.html">← 返回索引</a>
+    <a href="02-tensor.html">下一步：Tensor 内部 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 01 整体架构 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

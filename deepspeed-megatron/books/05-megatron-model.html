@@ -82,12 +82,12 @@
     packed_seq_params: <span class="cl">PackedSeqParams</span> = <span class="kw">None</span>,  <span class="cmt"># 变长序列打包（THD 格式）</span>
     ...,
 ):</pre>
-    <div class="annotation"><b>签名里有两个训练时用不上的参数，但它们正好暴露了并行结构：</b><code class="inline">decoder_input</code>——PP 非首阶段不需要 embedding 输出，直接以「上一阶段传来的激活」为输入（首阶段则先过 <code class="inline">embedding</code>）；<code class="inline">packed_seq_params</code>——变长 packing 后的段边界信息，配合 FA2 的 varlen 路径；还有 <code class="inline">inference_context</code>——推理时携带 KV cache 状态。训练主路径里它们多半为 None，但签名本身就是 3D 并行下的输入全景。</div>
+    <div class="annotation"><b>签名里有两个训练时用不上的参数，但它们正好暴露了并行结构：</b><code class="inline">decoder_input</code>——PP 非首阶段不需要 embedding 输出，直接以「上一阶段传来的激活」为输入（首阶段则先过 <code class="inline">embedding</code>）；<code class="inline">packed_seq_params</code>——变长 packing 后的段边界信息，配合 FA2 的 varlen 路径；还有 <code class="inline">inference_context</code>——推理时携带 KV cache 状态。训练主路径里它们多半为 None，但签名本身就列全了 3D 并行下要传的输入。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.3</span>混合精度包裹：Float16Module</h2>
-    <p>下一个问题关于精度：权重、梯度、master 权重、loss scale，各属于哪一层？直觉上「模型用 fp16 训练」就是模型自己的事——但 Megatron 把它拆成了三处：cast 在模型外壳、master 权重在 optimizer、缩放也在 optimizer。边界划错了，自研时就会出现「两边都做一遍缩放」这类静默错误。看代码：</p>
+    <p>下一个问题关于精度：权重、梯度、master 权重、loss scale，各属于哪一层？直觉上「模型用 fp16 训练」就是模型自己的事——但 Megatron 把它拆成了三处：cast 在最外层的包裹模块、master 权重在 optimizer、缩放也在 optimizer。边界划错了，自研时就会出现「两边都做一遍缩放」这类静默错误。看代码：</p>
     <div class="code-title">megatron/core/transformer/module.py — Float16Module（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Float16Module</span>(torch.nn.Module):
     <span class="st">"""Wrap the module with fp16/bf16 conversion in forward pass"""</span>
@@ -104,7 +104,7 @@
   <section class="block">
     <h2><span class="num">5.4</span>数据管线：组内同批、DP 间不重叠</h2>
     <p>并行组内各卡吃什么？3D 并行下数据加载有两个特殊要求：同一 TP/PP/CP 组内各卡必须拿到<strong>同一批样本</strong>（它们在算同一个模型的同一段）；不同 DP 副本拿到<strong>不重叠的样本</strong>。还有一条更隐蔽的：TP/PP 到底进不进 batch 公式？看代码怎么用 rank 算偏移：</p>
-    <div class="code-title">megatron/training/data_samplers.py — MegatronPretrainingSampler.__iter__（摘录，译注）</div>
+    <div class="code-title">megatron/training/datasets/data_samplers.py — MegatronPretrainingSampler.__iter__（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__iter__(self)</span>:
     batch = []
     <span class="cmt"># start/end 由 consumed_samples + 全局 batch 推出；组内各卡算出同一个区间</span>
@@ -113,7 +113,7 @@
         <span class="kw">if</span> len(batch) == self.micro_batch_times_data_parallel_size:
             <span class="kw">yield</span> batch[batch_start:batch_end]  <span class="cmt"># 每张 DP 卡切走自己的 microbatch</span>
             batch = []</pre>
-    <div class="annotation"><b>批大小公式：</b><strong>global batch = micro_batch × DP × grad_accum</strong>。TP/PP/CP 不影响全局 batch——它们切的是模型不是数据。采样器一次产出的区间覆盖整个 DP 组（micro_batch_times_data_parallel_size），再按 DP rank 切走各自那份。这行公式是新手最常搞错的地方：把 micro_batch × TP 误当成全局 batch，然后困惑「loss 曲线和论文对不上」。</div>
+    <div class="annotation"><b>批大小公式：</b><strong>global batch = micro_batch × DP × grad_accum</strong>。TP/PP/CP 都不影响全局 batch——TP/PP 切的是模型不是数据；CP 切的是序列，但 CP 组内各卡拿同一批样本各看一段，样本总量不变。采样器一次产出的区间覆盖整个 DP 组（micro_batch_times_data_parallel_size），再按 DP rank 切走各自那份。这行公式是新手最常搞错的地方：把 micro_batch × TP 误当成全局 batch，然后困惑「loss 曲线和论文对不上」；CP 侧的误区则相反——以为切了序列就算更多数据，其实 CP 组内各卡拿的是同一批样本，全局 batch 里没有 CP 的位置。</div>
   </section>
 
   <section class="block">
@@ -158,7 +158,7 @@
 
         <rect class="node acc" x="560" y="44" width="330" height="64" rx="8"></rect>
         <text class="lbl code" x="725" y="70" text-anchor="middle">global = micro × DP × grad_accum</text>
-        <text class="lbl sm" x="725" y="90" text-anchor="middle">TP/PP 不进这条公式；CP 加入后乘上 CP</text>
+        <text class="lbl sm" x="725" y="90" text-anchor="middle">TP/PP 不进这条公式；CP 切序列维，同样不进</text>
 
         <line x1="40" y1="152" x2="900" y2="152" stroke="var(--fg-muted)" stroke-dasharray="4 5" stroke-width="1"></line>
 
@@ -208,13 +208,13 @@
         <text class="lbl sm" x="700" y="394">因果注意力载荷是三角形，</text>
         <text class="lbl sm" x="700" y="410">首尾配对让每卡合计工作量相等</text>
       </svg>
-      <div class="fig-cap">图 5.1：一个 batch 的三条切分轴。batch 维归 DP（进 global batch 公式），模型维归 TP/PP（模型代码全程透明），序列维归 CP（zigzag 配对）。CP 本质上是第二种数据切分，所以它进 batch 公式；TP/PP 切的是模型，永远不进。</div>
+      <div class="fig-cap">图 5.1：一个 batch 的三条切分轴。batch 维归 DP（进 global batch 公式），模型维归 TP/PP（模型代码全程透明），序列维归 CP（zigzag 配对）。CP 虽然也切数据，但组内各卡共享同一批样本、各拿一段序列，全局 batch 不变——所以它和 TP/PP 一样不进 batch 公式。</div>
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.6</span>小结 + 自研启示</h2>
-    <p>本章的四个问题各有各的答案，但核心就两句：并行透明靠「算子类即切分点」——换并行度等于换构造参数，模型代码不动；精度边界拆成三处——cast 在 Float16Module 外壳，master 权重与缩放都在 optimizer，模型内部只存 params_dtype。数据侧的规则是一条公式——global batch = micro_batch × DP × grad_accum，TP/PP 永远不进这条公式；CP 切序列走 zigzag 配对，每卡拿「第 i 段 + 对称尾段」，tokens/position_ids/labels 三个 key 必须同步切。五个部件归拢成一张表：</p>
+    <p>本章的四个问题各有各的答案，但核心就两句：并行透明靠「算子类即切分点」——换并行度等于换构造参数，模型代码不动；精度边界拆成三处——cast 在 Float16Module 这层包裹里，master 权重与缩放都在 optimizer，模型内部只存 params_dtype。数据侧的规则是一条公式——global batch = micro_batch × DP × grad_accum，TP/PP 永远不进这条公式；CP 切序列走 zigzag 配对，每卡拿「第 i 段 + 对称尾段」，tokens/position_ids/labels 三个 key 必须同步切。五个部件归拢成一张表：</p>
     <table class="tbl">
       <tr><th>部件</th><th>切分方式</th><th>关键机制</th></tr>
       <tr><td>TransformerLayer</td><td>TP 切分写进构造参数</td><td>build_module + submodules</td></tr>
@@ -236,7 +236,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 05 模型与数据 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f · 所有引用代码路径以仓库最新为准
+  深入浅出 DeepSpeed · Megatron · 05 模型与数据 · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

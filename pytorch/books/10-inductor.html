@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · Inductor 与 AOTAutograd — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a class="active" href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 Inductor 与 AOTAutograd</div>
+    <h1>Inductor：图怎么变成 Triton kernel</h1>
+    <div class="subtitle">Dynamo 交出前向图之后，编译管线还剩三站：AOTAutograd 把图拆成前向+反向（顺带决定哪些中间值留着、哪些重算），Inductor 的 Scheduler 把算子融合成大 kernel，最后生成 Triton 代码并 autotune。这章按执行顺序走一遍，重点讲两个决定性能的机制：min-cut 分区和算子融合。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>管线总览：compile_fx 的自述</h2>
+    <p>整个管线的入口是 compile_fx（<code class="inline">torch/_inductor/compile_fx.py</code>），主函数 _compile_fx_main 的 docstring 就是最好的目录导览，原文照抄：</p>
+    <div class="code-title">torch/_inductor/compile_fx.py — 管线步骤自述（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>    <span class="st">"""
+    Main part of compile_fx, called after wrapping is done.
+
+    Roughly speaking, here the steps will be:
+    (1) apply pre-grad passes
+    (2) create `fw_compiler` and `bw_compiler` functions out of `inner_compile`
+    (3) call aot_autograd, which:
+    - (3a) creates a joint graph with `decompositions`,
+    - (3b) partitions it with `partition_fn` into fw and bw graphs (applying joint-graph passes),
+    - (3c) calls `fw_compiler` and `bw_compiler` on those graphs (applying post-grad passes)
+    - (3d) finally, assembles the fw and bw compiled functions back together and returns.
+    """</span></pre>
+    <p>读法：先把前向图做一遍预处理（归并冗余、规范化），然后构造「前向编译器」和「反向编译器」两个回调，最后交给 AOTAutograd 去拆图——拆出来的两张图分别交给那两个回调（也就是 Inductor）编译，编完再拼回一个可调用的整体。docstring 里的 (3a)–(3d) 就是 AOTAutograd 内部的四步，10.2 讲其中的分区分步。下面的图把整条线画出来：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t101 d101">
+        <title id="t101">torch.compile 编译管线</title>
+        <desc id="d101">编译管线五站：Dynamo 产出 FX 图；pre-grad pass 规范化；AOTAutograd 先建联合图（前向+反向公式在内）、再用 min-cut 分区切成前向图与反向图、决定每个中间值的去向（保留或重算）；两张图分别进入 Inductor 的 Scheduler（融合）、代码生成（Triton/C++）、autotune 与缓存；产物是可直接调用的编译函数，guards 决定何时复用。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="30" y="60" width="150" height="70" rx="8"></rect>
+        <text class="lbl" x="105" y="86" text-anchor="middle">Dynamo</text>
+        <text class="lbl sm" x="105" y="106" text-anchor="middle">字节码 → FX 图（09）</text>
+
+        <rect class="node" x="220" y="60" width="160" height="70" rx="8"></rect>
+        <text class="lbl" x="300" y="86" text-anchor="middle">pre-grad pass</text>
+        <text class="lbl sm" x="300" y="106" text-anchor="middle">图规范化/清理</text>
+
+        <rect class="node core" x="420" y="40" width="220" height="110" rx="8"></rect>
+        <text class="lbl" x="530" y="66" text-anchor="middle">AOTAutograd</text>
+        <text class="lbl sm" x="530" y="86" text-anchor="middle">联合图 → min-cut 切分</text>
+        <text class="lbl sm" x="530" y="104" text-anchor="middle">前向图 + 反向图</text>
+        <text class="lbl sm" x="530" y="122" text-anchor="middle">决定保存/重算（10.2）</text>
+
+        <rect class="node core" x="680" y="20" width="230" height="80" rx="8"></rect>
+        <text class="lbl" x="795" y="44" text-anchor="middle">Inductor（前向）</text>
+        <text class="lbl sm" x="795" y="62" text-anchor="middle">Scheduler 融合 → Triton</text>
+        <text class="lbl sm" x="795" y="80" text-anchor="middle">autotune + 缓存</text>
+
+        <rect class="node core" x="680" y="120" width="230" height="80" rx="8"></rect>
+        <text class="lbl" x="795" y="144" text-anchor="middle">Inductor（反向）</text>
+        <text class="lbl sm" x="795" y="162" text-anchor="middle">同一套管线</text>
+        <text class="lbl sm" x="795" y="180" text-anchor="middle">产物含梯度回调</text>
+
+        <line class="edge" x1="180" y1="95" x2="218" y2="95"></line>
+        <line class="edge" x1="380" y1="95" x2="418" y2="95"></line>
+        <line class="edge" x1="640" y1="70" x2="678" y2="60"></line>
+        <line class="edge" x1="640" y1="120" x2="678" y2="160"></line>
+
+        <rect class="node ok" x="420" y="200" width="490" height="60" rx="8"></rect>
+        <text class="lbl" x="665" y="224" text-anchor="middle">编译产物：一组可直接调用的 Python/模块</text>
+        <text class="lbl sm" x="665" y="244" text-anchor="middle">运行时按 guards 决定复用哪份（09 章的缓存语义）</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>图变换阶段</span>
+        <span class="lg-item"><span class="sw ok"></span>产物</span>
+      </div>
+      <div class="fig-cap">图 10.1：compile(backend="inductor") 的完整管线。值得注意的分工细节：AOTAutograd 是「图怎么拆、存什么」的策略层，Inductor 是「图怎么跑得快」的执行层——两者可以独立替换（compile(backend=...) 换的是 Inductor 一侧）。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>min-cut 分区：保存还是重算</h2>
+    <p>训练编译要回答一个 eager 模式不存在的问题：反向需要前向的中间值（比如 relu 的输出），编译后的前向是把它们全存下来（占显存），还是反向时重算（占算力）？答案因值而异，而「哪些存哪些算」的最优解是一个图论问题——在联合图上找最小割：</p>
+    <div class="code-title">torch/_functorch/partitioners.py — min_cut_rematerialization_partition 签名与 docstring（摘录，省略号与注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">min_cut_rematerialization_partition</span>(
+    joint_module: fx.GraphModule,
+    _joint_inputs: Any,
+    compiler: str = <span class="st">"inductor"</span>,
+    *,
+    num_fwd_outputs: int,
+    ...):
+    <span class="st">"""
+    Partitions the joint graph such that the backward recomputes the forward.
+    Recomputing helps in trading off memory bandwidth with computation.
+    """</span></pre>
+    <p>机制直说：把「前向计算代价」「显存保存代价」「重算代价」建模成图的边权，跑最小割算法，割线把节点分成「必须保存」和「反向重算」两堆。大矩阵乘这类重算代价高的留保存，逐元素小算子（relu、norm 的中间态）重算便宜就砍掉。docstring 里 "trading off memory bandwidth with computation" 说的就是这笔交换。eager 模式做不到这个粒度——它只有「全存」这一个选项（激活检查点 activation checkpointing 是手工版的粗粒度重算，第 13 章对照）。</p>
+    <div class="annotation"><b>一处演进痕迹：</b>联合图的「反向公式」不是现成的反向图，而是把 04 章那套 derivatives.yaml 生成的规则应用到图上得到的大图——先合再拆，才有全局最优。「先联合后切分」是 AOTAutograd 区别于「前向反向分别编译」的关键一步。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>Scheduler：融合怎么发生</h2>
+    <p>拿到前向（或反向）图后，Inductor 的第一件大事是排程。Scheduler（<code class="inline">torch/_inductor/scheduler.py</code>）把每个算子变成调度节点（SchedulerNode），分析它们对内存的读写依赖，把「读同一块缓冲、逐元素操作」的相邻节点合并成一个 FusedSchedulerNode——这就是融合。融合的收益链是：一次 kernel launch 替代多次（省启动开销），中间结果留在寄存器/共享内存不落显存（省带宽）。</p>
+    <p>融合的边界也由依赖决定：两个算子若一个要读另一个的「全部历史」（比如 reduction 求和后再归一化），硬融合会破坏并行性，Scheduler 会拆开。最终排出的「组」就是 Triton kernel 的边界——图里一个 op 不对应一个 kernel，一组 op 对应一个 kernel，这是编译路径和 eager 路径在微观结构上的本质区别。</p>
+    <div class="callout info">
+      <b class="tag">关联</b>
+      矩阵乘这类大算子不参与逐元素融合，但有自己的选型层：tuned_mm（<code class="inline">kernel/mm.py</code>，lowering for autotuning aten.mm）会在 Aten、Triton、CUTLASS 等实现间做自动选择。看到的 profile 里 "triton_mm" 还是 "cutlass" 就由这一层决定。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>autotune 与编译缓存</h2>
+    <p>Triton 代码生成后还有一个「选参数」步骤：block 大小、循环展开数等配置影响性能且无解析最优解。CachingAutotuner（<code class="inline">runtime/triton_heuristics.py</code>）的做法是穷举候选配置真实跑一遍（benchmark_all_configs，:1821）取最快——这就是第一次运行 compile 慢的主要原因之一，也是 benchmark 模式下必须 warmup 的原因。</p>
+    <p>编译产物的两级缓存把这笔一次性的贵费用摊平：FxGraphCache（<code class="inline">codecache.py</code>）缓存「整张图的编译结果」，key 是图内容 + 相关配置的哈希——同一个模型第二次启动、或多个 rank 编同一张图，直接命中；Triton kernel 级缓存再往下管一层。缓存的 guard 语义与 09 章一致：环境变了（驱动、架构、配置）缓存失效重编。</p>
+    <div class="annotation"><b>分布式训练里的一个实用细节：</b>多卡启动时所有 rank 会各自编一遍同样的图。FxGraphCache 是文件级缓存，理论上有进程间共享的可能，但实际多机各存各的——因此「编译时间」在大规模启动里是全体 rank 同时付出的。torch.compile 的 warmup 优化（异步编译、编译调度）就是冲着这段墙钟时间去的，async_compile（<code class="inline">torch/_inductor/async_compile.py</code>）把编译任务丢进子进程并行做。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.5</span>把账算完：编译收益从哪来</h2>
+    <p>把 09、10 两章合起来算一次账。torch.compile 相对 eager 的收益，来自四个互相独立的来源，profile 里都能各自验证：</p>
+    <table class="tbl">
+      <tr><th>来源</th><th>机制</th><th>典型占比</th></tr>
+      <tr><td>kernel 融合</td><td>Scheduler 合并逐元素算子，省启动 + 省中间落盘</td><td>小算子多的模型最大头</td></tr>
+      <tr><td>重算换显存</td><td>min-cut 分区砍掉保存，减少带宽压力</td><td>显存吃紧时显著</td></tr>
+      <tr><td>去掉 Python 开销</td><td>整段图一次执行，无逐 op 的解释器/dispatch 开销</td><td>小 batch、小模型时最大头</td></tr>
+      <tr><td>autotune</td><td>每个 kernel 现场选配置</td><td>计算密集算子上的稳定小赚</td></tr>
+    </table>
+    <p>四个来源互相独立意味着：收益不是均匀的。大模型大 batch 训练时第 3 行几乎为零（本来就是 GPU 密集），主要赚第 1、2 行；小模型推理时第 3 行是全部。理解这点，再看「compile 到底快多少」的各种实测数字就不会困惑——它们测的是不同来源的组合。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      Inductor 一章的两根支柱：min-cut 分区决定「存还是算」（显存侧），Scheduler 融合决定「几个算子一个 kernel」（带宽侧）。加上 Dynamo 的缓存语义（09 章），torch.compile 的全部机制就这三大块。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="09-dynamo.html">← 上一章：Dynamo</a>
+    <a href="11-memory.html">下一步：显存与 CUDA →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 10 Inductor 与 AOTAutograd · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

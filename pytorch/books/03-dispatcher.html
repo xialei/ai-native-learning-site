@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Dispatcher — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a class="active" href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 Dispatcher</div>
+    <h1>Dispatcher：一次 x + y，代码怎么选中 CPU kernel</h1>
+    <div class="subtitle">你在 Python 写 <code class="inline">x + y</code>，同一行代码在 CPU tensor、CUDA tensor、no_grad 区、torch.compile 里走的是完全不同的实现。决定「这次调用落进哪个实现」的机制就是 dispatcher。这章从一次调用走完全程，把 DispatchKey、kernel 表、autograd 的挂载点一次讲清。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>同一个 add，有几种写法</h2>
+    <p>先列一遍事实。<code class="inline">x + y</code> 这一个调用，在不同上下文里需要不同行为：</p>
+    <ul>
+      <li><strong>CPU tensor</strong>：普通 C++ 循环。</li>
+      <li><strong>CUDA tensor</strong>：一次 kernel launch。</li>
+      <li><strong>requires_grad 的 tensor</strong>：先记进计算图（第 4 章），再调上面某个实现。</li>
+      <li><strong>no_grad 区</strong>：跳过记录，直接算。</li>
+      <li><strong>torch.compile 里</strong>：根本不真算，转成图交给编译器。</li>
+      <li><strong>Meta tensor</strong>（只有形状没有数据）：不碰数据，只推出输出形状。</li>
+    </ul>
+    <p>六个行为，一套 API。如果靠 if-else 在每个算子里罗列条件，2590 个算子（native_functions.yaml 顶层的 func 数，另有 7 条注释掉的条目）每个都要写一遍、每加一种上下文全部重写。dispatcher 的思路是把「上下文」从算子里抽出来：每个 tensor 自带一组标签（DispatchKeySet），调用时按标签查表。算子作者只注册「我这 Context 下的实现」，不知道也不关心别的 Context 存在。</p>
+    <div class="annotation"><b>一段解释设计的话：</b>c10/core/DispatchKey.h 里 BackendComponent 枚举上方的注释值得整段读——它说「backend 这个词通常指真正实现数值计算的那些 handler」，并且强调一个细节：大部分 backend 的枚举顺序没有语义，唯一有意义的场景是多 backend 同时参与 dispatch（比如 CPU 和 CUDA 同时在场时，CUDA 优先级必须更高）。一张表按优先级查行，顺序就是语义——这是后面所有机制的地基。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>DispatchKey：tensor 身上的标签</h2>
+    <p>DispatchKey 是一个枚举，但结构上有两截：<strong>BackendComponent</strong>（CPU、CUDA、Meta……「数字在哪里算」）和叠在它上面的 <strong>functionality</strong>（Autograd、Functionalize……「算之前/之后要不要做额外的事」）。两者做笛卡尔积，拼出完整的 key 空间：</p>
+    <div class="code-title">c10/core/DispatchKey.h — BackendComponent 注释（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="cmt">// These keys don't correspond to individual kernels.</span>
+  <span class="cmt">// Instead, they represent the backends that are allowed to override specific</span>
+  <span class="cmt">// pieces of functionality:</span>
+  <span class="cmt">// - dense kernels (e.g. DispatchKey::CPU)</span>
+  <span class="cmt">// - sparse kernels (e.g. DispatchKey::SparseCPU)</span>
+  <span class="cmt">// - quantized kernels (e.g. DispatchKey::QuantizedCPU)</span>
+  <span class="cmt">// - autograd kernels (e.g. DispatchKey::AutogradCPU)</span>
+  <span class="cmt">// We reserve space in the runtime operator table for this full cross product</span>
+  <span class="cmt">// of</span>
+  <span class="cmt">// [backends in this enum] x [keys below that are explicitly marked as having</span>
+  <span class="cmt">// per-backend functionality]</span></pre>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t32 d32">
+        <title id="t32">DispatchKey 的两维结构与一个 CUDA tensor 的 key set</title>
+        <desc id="d32">两维表格：横轴是 functionality（Dense、Autograd、ADInplaceOrView、Functionalize），纵轴是 backend（CPU、CUDA、Meta）。一个 CUDA tensor 的 DispatchKeySet 在表里点亮三格：CUDA×Dense（真实现）、CUDA×Autograd（记图）、CUDA×ADInplaceOrView（原地/视图处理）。Dispatcher 按优先级从高到低问：Functionalize 有 kernel 吗？没有。Autograd 有吗？有——先执行它。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl sm" x="70" y="34" font-weight="bold" fill="#165a7b">functionality →</text>
+        <text class="lbl sm" x="270" y="60" text-anchor="middle">Dense（真算）</text>
+        <text class="lbl sm" x="470" y="60" text-anchor="middle">Autograd</text>
+        <text class="lbl sm" x="670" y="60" text-anchor="middle">ADInplaceOrView</text>
+        <text class="lbl sm" x="830" y="60" text-anchor="middle">Functionalize</text>
+
+        <rect class="node" x="40" y="72" width="110" height="50" rx="6"></rect>
+        <text class="lbl" x="95" y="101" text-anchor="middle">CPU</text>
+        <rect class="node" x="200" y="72" width="140" height="50" rx="6"></rect>
+        <text class="lbl sm" x="270" y="101" text-anchor="middle">C++ 循环</text>
+        <rect class="node" x="400" y="72" width="140" height="50" rx="6"></rect>
+        <rect class="node" x="600" y="72" width="140" height="50" rx="6"></rect>
+        <rect class="node" x="800" y="72" width="120" height="50" rx="6"></rect>
+
+        <rect class="node" x="40" y="134" width="110" height="50" rx="6"></rect>
+        <text class="lbl" x="95" y="163" text-anchor="middle">CUDA</text>
+        <rect class="node ok" x="200" y="134" width="140" height="50" rx="6"></rect>
+        <text class="lbl sm" x="270" y="163" text-anchor="middle">kernel launch</text>
+        <rect class="node core" x="400" y="134" width="140" height="50" rx="6"></rect>
+        <text class="lbl sm" x="470" y="163" text-anchor="middle">先记图（04）</text>
+        <rect class="node core" x="600" y="134" width="140" height="50" rx="6"></rect>
+        <text class="lbl sm" x="670" y="163" text-anchor="middle">版本计数等</text>
+        <rect class="node" x="800" y="134" width="120" height="50" rx="6"></rect>
+
+        <rect class="node" x="40" y="196" width="110" height="50" rx="6"></rect>
+        <text class="lbl" x="95" y="225" text-anchor="middle">Meta</text>
+        <rect class="node" x="200" y="196" width="140" height="50" rx="6"></rect>
+        <text class="lbl sm" x="270" y="225" text-anchor="middle">只推形状</text>
+        <rect class="node" x="400" y="196" width="140" height="50" rx="6"></rect>
+        <rect class="node" x="600" y="196" width="140" height="50" rx="6"></rect>
+        <rect class="node" x="800" y="196" width="120" height="50" rx="6"></rect>
+
+        <rect class="st" x="185" y="122" width="740" height="140" rx="10" stroke-dasharray="6 4"></rect>
+        <text class="lbl sm" x="920" y="140" text-anchor="end" fill="#165a7b" font-weight="bold">一个 requires_grad 的 CUDA tensor 的 key set</text>
+        <text class="lbl sm" x="920" y="158" text-anchor="end">点亮的三格按优先级依次被问：</text>
+        <text class="lbl sm" x="920" y="176" text-anchor="end">Functionalize？没注册 → 跳过</text>
+        <text class="lbl sm" x="920" y="194" text-anchor="end">ADInplaceOrView？原地/视图才走</text>
+        <text class="lbl sm" x="920" y="212" text-anchor="end">Autograd？有 → 记图后 redispatch ↓</text>
+        <text class="lbl sm" x="920" y="230" text-anchor="end">最后落到 Dense 的 CUDA kernel</text>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw ok"></span>Dense：真正算数</span>
+        <span class="lg-item"><span class="sw core"></span>autograd 系：记录与簿记</span>
+        <span class="lg-item"><span class="sw"></span>其余格位：按需注册</span>
+      </div>
+      <div class="fig-cap">图 3.2：key 空间是 backend × functionality 的网格。一次调用不是「选一个 key」，而是 tensor 的 DispatchKeySet 在网格里点亮若干格，dispatcher 按优先级逐格询问「这格有 kernel 吗」，第一个有 kernel 的格先执行；它干完自己的事（比如记图）后用 redispatch 把调用传给下一格。第 4 章讲的「autograd 记图」就发生在这一格。</div>
+    </div>
+    <p>枚举里还有几个容易混的名字，先钉在这里，后文直接用：</p>
+    <table class="tbl">
+      <tr><th>key</th><th>干什么</th><th>备注</th></tr>
+      <tr><td>ADInplaceOrView</td><td>原地操作与视图 op 的簿记：bump 版本号、view 的 as_view 登记</td><td>第 2 章版本计数在这里被加</td></tr>
+      <tr><td>AutogradCPU / AutogradCUDA…</td><td>autograd 的 per-backend 变体；另有别名 key Autograd 覆盖全部</td><td>记图入口（04 章）</td></tr>
+      <tr><td>Functionalize</td><td>torch.compile 与 functorch 用：把 inplace/view 重写成函数式</td><td>第 9/10 章出现</td></tr>
+      <tr><td>Python</td><td>__torch_dispatch__ 子类化 tensor 的拦截点</td><td>3.5 节</td></tr>
+      <tr><td>BackendSelect</td><td>参数跨设备时决定该用哪个 backend</td><td>优先级很高</td></tr>
+    </table>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>查表：Dispatcher::call 与 OperatorEntry</h2>
+    <p>机制本体是两个类。Dispatcher 是全局单例，管所有算子；每个算子在它那里有一个 OperatorEntry，其中核心是一张 <code class="inline">dispatchTable_</code>——按下标索引的 kernel 数组，下标由 DispatchKeySet 算出。先看热路径，这是全 PyTorch 被执行次数最多的几行代码：</p>
+    <div class="code-title">aten/src/ATen/core/dispatch/Dispatcher.h — call 的快路径（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">template</span> &lt;<span class="kw">class</span> <span class="cl">Return</span>, <span class="kw">class</span>... Args&gt;
+C10_ALWAYS_INLINE_UNLESS_MOBILE <span class="cl">Return</span> <span class="cl">Dispatcher::call</span>(
+    <span class="kw">const</span> <span class="cl">TypedOperatorHandle</span>&lt;<span class="cl">Return</span>(Args...)&gt;&amp; op,
+    Args... args) <span class="kw">const</span> {
+  <span class="kw">auto</span> dispatchKeySet =
+      op.operatorDef_-&gt;op.dispatchKeyExtractor()
+          .<span class="kw">template</span> <span class="fn">getDispatchKeySetUnboxed</span>&lt;Args...&gt;(args...);
+  <span class="cmt">// （调试分支省略：show_dispatch_trace 时打印调用轨迹）</span>
+  <span class="kw">const</span> <span class="cl">KernelFunction</span>&amp; kernel = op.operatorDef_-&gt;op.<span class="fn">lookup</span>(dispatchKeySet);
+<span class="kw">#ifndef</span> PYTORCH_DISABLE_PER_OP_PROFILING
+  <span class="kw">auto</span> step_callbacks =
+      at::getStepCallbacksUnlessEmpty(at::RecordScope::FUNCTION);
+  <span class="kw">if</span> (C10_UNLIKELY(
+          step_callbacks.has_value() &amp;&amp; op.operatorDef_-&gt;op.isObserved())) {
+    <span class="kw">return</span> callWithDispatchKeySlowPath&lt;<span class="cl">Return</span>, Args...&gt;(
+        op, *step_callbacks, dispatchKeySet, kernel, std::forward&lt;Args&gt;(args)...);
+  }
+<span class="kw">#endif</span></pre>
+    <p>四步，每步都有名字：<strong>收集</strong>——从参数里的 tensor 抽出 DispatchKeySet（tensor 自带，第 2 章那个 key_set_ 字段）；<strong>查表</strong>——lookup 按这组 key 算下标；<strong>观测</strong>——profiler 开着才走慢路径（<code class="inline">C10_UNLIKELY</code>，正常时一个分支预测就跳过）；<strong>调用</strong>——执行选中的 kernel。日常调用走的就是这四步，没有比这更多的了。</p>
+    <p>查表那一半在 OperatorEntry 里：</p>
+    <div class="code-title">aten/src/ATen/core/dispatch/OperatorEntry.h — lookup（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="kw">const</span> <span class="cl">KernelFunction</span>&amp; <span class="fn">lookup</span>(<span class="cl">DispatchKeySet</span> ks) <span class="kw">const</span> {
+    <span class="kw">const auto</span> idx = ks.getDispatchTableIndexForDispatchKeySet();
+    <span class="kw">if</span> (C10_UNLIKELY(idx == -1)) {
+      <span class="fn">reportError</span>(ks.highestPriorityTypeId());
+    }
+    <span class="kw">const</span> <span class="kw">auto</span>&amp; kernel = dispatchTable_[idx];
+    <span class="cmt">// A valid kernel *always* has a boxed kernel and *may* have an</span>
+    <span class="cmt">// unboxed kernel. However, we typically do unboxed calls in at::</span>
+    <span class="cmt">// APIs, where the kernel 1) will very likely be valid and 2)</span>
+    <span class="cmt">// should have an unboxed kernel. Checking the unboxed kernel</span>
+    <span class="cmt">// first will allow us to avoid touching the boxed kernel at all</span>
+    <span class="cmt">// in the common case.</span>
+    <span class="kw">if</span> (C10_UNLIKELY(!kernel.isValidUnboxed())) {
+      <span class="kw">if</span> (!kernel.isValid()) {
+        <span class="fn">reportError</span>(ks.highestPriorityTypeId());
+      }
+    }
+    <span class="kw">return</span> kernel;
+  }</pre>
+    <div class="annotation"><b>两个补充点：</b>其一，idx == -1 的含义是「这组 key 没法映射到单一表格下标」（比如 key set 里混入了不该出现的 alias key），此时报错信息用的是最高优先级的 key——这就是日常见到的 "not implemented for" 报错的真实出处。其二，注释里 boxed/unboxed 的区别：boxed 调用把参数装进通用容器（IValue 列表），任何签名的 kernel 都能接；unboxed 是直连 C++ 签名的快路径。表里常驻 boxed，unboxed 有就先走——这是同一张表上的两级缓存。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>一个 key 拦截之后：redispatch 链</h2>
+    <p>图 3.2 里「记图后 redispatch」那一步是理解整个体系的关键。Autograd key 的 kernel 干完记录工作后，调用并没有结束——它带着同一组参数继续问下一优先级的 key。这个动作叫 redispatch：</p>
+    <div class="code-title">aten/src/ATen/core/dispatch/Dispatcher.h — redispatch 声明（摘录）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="kw">template</span> &lt;<span class="kw">class</span> <span class="cl">Return</span>, <span class="kw">class</span>... Args&gt;
+  <span class="cl">Return</span> <span class="fn">redispatch</span>(
+      <span class="kw">const</span> <span class="cl">TypedOperatorHandle</span>&lt;<span class="cl">Return</span>(Args...)&gt;&amp; op,
+      <span class="cl">DispatchKeySet</span> currentDispatchKeySet,
+      Args... args) <span class="kw">const</span>;</pre>
+    <p>redispatch 与 call 的差别在 key set 从哪来：call 每次从参数重新收集；redispatch 收到的是调用方算好的集合——autograd kernel 调它之前，已经把自己那一位掐掉，查表自然落到下一格。这个「key set 随调用下传、每层掐掉自己那一位」的约定在源码里有个专门的注释（Note [Plumbing Keys Through The Dispatcher]，<code class="inline">boxing/BoxedKernel.h</code>，起因是省掉每次 redispatch 都重读线程局部变量的开销）。一条调用链就这样串起来：Functionalize（如注册）→ Autograd（记图）→ ADInplaceOrView（版本号/视图簿记）→ Backend（真算）。每一层只做自己的事，做完交棒。</p>
+    <div class="callout warn">
+      <b class="tag">困惑点</b>
+      为什么 autograd 不是「在算子完成后由引擎回调」，而要占一个 dispatch key？答案在性能与组合性：记图必须发生在真正计算之前（要保存输入、构造 Node），而且必须对 2590 个算子统一生效。放一个 key 在链路最高优先级段，恰好同时满足这两条——每个算子的 autograd kernel 由 derivatives.yaml 生成（第 4 章），数学实现则完全不感知 autograd 的存在。分层注册 + 顺序拦截，比在每个 kernel 里写「如果 requires_grad 就……」便宜得多。
+    </div>
+    <p>no_grad 的实现现在也一眼可见了：<code class="inline">torch.no_grad()</code> 只是把 GradMode 置关（一个 thread-local 布尔，c10/core/GradMode.h 全文不到百行）。Autograd key 的 kernel 进来先问一句 GradMode——关着就不记图，直接 redispatch 到 backend。一层薄开关控制一层行为，层与层之间零耦合。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>用户可插的两层：torch.library 与 __torch_dispatch__</h2>
+    <p>dispatcher 不只是内部机制，它就是 PyTorch 的插件系统。给用户留了两个层级的入口，位置不同、用途不同。</p>
+    <p><strong>算子级：注册一个新 op 的 kernel。</strong>这是写自定义 CUDA 算子、接 NCCL 之外通信原语的标准做法，第 14 章展开用法；这里只看它落在机制的哪个位置：</p>
+    <div class="code-title">torch/library.py — register_fake（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">register_fake</span>(
+    op: _op_identifier,
+    func: Callable | None = None,
+    /,
+    *,
+    lib: Library | None = None,
+    _stacklevel: int = 1,
+    allow_override: bool = True,
+):
+    r"""Register a FakeTensor implementation ("fake impl") for this operator.
+
+    Also sometimes known as a "meta kernel", "abstract impl".
+    ...
+    """</pre>
+    <p>所谓 fake impl，就是往 Meta backend 的格子里填函数——「只推形状不真算」因此成为一种注册行为。第 10 章 Inductor 里那些「影子执行」全都踩在这格上。</p>
+    <p><strong>tensor 级：子类化拦截一切调用。</strong>Python key 让整个 tensor 子类（如第 12 章的 DTensor）接管 dispatcher：</p>
+    <div class="code-title">torch/overrides.py — __torch_function__ 的位置（文件头注释，原文摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="st">"""
+Python implementation of ``__torch_function__``
+
+While most of the torch API and handling for ``__torch_function__`` happens
+at the C++ level, some of the torch API is written in Python so we need
+python-level handling for ``__torch_function__`` overrides as well.
+"""</span></pre>
+    <div class="annotation"><b>两个入口怎么选：</b>想把「某一种数学」接到新硬件上——注册 op（算子级，C++ 层，快）；想把「一类 tensor 的所有行为」都改掉——子类化（tensor 级，Python 层，灵活但每次调用多一层）。DTensor 选的是后者，因为它要拦的不是某个算子而是「分片状态下所有算子的语义」（第 12 章细讲）。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>回顾与下一章的接口</h2>
+    <p>把这章的机制压回三句话：tensor 带着 DispatchKeySet；dispatcher 按优先级查表选中 kernel；kernel 干完自己的事可以 redispatch 给下一层。autograd、 Functionalize、DTensor、自定义 op，全部是往这张表的不同格子里填东西—— PyTorch 的「可扩展」说的就是这张表的可扩展。</p>
+    <p>下一章进表里最核心的那个格子：Autograd key 的 kernel。它由 696 条 YAML 规则生成，工作只有一个——前向执行的瞬间，把「反向该怎么算」写进一张图。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      一次 x + y 的完整链路：Python 绑定（torch._C）→ Dispatcher::call 抽 DispatchKeySet → OperatorEntry::lookup 查表 → 逐优先级执行（autograd 记图 → inplace 簿记 → CUDA kernel）。谜底没有超出一行摘要的范围：一张二维表和几行 inline 代码。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="02-tensor.html">← 上一章：Tensor 内部</a>
+    <a href="04-autograd-graph.html">下一步：autograd 计算图 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 03 Dispatcher · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

@@ -103,7 +103,7 @@
       </div>
       <div class="fig-cap">图 8.1：显存三块——权重与 activation 是固定开销，KV 用的是剩下的部分；虚线框是本章要划出的总预算。比例仅为示意。</div>
     </div>
-    <div class="annotation"><b>五个问题的答案怎么排：</b>划线用配置声明总量上限，实测扣除靠启动时跑一遍假前向量出峰值——这两件合在 8.2 一节；换算成块是一条除法（8.3），每步上限是两个调度参数（8.4），前缀共享靠块哈希 + 引用计数（8.5）。8.6 再看 SGLang 对同一串问题给出的另一套答案。</div>
+    <p>五个问题的答案这样铺开：8.2 合并回答前两问——划线用配置声明总量上限，实测扣除靠启动时跑一遍假前向量出峰值；8.3 把字节数换算成块，那是一条除法；8.4 定每步上限，落在两个调度参数上；8.5 讲前缀共享，靠块哈希加引用计数。8.6 再看 SGLang 对同一串问题给出的另一套答案。</p>
   </section>
 
   <section class="block">
@@ -124,7 +124,7 @@
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># take current memory snapshot</span>
 self.init_snapshot = init_snapshot = <span class="cl">MemorySnapshot</span>(device=self.device)
 self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, self.cache_config)</pre>
-    <div class="annotation"><b>读懂 <code class="inline">request_memory</code>（vllm/v1/worker/utils.py:533）：</b>它就是 <code class="inline">ceil(总显存 × gpu_memory_utilization)</code>——上面 CacheConfig 里那个 0.92 在这里变成具体字节数。如果当前空闲显存连这个数都不到，直接抛错让你调低比例。</div>
+    <div class="annotation"><b><code class="inline">request_memory</code>（vllm/v1/worker/utils.py）就干一件事：</b><code class="inline">ceil(总显存 × gpu_memory_utilization)</code>——上面 CacheConfig 里那个 0.92 在这里变成具体字节数。如果当前空闲显存连这个数都不到，直接抛错让你调低比例。</div>
     <p>然后是关键的量测段：</p>
     <div class="code-title">vllm/v1/worker/gpu_worker.py — profile 假前向（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Execute a forward pass with dummy inputs to profile the memory usage</span>
@@ -134,7 +134,7 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
     weights_memory=<span class="fn">int</span>(self.model_runner.model_memory_usage),
 ) <span class="kw">as</span> profile_result:
     self.model_runner.profile_run()</pre>
-    <div class="annotation"><b>这段的重点在「顶满」二字：</b><code class="inline">profile_run</code> 内部就是 <code class="inline">_dummy_run(max_num_tokens)</code>——按 <code class="inline">max_num_batched_tokens</code> 顶满的假输入跑一次完整前向（V2 实现在 <code class="inline">vllm/v1/worker/gpu/model_runner.py:934</code>）。顶满而不是随便跑，量出来的才是 activation 的<strong>峰值</strong>；之后运行时无论 batch 怎么变，都不会超过这个数。<code class="inline">memory_profiling</code> 上下文负责前后快照相减，把权重（显式传入）和激活峰值分开记账。</div>
+    <div class="annotation"><b>这段的重点在「顶满」二字：</b><code class="inline">profile_run</code> 内部就是 <code class="inline">_dummy_run(max_num_tokens)</code>——按 <code class="inline">max_num_batched_tokens</code> 顶满的假输入跑一次完整前向（V2 实现在 <code class="inline">vllm/v1/worker/gpu/model_runner.py</code>）。顶满而不是随便跑，量出来的才是 activation 的<strong>峰值</strong>；之后运行时无论 batch 怎么变，都不会超过这个数。<code class="inline">memory_profiling</code> 上下文负责前后快照相减，把权重（显式传入）和激活峰值分开记账。</div>
     <p>量完之后，KV 预算就是三行减法：</p>
     <div class="code-title">vllm/v1/worker/gpu_worker.py — KV 预算计算（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>self.available_kv_cache_memory_bytes = (
@@ -142,7 +142,7 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
     - profile_result.non_kv_cache_memory <span class="cmt"># 减掉权重 + activation 峰值</span>
     - cudagraph_memory_estimate_applied  <span class="cmt"># CUDA graph 缓冲也要留</span>
 )</pre>
-    <div class="annotation"><b>三项都有出处：</b>第一项来自启动时的 <code class="inline">request_memory</code>；第二项是 profile 实测（权重显式传入 + 激活峰值快照差）；第三项在启用 CUDA graph 时按捕获计划估算（<code class="inline">profile_cudagraph_memory</code>，gpu_worker.py:624），捕获前就得给它留位。这个减法是 vLLM 显存管理的全部秘密：<strong>KV 拿到的不是「总显存减权重」，而是「预算减去所有实测占用」</strong>——谁的峰值涨了，KV 就让位。</div>
+    <div class="annotation"><b>三项都有出处：</b>第一项来自启动时的 <code class="inline">request_memory</code>；第二项是 profile 实测（权重显式传入 + 激活峰值快照差）；第三项在启用 CUDA graph 时按捕获计划估算（<code class="inline">profile_cudagraph_memory</code>，gpu_worker.py），捕获前就得给它留位。这个减法是 vLLM 显存管理的全部秘密：<strong>KV 拿到的不是「总显存减权重」，而是「预算减去所有实测占用」</strong>——谁的峰值涨了，KV 就让位。</div>
     <p>代进一张具体的卡算一遍就清楚了。设定：单张 80 GiB 数据中心卡，跑一个 7B 级 FP16 模型，<code class="inline">gpu_memory_utilization</code> 取默认 0.92，块大小 16，KV 每 token 128 KiB（8.3 推这个数）。一步步扣：</p>
     <table class="tbl">
       <thead><tr><th style="width:6%">步</th><th style="width:34%">算什么</th><th style="width:22%">结果</th><th>依据</th></tr></thead>
@@ -151,14 +151,14 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
         <tr><td>2</td><td>扣权重：7B 参数 × 2 字节</td><td><code class="inline">−14 GiB → 余 59.6</code></td><td>profile 实测的 non_kv_cache_memory 的大头</td></tr>
         <tr><td>3</td><td>扣 activation 峰值（<code class="inline">_dummy_run</code> 顶出来的最大 batch 假前向）</td><td><code class="inline">−2 GiB → 余 57.6</code></td><td>同上，profile 的另一部分</td></tr>
         <tr><td>4</td><td>扣 CUDA graph 缓冲估计值</td><td><code class="inline">−1.6 GiB → 余 56.0</code></td><td><code class="inline">cudagraph_memory_estimate_applied</code></td></tr>
-        <tr><td>5</td><td>得到 KV 总字节 56 GiB ≈ 6.0 × 10¹⁰ B</td><td><code class="inline">available_kv_cache_memory_bytes</code></td><td>gpu_worker.py:660 的减法结果</td></tr>
+        <tr><td>5</td><td>得到 KV 总字节 56 GiB ≈ 6.0 × 10¹⁰ B</td><td><code class="inline">available_kv_cache_memory_bytes</code></td><td>gpu_worker.py 的减法结果</td></tr>
         <tr><td>6</td><td>56 GiB 换算成块：÷ 每块 2 MiB</td><td><code class="inline">≈ 28 700 块</code></td><td>8.3 的除法（图 8.2 画出换算过程）</td></tr>
         <tr><td>7</td><td>÷ 每请求块数（如 4K token 序列 ÷ 16 = 256 块）</td><td><code class="inline">≈ 110 并发请求</code></td><td>理论上限，未计 watermark</td></tr>
-        <tr><td>8</td><td>预留 watermark（默认 0.0 关闭；按 1% 举例，约 287 块）——只对 WAITING/PREEMPTED 请求的准入生效，给它们留出免于反复抢占的余量</td><td><code class="inline">运行中可用 ≈ 28 385 块</code></td><td><code class="inline">kv_cache_manager.py:513</code> 的 <code class="inline">watermark_blocks</code>（config/scheduler.py:191 默认 0.0）</td></tr>
+        <tr><td>8</td><td>预留 watermark（默认 0.0 关闭；按 1% 举例，约 287 块）——只对 WAITING/PREEMPTED 请求的准入生效，给它们留出免于反复抢占的余量</td><td><code class="inline">运行中可用 ≈ 28 385 块</code></td><td><code class="inline">kv_cache_manager.py</code> 的 <code class="inline">watermark_blocks</code>（config/scheduler.py 默认 0.0）</td></tr>
       </tbody>
     </table>
     <p>注意第 4 步和第 8 步是纯预留：CUDA graph 缓冲和水印块平时都闲着，但前者保证回放时不会 OOM，后者让新请求和被抢占的请求恢复时「总有一个块可拿」。反过来读这张表也成立：线上问「为什么并发上不去」，答案就藏在哪一行扣掉了多少——权重超预期？activation 峰值没量准？还是 watermark 留多了。</p>
-    <p>量出来之后还有最后一道保险。第 5 步的 56 GiB 换成块、<code class="inline">num_gpu_blocks</code> 写回配置之后，vLLM 会跑一整段 warm-up（<code class="inline">compile_or_warm_up_model</code>，gpu_worker.py:807）：先把要用的 kernel 都真实执行一遍（<code class="inline">warmup_kernels</code>，gpu_worker.py:849 调入），其中专门有一段<strong>拿 KV 块数反推 warmup 批大小</strong>——如果块不够塞下我准备调的 batch，就把批改小，而不是硬调到 OOM：</p>
+    <p>量出来之后还有最后一道保险。第 5 步的 56 GiB 换成块、<code class="inline">num_gpu_blocks</code> 写回配置之后，vLLM 会跑一整段 warm-up（<code class="inline">compile_or_warm_up_model</code>，gpu_worker.py）：先把要用的 kernel 都真实执行一遍（<code class="inline">warmup_kernels</code>，gpu_worker.py 调入），其中专门有一段<strong>拿 KV 块数反推 warmup 批大小</strong>——如果块不够塞下我准备调的 batch，就把批改小，而不是硬调到 OOM：</p>
     <div class="code-title">vllm/v1/worker/gpu/warmup.py — 用 KV 块数决定 warmup 批大小（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>num_reqs = <span class="fn">min</span>(
     model_runner.scheduler_config.max_num_seqs,
@@ -193,7 +193,7 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
     num_blocks = <span class="fn">may_override_num_blocks</span>(vllm_config, num_blocks)
     size = bytes_per_block * num_blocks
     <span class="kw">return</span> <span class="cl">KVCacheConfig</span>(num_blocks=num_blocks, kv_cache_tensors=[...], ...)</pre>
-    <div class="annotation"><b>读懂 <code class="inline">num_blocks = available_memory // bytes_per_block</code>（kv_cache_utils.py:1762）：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值（写入点在 <code class="inline">vllm/v1/engine/core.py:337</code>），即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
+    <div class="annotation"><b>这行除法的去向：</b>这个 <code class="inline">num_blocks</code> 就是最终写回 <code class="inline">cache_config.num_gpu_blocks</code> 的值（写入点在 <code class="inline">vllm/v1/engine/core.py</code>），即 8.2 的 <code class="inline">available_kv_cache_memory_bytes</code> 换算来的块数。它是 <code class="inline">BlockPool</code> 预先分配的总物理块数；<code class="inline">may_override_num_blocks</code> 允许你用 <code class="inline">num_gpu_blocks_override</code> 手动指定（测试/预取用）。</div>
     <p>回到 8.2 表格第 6 步——「÷ 每 token 128 KiB → 再 ÷ 块 16 token」两次除法，和代码里「只除一次」的 <code class="inline">bytes_per_block</code> 是同一件事：源码不做两次除，它先把「每 token 128 KiB × 16 token」合算成「每块 2 MiB」，再拿可用显存一次除到位。两种算法结果相同，图 8.2 把这条对应关系画出来：</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 400" xmlns="http://www.w3.org/2000/svg">
@@ -389,7 +389,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 
   <section class="block">
     <h2><span class="num">8.6</span>SGLang 的另一套答案与自研启示</h2>
-    <p>回到 8.1 摆出的五个问题，vLLM 的答案是「配置划线 → profile 实测 → 除法换算 → 双上限 → 块哈希」。回到最初那条减法和那条除法：profile 量出权重与激活的峰值，<strong>预算减去实测占用</strong>得到 KV 的字节数；字节<strong>除以每块字节</strong>得到物理块数。批上限决定激活峰值，块数反过来封顶批大小——三个变量咬合成一个闭环。前缀缓存则不改变这个闭环，只是让同一个块服务更多请求。</p>
+    <p>回到 8.1 摆出的五个问题，vLLM 的答案是「配置划线 → profile 实测 → 除法换算 → 双上限 → 块哈希」。回到最初那条减法和那条除法：profile 量出权重与激活的峰值，<strong>预算减去实测占用</strong>得到 KV 的字节数；字节<strong>除以每块字节</strong>得到物理块数。批上限决定激活峰值，块数反过来封顶批大小——三个变量互相咬合，牵一发而动全身。前缀缓存则不动这条链路，只是让同一个块服务更多请求。</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以先做</th></tr>
       <tr><td>总预算</td><td>gpu_memory_utilization=0.92</td><td>先写成「总显存 × 比例 − 权重 − 激活」的公式</td></tr>
@@ -428,7 +428,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 </div>
 
 <footer>
-  深入浅出vLLM · 08 内存 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 08 内存 · 版本 v0.30.1rc0-311-g1fde8ff7da
 </footer>
 
 </body>

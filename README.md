@@ -15,6 +15,7 @@
 - **DeepSeek Harness** —— 拆解 TypeScript Agent 运行时 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`):一切皆插件(cordis)、append-only 会话日志、Agent 循环、持久化与冷恢复、工具调度、LLM 适配层、Prompt 组装与 Scope、沙箱与审批、五条能力缝、Compaction、多 Agent 编排,最后给出自制 Harness 路线图(13 章)。
 - **深入浅出具身智能** —— 拆解具身智能全栈：HuggingFace [lerobot](https://github.com/huggingface/lerobot)（真机/数据/模仿策略）、NVIDIA [IsaacLab](https://github.com/isaac-sim/IsaacLab)（仿真/RL）、[prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) 与 unifolm-vla（VLA 模型）——硬件抽象、数据集、ACT/Diffusion/SmolVLA/π0、并行仿真与 RL 训练、Sim2Real 部署,附六里程碑实战路线(13 章)。
 - **深入浅出 DeepSpeed · Megatron** —— 双书结构拆解大模型训练栈：[Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 的计算侧并行（TP/PP/CP/EP、1F1B 调度、selective 重算、可重分片 checkpoint）与 [DeepSpeed](https://github.com/deepspeedai/DeepSpeed) 的显存侧优化（ZeRO 1/2/3、offload/DeepNVMe、CPU Adam）,以"算不过来 vs 存不下"的分工论贯穿,附六里程碑自研训练器路线(14 章)。
+- **深入浅出 PyTorch** —— 拆解 [pytorch/pytorch](https://github.com/pytorch/pytorch) 本体实现：从 `torch/__init__.py` 的导入前厅到 c10/ATen/torch-csrc 三层,经 TensorImpl 与 StorageImpl 分离、Dispatcher 路由、自动求导图与反向引擎、Module/优化器/DataLoader 应用层,再到 Dynamo→Inductor 编译栈、缓存分配器与 CUDA Graphs、DeviceMesh/DTensor/FSDP2 分布式与 DCP/pipelining/torchrun 工程件,收口于扩展档位表与自研里程碑(14 章)。
 
 ## 适合谁读
 
@@ -41,6 +42,7 @@
 | [`sglang/`](sglang/) | [sgl-project/sglang](https://github.com/sgl-project/sglang) | [`../sglang`](../sglang) |
 | [`robotics/`](robotics/) | [huggingface/lerobot](https://github.com/huggingface/lerobot) · [isaac-sim/IsaacLab](https://github.com/isaac-sim/IsaacLab) · [TRI-ML/prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) · unifolm-vla | [`../robotics`](../robotics) |
 | [`deepspeed-megatron/`](deepspeed-megatron/) | [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) · [deepspeedai/DeepSpeed](https://github.com/deepspeedai/DeepSpeed) | [`../Megatron-LM`](../Megatron-LM) · [`../DeepSpeed`](../DeepSpeed) |
+| [`pytorch/`](pytorch/) | [pytorch/pytorch](https://github.com/pytorch/pytorch) | [`../pytorch`](../pytorch) |
 
 ## 阅读方式
 
@@ -63,6 +65,6 @@
 
 本站涉及主题:
 
-`ai-native` `llm` `agent` `ai-agent` `agent-runtime` `agent-harness` `context-engine` `context-engineering` `rag` `retrieval-augmented-generation` `knowledge-graph` `context-window` `compaction` `multi-agent` `tool-use` `function-calling` `observability` `llm-inference` `vllm` `sglang` `langgraph` `langchain` `typescript-agent` `claude-code` `codex` `codex-cli` `rust-agent` `coding-agent` `agentic-coding` `sandbox` `hooks` `mcp` `model-context-protocol` `source-code-reading` `learn-to-code` `中文技术文档` `源码精读`
+`ai-native` `llm` `agent` `ai-agent` `agent-runtime` `agent-harness` `context-engine` `context-engineering` `rag` `retrieval-augmented-generation` `knowledge-graph` `context-window` `compaction` `multi-agent` `tool-use` `function-calling` `observability` `llm-inference` `vllm` `sglang` `langgraph` `langchain` `typescript-agent` `claude-code` `codex` `codex-cli` `rust-agent` `coding-agent` `agentic-coding` `sandbox` `hooks` `mcp` `model-context-protocol` `pytorch` `deep-learning` `training-framework` `source-code-reading` `learn-to-code` `中文技术文档` `源码精读`
 
 </details>

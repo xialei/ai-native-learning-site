@@ -37,7 +37,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Kernel 层</div>
     <h1>Kernel 层：并行框架底下的算子竞赛</h1>
-    <div class="subtitle">融合省的到底是什么——计算还是显存往返？哪些算子值得融合、哪些永远不值得？Megatron 的 fusions 目录和 DS 的 csrc 各自补谁的短板，fp8 为什么直接用 TE 不自己写？自研到什么程度该收手？</div>
+    <div class="subtitle">融合省的到底是什么——计算还是显存往返？哪些算子值得融合、哪些永远不值得？Megatron 的 fusions 目录和 DS 的 csrc 各自补谁的短板，fp8 为什么直接用 TE 不自己写，fp4（NVFP4）落地又动了哪里？自研到什么程度该收手？</div>
   </div>
 
   <section class="block">
@@ -52,7 +52,7 @@
     </ul>
     <div class="callout info">
       <b class="tag">判断标准</b>
-      看 kernel 是否「拉满 tensor core」：GEMM 类不用管（cuBLAS/cuBLASLt 已极致）；LN+激活+dropout+残差这类元素级算子才值得融合——这也是两库融合清单的共同形态。
+      看 kernel 是否已把 tensor core 用到极限：GEMM 类不用管（cuBLAS/cuBLASLt 已极致）；LN+激活+dropout+残差这类元素级算子才值得融合——这也是两库融合清单的共同形态。
     </div>
   </section>
 
@@ -79,6 +79,17 @@
     <span class="cmt"># fp8: TE 在 module 内部管理 amax 历史 + 当前 scale（per-tensor）</span>
     <span class="cmt"># 与 Megatron 的对接点：config.recompute / TP group / SP 变体全部透传</span></pre>
     <div class="annotation"><b>接入模式：</b>Megatron 不重写 fp8——它把并行边界（TP/SP 组、重算策略、分布式 optimizer 的 main_grad 通道）作为参数传给 TE，让 TE 在其内部处理 fp8。<strong>main_grad 是关键通道</strong>：TE 的 wgrad 也走 gradient_accumulation_fusion 写进主缓冲（第 3、7 章的伏笔在此汇合）。自研时若想上 fp8，直接用 TE，不要自己写量化调度。</div>
+
+    <p>fp8 之外，2026-09 落地的 NVFP4 训练（#7328，DeepSeek-V3）把同一条「不自研、透传 TE」的路线又走了一遍，且留下一段值得读的演化痕迹：这个功能第一次合并（#6841）几小时后就随 CI 修复 PR（#7326）被整体回滚——同批被回滚的还有 TE 扩展和 GDN SSM kernel 等几处与它无关的改动，一起被拉了回来；八天后重提（#7328）才站稳。浮点格式上新档位的落地常态是「先合并、再修边角、再稳定」，单看最终代码读不出这段反复。</p>
+    <div class="code-title">megatron/core/transformer/multi_token_prediction.py — MTP 的量化上下文（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># fp8 与 fp4 互斥；MTP 层曾经只支持 fp8（「FP4 还需数值验证」的注释挂了很久）</span>
+<span class="kw">if</span> self.config.fp8:
+    quantization_context = get_fp8_context(self.config)
+<span class="kw">elif</span> self.config.fp4:
+    quantization_context = get_fp4_context(self.config)   <span class="cmt"># e2m1 + NVFP4 block scaling</span>
+<span class="kw">else</span>:
+    quantization_context = nullcontext()</pre>
+    <div class="annotation"><b>读法：</b>fp4 的接入面与 fp8 完全同构——配置上 <code class="inline">fp4='e2m1'</code> + <code class="inline">fp4_recipe='nvfp4'</code>（走 TE 的 NVFP4BlockScaling，需要 Blackwell 及以上），代码里换成 <code class="inline">get_fp4_context</code>；MTP 层用独立的上下文包住 transformer layer，动机和 fp8 一样（cuda graph 下 <code class="inline">is_first_fp8_module</code> 的权重缓存判定）。真正的活儿在两处边角：一是 MTP 层数值验证 finally 通过（源码里那句「FP4 in MTP layers still needs numerical validation」注释的消失即标志）；二是 fused-LN MLA（DeepSeek-V3 的 <code class="inline">mla_down_proj_fusion</code>）把 LN 参数挂在 down-proj 模块上、checkpoint 里却归一到 input_layernorm——DistributedOptimizer 重载主参数时按 <code class="inline">sharded_state_dict_keys_map</code> 生成候选名逐个匹配，否则名字对不上直接断言失败。量化训练的工程量从来不在 GEMM 本身，在这些名字和上下文的对齐处。</div>
   </section>
 
   <section class="block">
@@ -141,7 +152,7 @@
         <text class="lbl sm" x="20" y="266" fill="#2e8b57" font-weight="bold">省的不是计算：GEMM 时间没变，省的是中间张量的全量显存往返与 kernel launch</text>
         <text class="lbl sm" x="20" y="286">两库的融合清单（softmax/LN/激活/残差/cross-entropy）全部落在这个「带宽密集区」，没有一个 GEMM</text>
       </svg>
-      <div class="fig-cap">图 11.1：融合的收益来源。判断标准就是 11.1 的一句话——算子是否拉满 tensor core；没拉满的元素级算子，融合是把「多次显存往返」折成一次。</div>
+      <div class="fig-cap">图 11.1：融合的收益来源。判断标准就是 11.1 的一句话——算子有没有把 tensor core 用到极限；没有的元素级算子，融合是把「多次显存往返」折成一次。</div>
     </div>
   </section>
 
@@ -153,7 +164,7 @@
       <tr><td>GEMM</td><td>直接用 cuBLAS/cuBLASLt 或 TE</td><td>自研打不过厂商库</td></tr>
       <tr><td>注意力</td><td>直接用 FlashAttention / TE</td><td>同样打不过，且变长支持复杂</td></tr>
       <tr><td>LN+激活+残差融合</td><td>值得抄思路（简单、收益明确）</td><td>元素级 kernel，C++/Triton 一天能写</td></tr>
-      <tr><td>Fused optimizer</td><td>值得抄（multi-tensor batch 化）</td><td>launch 开销是 optimizer 热路径大头</td></tr>
+      <tr><td>Fused optimizer</td><td>值得抄实现（multi-tensor batch 化）</td><td>launch 开销是 optimizer 热路径大头</td></tr>
       <tr><td>异步 IO / offload</td><td>直接用 DS 的 DeepNVMe</td><td>调优过的 libaio 封装，重写不经济</td></tr>
       <tr><td>fp8 量化调度</td><td>直接用 TE</td><td>scale 管理的状态机深，别自己碰</td></tr>
     </table>
@@ -161,7 +172,7 @@
 
   <section class="block">
     <h2><span class="num">11.5</span>小结 + 自研启示</h2>
-    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「是否拉满 tensor core」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、quantizer）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8 都直接用现成。把自研纪律归拢：</p>
+    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、quantizer）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE；fp4/NVFP4 沿同一条路（11.2 末），连落地时的回滚反复，都是「不自研、透传 TE」这条路线的再现。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8/fp4 都直接用现成。把自研纪律归拢：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
       kernel 层的自研纪律：<strong>先 profile 再动手</strong>——nsight 里看到 launch gap 或带宽打满才值得写融合；GEMM 与注意力的时间占比决定了自研 kernel 的天花板（通常 < 40% 时间在元素级算子上，融合的全部收益在这 40% 里）。最容易错的三点：融合 kernel 的 backward 忘了与 forward 配对（autograd 断链静默错）、用了 fp16 累加（元素级 kernel 应 fp32 累加）、融合边界跨了 TP 通信（第 10 章同款坑）。
@@ -175,7 +186,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>

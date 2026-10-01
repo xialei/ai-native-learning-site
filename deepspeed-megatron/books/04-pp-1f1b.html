@@ -37,7 +37,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 流水线并行</div>
     <h1>流水线并行：1F1B 调度怎么排</h1>
-    <div class="subtitle">PP 的激活显存怎么才能不随 microbatch 涨（三种调度的取舍）？每阶段先做几个前向（warmup 步数公式）？1F1B 的气泡还能再砍吗？DeepSpeed 的 pipe 引擎为什么把调度写成命令列表？</div>
+    <div class="subtitle">PP 的激活显存怎么才能不随 microbatch 涨（三种调度的取舍）？每阶段先做几个前向（warmup 步数公式）？1F1B 的气泡还能再砍吗？DeepSpeed 的 pipe 引擎为什么把调度写成命令列表？DeepSeek 的 DualPipeV 用「每卡两个阶段」填气泡，命令列表抽象怎么接住它？</div>
   </div>
 
   <section class="block">
@@ -48,7 +48,7 @@
       <li><strong>1F1B</strong>：warmup 阶段先堆若干前向，之后<strong>严格一前一后交替</strong>。in-flight 数被钉在 stages − stage_id − 1，显存只跟阶段位置相关，microbatch 数随便加。</li>
       <li><strong>Interleaved（虚拟流水线）</strong>：一张卡拿多个不连续的层段（virtual model chunks），进一步把气泡砍半，代价是通信次数变多。</li>
     </ul>
-    <p>1F1B 用「一次 F 换一次 B」把激活显存从随 microbatch 涨，改写成只跟流水线位置有关——这是它至今仍是默认调度的原因。本章顺着这条线看三件事：warmup 步数公式从哪来，气泡还能不能再砍，以及 DeepSpeed 为什么把同样的调度写成了命令列表。</p>
+    <p>1F1B 用「一次 F 换一次 B」把激活显存从随 microbatch 涨，改写成只跟流水线位置有关——这是它至今仍是默认调度的原因。本章顺着这条线看四件事：warmup 步数公式从哪来，气泡还能不能再砍，DeepSpeed 为什么把同样的调度写成了命令列表，以及 2026 年 9 月刚进 DeepSpeed 主干的 DualPipeV（#8576，DeepSeek-V3 的调度）怎么用这套命令列表表达。</p>
     <div class="callout info">
       <b class="tag">气泡公式</b>
       1F1B 的空闲率 ≈ (pp − 1) / (num_microbatches + pp − 1)。pp=8、microbatch=32 时约 18%；pp=8、microbatch=8 时 47%——所以 PP 必须配大 microbatch，而 microbatch×DP 又决定全局 batch，三者的耦合在 2.5 节的选型表里。
@@ -85,7 +85,7 @@ num_warmup_microbatches = <span class="fn">min</span>(num_warmup_microbatches, n
     output_tensor_grad = <span class="fn">recv_backward</span>(...)
     input_tensor_grad = backward_step(...)
     <span class="fn">send_backward</span>(input_tensor_grad, ...)</pre>
-    <div class="annotation"><b>整体是三段式：warmup（堆前向）→ steady（F/B 交替）→ cooldown（清反向）。</b>代码里最值得注意的是 steady 段的<strong>收发配对顺序</strong>：<code class="inline">recv_backward</code> 先挂上异步接收，前向算完立刻 <code class="inline">send_forward + send_backward + recv_backward</code>，让相邻阶段的通信全部异步飞着。另一个细节：<code class="inline">enable_grad_sync</code> 只在<strong>最后一个 microbatch</strong> 打开——梯度 all-reduce 不必每个 microbatch 都做，攒到最后一次即可（配合 DDP 的 grad buffer，第 7 章展开）。</div>
+    <div class="annotation"><b>整体是三段式：warmup（堆前向）→ steady（F/B 交替）→ cooldown（清反向）。</b>代码里真正的细节在 steady 段的<strong>收发配对顺序</strong>：<code class="inline">recv_backward</code> 先挂上异步接收，前向算完立刻 <code class="inline">send_forward + send_backward + recv_backward</code>，让相邻阶段的通信全部异步飞着。另一个细节：<code class="inline">enable_grad_sync</code> 只在<strong>最后一个 microbatch</strong> 打开——梯度 all-reduce 不必每个 microbatch 都做，攒到最后一次即可（配合 DDP 的 grad buffer，第 7 章展开）。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t41 d41">
@@ -146,7 +146,7 @@ num_warmup_microbatches = <span class="fn">min</span>(num_warmup_microbatches, n
 <span class="cmt"># （本卡 chunk0 的下一阶段可能在别的卡上 chunk1）→ p2p 通信对数成倍增加</span>
 <span class="kw">for</span> k <span class="kw">in</span> <span class="fn">range</span>(num_model_chunks):
     input_tensor, output_tensor = ...</pre>
-    <div class="annotation"><b>这笔交易未必划算：</b>气泡从 (pp−1)/(m+pp−1) 降到约 (pp−1)/(2·v·m) 量级（v = virtual size），但 p2p 消息次数 ×v——小消息多了，带宽便宜延迟贵的机器（跨机网线）反而变慢。所以 interleaved 通常只在<strong>机内 TP 大、跨机 PP 小</strong>的拓扑下收益为正。这也是为什么默认配置不开。</div>
+    <div class="annotation"><b>这笔交易未必划算：</b>气泡从 (pp−1)/(m+pp−1) 降到约 (pp−1)/(2·v·m) 量级（v = virtual size），但 p2p 消息次数 ×v——小消息多了，带宽便宜延迟贵的机器（跨机链路）反而变慢。所以 interleaved 通常只在<strong>机内 TP 大、跨机 PP 小</strong>的拓扑下收益为正。这也是为什么默认配置不开。</div>
   </section>
 
   <section class="block">
@@ -167,18 +167,48 @@ num_warmup_microbatches = <span class="fn">min</span>(num_warmup_microbatches, n
     <div class="annotation"><b>同一个 1F1B，两种表达：</b>Megatron 把 1F1B 写死在 forward_backward_func 里（性能路径，不可换）；DeepSpeed 把它抽象成命令序列（可读、可换，引擎逐条解释执行）。DeepSpeed 还有 <code class="inline">num_pipe_buffers = max(2, min(stages − stage_id, micro_batches))</code>——每阶段只需这么多个缓冲区来接力。代价是抽象层开销与功能边界：DS pipe <strong>不支持 ZeRO-2/3</strong>（engine.py 的 assert <code class="inline">zero_optimization_stage() &lt; ZeroStageEnum.gradients</code>），所以真要把 PP 和 ZeRO-3 组合，得走 Megatron 主导的 MCore-DeepSpeed 路线（第 1 章 1.5 节的模式 C）。</div>
     <div class="callout info">
       <b class="tag">数据对比</b>
-      同样是 1F1B，Megatron 的 schedules.py 约 2500 行（含 interleaved、只前向、CP 融合等全部分支），DS 的 schedule.py 约 500 行。前者是生产主路径，后者是教学友好的参考实现——读懂后者，前者只是多了工程细节。
+      同样是 1F1B，Megatron 的 schedules.py 约 2500 行（含 interleaved、只前向、CP 融合等全部分支），DS 的 schedule.py 约 650 行——DualPipeV 加入前只有约 500 行，一个新调度 +151 行。前者是生产主路径，后者是教学友好的参考实现——读懂后者，前者只是多了工程细节。
     </div>
   </section>
 
   <section class="block">
-    <h2><span class="num">4.5</span>小结 + 自研启示</h2>
-    <p>串一下本章：GPipe 显存随 microbatch 涨，1F1B 用 warmup 公式把 in-flight 钉在 stages−stage_id−1，interleaved 把气泡砍半但通信 ×v、只在特定拓扑下划算；DS 把调度抽象成 yield 命令流（可读可换），Megatron 写死在函数里（性能路径）。两库对照表：</p>
+    <h2><span class="num">4.5</span>DualPipeV：每卡两个阶段，双向填气泡</h2>
+    <p>命令列表这套抽象刚立起来，就迎来了第一个「换一个调度」的实测用户。2026 年 9 月 #8576 把 DeepSeek-V3 的 DualPipeV 调度合进 DeepSpeed 主干：新增 <code class="inline">deepspeed/runtime/pipe/dualpipev.py</code>（283 行）+ <code class="inline">DualPipeVSchedule</code>（schedule.py +151 行）。它攻击的是 1F1B 的老问题——<strong>首尾阶段的气泡</strong>。1F1B 里 stage0 开头干等数据、末段流水线尾部清反向；DualPipeV 的做法是<strong>每张卡持有两个阶段</strong>：模型切成 2P 段（P = 流水线卡数），卡 r 拿第 r 段（phase 0，激活往尾卡流）和第 2P−1−r 段（phase 1，激活折返回头卡）：</p>
+    <div class="code-title">deepspeed/runtime/pipe/dualpipev.py — DualPipeVModule（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">DualPipeVModule</span>(PipelineModule):
+    <span class="cmt"># 模型切成 2P 段；卡 r 建第 r 段（phase 0）和第 2P−1−r 段（phase 1）</span>
+    <span class="kw">def</span> <span class="fn">_partition_layers</span>(self, method=<span class="st">'uniform'</span>):
+        self.num_stages *= <span class="nu">2</span>          <span class="cmt"># 先翻倍，再按普通 PipelineModule 切</span>
+        <span class="kw">super</span>()._partition_layers(method)
+        mirror = self.num_stages - <span class="nu">1</span> - self.stage_id
+        self.phase_bounds = [(self._local_start, self._local_stop),
+                             (self.parts[mirror], self.parts[mirror + <span class="nu">1</span>])]</pre>
+    <div class="annotation"><b>V 形的意思：</b>micro-batch 从卡 0 进 phase 0，一路前向到尾卡，在尾卡「掉头」进 phase 1（尾卡的另一半），再一路反向折回卡 0——rank 0 既是数据入口又是 loss 阶段（<code class="inline">_is_loss_stage(phase)</code> 只有 <code class="inline">stage_id == 0 and phase == 1</code> 为真）。两个 phase 的 F/B 交错执行（step 4 主段是 nF0B1F1B0），第一段的反向梯度刚好垫住第二段前向的等待时间，气泡被双向的活填住。首尾卡的权重在 2P 段切法下天然同卡，tied embedding 不需要梯度交换。</div>
+    <p>调度本身照旧是一串 yield 命令，但多了一个新命令——<code class="inline">CommitP2P</code>：</p>
+    <div class="code-title">deepspeed/runtime/pipe/schedule.py — DualPipeVSchedule.steps()（结构摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward_backward_chunk</span>(phase0, phase1, recv0=<span class="kw">True</span>):
+    cmds = recv_forward(phase0) <span class="kw">if</span> recv0 <span class="kw">else</span> []
+    cmds += recv_backward(phase1) + [<span class="fn">CommitP2P</span>()] + forward(phase0) + backward(phase1)
+    <span class="kw">return</span> cmds + send_forward(phase0) + send_backward(phase1)
+
+<span class="cmt"># 主段（step 4）：nF0B1F1B0——两个 phase 各推进一步，交替成对出现</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(self.micro_batches - num_ranks * <span class="nu">2</span> + rank + <span class="nu">1</span>):
+    <span class="kw">yield</span> forward_backward_chunk(<span class="nu">0</span>, <span class="nu">1</span>) + forward_backward_chunk(<span class="nu">1</span>, <span class="nu">0</span>)</pre>
+    <div class="annotation"><b>CommitP2P 是为 DualPipeV 加的第九条命令：</b>普通 TrainSchedule 的 Send/Recv 命令立即执行阻塞点对点；DualPipeV 的收发只<strong>入队</strong>（<code class="inline">dist.P2POp</code> 攒进 <code class="inline">_p2p_ops</code>），遇到 <code class="inline">CommitP2P</code> 才用 <code class="inline">batch_isend_irecv</code> 一次性批量发出并等待。为什么要攒批？因为每步同一张卡要对上下游两个方向同时收发，逐条 isend/irecv 会让消息排序退化成串行等待；攒成一批交给 NCCL 自己排，才对得上 DualPipe 论文里的时序。代价写在构造函数的 assert 里：<code class="inline">micro_batches &gt;= 2 * stages</code>——气泡靠双向 micro-batch 填，喂不饱双向就填不满。官方测试：4 卡上比 1F1B 步时 0.465s → 0.439s，代价是峰值显存 621→761 MB（每卡两个阶段，激活翻倍是明码标价）。</div>
+    <div class="callout info">
+      <b class="tag">自研视角</b>
+      DualPipeV 进 DeepSpeed 的方式很说明问题：<strong>引擎不改，只加子类</strong>。DualPipeVEngine 只覆写了 send/recv 指令的实现和指令表（_INSTRUCTION_MAP 加一行 CommitP2P），调度纯靠新 Schedule 类——1F1B 用户完全不受影响。你自研框架要支持多种调度，「命令列表 + 引擎逐条解释」这套抽象的扩展成本，这次有了一个可量化的参照：加一种 V 形调度 = 283 行新文件 + 151 行调度 + 26 行 comm 层。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">4.6</span>小结 + 自研启示</h2>
+    <p>串一下本章：GPipe 显存随 microbatch 涨，1F1B 用 warmup 公式把 in-flight 钉在 stages−stage_id−1，interleaved 把气泡砍半但通信 ×v、只在特定拓扑下划算；DS 把调度抽象成 yield 命令流（可读可换），Megatron 写死在函数里（性能路径）；DualPipeV 沿着命令列表这条路进来，证明「每卡两阶段 + 批量 p2p」能在 1F1B 之外再挤一截气泡。两库对照表：</p>
     <table class="tbl">
       <tr><th>维度</th><th>Megatron 1F1B</th><th>DeepSpeed pipe TrainSchedule</th></tr>
       <tr><td>调度表达</td><td>过程式循环，写死在 schedule 函数</td><td>yield 命令流，可自定义</td></tr>
       <tr><td>通信时机</td><td>recv 先行 + async send，通信藏在 F/B 步内</td><td>命令显式列出 Send/Recv</td></tr><tr><td>梯度同步</td><td>最后一个 microbatch 才开 grad_sync</td><td>ReduceGrads 命令统一收尾</td></tr>
-      <tr><td>虚拟流水线</td><td>支持（interleaved）</td><td>不支持</td></tr>
+      <tr><td>虚拟流水线</td><td>支持（interleaved）</td><td>不支持（DualPipeV 是另一种「多段」方案）</td></tr>
       <tr><td>ZeRO 兼容</td><td>配合 DistributedOptimizer（ZeRO-1 等价）</td><td>仅 ZeRO-0/1</td></tr>
     </table>
     <div class="callout warn">
@@ -194,7 +224,7 @@ num_warmup_microbatches = <span class="fn">min</span>(num_warmup_microbatches, n
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 04 流水线 1F1B · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 04 流水线 1F1B · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>

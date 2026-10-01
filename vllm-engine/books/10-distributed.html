@@ -36,21 +36,17 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 10 分布式</div>
     <h1>分布式推理：一张卡装不下时怎么办</h1>
-    <div class="subtitle">模型太大、一张 GPU 放不下或跑不动时，就要把它「切开」分到多张卡。这一章回答三个问题：切法有哪几种、各切的是什么？谁来把「一次推理」分发到多个 worker 进程？切开的卡之间要付出多少通信代价？先立概念，再看 Executor 层的代码，末了拿 SGLang 对照一眼。</div>
+    <div class="subtitle">模型太大、一张 GPU 放不下或跑不动时，就得把它切到多张卡上。这一章讲三件事：四种并行切法各切的是什么；vLLM 怎么用 Executor 这一层把多张卡组织起来干活；切开的卡之间要付出多少通信代价。先立概念，再看代码，末了拿 SGLang 对照。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">10.1</span>单卡放不下、算不动，怎么办</h2>
-    <p>这一章要回答的问题有三个：</p>
-    <ul>
-      <li><strong>切法有哪几种，各切的对象是什么</strong>——TP/PP/DP/EP 名字都听过，但「切模型」和「复制模型」是两回事，通信量天差地别。→ 10.1 本节、10.4 通信取舍。</li>
-      <li><strong>谁把「一次推理」分发到多个 worker 进程</strong>——引擎的调度意图怎么落到每张卡。→ 10.2 Executor 职责、10.3 三种后端。</li>
-      <li><strong>切开的卡之间要付出多少通信代价</strong>——TP 每层都通信、PP 只传一次，取舍怎么定。→ 10.4。</li>
-    </ul>
-    <p>其中切法和通信代价是概念问题——切法先在本节立住、通信到 10.4 收拢；中间的 10.2、10.3 是工程问题，用 vLLM 的 Executor 层代码作答「谁来分发」。两个最原始的动机：</p>
-    <p><strong>放不下</strong>：模型权重 + KV cache + 激活，加起来超过单卡显存。比如 671B 参数的 MoE 模型，光权重就几百 GB，任何一张消费级卡都装不下。</p>
-    <p><strong>算不动</strong>：即使塞得进一张卡，单卡算力也有上限。吞吐（每秒处理多少 token）上不去，尤其面对高并发请求时，需要多张卡分摊计算。</p>
-    <p>于是有了四种「切法」。它们切的对象不同，通信的频率和量也完全不同：</p>
+    <p>先说多卡推理为什么存在，原因就两个，都很直接。一是<strong>放不下</strong>：模型权重、KV cache、中间激活加在一起，超过一张卡的显存。671B 参数的 MoE 模型光权重就有几百 GB，任何一张消费级卡都装不下。二是<strong>算不动</strong>：模型塞得进一张卡，但高并发下单卡算力见顶，吞吐上不去，需要几张卡分摊计算。</p>
+    <p>解决办法都绕不开同一个动作——把模型「切开」，或者把请求「摊开」。vLLM 有四种并行的说法：TP、PP、DP、EP。这四个缩写经常一起出现，但它们切的不是同一样东西，卡之间要做的通信也完全不同。一个一个看。</p>
+    <p><strong>TP（张量并行）</strong>是把<strong>一层内部的权重</strong>切成几份，每张卡拿一份。比如一个 4096×4096 的权重矩阵，TP=2 时每张卡各算一半，算完把两半的结果合起来。因为每一层都被切了，<strong>每层算完都得合一次</strong>——通信又频繁，又吃带宽。</p>
+    <p><strong>PP（流水线并行）</strong>是<strong>按层分段</strong>：前 32 层放 A 卡，后 32 层放 B 卡，A 算完把结果交给 B。它切的是「层与层之间」，卡之间只在段与段的边界上传数据，通信少得多；代价是像工厂流水线，各段必须衔接好，否则有的卡在空等。</p>
+    <p><strong>DP（数据并行）</strong>不切模型——<strong>每张卡放一份完整的模型副本</strong>，各接各的请求，互相不通信（训练时才同步参数）。推理里它就是最朴素的扩容手段：请求多了就加副本。</p>
+    <p><strong>EP（专家并行）</strong>只针对 MoE 模型。MoE 的一层里有很多「专家」，每个专家是一块独立的 FFN 权重，token 按路由结果只走其中少数几个。EP 把<strong>不同的专家放到不同的卡</strong>上，路由到谁，就把 token 发给谁。它不增加 KV cache 开销，只搬运激活，是大 MoE 模型最省显存的切法。</p>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
@@ -124,31 +120,37 @@
       </div>
       <div class="fig-cap">图 10.1：四种并行的直观区分。TP/PP 切模型，DP 复制模型，EP 只切 MoE 的 expert 层。</div>
     </div>
-    <div class="annotation"><b>带着这三个问题往下走：</b>切法怎么选 → 图 10.1 给直观区分、10.4 讲通信取舍；谁来分发 → 10.2 Executor 职责、10.3 三种后端代码；通信代价 → 10.4 TP vs PP。10.5 拿 SGLang 对照。</div>
+    <p>切法怎么选、通信代价差多少，10.4 再算这笔账。中间两节先解决一个更工程的问题：这些「切法」最终都要落到一个个独立进程上，谁来管这些进程、谁来把「这一步该跑了」通知到每一张卡？vLLM 给出的答案是 Executor。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.2</span>谁来分发：Executor 把「意图」交给 worker</h2>
-    <p>在 <code class="inline">vllm/v1/executor/abstract.py</code> 里，Executor 是抽象基类，注释写得很直白：<em>“An executor is responsible for executing the model on one device, or it can be a distributed executor that can execute the model on multiple devices.”</em> 它位于 <strong>EngineCore 的调度意图</strong> 和 <strong>每个 worker 进程</strong> 之间：引擎拿到调度输出后，把它交给 Executor，由 Executor 决定如何落到一个个 worker 上。</p>
-    <p>关键接口是 <code class="inline">collective_rpc(method, ...)</code>——「把同一个方法名广播给所有 worker 执行」，以及 <code class="inline">execute_model(scheduler_output)</code>。抽象基类还声明了两个类级标志位，用于描述实现的能力：</p>
+    <h2><span class="num">10.2</span>谁来分发：Executor 把每一步交给所有 worker</h2>
+    <p>第 1 章讲过 vLLM 的进程划分：EngineCore 是一个独立进程，里面跑着调度器，每一步它决定「处理哪些请求、每个请求算几个 token」。单卡时，决定做完，直接在本进程里把模型跑了就行。多卡时，「跑模型」这件事发生在别的进程、甚至别的机器上——EngineCore 自己够不着那些卡，中间必须有一层传话的代码。</p>
+    <p>这一层就是 Executor。抽象基类的 docstring 把职责说得很直白：一个 executor 负责在单个设备上执行模型，也可以是分布式 executor，在多个设备上执行。类上还挂着两个能力标志：</p>
+    <div class="code-title">vllm/v1/executor/abstract.py — class Executor（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="fn">Executor</span>(ABC):
-    uses_ray: <span class="cl">bool</span> = <span class="kw">False</span>   <span class="cmt"># 是否用 Ray 来编排进程</span>
-    supports_pp: <span class="cl">bool</span> = <span class="kw">False</span>  <span class="cmt"># 是否支持流水线并行(PP)</span>
-    <span class="cmt"># 下面都是统一入口，交给 subclass 实现：</span>
-    ...</pre>
-    <p><code class="inline">get_class(vllm_config)</code> 根据 <code class="inline">parallel_config.distributed_executor_backend</code> 选出具体实现。vLLM 提供三种主流后端，先一张表看差异，10.3 再看代码：</p>
+    uses_ray: <span class="cl">bool</span> = <span class="kw">False</span>   <span class="cmt"># 进程编排是否交给 Ray</span>
+    supports_pp: <span class="cl">bool</span> = <span class="kw">False</span>  <span class="cmt"># 是否支持流水线并行(PP)</span></pre>
+    <p>对上，Executor 暴露的方法很少，最核心的是 <code class="inline">execute_model(scheduler_output)</code>——把这一步的批次交下去。它内部统一走另一个入口 <code class="inline">collective_rpc</code>：把一个方法名连同参数，发给<strong>所有</strong> worker 执行，再把结果收回来。基类里的默认实现就是一层薄封装：</p>
+    <div class="code-title">vllm/v1/executor/abstract.py — execute_model 默认实现（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>output = <span class="kw">self</span>.<span class="fn">collective_rpc</span>(
+    <span class="st">"execute_model"</span>, args=(scheduler_output,), non_block=non_block
+)
+<span class="kw">return</span> output[<span class="nu">0</span>]</pre>
+    <p>换句话说，EngineCore 不关心有几张卡、卡在哪个进程，它只对 Executor 这一个入口说话；「同一个方法怎么送到每一张卡上」，是 Executor 的事。worker 从哪来、彼此怎么通信，由「后端」决定。vLLM 内置三种后端：</p>
     <table class="tbl">
-      <tr><th>后端</th><th>worker 怎么来</th><th>怎么通信</th><th>适用场景</th></tr>
-      <tr><td><strong>uni</strong>（UniProcExecutor）</td><td>没有独立 worker 进程，driver 直接执行</td><td>同进程直接调用，无 IPC</td><td>单卡，最简单也最快</td></tr>
-      <tr><td><strong>mp</strong>（MultiprocExecutor）</td><td><code class="inline">context.Process(target=WorkerProc.worker_main, name=f"VllmWorker-{rank}")</code> 拉起独立进程</td><td>共享内存消息队列 MessageQueue</td><td>单机多卡（默认多卡后端，不依赖 Ray）</td></tr>
-      <tr><td><strong>ray</strong>（RayDistributedExecutor / RayExecutorV2）</td><td>每个 worker 是 Ray actor（<code class="inline">ray.remote(RayWorkerProc)</code>）</td><td>复用 MultiprocExecutor 的消息队列控制平面，进程编排交给 Ray</td><td>多机集群；支持 PP 编译 DAG</td></tr>
+      <tr><th>后端</th><th>worker 进程从哪来</th><th>怎么通信</th><th>什么时候用</th></tr>
+      <tr><td><strong>uni</strong>（UniProcExecutor）</td><td>不起 worker——模型就在 EngineCore 所在的进程里跑</td><td>普通函数调用</td><td>单卡；最简单也最快</td></tr>
+      <tr><td><strong>mp</strong>（MultiprocExecutor）</td><td>每张卡一个 multiprocessing 子进程</td><td>共享内存上的消息队列（MessageQueue）</td><td>单机多卡；默认的多卡后端，不依赖 Ray</td></tr>
+      <tr><td><strong>ray</strong>（RayDistributedExecutor / RayExecutorV2）</td><td>每张卡一个 Ray actor</td><td>控制面复用 mp 的消息队列实现</td><td>多机集群；支持 PP 编译 DAG</td></tr>
     </table>
-    <div class="annotation"><b>小结：</b>Executor = 引擎与 worker 之间的「调度/分发层」。你把并行配置给它，它拉起进程、把每步的调度输出广播下去（<code class="inline">collective_rpc("execute_model", ...)</code>），再把结果收回来。uni 是「同一个进程直接调」，mp/ray 是「跨进程 RPC」。注意 <code class="inline">RayExecutorV2</code> 继承自 <code class="inline">MultiprocExecutor</code>——两种跨进程后端的差别只在 worker 进程谁来管，不在控制面。</div>
+    <p>不指定后端时怎么选，配置里也写了规则：<code class="inline">world_size</code> 为 1 就用 uni；单机放得下就用 mp；显式要求 Ray、或者引擎跑在 Ray placement group 里，才用 ray。</p>
+    <div class="annotation"><b>分工小结：</b>EngineCore 对 Executor 说话，Executor 按后端拉起 worker（同进程 / 子进程 / Ray actor），每步通过 <code class="inline">collective_rpc</code> 广播下去、把结果收上来。uni 和 mp/ray 的区别是「同进程直调」还是「跨进程传消息」；ray 和 mp 的区别只在 worker 进程由谁拉起——<code class="inline">RayExecutorV2</code> 直接继承自 <code class="inline">MultiprocExecutor</code>，消息队列那套控制面代码是同一份。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.3</span>落到代码：三种 Executor 的差异与并行配置</h2>
-    <p>10.2 的表格落到代码上是三件事：后端怎么被选出来、两种 IPC 形态（同进程直调 vs 远程 actor）长什么样、并行规模怎么算。先看后端是怎么被选出来的，下面这段来自抽象基类的工厂方法，按字符串挂载对应类：</p>
+    <h2><span class="num">10.3</span>落到代码：后端怎么选、worker 怎么跑</h2>
+    <p>三种后端在 <code class="inline">get_class</code> 里就是一段字符串分支，没什么玄机——按配置里的 <code class="inline">distributed_executor_backend</code> 挂载对应的类：</p>
     <div class="code-title">vllm/v1/executor/abstract.py — get_class（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">elif</span> distributed_executor_backend == <span class="st">"ray"</span>:
     executor_class = RayDistributedExecutor
@@ -157,13 +159,22 @@
 <span class="kw">elif</span> distributed_executor_backend == <span class="st">"uni"</span>:
     executor_class = <span class="fn">UniProcExecutor</span></pre>
 
-    <p>单进程的 <code class="inline">collective_rpc</code> 最朴素——根本没有网络，直接在同进程内调用 worker 方法：</p>
+    <p>uni 版的 <code class="inline">collective_rpc</code> 是三种里最短的：所谓「广播给所有 worker」，实际上就是直接调用那唯一的 worker——它就住在当前进程里，连序列化都不需要：</p>
     <div class="code-title">vllm/v1/executor/uniproc_executor.py — UniProcExecutor.collective_rpc（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># driver_worker 就在当前进程里，调用等同于直接执行</span>
 result = <span class="fn">run_method</span>(self.driver_worker, method, args, kwargs)
 <span class="kw">return</span> result <span class="kw">if</span> single_value <span class="kw">else</span> [result]</pre>
 
-    <p>而 Ray 版每个 worker 是一个远端 actor，于是 <code class="inline">collective_rpc</code> 变成「把方法序列化后 <code class="inline">.remote()</code> 发出去，再 <code class="inline">ray.get()</code> 收结果」：</p>
+    <p>mp 是默认的多卡后端，也最能说明「分布式」在 vLLM 里具体指什么。每个 worker 是一个用 multiprocessing 拉起的独立子进程（进程名 <code class="inline">VllmWorker-{rank}</code>），和 EngineCore 之间不共享任何 Python 对象，全靠共享内存上的消息队列传话：Executor 把方法名和参数写进广播队列，每个 worker 取到自己那份，执行完再把结果写回各自的应答队列：</p>
+    <div class="code-title">vllm/v1/executor/multiproc_executor.py — MultiprocExecutor.collective_rpc（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> <span class="fn">isinstance</span>(method, <span class="cl">str</span>):
+    send_method = method
+<span class="kw">else</span>:
+    send_method = <span class="fn">cloudpickle.dumps</span>(method, protocol=pickle.HIGHEST_PROTOCOL)
+<span class="kw">self</span>.rpc_broadcast_mq.<span class="fn">enqueue</span>((send_method, args, kwargs, output_rank))</pre>
+    <p>写进队列之后，Executor 逐个从各 worker 的应答队列里收结果，<code class="inline">timeout</code> 参数管的就是这一步的等待上限。方法名可以直接传字符串；传整个函数的话，先 cloudpickle 序列化再入队。</p>
+
+    <p>ray 版的思路一样，只是 worker 换成了 Ray actor——它们可能住在别的机器上，所以调用方式从「写队列」变成 Ray 的远程调用：把方法通过 <code class="inline">.remote()</code> 发给每个 actor，再用 <code class="inline">ray.get</code> 把所有结果等齐：</p>
     <div class="code-title">vllm/v1/executor/ray_executor.py — RayDistributedExecutor.collective_rpc（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>ray_worker_outputs = [
     worker.<span class="fn">execute_method</span>.remote(sent_method, *args, **kwargs)
@@ -171,7 +182,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 ]
 <span class="kw">return</span> ray.<span class="fn">get</span>(ray_worker_outputs, timeout=timeout)</pre>
 
-    <p>并行规模最终由配置决定，而 worker 总数 <code class="inline">world_size</code> 是这样来的（vLLM 里它被定义为 TP×PP，CP/DP 再在此基础上扩展）：</p>
+    <p>worker 一共该有几个？这是并行配置算出来的。TP、PP、DP 各有一个尺寸字段，它们的乘积决定了进程总数，配置里对应的名字就叫 <code class="inline">world_size</code>：</p>
     <div class="code-title">vllm/config/parallel.py — world_size（摘录，注释为官方）</div>
     <pre class="code"><span class="lang-tag">python</span>world_size: <span class="cl">int</span> = <span class="cl">Field</span>(init=<span class="kw">False</span>)
 <span class="cmt">"""world_size is TPxPP, it affects the number of workers we create."""</span>
@@ -180,9 +191,9 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 <span class="kw">def</span> <span class="fn">world_size_across_dp</span>(self) <span class="kw">-&gt;</span> <span class="cl">int</span>:
     <span class="cmt">"""Process world size across TP, PCP, PP, and DP."""</span>
     <span class="kw">return</span> self.world_size * self.data_parallel_size</pre>
-    <div class="annotation"><b>逐行读：</b>vLLM 里 <code class="inline">world_size</code> 的本质是 <strong>TP × PP</strong>（决定 worker 数量）；<code class="inline">world_size_across_dp</code> 在它基础上再乘 <code class="inline">data_parallel_size</code>，把 DP 的复制份也算进来。注意官方 docstring 写的是“TPxPP”，但代码里实际计算是 <code class="inline">PP × TP × PCP</code>（<code class="inline">prefill_context_parallel_size</code>，默认 1，所以多数情况等价于 TP×PP）；DCP（decode context parallel）则复用 TP 的 rank 来切序列。另外 vLLM <strong>没有独立的 <code class="inline">expert_parallel_size</code> 字段</strong>——MoE 的 expert 切分直接复用 TP/DP 的世界大小（<code class="inline">enable_expert_parallel</code> 只是开关）。</div>
+    <div class="annotation"><b>几处容易认错的细节：</b>docstring 写的是 world_size = TP × PP，但 <code class="inline">__post_init__</code> 里的实际计算还乘了第三个因子 PCP——prefill context parallel，把长 prefill 的序列维再切给几张卡算，默认 1，所以平时把它当 TP × PP 没错。DCP（decode context parallel）是另一个维度：decode 时把 KV cache 切到几张卡上，它不增加进程数，直接复用 TP 的 rank。还有，vLLM 没有 <code class="inline">expert_parallel_size</code> 这个字段——EP 不单独占一维，MoE 的专家切分就发生在 TP/DP 的组上，<code class="inline">enable_expert_parallel</code> 只是个开关。</div>
 
-    <p>多卡之间的「对话」最终落到设备通信。TP 组里每层都要做一次 all-reduce，走在 <code class="inline">GroupCoordinator</code> 上：</p>
+    <p>worker 之间真正搬数据的地方不在 Executor 层，而在通信库里。TP 切开后，每层末尾要把各卡的「半份结果」合成整体，这个「合」就是集合通信里的 all-reduce：每张卡各持有一部分和，通信做完，每张卡都拿到总和。vLLM 给它留了统一入口，在 <code class="inline">GroupCoordinator</code> 上：</p>
     <div class="code-title">vllm/distributed/parallel_state.py — GroupCoordinator.all_reduce（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">all_reduce</span>(self, input_: torch.Tensor) -&gt; torch.Tensor:
     <span class="kw">if</span> self.world_size == <span class="nu">1</span>:        <span class="cmt"># 单卡直接跳过</span>
@@ -191,12 +202,14 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
         <span class="kw">return</span> torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
     <span class="kw">else</span>:
         <span class="kw">return</span> self._all_reduce_out_place(input_)  <span class="cmt"># 最终调 device_communicator</span></pre>
-    <p>底层设备通信在 <code class="inline">vllm/distributed/device_communicators/</code> 里（如 <code class="inline">pynccl.py</code> 的 <code class="inline">PyNcclCommunicator</code>、<code class="inline">custom_all_reduce.py</code>）。而各个并行组的句柄由 <code class="inline">parallel_state</code> 提供，例如 <code class="inline">get_tp_group()</code>、<code class="inline">get_pp_group()</code>、<code class="inline">get_dp_group()</code>、<code class="inline">get_ep_group()</code>、<code class="inline">get_pcp_group()</code>、<code class="inline">get_world_group()</code>。</p>
+    <p>单卡时原样返回，什么通信都不做；多卡时走 torch 自定义算子，或直接调底层通信器——实现在 <code class="inline">vllm/distributed/device_communicators/</code> 下，如 <code class="inline">pynccl.py</code> 的 <code class="inline">PyNcclCommunicator</code>、<code class="inline">custom_all_reduce.py</code>。各个并行组的句柄则由 <code class="inline">parallel_state</code> 提供，例如 <code class="inline">get_tp_group()</code>、<code class="inline">get_pp_group()</code>、<code class="inline">get_dp_group()</code>、<code class="inline">get_ep_group()</code>。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">10.4</span>切开的代价：TP 与 PP 的通信取舍</h2>
-    <p>分布式的悖论在于：<strong>切开的多卡必须互相说话</strong>，而跨卡通信（甚至跨机走网卡）比显存内带宽慢得多。两种主要切法通信模式截然不同：</p>
+    <p>分布式不是免费的。切开的卡必须互相说话，而跨卡通信——尤其是跨机走网卡——比卡内显存带宽慢得多。所以选切法，本质是在选「把通信花在哪里」。</p>
+    <p>TP 把通信花在<strong>每一层</strong>。同一层切到多张卡，每层前向结束都要 all-reduce 一次，通信量正比于「层数 × 每次合的张量大小」。它对带宽的要求很高，最好几张卡在同一台机器上、走 NVLink 互联。换来的是各卡干一样的活，负载天然均衡。</p>
+    <p>PP 把通信压到<strong>阶段边界</strong>。整条流水线几十上百层，只在段与段之间传一两次激活，通信量小，对带宽不敏感，可以跨机。代价有二：一是流水线气泡——下游必须等上游，节奏对不齐就有卡在空转；二是各阶段持有的层数不同，显存占用不均衡。</p>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 190" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -225,18 +238,14 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
         <text class="lbl sm" x="540" y="150" text-anchor="middle">几十层里只传 1~2 次激活 → 通信量小</text>
         <text class="lbl sm" x="540" y="168" text-anchor="middle">但阶段间串行，延迟略高、显存不均衡</text>
       </svg>
-      <div class="fig-cap">图 10.4：TP 通信频繁但单次小、卡间算力均衡；PP 通信少但引入串行 bubble。</div>
+      <div class="fig-cap">图 10.2：TP 通信频繁但单次小、卡间算力均衡；PP 通信少但引入串行 bubble。</div>
     </div>
-    <ul>
-      <li><strong>TP（张量并行）</strong>：通信发生在<strong>每一层</strong>。同一层切开后，推理前向中每层都要做 all-reduce / all-gather 集合通信（若用于训练，反向传播还要再来一轮），通信量大致正比于 <code class="inline">层数 × 张量大小</code>。带宽要求高（最好在同一节点、走 NVLink），但每张卡算的工作量均衡。适用：单卡放得下、只想更快。</li>
-      <li><strong>PP（流水线并行）</strong>：通信只发生在<strong>流水线阶段之间</strong>——上游把整段激活传给下游。几十上百层只传一两次，通信少、对带宽不敏感（可跨机）。代价是 phase 串行会引入「流水线气泡」（bubble），且不同阶段间显存占用不均衡。</li>
-      <li><strong>小结取舍</strong>：能塞进一张卡 → 优先 TP；模型大到必须分阶段（且带宽紧张/跨机）→ 才上 PP。这也是 vLLM 默认优先用 TP、把 PP 留给超大模型的原因。</li>
-    </ul>
+    <p>两种切法不互斥，可以组合着用。选型的出发点是通信路径：卡挨得近、带宽足，TP 通常是第一选择——通信虽频繁，但走的是卡间高速互联，而且负载均衡；模型大到单机放不下，就把跨机的部分交给 PP，让它把「贵」的通信压缩到段边界那几次。vLLM 默认优先 TP、把 PP 留给超大模型，道理就在这笔账上。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">10.5</span>SGLang 的进程组织与自研启示</h2>
-    <p>回到 10.1 摆出的三个问题，vLLM 的答案是「四种切法按对象区分：切模型（TP/PP）、复制模型（DP）、切 expert（EP）」「Executor 拉起 worker、collective_rpc 广播每步」「TP 均衡但每层通信、PP 省通信但有气泡——默认优先 TP」。先把四种切法收进一张表：</p>
+    <h2><span class="num">10.5</span>对照 SGLang：同一个问题的另一种组织</h2>
+    <p>vLLM 的答案到这里齐了：切法按对象分四种；Executor 负责拉起 worker、把每步广播下去；通信代价上，TP 每层都付、PP 只在段边界付。先把四种切法收进一张表：</p>
     <table class="tbl">
       <tr><th>并行</th><th>切的对象</th><th>通信</th><th>什么时候用</th></tr>
       <tr><td>TP</td><td>同一层权重</td><td>每层 all-reduce（多）</td><td>单卡放得下、想更快，带宽好</td></tr>
@@ -250,14 +259,14 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
     </div>
     <div class="callout info">
       <b class="tag">与 SGLang 对照</b>
-      同一个「多卡推理」，SGLang 的进程组织根本不同，逐项对照：<br>
+      同样是「多卡跑一次推理」，SGLang 的进程组织完全不同。逐项对照：<br>
       <table class="tbl">
         <tr><th style="width:22%">对比点</th><th>vLLM</th><th>SGLang</th></tr>
-        <tr><td>进程组织</td><td>一个 EngineCore 经 Executor（UniProc/Multiproc/Ray）把每步调度结果分发给 worker——一个调度者、多个执行者</td><td>每个 TP rank 一个完整 Scheduler 子进程，各自跑事件循环，靠「输入相同 → 输出一致」同步——每张卡一个完整调度者</td></tr>
-        <tr><td>TP 通信选路</td><td>GroupCoordinator.all_reduce 走 custom op 或 device_communicator（10.3 节）</td><td>GroupCoordinator.all_reduce 六路分流：pymscclpp / symmetric-memory pynccl / flashinfer / torch 等，按平台与消息大小现选（<code class="inline">python/sglang/srt/distributed/parallel_state.py</code>）</td></tr>
-        <tr><td>DP 的含义</td><td>多副本分摊负载（10.4 节）</td><td>DataParallelController 做请求路由（四种均衡策略）+ dp_attention：注意力复制、MoE 分片，每张卡仍是完整 Scheduler</td></tr>
+        <tr><td>进程组织</td><td>一个 EngineCore 经 Executor 把每步调度结果分发给 worker——一个调度者，多个执行者</td><td>每个 TP rank 一个完整的 Scheduler 子进程，各自跑事件循环，靠「输入相同 → 输出一致」保持同步——每张卡上都有一个完整调度者</td></tr>
+        <tr><td>TP 通信选路</td><td>GroupCoordinator.all_reduce 走自定义算子或底层通信器（10.3 节）</td><td>同一个入口，按平台和消息大小现场选实现：custom allreduce / quick allreduce / pymscclpp / torch symm-mem / pynccl / flashinfer 六条路（<code class="inline">python/sglang/srt/distributed/parallel_state.py</code>）</td></tr>
+        <tr><td>DP 的含义</td><td>多副本分摊负载（10.4 节）</td><td>DataParallelController 把请求路由到各副本（四种均衡策略）；dp_attention 变换并行组切法——注意力各卡复制、MoE 分片</td></tr>
       </table>
-      dp_attention 那行值得展开：大 MoE 模型上注意力复制 + MoE 分片，每张卡仍是完整 Scheduler，只是并行组换了切法——这正是「每卡一个完整调度者」这个组织换来的扩展自由度。详见 <a href="../../sglang/books/10-distributed.html">深入浅出SGLang · 10 分布式推理</a>。
+      dp_attention 那行稍微展开一点：大 MoE 模型上，注意力部分每张卡复制一份，MoE 部分切开分片，而每张卡上跑的仍是一个完整的 Scheduler——变的只是并行组的切法。「每卡一个完整调度者」这个组织，换来的正是这种扩展上的自由度。详见 <a href="../../sglang/books/10-distributed.html">深入浅出SGLang · 10 分布式推理</a>。
     </div>
   </section>
 
@@ -268,7 +277,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 </div>
 
 <footer>
-  深入浅出vLLM · 10 分布式 · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 10 分布式 · 版本 v0.30.1rc0-311-g1fde8ff7da
 </footer>
 
 </body>

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · autograd 引擎 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a class="active" href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 autograd 引擎</div>
+    <h1>autograd 引擎：backward 的多线程执行器</h1>
+    <div class="subtitle">上一章说清楚图是什么，这章看图怎么被执行。引擎在 torch/csrc/autograd/engine.cpp，一个文件三千多行，核心结构其实只有三样：GraphTask（一次 backward 的账本）、每设备一条工作线程加一条就绪队列、每个节点一个依赖计数。retain_graph、梯度 hook、CUDA 流同步全都挂在这三样上。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>入口：一次 backward 调用的路径</h2>
+    <p>从 Python 侧到 C++ 引擎，中间没有多少站。<code class="inline">loss.backward()</code> 先到 torch/autograd/__init__.py 的 <code class="inline">backward</code>，整理参数后调用 <code class="inline">_engine_run_backward</code>，再到 <code class="inline">torch/autograd/graph.py</code> 的同名包装，最后一步交给 <code class="inline">Variable._execution_engine.run_backward</code>——这一行就是 Python 和 C++ 引擎的分界线。graph.py 里的包装函数做的是线程本地状态（TLS）的存取，源码里那段注释值得看：TLS 上下文如果不在调用前后正确清理，会在下一次 backward 时死锁，这是真实修过的 bug。</p>
+    <p>进到 C++ 侧，一切从 Engine::execute 开始：</p>
+    <div class="code-title">torch/csrc/autograd/engine.cpp — execute 开头（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">auto</span> Engine::<span class="fn">execute</span>(
+    <span class="kw">const</span> edge_list&amp; root_edges,
+    <span class="kw">const</span> variable_list&amp; inputs,
+    <span class="kw">bool</span> keep_graph,
+    <span class="kw">bool</span> create_graph,
+    <span class="kw">bool</span> accumulate_grad,
+    <span class="kw">const</span> edge_list&amp; outputs) -&gt; variable_list {
+  <span class="cmt">// （开头的参数校验与 create_graph 警告省略）</span>
+  <span class="kw">auto</span> compiled_autograd = the_compiled_autograd.load();
+
+  <span class="cmt">// accumulate_grad is true if and only if the frontend call was to</span>
+  <span class="cmt">// backward(), not grad(). grad() returns the sum of the gradients</span>
+  <span class="cmt">// w.r.t. the inputs and thus needs the inputs to be present.</span>
+
+  <span class="cmt">// A fresh first time Engine::execute call should start on the CPU device,</span>
+  <span class="cmt">// initialize a new thread local ready queue on CPU or reuse the existing one</span>
+  <span class="cmt">// (if there is one allocated already, i.e. consecutive backward calls,</span>
+  <span class="cmt">// re-entrant backward calls), then memoize the local_ready_queue in GraphTask</span>
+  <span class="fn">init_local_ready_queue</span>();
+  <span class="kw">bool</span> not_reentrant_backward_call = worker_device == NO_DEVICE;
+
+  <span class="cmt">// Store root nodes so we can traverse through the graph later</span>
+  c10::SmallVector&lt;Node*, 4&gt; temp_roots{root_edges.size()};
+  <span class="kw">for</span> (<span class="kw">const auto</span> i : c10::irange(root_edges.size())) {
+    temp_roots[i] = root_edges[i].function.get();
+  }
+
+  <span class="kw">auto</span> graph_task = std::make_shared&lt;GraphTask&gt;(
+      <span class="cmt">/* keep_graph */</span> keep_graph,
+      <span class="cmt">/* grad_mode */</span> create_graph,
+      <span class="cmt">/* reentrant_depth */</span> not_reentrant_backward_call ? 0 : total_depth + 1,
+      <span class="cmt">/* cpu_ready_queue */</span> local_ready_queue,
+      <span class="cmt">/* graph_roots */</span> std::move(temp_roots));</pre>
+    <p>参数里的 <code class="inline">keep_graph</code> 就是 Python 侧的 <code class="inline">retain_graph</code>，<code class="inline">create_graph</code> 是高阶梯度开关。函数开头初始化本线程的就绪队列，然后造出 GraphTask——注意它是 <code class="inline">shared_ptr</code>，后面所有工作线程都攥着它，谁也不提前释放。这个函数后半段构造 GraphRoot、算依赖，最后把第一个任务塞进队列并进入等待循环（调用方线程在 backward 期间是阻塞的）。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>GraphTask：一次 backward 的账本</h2>
+    <p>GraphTask 是这次 backward 的全部共享状态。它的关键字段不多，每个都对应一类用户可感知的行为：</p>
+    <table class="tbl">
+      <tr><th>字段</th><th>含义</th><th>对应的用户可见行为</th></tr>
+      <tr><td>dependencies_</td><td>每个节点还差几路输入才可执行</td><td>执行顺序正确性的保证（5.4）</td></tr>
+      <tr><td>not_ready_</td><td>已到但没凑齐的梯度暂存区</td><td>菱形结构（多路径汇聚）不丢梯度</td></tr>
+      <tr><td>exec_info_ / needed_</td><td>本次需要执行哪些节点</td><td>指定 inputs 的 grad()；hook 过滤</td></tr>
+      <tr><td>captured_vars_</td><td>要返回给调用方的梯度</td><td>autograd.grad() 的返回值</td></tr>
+      <tr><td>keep_graph_</td><td>是否保留图</td><td>retain_graph 参数</td></tr>
+      <tr><td>outstanding_tasks_</td><td>还没执行完的任务数</td><td>backward 何时返回</td></tr>
+    </table>
+    <p>开始执行前的准备工作有两步，都在 execute 里。第一步 compute_dependencies：从根出发遍历全图，数清每个节点被几条边指着——这个数就是它必须等齐的输入份数。第二步 init_to_execute：如果用户调的是 grad(loss, inputs) 而不是 backward(loss)，把「与 inputs 无关的子树」标记为不需要执行。两步都做在同一个 GraphTask 上，之后的执行就只查账本、不再碰图。</p>
+    <div class="annotation"><b>为什么先算依赖再执行：</b>图是动态长出来的，节点间没有任何拓扑序字段（sequence_nr 只用于异常诊断）。与其执行时反复判断「我该不该等」，不如开工前一次性把每个节点的依赖数算好、执行时只做减法。这是空间换顺序：一次 O(V+E) 遍历，换每个节点 O(1) 的就绪判断。第 12 章的 FSDP2 也会在反向里插自己的 all-gather，靠的正是这套通用的依赖机制而不是改引擎。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>工作线程与就绪队列</h2>
+    <p>引擎的线程模型是理解 backward 性能的钥匙，规则只有一条：<strong>每个设备一条工作线程，每条线程一条自己的就绪队列</strong>。首次 backward 的用户线程扮演 CPU 工作线程；CUDA tensor 的节点会触发为该 GPU 创建专属线程（每个设备进程内只建一次，长期复用）。</p>
+    <div class="code-title">torch/csrc/autograd/engine.cpp — thread_main（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">auto</span> Engine::<span class="fn">thread_main</span>(<span class="kw">const</span> std::shared_ptr&lt;GraphTask&gt;&amp; graph_task) -&gt; <span class="kw">void</span> {
+  <span class="cmt">// When graph_task is nullptr, this is a long running thread that processes</span>
+  <span class="cmt">// tasks (ex: device threads). When graph_task is non-null (ex: reentrant</span>
+  <span class="cmt">// backwards, user thread), this function is expected to exit once that</span>
+  <span class="cmt">// graph_task complete.</span>
+
+  <span class="cmt">// local_ready_queue should already been initialized when we get into</span>
+  <span class="cmt">// thread_main</span>
+  TORCH_INTERNAL_ASSERT(local_ready_queue != <span class="kw">nullptr</span>);
+  <span class="kw">while</span> (graph_task == <span class="kw">nullptr</span> || !graph_task-&gt;future_result_-&gt;<span class="fn">completed</span>()) {
+    <span class="cmt">// （local_graph_task：本次从队列取出的任务所属的 GraphTask）</span>
+    <span class="cl">NodeTask</span> task = local_ready_queue-&gt;<span class="fn">pop</span>();
+    <span class="kw">if</span> (task.<span class="fn">isShutdownTask_</span>) {
+      C10_LOG_API_USAGE_ONCE(<span class="st">"torch.autograd.thread_shutdown"</span>);
+      <span class="kw">break</span>;
+    }
+
+    local_graph_task = task.base_.<span class="fn">lock</span>();
+    <span class="kw">if</span> (!local_graph_task) {
+      <span class="cmt">// GraphTask for function is no longer valid, skipping further execution.</span>
+      <span class="kw">continue</span>;
+    }
+
+    <span class="fn">set_device</span>(worker_device);
+
+    <span class="kw">if</span> (task.fn_ &amp;&amp; !local_graph_task-&gt;has_error_.load()) {
+      <span class="cmt">// Set the ThreadLocalState before calling the function.</span>
+      at::ThreadLocalStateGuard tls_guard(local_graph_task-&gt;thread_locals_);
+      c10::WarningUtils::WarningHandlerGuard warnings_guard(
+          &amp;local_graph_task-&gt;warning_handler_);
+
+      <span class="kw">try</span> {
+        GraphTaskGuard guard(local_graph_task);
+        NodeGuard ndguard(task.fn_);
+        {
+          RECORD_FUNCTION(
+              c10::str(
+                  <span class="st">"autograd::engine::evaluate_function: "</span>,
+                  task.fn_.get()-&gt;<span class="fn">name</span>()),
+              c10::ArrayRef&lt;<span class="kw">const</span> c10::IValue&gt;());
+          <span class="fn">evaluate_function</span>(
+              local_graph_task,
+              task.fn_.get(),
+              task.inputs_,
+              local_graph_task-&gt;cpu_ready_queue_);
+        }
+      } <span class="kw">catch</span> (std::exception&amp; e) {
+        <span class="cmt">// See Note [ Persisting PyErr state across autograd engine threads ]</span>
+        thread_on_exception(local_graph_task, task.fn_, e);
+      }</pre>
+    <p>循环体结构简单：从队列取任务、检查这次 backward 是否已被异常终止、恢复线程本地状态、执行、异常则记录到 GraphTask。两个细节值得停留。</p>
+    <p>其一，队列为空时线程 <code class="inline">pop</code> 阻塞，不做忙等。GPU 工作线程平时全在睡觉，backward 一来才醒——所以 idle 的 PyTorch 进程 CPU 占用为零，是设计使然而非巧合。</p>
+    <p>其二，device 线程是常驻的（graph_task == nullptr 的分支），跨多次 backward 复用。首次调用会支付线程创建成本，此后每次 backward 只是唤醒。这就是为什么第一个 step 的 backward 明显比后续慢。</p>
+    <p>其三，执行中出错的传播方式不是跨线程抛异常，而是记到 GraphTask 上（thread_on_exception 内部调 set_exception，在 GraphTask 上留下 has_error_ 标志并把异常存进 future_result_）。has_error_ 一旦置位，主循环里 <code class="inline">task.fn_ &amp;&amp; !has_error_.load()</code> 的条件不再满足，其余任务跳过执行但仍走计数递减；而 future_result_ 一旦完成，while 循环条件 <code class="inline">!graph_task-&gt;future_result_-&gt;completed()</code> 不再成立，各线程依次退出。错误处理同样搭在这套计数与队列机制上。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>执行与计数：evaluate_function</h2>
+    <p>每个入队的任务就是「某节点依赖已凑齐，可以执行了」。执行函数 <code class="inline">evaluate_function</code>承担三件事：调 Node 的 apply 拿到梯度输出、按 next_edges 把梯度分发给下游、递减下游依赖计数，减到零就入队。分发与计数的核心片段（<code class="inline">engine.cpp</code> 起，收在 else 分支进入前）：</p>
+    <div class="code-title">torch/csrc/autograd/engine.cpp — 依赖递减与入队（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="cmt">// Lock mutex for the accesses to GraphTask dependencies_, not_ready_ and</span>
+  <span class="cmt">// cpu_ready_queue_ below</span>
+  std::lock_guard&lt;std::mutex&gt; lock(graph_task-&gt;mutex_);
+  <span class="kw">for</span> (<span class="kw">const auto</span> i : c10::irange(num_outputs)) {
+    <span class="kw">auto</span>&amp; output = outputs[i];
+    <span class="kw">const</span> <span class="kw">auto</span>&amp; next = fn.<span class="fn">next_edge</span>(i);
+
+    <span class="kw">if</span> (!next.<span class="fn">is_valid</span>())
+      <span class="kw">continue</span>;
+
+    <span class="cmt">// Check if the next function is ready to be computed</span>
+    <span class="kw">bool</span> is_ready = <span class="kw">false</span>;
+    <span class="kw">auto</span>&amp; dependencies = graph_task-&gt;dependencies_;
+    <span class="kw">auto</span> it = dependencies.find(next.function.get());
+
+    <span class="kw">if</span> (it == dependencies.end()) {
+      <span class="kw">auto</span> name = next.function-&gt;<span class="fn">name</span>();
+      TORCH_CHECK(<span class="kw">false</span>, <span class="st">"dependency not found for "</span>, name);
+    } <span class="kw">else if</span> (--it-&gt;second == 0) {
+      dependencies.erase(it);
+      is_ready = <span class="kw">true</span>;
+    }
+
+    <span class="kw">auto</span>&amp; not_ready = graph_task-&gt;not_ready_;
+    <span class="kw">auto</span> not_ready_it = not_ready.find(next.function.get());
+    <span class="kw">if</span> (not_ready_it == not_ready.end()) {
+      <span class="cmt">// （exec_info_ 过滤：本次不执行的节点直接跳过）</span>
+      <span class="cmt">// No buffers have been allocated for the function</span>
+      <span class="cl">InputBuffer</span> input_buffer(next.function-&gt;<span class="fn">num_inputs</span>());
+
+      input_buffer.<span class="fn">add</span>(
+          next.input_nr,
+          std::move(output),
+          opt_parent_stream,
+          next.function-&gt;<span class="fn">stream</span>(),
+          next.function.get());
+
+      <span class="kw">if</span> (is_ready) {
+        <span class="kw">auto</span> queue = <span class="fn">ready_queue</span>(cpu_ready_queue, next.function-&gt;device());
+        queue-&gt;<span class="fn">push</span>(
+            <span class="cl">NodeTask</span>(graph_task, next.function, std::move(input_buffer)));
+      } <span class="kw">else</span> {
+        not_ready.emplace(next.function.get(), std::move(input_buffer));
+      }
+    }</pre>
+    <div class="annotation"><b>InputBuffer 与 CUDA 流同步：</b>evaluate_function 开头有一段「等上游事件」的逻辑（opt_parent_stream / opt_ready_event）：上游梯度在别的流上算完时，这里插入 stream wait 保证消费不早于生产。单卡代码永远感知不到它；多流训练（比如用多个 stream 并行几层）时的「偶发 NaN」，值得先怀疑这里的同步是否被自定义 hook 打乱。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>执行顺序：广度优先的实际效果</h2>
+    <p>很多人以为 backward 是「深度优先」：从 loss 一路推到最底层再回头。实际不是。依赖计数机制天然产生的是一种自适应的并行推进：所有依赖已清零的节点同时可执行、各设备各取各的。用一个两层 MLP 的图看实际顺序：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t55 d55">
+        <title id="t55">backward 执行顺序：依赖清零即执行</title>
+        <desc id="d55">一个 y = W2·relu(W1·x) 的图在 backward 时的推进：t0 只有输出侧节点可执行；t1 它把梯度发回后，下游两个节点依赖清零、同时入队（在单卡上串行执行，在多卡上可并行）；t2 更底层的节点执行并写入 AccumulateGrad。每步的「可执行集合」由依赖计数而非树深决定。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl sm" x="60" y="40" font-weight="bold" fill="#165a7b">t0：起点</text>
+        <rect class="node core" x="60" y="50" width="240" height="54" rx="8"></rect>
+        <text class="lbl" x="180" y="72" text-anchor="middle">NllBackward（loss 侧）</text>
+        <text class="lbl sm" x="180" y="90" text-anchor="middle">唯一入队节点</text>
+
+        <line class="edge" x1="300" y1="77" x2="350" y2="77"></line>
+
+        <text class="lbl sm" x="360" y="40" font-weight="bold" fill="#165a7b">t1：两个节点同时清零</text>
+        <rect class="node core" x="360" y="50" width="180" height="54" rx="8"></rect>
+        <text class="lbl" x="450" y="72" text-anchor="middle">ReluBackward</text>
+        <text class="lbl sm" x="450" y="90" text-anchor="middle">W1 路径</text>
+        <rect class="node core" x="360" y="150" width="180" height="54" rx="8"></rect>
+        <text class="lbl" x="450" y="172" text-anchor="middle">AddmmBackward</text>
+        <text class="lbl sm" x="450" y="190" text-anchor="middle">W2 路径</text>
+
+        <line class="edge" x1="540" y1="77" x2="640" y2="130"></line>
+        <line class="edge" x1="540" y1="177" x2="640" y2="150"></line>
+
+        <text class="lbl sm" x="650" y="120" font-weight="bold" fill="#165a7b">t2：叶子</text>
+        <rect class="node acc" x="650" y="130" width="250" height="54" rx="8"></rect>
+        <text class="lbl" x="775" y="152" text-anchor="middle">AccumulateGrad × 2</text>
+        <text class="lbl sm" x="775" y="170" text-anchor="middle">写 param.grad，无下游</text>
+
+        <text class="lbl sm" x="60" y="250">执行顺序 = 每一时刻「依赖计数已清零的节点集合」，不是先序/后序遍历。单卡上这个集合串行跑；多卡上每个设备的线程并行消化各自队列里的部分。</text>
+      </svg>
+      <div class="fig-cap">图 5.1：backward 不是树遍历，是依赖驱动的推进。引擎从不知道「第几层」，只认计数。这个设计换来一个重要性质：图中任何节点的执行不需要等全图遍历到某个固定位置——只要它的输入齐了，随时开始。</div>
+    </div>
+    <p>这个性质直接解释了两个日常现象。一是 <code class="inline">retain_graph</code> 为什么会拖慢第二次 backward：图不释放、节点引用都在，第二次执行没法复用第一次的任何中间缓存，该算的全部重算。二是 hook 的执行时机——tensor 的 post-accumulate hook 挂在 AccumulateGrad 上，所以它跑在「该参数梯度刚写完」的时刻，而不是 backward 结束的统一时刻。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>回顾：把图和引擎接起来</h2>
+    <p>两章合起来，backward 的完整故事是：前向时 dispatcher 的 autograd key 把 696 条 YAML 规则实例化成 Node/Edge 图（04 章）；backward 时引擎为这次调用造 GraphTask、数依赖、多设备线程按计数推进、梯度最终经 AccumulateGrad 写进 .grad（本章）。全部过程里，用户代码只出现两次——发起前向，和调用 backward。</p>
+    <p>有一个把两章连起来的对照值得放进脑内：前向的「顺序」来自 Python 语句的先后，后向的「顺序」来自依赖计数。前者是书写顺序，后者是数据流顺序。动态图框架的全部自由与全部开销，都藏在这句话里——自由是因为图随代码走，昂贵是因为每步都在解释执行。第 9 章的 Dynamo 就要从这里下手：把「解释执行」变成「编译执行」，同时尽量不破坏这套语义。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      引擎三件套：GraphTask（账本）、每设备线程 + 就绪队列（并行单元）、依赖计数（顺序保证）。理解了这三样，retain_graph、hook 时机、多卡并行、首次 backward 变慢，全部有了出处。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="04-autograd-graph.html">← 上一章：autograd 计算图</a>
+    <a href="06-module.html">下一步：nn.Module →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 05 autograd 引擎 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

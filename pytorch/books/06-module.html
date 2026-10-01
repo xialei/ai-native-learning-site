@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · nn.Module — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a class="active" href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 06 nn.Module</div>
+    <h1>nn.Module：注册树、hook、state_dict 的三层来源</h1>
+    <div class="subtitle">写模型时 <code class="inline">self.linear = nn.Linear(...)</code> 这行赋值背后，是一套注册机制在工作。这章拆 Module 的三个侧面：赋值时发生了什么（__setattr__ 的分流）、调用时发生了什么（_call_impl 的快慢路径）、checkpoint 靠什么格式（state_dict 的拼装）。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">6.1</span>self.linear = ... 那一瞬间</h2>
+    <p>Python 赋值语句默认只是写 <code class="inline">__dict__</code>，但 Module 重写了 <code class="inline">__setattr__</code>，把每次赋值按类型分拣进三本账：参数（_parameters）、子模块（_modules）、缓冲（_buffers）。分类逻辑的第一段：</p>
+    <div class="code-title">torch/nn/modules/module.py — __setattr__ 的参数分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__setattr__</span>(self, name: <span class="cl">str</span>, value: <span class="cl">Union</span>[<span class="cl">Tensor</span>, <span class="st">"Module"</span>]) -&gt; <span class="kw">None</span>:
+    <span class="kw">def</span> <span class="fn">remove_from</span>(*dicts_or_sets) -&gt; <span class="kw">None</span>:
+        <span class="kw">for</span> d <span class="kw">in</span> dicts_or_sets:
+            <span class="kw">if</span> name <span class="kw">in</span> d:
+                <span class="kw">if</span> isinstance(d, <span class="kw">dict</span>):
+                    <span class="kw">del</span> d[name]
+                <span class="kw">else</span>:
+                    d.discard(name)
+
+    params = self.__dict__.get(<span class="st">"_parameters"</span>)
+    <span class="kw">if</span> isinstance(value, <span class="cl">Parameter</span>):
+        <span class="kw">if</span> params <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">raise</span> <span class="cl">AttributeError</span>(
+                <span class="st">"cannot assign parameters before Module.__init__() call"</span>
+            )
+        remove_from(
+            self.__dict__,
+            self._buffers,
+            self._modules,
+            self._non_persistent_buffers_set,
+        )
+        self.<span class="fn">register_parameter</span>(name, value)</pre>
+    <p>往下还有两个分支：value 是 Module 就进 <code class="inline">self._modules[name]</code>（顺带触发全局注册 hook），是普通 tensor 且名字已占用就进 buffers。三本账是 Module 一切能力的根——parameters() 能递归出全部参数、to(device) 能搬动整个模型、state_dict 能序列化，都是遍历这三本账。</p>
+    <div class="annotation"><b>读时的那半边：</b>读取走 <code class="inline">__getattr__</code>——只在常规属性查找失败后才被调用，依次翻 _parameters、_buffers、_modules 三本账。这个顺序解释了一个日常细节：给子模块起名 <code class="inline">training</code> 或 <code class="inline">forward</code> 会出诡异行为——那些名字在常规查找就命中了，根本轮不到账本。另有一处容易忽视的报错也出自这里：在 <code class="inline">__init__</code> 之前赋值参数会得到 "cannot assign parameters before Module.__init__() call"，因为 <code class="inline">_parameters</code> 字典还没建。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.2</span>调用：_call_impl 的快慢路径</h2>
+    <p>前向调用 <code class="inline">model(x)</code> 实际调的是 <code class="inline">_wrapped_call_impl</code> → <code class="inline">_call_impl</code>。这个函数有个关键的分支：</p>
+    <div class="code-title">torch/nn/modules/module.py — _call_impl（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_call_impl</span>(self, *args, **kwargs):
+    forward_call = (self._slow_forward <span class="kw">if</span> torch._C._is_tracing() <span class="kw">else</span> self.forward)
+    <span class="cmt"># If we don't have any hooks, we want to skip the rest of the logic in</span>
+    <span class="cmt"># this function, and just call forward.</span>
+    <span class="kw">if</span> <span class="kw">not</span> (self._backward_hooks <span class="kw">or</span> self._backward_pre_hooks <span class="kw">or</span> self._forward_hooks <span class="kw">or</span> self._forward_pre_hooks
+            <span class="kw">or</span> _global_backward_pre_hooks <span class="kw">or</span> _global_backward_hooks
+            <span class="kw">or</span> _global_forward_hooks <span class="kw">or</span> _global_forward_pre_hooks):
+        <span class="kw">return</span> forward_call(*args, **kwargs)
+
+    result = <span class="kw">None</span>
+    called_always_called_hooks = set()
+
+    <span class="kw">def</span> <span class="fn">inner</span>():
+        nonlocal result, args, kwargs
+        ...
+        result = forward_call(*args, **kwargs)
+        <span class="kw">if</span> _global_forward_hooks <span class="kw">or</span> self._forward_hooks:
+            <span class="kw">for</span> hook_id, hook <span class="kw">in</span> (
+                *_global_forward_hooks.items(),
+                *self._forward_hooks.items(),
+            ):</pre>
+    <p>开头一长串 or 是热路径的守卫：没有任何 hook 时直接 <code class="inline">forward_call(*args)</code>，连函数调用的壳都不多套一层。这个判断每层每次前向都要做一遍，所以在小模型、高频调用的场景下，hook 的存在与否是可测量的——「随手注册个 forward hook 调试」在大模型里不是免费的。注册了 hook 才进入 inner() 的慢路径：pre-hooks 改输入、forward_call、post-hooks 改输出，全套按注册顺序执行。</p>
+    <div class="callout warn">
+      <b class="tag">演进痕迹</b>
+      源码里还有一行 <code class="inline">torch._C._is_tracing()</code> 的分支：在 torch.jit.trace 模式下走 _slow_forward。它是最早一代「图捕获」的痕迹——比第 9 章的 Dynamo 早了六年。今天写新代码不该再依赖它，但这行代码解释了为什么 Module 的调用协议里要预留「可替换的 forward」这个缝：后来的 compile、量化、并行都从这里进出。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.3</span>state_dict：名字是拼出来的</h2>
+    <p>checkpoint 的通用格式是 state_dict——「参数名 → 张量」。这个名字不是存的时候起的，是 Module 树的路径：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t63 d63">
+        <title id="t63">state_dict 的名字拼装</title>
+        <desc id="d63">模型结构 Transformer（顶层）含 block.0 和 block.1 两个子模块，每个子模块含 attention（子模块）和 norm（子模块），attention 里有权重 w_q/w_k。state_dict 的键由逐层属性名用点号拼接：block.0.attention.w_q 等。保存和加载都依赖这个拼名规则与注册树一致。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="40" y="60" width="170" height="52" rx="8"></rect>
+        <text class="lbl" x="125" y="82" text-anchor="middle">Transformer</text>
+        <text class="lbl sm" x="125" y="100" text-anchor="middle">self.block = ModuleList</text>
+
+        <rect class="node" x="290" y="30" width="170" height="46" rx="8"></rect>
+        <text class="lbl code" x="375" y="58" text-anchor="middle">block.0</text>
+        <rect class="node" x="290" y="100" width="170" height="46" rx="8"></rect>
+        <text class="lbl code" x="375" y="128" text-anchor="middle">block.1</text>
+
+        <rect class="node" x="540" y="30" width="190" height="46" rx="8"></rect>
+        <text class="lbl code" x="625" y="58" text-anchor="middle">block.0.attention</text>
+        <rect class="node" x="540" y="100" width="190" height="46" rx="8"></rect>
+        <text class="lbl code" x="625" y="128" text-anchor="middle">block.0.norm</text>
+
+        <rect class="node core" x="760" y="30" width="150" height="46" rx="8"></rect>
+        <text class="lbl code" x="825" y="58" text-anchor="middle">w_q / w_k</text>
+
+        <line class="edge" x1="210" y1="86" x2="288" y2="58"></line>
+        <line class="edge" x1="210" y1="86" x2="288" y2="118"></line>
+        <line class="edge" x1="460" y1="53" x2="538" y2="53"></line>
+        <line class="edge" x1="460" y1="123" x2="538" y2="123"></line>
+        <line class="edge" x1="710" y1="53" x2="758" y2="53"></line>
+
+        <text class="lbl sm" x="40" y="190">拼出来的键名（逐层属性名用点连）：</text>
+        <text class="lbl code" x="40" y="214">block.0.attention.w_q · block.0.attention.w_k · block.0.norm.weight · block.1.attention.w_q · …</text>
+        <text class="lbl sm" x="60" y="170">↑ 树的形状完全由 __setattr__ 的注册决定；改名、动态建子模块，state_dict 的键就跟着变</text>
+      </svg>
+      <div class="fig-cap">图 6.1：state_dict 键名的来源。Module 树（__setattr__ 注册的）+ 属性名拼接 = checkpoint 里的键。这就是「加载别人的 checkpoint 时报 missing key / unexpected key」的机制根源：键名不匹配，本质是两边 Module 树的形状或命名不一致。</div>
+    </div>
+    <p>第三方的权重文件能直接 load 进 PyTorch 模型，靠的从来不是格式兼容，而是「名字对得上」。社区里大量的权重转换脚本（HF checkpoint → 自定义模型）本质都在做同一件事：把两边的拼名规则对齐。分布式时代这个机制升级成了 DCP（第 13 章），但「名字即契约」的原则没变。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.4</span>Module 层的三个实用推论</h2>
+    <p>把机制换算成日常动作的解释：</p>
+    <ul>
+      <li><strong>列表里放子模块会失效</strong>：<code class="inline">self.layers = [nn.Linear(...)] * n</code> 里的模块没进 _modules（Python list 不是 Module），parameters() 找不到它们。要用 <code class="inline">nn.ModuleList</code>/<code class="inline">nn.ModuleDict</code>——它们就是「把容器操作翻译成注册」的适配器。</li>
+      <li><strong>to(device) 之后的参数多半还是同一批</strong>：Module._apply 对每个参数先算 fn(param)，再由 <code class="inline">compute_should_use_set_data</code>（<code class="inline">module.py</code>）决定怎么落账：新旧张量浅拷贝类型兼容时走 <code class="inline">param.data = param_applied</code>（第 2 章的 set_data 路径），Parameter 对象身份不变、autograd 元信息保留，hook 不用重挂；类型不兼容（如量化、DTensor 包装）或打开了 overwrite 开关时则换新 Parameter 对象，甚至 swap_tensors 整体置换。这也解释了「有人持有旧 param 引用时 to() 不生效」的传言：只有引用旧 TensorImpl 的情形才踩得到，普通 to() 走 set_data 并不换对象。</li>
+      <li><strong>训练/评测的开关是遍历</strong>：train()/eval() 就是把整棵树的 self.training 逐个置位。任何没注册进树的自定义结构（又见第一条）不会被切换——BN 层行为不对时先查这里。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      Module 的全部机制都源于重写的 __setattr__/__getattr__ 与三本账。记住「注册决定一切」：参数、子模块、buffer 注册了才存在，state_dict 名字、device 迁移、train/eval 切换全都以注册树为准。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="05-autograd-engine.html">← 上一章：autograd 引擎</a>
+    <a href="07-optimizer.html">下一步：优化器与 AMP →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 06 nn.Module · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

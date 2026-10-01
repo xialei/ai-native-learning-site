@@ -89,20 +89,35 @@
 
   <section class="block">
     <h2><span class="num">10.3</span>Megatron 的层内重算与选择性重算</h2>
-    <p>全重算存得最少，但每个算子都付一遍算力——能不能只重算「便宜的」、保留「昂贵的」？Megatron 的 selective 档就是这个思路：</p>
-    <div class="code-title">megatron/core/transformer/transformer_layer.py — checkpointed_forward（结构摘录，译注）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># full granularity：整个 layer 一个 checkpoint 段</span>
-<span class="kw">def</span> <span class="fn">checkpointed_forward</span>(self, *args):
-    <span class="kw">def</span> <span class="fn">custom</span>(*args):
-        <span class="kw">return</span> self._get_layer()(*args)   <span class="cmt"># 一整层：LN+Attn+LN+MLP</span>
-    <span class="kw">if</span> self.config.recompute_granularity == <span class="st">"full"</span>:
-        <span class="cmt"># full：整层存一个输入；backward 时整层重算</span>
-        <span class="kw">return</span> tensor_parallel.checkpoint(...)
-    <span class="kw">elif</span> self.config.recompute_granularity == <span class="st">"selective"</span>:
-        <span class="cmt"># selective：只重算核心注意力段，其余正常建图</span>
-        <span class="cmt"># 挂点在 Attention 模块内部（core_attention 的输入输出保留）</span>
-        ...</pre>
-    <div class="annotation"><b>三档怎么用配置项表达：</b>Megatron 用 <code class="inline">--recompute-granularity full|selective</code> + <code class="inline">--recompute-method uniform|block</code> + <code class="inline">--recompute-num-layers n</code> 组合表达档位。selective 的思想（论文 Checkmate/Reduction 系）：attention 概率矩阵是平方级显存大户，重算它最划算；QKV 输出保留（重算它要重跑两个 GEMM，不划算）。<strong>Megatron 的实现是非侵入的</strong>——配置开关决定层怎么包，模型代码不变；DS 是显式函数调用。自研选哪种取决于你的代码形态，但<strong>RNG 恢复是共同的责任</strong>，两库都处理了。</div>
+    <p>全重算存得最少，但每个算子都付一遍算力——能不能只重算「便宜的」、保留「昂贵的」？Megatron 的 selective 档就是这个思路。两条实现路径分属两个文件：<code class="inline">full</code> 档整层打包，走 <code class="inline">megatron/core/recompute.py</code> 的 <code class="inline">checkpointed_forward()</code>；<code class="inline">selective</code> 档把重算决策下放到各模块自己的构造函数里，按 <code class="inline">recompute_modules</code> 列表逐个挂号：</p>
+    <div class="code-title">megatron/core/recompute.py — checkpointed_forward（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># full granularity：整个 block 按 uniform/block 两种方法分段 checkpoint</span>
+<span class="kw">def</span> <span class="fn">checkpointed_forward</span>(self, hidden_states, ...):
+    <span class="kw">def</span> <span class="fn">custom</span>(start, end):
+        <span class="kw">def</span> <span class="fn">custom_forward</span>(*args):
+            <span class="kw">for</span> index <span class="kw">in</span> range(start, end):
+                hidden_states = self.layers[index](...)  <span class="cmt"># 逐层跑，不逐层存</span>
+            <span class="kw">return</span> hidden_states, context
+        <span class="kw">return</span> custom_forward
+    <span class="kw">if</span> self.config.recompute_method == <span class="st">'uniform'</span>:
+        <span class="cmt"># 均匀切：每 recompute_num_layers 层存一份输入</span>
+        <span class="kw">while</span> layer_idx &lt; self.num_layers_per_pipeline_rank:
+            chunk_runner(layer_idx, chunk_end, use_checkpoint=<span class="kw">True</span>)
+    <span class="kw">elif</span> self.config.recompute_method == <span class="st">'block'</span>:
+        <span class="cmt"># 前 recompute_num_layers 层存，其余不存</span>
+        chunk_runner(layer_idx, layer_idx + 1, use_checkpoint=layer_idx &lt; n)</pre>
+    <div class="annotation"><b>两条路径的分工：</b>TransformerBlock 的 forward 只有 <code class="inline">recompute_granularity == 'full' and self.training</code> 时才调用这个函数（transformer_block.py:687）；selective 档根本不走它——层照常逐个执行，只是各模块内部在 <code class="inline">__init__</code> 时根据配置给自己挂上 checkpoint。</div>
+
+    <div class="code-title">megatron/core/transformer/attention.py:393 — selective 档的挂点（摘录，译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 构造时决定：core_attention 的输入是否保存、反向时重算</span>
+self.checkpoint_core_attention = (
+    self.config.recompute_granularity == <span class="st">'selective'</span>
+    <span class="kw">and</span> <span class="st">"core_attn"</span> <span class="kw">in</span> self.config.recompute_modules
+)
+<span class="cmt"># forward 里：挂上就只存 q/k/v，softmax 概率反向重算</span>
+<span class="kw">if</span> self.checkpoint_core_attention <span class="kw">and</span> self.training:
+    core_attn_out = self._checkpointed_attention_forward(query, key, value, ...)</pre>
+    <div class="annotation"><b>三档怎么用配置项表达：</b>Megatron 用 <code class="inline">--recompute-granularity full|selective</code> + <code class="inline">--recompute-method uniform|block</code> + <code class="inline">--recompute-num-layers n</code> 组合表达档位。selective 档再配 <code class="inline">recompute_modules</code> 列表挑要重算的模块——可选值有 <code class="inline">core_attn</code>（默认，注意力概率矩阵是平方级显存大户，重算它最划算；QKV 输出保留，重算它要重跑两个 GEMM，不划算）、<code class="inline">layernorm</code>、<code class="inline">mlp</code>、<code class="inline">moe</code> 等。<strong>Megatron 的实现是非侵入的</strong>——配置开关决定模块怎么包，模型代码不变；DS 是显式函数调用。自研选哪种取决于你的代码形态，但<strong>RNG 恢复是共同的责任</strong>，两库都处理了。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t101 d101">
@@ -160,7 +175,7 @@
     <table class="tbl">
       <tr><th>实现</th><th>侵入性</th><th>RNG 处理</th><th>特色</th></tr>
       <tr><td>DS CheckpointFunction</td><td>显式包裹函数</td><td>保存 CPU+CUDA+tracker 三份</td><td>PARTITION_ACTIVATIONS / CPU_CHECKPOINT</td></tr>
-      <tr><td>Megatron checkpointed_forward</td><td>配置开关，模型无感</td><td>复用 TP RNG tracker</td><td>selective 重算 + uniform/block 分段</td></tr>
+      <tr><td>Megatron checkpointed_forward</td><td>配置开关，模型无感</td><td>复用 TP RNG tracker</td><td>full 分段 + selective 按模块挂点</td></tr>
       <tr><td>torch.utils.checkpoint</td><td>原生 API</td><td>自动 fork_rng</td><td>use_reentrant 区别（新版默认 False）</td></tr>
     </table>
     <div class="callout warn">
@@ -176,7 +191,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 10 激活重算 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 10 激活重算 · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>

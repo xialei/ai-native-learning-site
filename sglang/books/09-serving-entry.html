@@ -86,7 +86,7 @@
         <text class="lbl sm" x="540" y="186" text-anchor="middle">/v1/messages（anthropic 兼容）</text>
         <rect class="node warn" x="40" y="224" width="600" height="44" rx="6"></rect>
         <text class="lbl" x="335" y="244" text-anchor="middle">运维路由：/flush_cache · /get_server_info · /update_weights_from_disk</text>
-        <text class="lbl sm" x="335" y="260" text-anchor="middle">/start_profile · /abort_request · /health /health_generate …</text>
+        <text class="lbl sm" x="335" y="260" text-anchor="middle">/begin_weight_update · /end_weight_update · /start_profile · /abort_request …</text>
 
         <!-- OpenAI 适配层 -->
         <rect class="node acc" x="230" y="330" width="210" height="48" rx="6"></rect>
@@ -145,9 +145,10 @@
       <tr><th>路由组</th><th>代表路径</th><th>去向</th></tr>
       <tr><td>原生生成</td><td>/generate · /encode · /classify</td><td>TokenizerManager.generate_request</td></tr>
       <tr><td>OpenAI 兼容</td><td>/v1/chat/completions · /v1/completions · /v1/embeddings · /v1/responses</td><td>OpenAIServing* 适配层</td></tr>
+      <tr><td>评分类</td><td>/v1/rerank · /v1/decisions · /v1/systemone</td><td>OpenAIServingDecisions 系（/v1/systemone 保留 422 detail list，见下方演进痕迹）</td></tr>
       <tr><td>第三方兼容</td><td>/api/chat（ollama）· /v1/messages（anthropic）</td><td>转译后进 OpenAI 适配层</td></tr>
       <tr><td>运维控制</td><td>/flush_cache · /get_server_info · /abort_request · /pause_generation</td><td>TokenizerManager 专用方法</td></tr>
-      <tr><td>权重更新</td><td>/update_weights_from_disk · /update_weights_from_tensor · /update_weights_from_distributed</td><td>TokenizerManager → Scheduler</td></tr>
+      <tr><td>权重更新</td><td>/update_weights_from_disk · /update_weights_from_tensor · /update_weights_from_distributed · /begin_weight_update · /end_weight_update</td><td>TokenizerManager → Scheduler（后两条走 session，见下方演进痕迹）</td></tr>
       <tr><td>可观测</td><td>/start_profile · /stop_profile · /set_trace_level · /freeze_gc</td><td>profiler / tracing</td></tr>
       <tr><td>健康检查</td><td>/health · /health_generate · /ping · /ready</td><td>状态检查或单 token 生成；/ready 额外反映暂停/排空状态（见下方注）</td></tr>
       <tr><td>HiCache 管理</td><td>/hicache/storage-backend（GET/PUT/DELETE）</td><td>分层缓存后端热切换（第 11 章）</td></tr>
@@ -209,7 +210,16 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
 
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      新近多出的第三条：<code class="inline">/ready</code>（http_server.py:663）。它与 /health 的分野在<strong>语义</strong>：/health 回答「进程活着」，/ready 回答「这个实例现在该不该接新请求」——实现读 <code class="inline">TokenizerManager.is_ready()</code>（tokenizer_manager.py:672）：未暂停、未在优雅排空、<code class="inline">ServerStatus.Up</code> 三个条件同时成立才 200，否则 503。滚动发布时先把实例置为排空、等它退出负载均衡、再停进程，探针就得盯 /ready 而不是 /health——活着但不想接活的实例，用 /health 看不出来。
+      新近多出的第三条：<code class="inline">/ready</code>（<code class="inline">http_server.py</code>）。它与 /health 的分野在<strong>语义</strong>：/health 回答「进程活着」，/ready 回答「这个实例现在该不该接新请求」——实现读 <code class="inline">TokenizerManager.is_ready()</code>（<code class="inline">tokenizer_manager.py</code>）：未暂停、未在优雅排空、<code class="inline">ServerStatus.Up</code> 三个条件同时成立才 200，否则 503。滚动发布时先把实例置为排空、等它退出负载均衡、再停进程，探针就得盯 /ready 而不是 /health——活着但不想接活的实例，用 /health 看不出来。
+    </div>
+
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      权重更新这条路最近长出了「会话」语义（commit f4d9d2e670，#40777）。此前的三条 /update_weights_* 是一次性 RPC，发一条做一件事；#40777 加了 <code class="inline">/begin_weight_update</code> 和 <code class="inline">/end_weight_update</code>（<code class="inline">http_server.py</code>、:1415，都是 ADMIN_OPTIONAL）把更新包进一个开关区间，动机是 RL 训练循环里反复推权重——而这些服务里大量模型做了<strong>原地量化打包</strong>（weight pack）：参数在显存里已经不是加载时的形状，新权重根本塞不进去。所以 begin 干的事是「恢复出厂形状」：调 <code class="inline">DefaultModelLoader.restore_weights_before_loading</code>，docstring 一句话讲清目的——"Undo in-place quant packing so fresh weights can be loaded"（<code class="inline">loader.py</code>）。<br><br>会话有三条规矩。其一，<code class="inline">update_weights_from_tensor / from_distributed</code> 在会话外直接拒绝——scheduler 侧 <code class="inline"><code class="inline">.py</code>、<code class="inline">:219.py</code></code> 的错误信息就是字面意思："must run between begin_weight_update() and end_weight_update()"；from_disk 不受此限，它本来就按「完整加载」的流程走。其二，end 时只在<strong>整个会话期间没跑过任何加载</strong>才补 <code class="inline">post_load_weights</code>（<code class="inline">run_post_load = not session.loaded_weights</code>，<code class="inline">weight_updater.py</code>）——P2P/RDMA 走自组网直拷，加载路径自己收尾；跑过 tensor/distributed 加载的会话，加载器已经做过后处理，再跑一次会把打包做两遍。其三，end 收尾的 runner 集合取自 begin 时记下的 selector，而不是 end 请求里重新给的那份——<code class="inline">_WeightUpdateSession</code> 就两个字段（<code class="inline">weight_updater.py</code>，注释原话 "recorded at begin so end finalizes the same runners"）。<br><br>selector 是这次改动引入的新旋钮：<code class="inline">Literal["target","draft","all"]</code>（<code class="inline">io_struct.py</code>），默认 all。实现不是 if-else，而是每个 worker 暴露 <code class="inline">weight_update_runners()</code> 返回 <code class="inline">(role, runner)</code> 列表：目标侧 tp_worker 返回 <code class="inline">[("target", …)]</code>（<code class="inline">tp_worker.py</code>），投机侧 BaseSpecWorker 返回 <code class="inline">[("draft", r) for r in draft_runners]</code>——NGRAM / UNO 这类无草稿模型的返回空表；多层 EAGLE 则按层给 <code class="inline">("draft_step_0", …), ("draft_step_1", …)</code>。_select_runners 把两边的表拼接起来，权重更新第一次能精确落到草稿模型上——RL 训 EAGLE 草稿头时不用再重启引擎。begin/end 各自以 <code class="inline">torch.distributed.barrier(group=self.tp_cpu_group)</code> 收尾，保证 TP 组对「会话开着/关着」的判断同步。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      路由表里评分类那一行最近热闹了两轮。其一，新增 <code class="inline">/v1/systemone</code>（<code class="inline">http_server.py</code>，commit 16d1c93b3d #41208）——System One 兼容的决策 API，与 <code class="inline">/v1/decisions</code> 共用 <code class="inline">OpenAIServingDecisions</code> 的渲染、标签校验与打分（<code class="inline">serving.py</code> 的子类说明写得很直白："Answers System One questions with the rendering, label checks, and scoring of /v1/decisions"）；唯一特化在错误格式：全局 422→400 的改写器单独给它留了口子，保留 System One API 文档规定的 422 detail list（<code class="inline">http_server.py</code> 的注释）。兼容层的「兼容」二字再次显形——不只兼容请求格式，连<strong>错误码语义</strong>都要兼容。其二，打分本身多了一种 setwise 读出（#38965/#41188）：请求带 <code class="inline">score_extraction_token</code>（<code class="inline">protocol.py</code>）后，读出点从「序列最后一个 token」变成「query+item 拼接里每次出现该 token 的位置」，返回嵌套形状 <code class="inline">[num_items][Nᵢ × num_labels]</code>——一次前向给一组候选各自打分（SeqCls 在该 token 处池化，CausalLM 读标签 logprob），嵌套深度本身用来区分 pointwise/setwise 两种返回形状（protocol.py 的 ScoringResponse 注释）。用途是 rerank/评审类负载：逐 item 独立打分对「候选项互相关」是盲的，setwise 让同批候选在同一个上下文里被比出来。
     </div>
 
     <p>还有一个值得注意的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
@@ -253,15 +263,19 @@ prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(ren
     <div class="annotation"><b>两步渲染，整体缓存：</b> 通用路径是「先渲染成文本、再 encode」两步，中间结果（<code class="inline">rendered_prompt</code> / <code class="inline">prompt_ids</code> / 反解码的 <code class="inline">decoded_prompt</code>）按 (chat_template, messages, tools, kwargs) 整体做 LRU 缓存（上限 128，仅多模态请求启用）——同一批图片重复请求时渲染和编码都省掉。template_manager 负责处理「模型没带模板」「用户传了 chat_template_kwargs」这类边界。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      这条路径上有过两次收敛。其一，渲染结果怎么交给引擎：可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是逐模型 <code class="inline">elif</code> 链（先 <code class="inline">kimi_k3</code> 再 <code class="inline">inkling</code>），后来抽成 <code class="inline">_engine_prompt()</code>，判断依据从模型名字符串换成能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>——<strong>每接一个特殊编码器就加一个 elif 是这类地方的典型退化路径</strong>，换成能力位之后新模型声明行为即可，这里不用动。其二，tokenize 本身：kimi_k3 一族仍走「<code class="inline">apply_chat_template(tokenize=True)</code> 一步出 id」的快路径（<code class="inline">_encode_messages</code> 内），通用模型走上面渲染+编码两步——一步出 id 少一次 tokenize 往返，但两步版能拿到中间文本做多模态缓存键，各取所需。如今两条路之间还插了一个自动仲裁：构造时跑一次 <code class="inline">_probe_prompt_text_round_trip</code>（serving_chat.py:374）——拿一条 <code class="inline">[{"role": "user", "content": "x"}]</code> 分别走「渲染成文本再 encode」和「直接 tokenize=True」，结果不同就标记 lossy，此后该 tokenizer 的请求直接走一步出 id。这是被 mistral_common 类 tokenizer 逼出来的：它们的控制 token（<code class="inline">[INST]</code>、<code class="inline">[AVAILABLE_TOOLS]</code>）没有文本形式，渲染成字符串会变成字面字母、再 encode 还会多出一个 BOS——模型看到的不再是框住工具块的控制 token，而是字面字符。探测失败（比如模板需要探测没给的 kwargs）时保守回到老的文本路径。
+      这条路径上有过两次收敛。其一，渲染结果怎么交给引擎：可能是<strong>文本</strong>（普通 VLM：带占位符字符串的 prompt，交给多模态处理器去 tokenize），也可能是<strong>预渲染好的 input_ids</strong>（token-first 编码器：单个占位符 id，文本部分是空的——这时必须原样透传，否则会去 tokenize 一个空串）。这个「文本还是 id」的分叉原来长在 <code class="inline">_convert_to_internal_request</code> 里，是逐模型 <code class="inline">elif</code> 链（先 <code class="inline">kimi_k3</code> 再 <code class="inline">inkling</code>），后来抽成 <code class="inline">_engine_prompt()</code>，判断依据从模型名字符串换成能力查询 <code class="inline">chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)</code>——<strong>每接一个特殊编码器就加一个 elif 是这类地方的典型退化路径</strong>，换成能力位之后新模型声明行为即可，这里不用动。其二，tokenize 本身：kimi_k3 一族仍走「<code class="inline">apply_chat_template(tokenize=True)</code> 一步出 id」的快路径（<code class="inline">_encode_messages</code> 内），通用模型走上面渲染+编码两步——一步出 id 少一次 tokenize 往返，但两步版能拿到中间文本做多模态缓存键，各取所需。如今两条路之间还插了一个自动仲裁：构造时跑一次 <code class="inline">_probe_prompt_text_round_trip</code>（<code class="inline">serving_chat.py</code>）——拿一条 <code class="inline">[{"role": "user", "content": "x"}]</code> 分别走「渲染成文本再 encode」和「直接 tokenize=True」，结果不同就标记 lossy，此后该 tokenizer 的请求直接走一步出 id。这是被 mistral_common 类 tokenizer 逼出来的：它们的控制 token（<code class="inline">[INST]</code>、<code class="inline">[AVAILABLE_TOOLS]</code>）没有文本形式，渲染成字符串会变成字面字母、再 encode 还会多出一个 BOS——模型看到的不再是框住工具块的控制 token，而是字面字符。探测失败（比如模板需要探测没给的 kwargs）时保守回到老的文本路径。
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      logprobs 的 <code class="inline">bytes</code> 字段最近也修了一处静默损坏：<code class="inline">_build_token_logprobs_from_raw</code>（serving_chat.py:2436）的 docstring 讲得很清楚——引擎返回的三元组里 token id 永远是真的，但 token text 是<strong>展示用的反解码字符串</strong>，会丢碎片字节 token：比如 U+20BB7 的四个单字节 BPE 片段各自 decode 都是坏字节，拼出来是 U+FFFD。此前 OpenAI 响应里的 <code class="inline">bytes</code> 字段从展示文本反推，多字节字符就被这几个 U+FFFD 毁掉；现在改成从 token_id 走 GPT-2 字节解码器恢复真实字节。SentencePiece 系 tokenizer 没有这种字节回退表，仍退回展示文本。凡是做「把内部 (logprob, token_id, text) 三元组映射成 OpenAI 格式」的适配层，这条「id 才是真身、text 是投影」的教训都直接适用。
+      logprobs 的 <code class="inline">bytes</code> 字段最近也修了一处静默损坏：<code class="inline">_build_token_logprobs_from_raw</code>（<code class="inline">serving_chat.py</code>）的 docstring 讲得很清楚——引擎返回的三元组里 token id 永远是真的，但 token text 是<strong>展示用的反解码字符串</strong>，会丢碎片字节 token：比如 U+20BB7 的四个单字节 BPE 片段各自 decode 都是坏字节，拼出来是 U+FFFD。此前 OpenAI 响应里的 <code class="inline">bytes</code> 字段从展示文本反推，多字节字符就被这几个 U+FFFD 毁掉；现在改成从 token_id 走 GPT-2 字节解码器恢复真实字节。SentencePiece 系 tokenizer 没有这种字节回退表，仍退回展示文本。凡是做「把内部 (logprob, token_id, text) 三元组映射成 OpenAI 格式」的适配层，这条「id 才是真身、text 是投影」的教训都直接适用。
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       input-logprob 的临时显存最近开始「借」CUDA Graph 池的空地（commit 9e5a62a767，#40038）。问题背景：chunked prefill 开 input-logprob 时，LM-head 的 logits 矩阵（行数 × 词表 × 4 字节）是整段临时分配的大块显存，prefill batch 一大就直接顶到 OOM；而 CUDA Graph 捕获用的内存池里，两次捕获之间天然留着大片空闲（最大连续空闲段，<code class="inline">graph_pool_borrow_largest_run()</code>）。现在 <code class="inline">logprob_processor.py</code> 的 <code class="inline">_can_borrow_logprob_memory</code> 会先算「这块空地按 1~3 个矩阵/行能躺多少行」，不够放整个 chunk 就不借——<strong>chunk 边界必须与图池布局无关</strong>（借不到就退回常驻 workspace，注释写明：改 chunk 大小会改变 LM-head GEMM 的形状与取整），TP 下还要跨 rank all-reduce 取最小。借来的空间当然随时可能被图重放覆写，所以复制结果时挂一个 <code class="inline">input_logprobs_copy_done</code> CUDA event，<code class="inline">LogitsProcessorOutput.finalize_input_logprobs()</code> 在消费侧同步它，再把借址上按 span 排布的片段拉平成列表。这是「图池死空间再利用」的一例——第 6 章讲的 CUDA Graph 捕获策略决定了这块空地有多大。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      模板这一层最近补上了一道安全闸（commit 3e7e652900，#28135）：请求的 <code class="inline">chat_template_kwargs</code> 会原样展开进 <code class="inline">apply_chat_template</code>（<code class="inline">serving_chat.py</code> 的 <code class="inline">extra_template_kwargs.update</code>），而这个函数的签名里本来就有 <code class="inline">chat_template: str | None</code> 参数——kwargs 里塞进同名键就等于替服务端换掉模板本身，客户端得以重写整套渲染规则。现在 <code class="inline">_validate_request</code>（<code class="inline">serving_chat.py</code>）直接拒掉这个键，报错指路 <code class="inline">--trust-request-chat-template</code>；开关定义在 <code class="inline">serving.py</code>，注释写明「Off by default for safety」。值得注意 <code class="inline">reasoning_effort</code> 走的也是 <code class="inline">chat_template_kwargs</code> 这条路，却不会被误伤——校验只拦名为 <code class="inline">chat_template</code> 的键，其余 kwargs 照常透传。这是「请求体字段流入模板引擎前必须过白名单」的一例，自研适配层里凡是 <code class="inline">**kwargs</code> 直通 Jinja 的地方都值得对照检查。
     </div>
 
     <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
@@ -329,6 +343,17 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 <span class="fn">publish</span>(server_args, role=<span class="st">"tokenizer"</span>)</pre>
     <div class="annotation"><b>role 不只是元数据：</b> <code class="inline">publish(role="tokenizer")</code> 之后，主进程内所有 <code class="inline">get_schedule()</code> 式的读取都有了着落。每个角色有一张「允许读取哪些配置命名空间」的表（<code class="inline">ROLE_NAMESPACE_SETS</code>），<code class="inline">SGLANG_ROLE_NAMESPACES=enforce</code> 时表外的读取直接报错——这是把「哪类进程依赖哪些配置」显式写进了代码。</div>
     <div class="annotation"><b>这张表目前还很宽松，原因写在注释里：</b> 查表会发现，<code class="inline">scheduler</code>、<code class="inline">tokenizer</code>、<code class="inline">detokenizer</code>、<code class="inline">encoder</code> 等角色的值都是 <code class="inline">None</code>——<code class="inline">None</code> 的语义是<strong>整棵树都可以读</strong>，不是「什么都不能读」。真正被收窄的只有一个：<code class="inline">dp_controller</code>，限定在 <code class="inline">{"exec", "parallel", "device", "disagg", "observability", "serving"}</code> 六个命名空间。<code class="inline">tokenizer</code> 那一项旁边留了一段注释解释为什么不收窄：做记录模式审计时只跑通了文本模型的几个端点，多模态处理器、LoRA / score 端点、disagg 角色、gRPC 桥都没覆盖到，「<strong>收窄需要把这些形态也审计完；写错的集合会让请求失败，而不是让测试失败</strong>」。所以这张表现在的实际作用是：框架就位、失败关闭（fail-closed）已经生效，但生产角色还没有一个真正被限制住。</div>
+
+    <p>离线 Engine 还补齐了一块与 <code class="inline">sglang serve</code> 的能力差：多 tokenizer 进程。此前 <code class="inline">--tokenizer-worker-num &gt; 1</code> 只在 HTTP 服务路径生效（uvicorn worker 各挂一个 TokenizerWorker），Engine 构造时拿到 <code class="inline">MultiTokenizerRouter</code> 就没辙了——它只负责把多个 worker 桥到 scheduler，自己没有 <code class="inline">generate_request</code>，调用方拿到的是个空壳。#40260 后 Engine 检测到这个形态会自己补齐（commit 66454d704b）：</p>
+    <div class="code-title">python/sglang/srt/entrypoints/engine.py — Engine 检测 MultiTokenizerRouter（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> isinstance(tokenizer_manager, <span class="cl">MultiTokenizerRouter</span>):
+    <span class="cmt"># --tokenizer-worker-num &gt; 1：router 只桥接，没有 generate_request；</span>
+    <span class="cmt"># 发布共享内存里的启动数据（与 sglang serve 同一契约），</span>
+    <span class="cmt"># 本进程自己挂一个 worker，其余进程用 attach_tokenizer_worker 加入</span>
+    self.tokenizer_router = tokenizer_manager
+    self._multi_tokenizer_shm = <span class="fn">write_data_for_multi_tokenizer</span>(...)
+    self.tokenizer_manager, self.template_manager = self.<span class="fn">_init_tokenizer_worker</span>(...)</pre>
+    <div class="annotation"><b>发布-加入的两段式：</b> 主 Engine 进程把 port_args、server_args、scheduler 信息写进共享内存（<code class="inline">write_data_for_multi_tokenizer</code>，与 <code class="inline">sglang serve</code> 同一套契约），自己持一个 worker 保证 <code class="inline">Engine.generate()</code> 在本进程可用；其他进程调 <code class="inline">Engine.attach_tokenizer_worker(parent_pid)</code> 加入——attach 返回的 Engine <strong>没有自己的子进程</strong>，只持一个注册到父进程 <code class="inline">MultiTokenizerRouter</code> 的 TokenizerWorker，generate 在本进程跑、prefill/decode 还在父进程的 scheduler 上。docstring 顺带划了一条界线："Weight updates and other RPCs must go through the parent Engine"——分出去的只是每请求的 Python 开销（分词、模板渲染），控制面 RPC 仍归父进程。读代码时留意区分两套机制：<code class="inline">detokenizer_worker_num</code> 的多 worker 是<strong>引擎自带</strong>的进程编排（<code class="inline">engine.py</code> 起，worker 各持私有 IPC socket、由 <code class="inline">MultiDetokenizerRouter</code> 持原名扇出），而 tokenizer 的多 worker 复用了 <code class="inline">sglang serve</code> 的共享内存 + attach 机制，两条路径的落点不同。</div>
   </section>
 
   <section class="block">
@@ -394,7 +419,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

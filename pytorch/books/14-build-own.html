@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>14 · 自研路线 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a class="active" href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 14 自研路线</div>
+    <h1>自研路线：读完之后，把每一层变成里程碑</h1>
+    <div class="subtitle">前十三章按依赖顺序拆了 PyTorch 的每一层。这一章换个方向：如果你要自己造一个「迷你 PyTorch」——为自己的加速器、自己的训练平台——各层该按什么顺序做、每层最小做到什么程度算完成。同时给出 PyTorch 官方预留的扩展点：很多「自研」其实只需要注册，不需要重写。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">14.1</span>先分清：注册就能做，还是必须重写</h2>
+    <p>PyTorch 的扩展点从轻到重排成一个序列，多数需求落在前三档，不必动源码：</p>
+    <table class="tbl">
+      <tr><th>扩展档位</th><th>API</th><th>能做什么</th><th>对应章节</th></tr>
+      <tr><td>注册新算子</td><td>torch.library.define / impl（<code class="inline">library.py</code>/:776）</td><td>自定义算子挂进 dispatcher，与内置算子同权</td><td>03</td></tr>
+      <tr><td>注册 fake/求导规则</td><td>torch.library.register_fake（<code class="inline">library.py</code>）</td><td>让新算子过 Dynamo/compile、自动求导</td><td>03/04</td></tr>
+      <tr><td>Python dispatch 挂钩</td><td>__torch_dispatch__ / __torch_function__</td><td>拦截所有算子：DTensor、稀疏、量化都走这里</td><td>03/12</td></tr>
+      <tr><td>替换编译后端</td><td>torch.compile(backend=...)</td><td>换掉 Inductor，自定义图到代码的编译</td><td>09/10</td></tr>
+      <tr><td>新后端接入</td><td>PrivateUse1 dispatch key + 注册器</td><td>让 PyTorch 跑在新硬件上</td><td>03</td></tr>
+    </table>
+    <p>第三方的「PyTorch 生态」基本都是这些档位上的实现：替换后端的例子是各种推理编译器，新后端接入的例子是各家 AI 芯片的插件，Python 挂钩的例子是 12 章 DTensor 本尊。动手之前先在这张表里找到自己的位置，能省掉大量重复工作。</p>
+    <div class="code-title">torch/library.py — 自定义算子的入口（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">define</span>(qualname, schema, *, lib=None, tags=()):
+    <span class="st">r"""Defines a new operator.
+
+    In PyTorch, defining an op (short for "operator") is a two step-process:
+    - we need to define the op (by providing an operator name and schema)
+    - we need to implement behavior for how the operator interacts with
+    various PyTorch subsystems, like CPU/CUDA Tensors, Autograd, etc.
+
+    This entrypoint defines the custom operator (the first step)
+    you must then perform the second step by calling various
+    ``impl_*`` APIs, like :func:`torch.library.impl` or
+    :func:`torch.library.register_fake`.
+    """</span></pre>
+    <p>docstring 里那句「两步走」就是 03 章 dispatcher 的注册模型：define 只往 OperatorEntry 登记名字和 schema，impl 往具体的 dispatch key（CUDA、Meta、PrivateUse1……）挂 kernel。一个算子可以有一个 CUDA kernel 加一个 fake kernel，两者由 dispatcher 自动路由。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.2</span>自研「迷你 torch」的里程碑</h2>
+    <p>如果目标不是扩展而是自研（比如为新加速器建整条栈），前十三章的每一层就是一张里程碑清单。顺序按依赖排，每一档都有「最小正确」标准：</p>
+    <table class="tbl">
+      <tr><th>里程碑</th><th>最小正确标准</th><th>参考源码</th></tr>
+      <tr><td>张量与存储分离</td><td>多 tensor 共享一份 storage；view 不拷贝数据</td><td>02 章 TensorImpl/StorageImpl</td></tr>
+      <tr><td>dispatch 表</td><td>同一 op 按设备/dtype 路由到不同 kernel；有可插拔位</td><td>03 章 OperatorEntry</td></tr>
+      <tr><td>自动求导</td><td>前向记录 Node/Edge；反向按依赖计数执行（不是栈遍历）</td><td>04/05 章 Node、Engine</td></tr>
+      <tr><td>Module 与优化器</td><td>参数注册走统一入口；optimizer 持参数引用而非拷贝</td><td>06/07 章</td></tr>
+      <tr><td>数据管道</td><td>worker 预取；关停不挂死</td><td>08 章 DataLoader</td></tr>
+      <tr><td>编译/融合（可选）</td><td>先做算子级融合；缓存编译产物</td><td>10 章 Scheduler</td></tr>
+      <tr><td>显存池（可选）</td><td>释放变账面操作；OOM 降级路径</td><td>11 章 CachingAllocator</td></tr>
+      <tr><td>分布式（可选）</td><td>布局声明与通信分离；all-gather 批处理</td><td>12 章 DTensor/FSDP2</td></tr>
+    </table>
+    <p>两个排序原则值得展开。第一，「反向引擎按依赖计数」出现在第 3 里程碑而不是更低——05 章讲过 GraphTask 的 dependencies_ 计数是多分支图的唯一正确执行序，先写成递归栈遍历的框架，在遇到分支合并时会整体返工。第二，编译和显存池标为可选，因为它们的门槛在调参和测试基建，而不在核心算法：没有 profiling 基建（13 章）之前做 autotune，是蒙着眼调。</p>
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      自研框架最常见的失败顺序是反着来：先写分布式，再补自动求导。结果是每一层都建立在「假设下层可换」的接口上，最后发现 04 章的 AutogradMeta 和 12 章的 Placement 需要共享同一份元数据，接口合不拢。PyTorch 自己的演化史（autograd 元数据长在 TensorImpl 上、DTensor 长在 dispatch 上）说的就是这件事：层的边界先于层的实现。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.3</span>离线部署：export 与 AOTInductor</h2>
+    <p>训练框架的最后一公里是导出：把 Python 里的动态图变成可以在无 Python 环境部署的产物。PyTorch 的答案分两步：</p>
+    <p>第一步 torch.export（<code class="inline">torch/export/__init__.py</code>）：跑一遍模型，产出 ExportedProgram——一张规范化为 functional ATen 算子的图，Python 控制流已被消除，形状假设作为约束记录在案（docstring 的 Soundness Guarantee 一节原话：ExportedProgram 被视为有效，当且仅当这些假设成立；假设验不过直接 fatal error）。这是 09 章 Dynamo 的延伸：同一个追踪引擎，产出从「可回退的编译缓存」变成「不可回退的部署产物」。</p>
+    <p>第二步 AOTInductor（<code class="inline">torch/_inductor/__init__.py</code> 的 aoti_compile_and_package）：把 ExportedProgram 直接编成 C 代码/CUDA 代码，打进 .pt2 包，加载方（aoti_load_package，:257）不依赖 Python。10 章讲过 Inductor 管线的三站，AOTInductor 就是把这条管线的产品从「Python 侧的编译函数」改成「提前编译的原生产物」——省掉的正是部署机上没有的那份编译开销和 Python 本身。</p>
+    <div class="annotation"><b>为什么 export 要单独一个 API 而不直接用 torch.compile：</b>两者的容错语义相反。compile 编不动时回退 eager，保证「能跑」；export 遇到图化不了的结构直接报错，保证「产物完整」。一个面向训练时的性能，一个面向部署时的确定性——同一条追踪管线，两种失败策略。看懂这个分工，就明白为什么两个 API 长期共存。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">14.4</span>全书回顾</h2>
+    <p>十四章的路线合起来看是一条因果链：因为 Tensor 与存储分离（02），dispatch 才有单点可插拔（03）；因为 dispatch 单点，autograd 才能挂在其中一条 key 链上（04）；因为图记录完整，反向引擎才能按依赖并行（05）；Module、优化器、数据加载（06-08）是纯应用层，随时可换；Dynamo 和 Inductor（09-10）站在 dispatch 和字节码两个边界上做编译；显存与 CUDA（11）和分布式（12）放大规模；工程四件套（13）保证跑得久；最后所有层都能从 14.1 的表里找到扩展位。</p>
+    <p>读源码的意义在最后收口：PyTorch 1500 万行代码里，多数是算子实现和测试，核心机制——上面这条因果链——不过十来个文件。知道哪十来个，读「大仓库」和读「小项目」就没有区别。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      全书的十来个核心文件：torch/__init__.py（导入）、c10/core/TensorImpl.h（张量）、c10/core/DispatchKey.h 与 Dispatcher.h（路由）、torch/csrc/autograd/node.h 与 engine.cpp（反向）、torch/nn/modules/module.py（模块）、torch/optim/adam.py（优化器）、torch/utils/data/dataloader.py（数据）、torch/_dynamo/eval_frame.py 与 torch/_inductor/compile_fx.py（编译）、c10/cuda/CUDACachingAllocator.cpp（显存）、torch/distributed/tensor/_api.py（分布式）。每章的第一个摘录几乎都出自这里。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="13-engineering.html">← 上一章：训练工程</a>
+    <a href="index.html">回到目录 →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 14 自研路线 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

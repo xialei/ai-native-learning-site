@@ -228,7 +228,7 @@
         input_ids, token_type_ids = <span class="kw">await</span> self.<span class="fn">_tokenize_texts</span>(
             input_text, is_cross_encoder_request
         )</pre>
-    <p>分词完成后经 <code class="inline">_send_one_request</code> 发给 Scheduler——注意这里对消息做了一系列「出发前的最后加工」（多模态准备、时间戳、pickle 字段打包），然后才 ZMQ 发出：</p>
+    <p>分词完成后经 <code class="inline">_send_one_request</code> 发给 Scheduler——注意这里对消息做了一系列「出发前的最后加工」（多模态准备、时间戳、pickle 字段打包），然后才 ZMQ 发出。请求上还能挂一个 <code class="inline">kv_hints</code> 字段：编排器（比如 RL 训练框架）对「这条请求的前缀在 KV 里该往哪放」有自己掌握的信息，SGLang 把它做成一个随请求传递的信封，下面 2.5 节会看到它一路走到哪：</p>
     <div class="code-title">python/sglang/srt/managers/tokenizer_manager.py — _send_one_request（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">async def</span> <span class="fn">_send_one_request</span>(self, tokenized_obj):
     tokenized_obj.time_stats.<span class="fn">set_api_server_dispatch_time</span>()
@@ -308,6 +308,11 @@
     )
     self._add_request_to_queue(req)     <span class="cmt"># 进 waiting_queue</span></pre>
     <div class="annotation"><b>中间省略的是一道校验关卡：</b> 上面把构造和入队并排摆着，是为了看清「<code class="inline">TokenizedGenerateReqInput</code> → <code class="inline">Req</code> → 队列」这条主干。实际源码里这两行之间夹着十几处提前返回的错误分支——会话不存在、多模态输入错、投机算法（dflash / uno）的请求校验、<code class="inline">return_sampling_mask</code> 的准入检查（第 8 章）等等。这些分支的形状几乎一样：<code class="inline">set_finish_with_abort</code> 挂错误 → <code class="inline">init_req_max_new_tokens</code> → <code class="inline">_add_request_to_queue</code> ——<strong>失败的请求照样入队</strong>，只是带了一个已完成的 abort 状态，由事件循环在下一拍把它当作已完成请求把错误吐回客户端。所以「入队」不等于「要跑模型」。</div>
+
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      <code class="inline">kv_hints</code> 是新近挂上请求 transport 的可版本化信封（commit 7fef014d51，#38891）。定义独立成一个小模块 <code class="inline">managers/kv_hints.py</code>：<code class="inline">KvHintsEnvelope</code>（<code class="inline">kv_hints.py</code>，msgspec.Struct）带 <code class="inline">protocol_version / message_id / actions</code> 三个字段，每个 <code class="inline">KvHintAction</code>（<code class="inline">kv_hints.py</code>）自带 <code class="inline">action_type</code> 和 <code class="inline">action_version</code>。设计的分界线写在模块 docstring 里："Consumers ignore actions they do not implement, and the component that implements an action validates its payload"——<strong>信封只管搬运和版本协商，不管语义</strong>；某个 action 的 payload 长什么样、怎么校验，是实现那个 action 的组件（HiCache 存储后端）自己的事。唯一强制形状的地方是入口的 <code class="inline">decode_kv_hints_envelope</code>：HTTP/gRPC 传进来的是普通 dict，<code class="inline">GenerateReqInput</code> 的规范化阶段把它转成类型化结构，转不动（缺字段、类型错）就抛 <code class="inline">ValueError</code> 让入口直接拒绝请求——docstring 说明这是刻意为之："This is the one place the shape is enforced; every layer below holds the typed struct"，宁可在第一道门把坏信封挡下，不让下游每层各写一遍防御。批量请求一条信封对应一条请求（<code class="inline">io_struct.py</code> 的检查：list 形式直接报错）。信封沿途的落点目前是：<code class="inline">GenerateReqInput.kv_hints</code>（<code class="inline">io_struct.py</code>）→ <code class="inline">TokenizedGenerateReqInput</code> → scheduler 构造 <code class="inline">Req</code> 时带上（<code class="inline">scheduler.py</code>）→ <code class="inline">Req.kv_hints</code>（<code class="inline">schedule_batch.py</code>）——挂在 Req 上的注释写明去向："forwarded to the HiCache storage backends"（第 11 章的 L3 存储）。这不是 SGLang 自己消费的提示，而是给外部编排器留的一条旁路：请求带什么动作，SGLang 不解释，只保证把它完整送到能解释的地方。
+    </div>
     <p>之后完全由事件循环接管。<code class="inline">event_loop_normal</code>（非 overlap 版本，最容易读）主干是四步一循环——收请求、挑批次、跑前向、收尾，但入口附近的几条守卫让它比「四步」读起来更长：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — event_loop_normal（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">event_loop_normal</span>(self):
@@ -406,7 +411,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 02 请求生命周期 · 版本 gateway-v0.3.1-9918-g9eda772a21 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 02 请求生命周期 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

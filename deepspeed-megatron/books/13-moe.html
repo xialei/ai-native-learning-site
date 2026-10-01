@@ -37,14 +37,14 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 13 MoE</div>
     <h1>MoE：专家并行与 token 的往返</h1>
-    <div class="subtitle">MoE 参数量乘 N、计算量不变——代价是什么，token 的往返通信怎么构成？一个 token 的四段旅程（route→dispatch→compute→combine）在代码里各对应什么，router 的四个中间量叫什么名字？负载均衡 aux loss 为什么用「未截断的 scores」算？DS 的 residual MoE 是另一条什么路？</div>
+    <div class="subtitle">MoE 参数量乘 N、计算量不变——代价是什么，token 的往返通信怎么构成？一个 token 的四段路径（route→dispatch→compute→combine）在代码里各对应什么，router 的四个中间量叫什么名字？负载均衡 aux loss 为什么用「未截断的 scores」算？DS 的 residual MoE 是另一条什么路？</div>
   </div>
 
   <section class="block">
     <h2><span class="num">13.1</span>token 怎么找到自己的专家</h2>
-    <p>MoE 把 FFN 换成 N 个专家、每个 token 只走 top-k 个。参数量乘 N、计算量不变——但前提是 <strong>token 能被送到专家所在的卡上</strong>，而 MoE 的代价也全藏在这个「送」字里。一句话结论先放这：<strong>MoE 的代价全在 token 往返——dispatch/combine 两次 all-to-all 是通信大头，EP 与 DP 共卡时带宽预算要一起算。</strong>下面顺着 token 的旅程看。</p>
+    <p>MoE 把 FFN 换成 N 个专家、每个 token 只走 top-k 个。参数量乘 N、计算量不变——但前提是 <strong>token 能被送到专家所在的卡上</strong>，而 MoE 的代价也全藏在这个「送」字里。一句话结论先放这：<strong>MoE 的代价全在 token 往返——dispatch/combine 两次 all-to-all 是通信大头，EP 与 DP 共卡时带宽预算要一起算。</strong>下面跟着 token 走一遍。</p>
     <h3>一分钟版本</h3>
-    <p>MoE 层的一个 token 的旅程：</p>
+    <p>MoE 层里一个 token 要经过四步：</p>
     <ol>
       <li><strong>route</strong>：router（一个小线性层 + softmax）给每个 token 算出 N 个专家的得分，选 top-k。</li>
       <li><strong>dispatch</strong>：token 按目的地重排（permute），跨卡发送到专家所在 rank（all-to-all）。</li>
@@ -59,7 +59,7 @@
 
   <section class="block">
     <h2><span class="num">13.2</span>MoELayer 的四段流水</h2>
-    <p>一分钟版本里的四段旅程，在 MoELayer.forward 里依次展开——</p>
+    <p>一分钟版本里的四段，在 MoELayer.forward 里依次展开——</p>
     <div class="code-title">megatron/core/transformer/moe/moe_layer.py — MoELayer.forward（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states):
     <span class="cmt"># ① route：router 打分 + top-k 选择 → probs + routing_map</span>
@@ -136,7 +136,7 @@
         <rect class="node warn" x="20" y="266" width="880" height="28" rx="6"></rect>
         <text class="lbl sm" x="470" y="286" text-anchor="middle" fill="#8f2d2d">dispatch/combine 两次 all-to-all 是通信大头：EP 组与 DP 组共卡时，与梯度归约共享同一批卡的带宽预算</text>
       </svg>
-      <div class="fig-cap">图 13.1：token 的四段旅程。dispatch 与 combine 是一对（permute/unpermute），dispatcher 家族（13.3 节）决定它们的实现；aux loss 在 router 内算，不占这四段。</div>
+      <div class="fig-cap">图 13.1：token 的四段路径。dispatch 与 combine 是一对（permute/unpermute），dispatcher 家族（13.3 节）决定它们的实现；aux loss 在 router 内算，不占这四段。</div>
     </div>
   </section>
 
@@ -175,7 +175,7 @@
 
   <section class="block">
     <h2><span class="num">13.5</span>两份实现对照 + 自研启示</h2>
-    <p>token 的旅程串完了：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（all-to-all 回程 + unpermute + 加权求和），代价全在中间两跳（图 13.1）。router 那边的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 topk_softmax_with_capacity 处截断；AlltoAll 无求和语义、纯路由，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡则各有各的手段——Megatron 的 aux loss（用未截断 scores），DS 的 noisy gate。两份实现放到一张表里对照：</p>
+    <p>token 的四段串完了：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（all-to-all 回程 + unpermute + 加权求和），代价全在中间两跳（图 13.1）。router 那边的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 topk_softmax_with_capacity 处截断；AlltoAll 无求和语义、纯路由，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡则各有各的手段——Megatron 的 aux loss（用未截断 scores），DS 的 noisy gate。两份实现放到一张表里对照：</p>
     <table class="tbl">
       <tr><th>维度</th><th>Megatron MoE</th><th>DeepSpeed MoE</th></tr>
       <tr><td>架构定位</td><td>专家是模型内的一等公民（experts 层）</td><td>MoE 是可插拔模块（包一层 MLP）</td></tr>
@@ -196,7 +196,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>

@@ -35,14 +35,14 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 decode 循环</div>
     <h1>decode 循环：一次 llama_decode 里发生了什么</h1>
-    <div class="subtitle">批校验 → KV 分槽 → ubatch 拆分 → 建图执行 → logits 提取 → 输出重排。整条路径都在 <code class="inline">llama_context::decode</code> 这一个 C++ 函数里（约 400 行）。</div>
+    <div class="subtitle">批校验 → KV 分槽 → ubatch 拆分 → 建图执行 → logits 提取 → 输出重排。整条路径都在 <code class="inline">llama_context::decode</code> 这一个 C++ 函数里（约 400 行）。2026-09 起 C API 侧的入口是 <code class="inline">llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_ext)</code>（#24669），它把 token/embd 混合批的描述统一成 <code class="inline">llama_batch_ext</code> 后转进同一个 decode——本章讲的内部流程不变。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">3.1</span>n_batch 与 n_ubatch：两个 batch 尺寸</h2>
-    <p><code class="inline">include/llama.h:361-362</code> 定义了两个容易混淆的参数：</p>
+    <p><code class="inline">include/llama.h:367-368</code> 定义了两个容易混淆的参数：</p>
     <div class="code-title">include/llama.h — 上下文参数（摘录）</div>
-    <pre class="code"><span class="lang-tag">c</span><span class="kw">uint32_t</span> n_batch;    <span class="cmt">// 逻辑最大批：一次 llama_decode 能提交的 token 数</span>
+    <pre class="code"><span class="lang-tag">c</span><span class="kw">uint32_t</span> n_batch;    <span class="cmt">// 逻辑最大批：一次 llama_process 能提交的 token 数</span>
 <span class="kw">uint32_t</span> n_ubatch;   <span class="cmt">// 物理最大批：一次真正前向计算的 token 数</span></pre>
     <p>两者的关系由 <code class="inline">memory-&gt;init_batch(*balloc, cparams.n_ubatch, output_all)</code> 驱动：llama_batch_allocr 把 n_tokens_all 的输入<strong>切成若干 ubatch</strong>，每个 ubatch 独立走一遍「KV 分槽 + 建图 + 前向」。为什么要切？KV cache 要为每个 ubatch 找槽位——一次找 2048 个连续位置比一次找 512 个难得多（第 4 章细讲）。decode 入口的断言点明了约束：</p>
     <div class="code-title">src/llama-context.cpp — decode 入口断言（摘录）</div>
@@ -65,7 +65,7 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
         </defs>
 
         <rect class="node" x="330" y="16" width="280" height="46" rx="8"></rect>
-        <text class="lbl" x="470" y="38" text-anchor="middle">llama_decode(batch_inp)</text>
+        <text class="lbl" x="470" y="38" text-anchor="middle">llama_process(DECODE, batch_ext)</text>
         <text class="lbl sm" x="470" y="54" text-anchor="middle">balloc-&gt;init：校验、计数、切 ubatch</text>
 
         <rect class="node" x="330" y="86" width="280" height="40" rx="8"></rect>
@@ -105,14 +105,14 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
         <line class="edge" x1="300" y1="460" x2="380" y2="494"></line>
         <line class="edge" x1="640" y1="460" x2="560" y2="494"></line>
       </svg>
-      <div class="fig-cap">图 3.1：decode 主路径。FAILED_PREPARE 的「重试一次」是理解内存管理的关键：engine 把「腾地方」的职责交给 memory 模块，自己只负责再问一遍。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#e8f5ee;border-color:#1d6b4f"></span>正常流程</span><span class="lg-item"><span class="sw" style="background:#d6e8de;border-color:#1d6b4f"></span>核心批处理循环</span><span class="lg-item"><span class="sw" style="background:#fdecec;border-color:#d33"></span>需重整的分支</span></div><div class="fig-cap">图 3.1：decode 主路径。FAILED_PREPARE 的「重试一次」是理解内存管理的关键：engine 把「腾地方」的职责交给 memory 模块，自己只负责再问一遍。</div>
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">3.3</span>源码：内存状态机</h2>
     <p>decode 的中段是一个循环，处理 KV cache「装不下」的情形。这是整个 llama.cpp 内存管理的枢纽：</p>
-    <div class="code-title">src/llama-context.cpp:1809-1846 — init_batch 状态机（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1810-1847 — init_batch 状态机（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span>llama_memory_context_ptr mctx;
 
 <span class="kw">while</span> (<span class="kw">true</span>) {
@@ -146,7 +146,7 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
   <section class="block">
     <h2><span class="num">3.4</span>源码：ubatch 执行与 logits 提取</h2>
     <p>状态机退出后进入 do-while 循环，每个 ubatch 调用 <code class="inline">process_ubatch</code>（内部做建图 + 执行，第 5 章展开）。成功后把 logits/embd <strong>异步</strong>搬回 host：</p>
-    <div class="code-title">src/llama-context.cpp:1925-1945 — logits 提取（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1926-1946 — logits 提取（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * t_logits = res-&gt;<span class="fn">get_logits</span>();
 ...
 <span class="cmt">// 从「logits 所在的设备」异步拷到 host 缓冲</span>
@@ -166,7 +166,7 @@ GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch &gt;= n_tokens_all)
   <section class="block">
     <h2><span class="num">3.5</span>源码：output_swaps 与选择排序</h2>
     <p>decode 的最后一段把输出顺序还原成「用户提交时的顺序」。llama.cpp 选择的算法值得一看：</p>
-    <div class="code-title">src/llama-context.cpp:2050-2083 — 输出重排（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:2051-2084 — 输出重排（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> &amp; out_ids = balloc-&gt;<span class="fn">get_out_ids</span>();
 GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 
@@ -221,7 +221,7 @@ GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 
   <section class="block">
     <h2><span class="num">3.7</span>小结</h2>
-    <p>一次 llama_decode 走下来，处处是「逻辑与物理分离」的影子：n_batch（逻辑批，≤2048）与 n_ubatch（物理批）分离，KV 找槽以 ubatch 为单位；内存状态机失败时整理一次、重试一次、再失败才放弃，返回值正数是业务失败、负数才是错误；logits 异步拷回、多 ubatch 追加填写，乱序的代价用 output_swaps 加选择排序在读取时还清，零额外拷贝。FreeToken 把同样的逻辑摊到 scheduler/engine/graph 三层，多请求共享而非 slot 独占。</p>
+    <p>一次 llama_decode 走下来，处处是「逻辑与物理分离」的影子：n_batch（逻辑批，≤2048）与 n_ubatch（物理批）分离，KV 找槽以 ubatch 为单位；内存状态机失败时整理一次、重试一次、再失败才放弃，返回值正数是业务失败、负数才是错误；logits 异步拷回、多 ubatch 追加填写，乱序的代价用 output_swaps 加选择排序在读取时还清，零额外拷贝。批的表示也刚完成一轮同主题的分离：llama_batch_ext 把「一条输入带什么」（token id、embedding、多段位置、输出标记）变成每个 entry 的显式字段，不再靠裸数组指针是否为 null 来猜——这是第 2 章「隐式约定 → 显式结构」的又一次重演。FreeToken 把同样的逻辑摊到 scheduler/engine/graph 三层，多请求共享而非 slot 独占。</p>
     <p>下一章把「KV 找槽」展开：这个 decode 里最频繁失败的环节。<a href="04-kv-cache.html">第 4 章：KV cache 家族</a>。</p>
   </section>
 
@@ -232,7 +232,7 @@ GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 03 decode循环 · llama.cpp b11095 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 03 decode循环 · llama.cpp b11243 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

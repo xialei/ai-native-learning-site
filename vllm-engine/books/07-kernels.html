@@ -94,12 +94,7 @@
 
   <section class="block">
     <h2><span class="num">7.1</span>模型代码怎么用上各家 kernel，还不被绑死</h2>
-    <p>这一章要回答的问题有三个：</p>
-    <ul>
-      <li><strong>模型代码怎么既用上各家的注意力 kernel，又不被绑死在哪家</strong>——FlashAttention、FlashInfer、TRT-LLM 的 API 各不相同、擅长的硬件不同，直接调用意味着换硬件就改模型代码。→ 7.2 接口抽象、7.3 selector。</li>
-      <li><strong>RMSNorm、RoPE 这些小算子怎么走到 C++/CUDA</strong>——它们不值得单独抽接口，但有现成的高性能实现。→ 7.4 <code class="inline">_custom_ops.py</code>。</li>
-      <li><strong>同一个接口写出来，真实后端的 forward 长什么样</strong>——抽象讲完总要看一次真实调用。→ 7.5 代码走读。</li>
-    </ul>
+    <p>副标题里那三问，先补上各自的背景：FlashAttention、FlashInfer、TRT-LLM 的 API 各不相同、擅长的硬件不同，模型代码直接调用意味着换硬件就改模型代码，所以要抽接口（7.2 接口抽象、7.3 selector）；RMSNorm、RoPE 这些小算子不值得单独抽接口，但有现成的高性能实现，得有条道走到 C++/CUDA（7.4 <code class="inline">_custom_ops.py</code>）；抽象讲完总要看一次真实调用（7.5 代码走读）。</p>
     <p>三问都建立在同一个前提上：kernel 是「为什么快」的最后一步。先把两块存储分清。GPU 线程想算数，数据得先到它手边，而手边有两级：</p>
     <ul>
       <li><strong>HBM（High Bandwidth Memory，高带宽显存）</strong>：焊在 GPU 旁边的大容量显存，几 GB 到一百多 GB，模型权重和 KV cache 都住这里。带宽高（H100 约 3.35 TB/s），但相对计算单元仍然很慢——一次访存的时间里，计算单元能做几百上千次浮点运算。</li>
@@ -150,7 +145,7 @@
       <li><strong>矩阵乘（GEMM）直接用现成库</strong>：QK^T、PV 这类矩阵乘在注意力 kernel 内部算，不单独走库；模型其余的大头矩阵乘（QKV 投影、输出投影）里，非量化的走 <code class="inline">F.linear</code> → cuBLAS，量化（FP8/INT8）的走 CUTLASS 写的 <code class="inline">cutlass_scaled_mm</code>（7.4 节）。自己写一个平庸的矩阵乘核没有意义。</li>
     </ul>
     <div class="annotation"><b>收拢成一句：</b>HBM 大而慢、SRAM 小而快，prefill 的瓶颈是算力，decode 的瓶颈是 HBM 带宽。kernel 层做的事，就是安排好数据在这两级之间的搬运，针对这两种瓶颈分别优化。</div>
-    <div class="annotation"><b>带着这三个问题往下走：</b>模型代码不被绑死 → 7.2 接口抽象、7.3 selector 挑后端；小算子进 CUDA → 7.4 <code class="inline">_custom_ops.py</code>；真实 forward 长什么样 → 7.5 代码走读。7.6 拿 SGLang 对照。</div>
+    <div class="annotation"><b>收拢成一句：</b>HBM 大而慢、SRAM 小而快，prefill 的瓶颈是算力，decode 的瓶颈是 HBM 带宽。kernel 层做的事，就是安排好数据在这两级之间的搬运，针对这两种瓶颈分别优化。</div>
   </section>
 
   <section class="block">
@@ -436,7 +431,7 @@
     <p>图上三处值得多看一眼的地方。每点先给结论，再说为什么，最后标锚点：</p>
     <ul>
       <li><strong>结论：KV 写入不归 forward 管</strong>——attention 层先写缓存、再算注意力。为什么：写缓存与 forward 是两个自定义 op，中间靠一个空张量 <code class="inline">kv_cache_dummy_dep</code> 建立数据依赖，保证 torch.compile 不重排先后。「先写缓存再 forward」不是唯一顺序：接口基类的 <code class="inline">forward_includes_kv_cache_update</code> 默认 <code class="inline">True</code>（写入归 forward 管），FlashAttention、FlashInfer 等绝大多数后端都覆写成 <code class="inline">False</code>，于是走上面这条先写后算的路；真正在 forward 内部写缓存的是少数，如 HPC_ATTN。锚点：<code class="inline">vllm/model_executor/layers/attention/attention.py</code>（写缓存即 <code class="inline">do_kv_cache_update</code>，内部是 <code class="inline">reshape_and_cache_flash</code> 算子）。</li>
-      <li><strong>结论：cascade 拆成两半算，结果精确等价</strong>，不是近似。为什么：softmax 注意力对「先看哪些 KV」可以分块——kernel ① 和 ② 各自除了输出还带出一个 LSE（log-sum-exp，配分函数的对数），<code class="inline">merge_attn_states</code> 拿这两组 (输出, LSE) 按 LSE 加权合成，数学上精确等价于对完整 KV 一次算完。收益在带宽：例 B 里 2048-token 前缀的 KV 如果走例 A 的路，8 个请求每人读一遍就是 8 次重复读取；cascade 只读 1 次。门槛也就由此而来——前缀 ≥256 token、请求 ≥8 个、无 sliding window / alibi，三者缺一就不值得拆。锚点：后两者不支持直接 assert 在 flash_attn.py:1998。</li>
+      <li><strong>结论：cascade 拆成两半算，结果精确等价</strong>，不是近似。为什么：softmax 注意力对「先看哪些 KV」可以分块——kernel ① 和 ② 各自除了输出还带出一个 LSE（log-sum-exp，配分函数的对数），<code class="inline">merge_attn_states</code> 拿这两组 (输出, LSE) 按 LSE 加权合成，数学上精确等价于对完整 KV 一次算完。收益在带宽：例 B 里 2048-token 前缀的 KV 如果走例 A 的路，8 个请求每人读一遍就是 8 次重复读取；cascade 只读 1 次。门槛也就由此而来——前缀 ≥256 token、请求 ≥8 个、无 sliding window / alibi，三者缺一就不值得拆。锚点：后两者不支持直接 assert 在 flash_attn.py。</li>
       <li><strong>结论：CPU 开销被当成一等公民</strong>。为什么：源码里 woosuk 的注释专门警告这段代码跑在 eager 模式（分段 CUDA graph 的间隙），<code class="inline">view</code>、<code class="inline">[:n]</code> 这类操作慢得出人意料，所以整个 forward 的原则是——Python 里只做切片和标量计算，注意力本体一概交给 kernel。</li>
     </ul>
 
@@ -487,7 +482,7 @@
 </div>
 
 <footer>
-  深入浅出vLLM · 07 Kernel · 版本 proto-v0.3.0-307-g94f4170df3 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出vLLM · 07 Kernel · 版本 v0.30.1rc0-311-g1fde8ff7da
 </footer>
 
 </body>

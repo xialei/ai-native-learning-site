@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · Dynamo — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a class="active" href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 Dynamo</div>
+    <h1>Dynamo：把 Python 函数变成图，且不出错</h1>
+    <div class="subtitle">torch.compile 的第一站是 Dynamo：截住 Python 字节码、转成 FX 图。难点从来不是「能不能转」，而是「转不动时怎么办」——Python 太动态，图必然有覆盖不了的地方。Dynamo 的答案是一套 guard + 回退机制：保证任何情况下要么产出正确编译结果、要么退回 eager。这章沿一次编译走完全程。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>入口：C 层的帧监控</h2>
+    <p><code class="inline">torch.compile(model)</code> 不改模型代码，也不解析源码字符串。它安装了一个 <strong>eval frame 回调</strong>——CPython 每次要执行一个 Python 帧时先问一句「这个帧要不要被 Dynamo 处理」。这个钩子在 C 层（torch._C._dynamo.eval_frame），Python 侧的 set_eval_frame 只是入口包装：</p>
+    <div class="code-title">torch/_dynamo/eval_frame.py — C 钩子的导入（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> torch._C._dynamo.eval_frame <span class="kw">import</span> (
+    ...
+    set_eval_frame,
+    ...
+)</pre>
+    <p>被标记处理的帧，其字节码交给 Dynamo 的 convert_frame 分析：模拟执行字节码、把张量操作记进 FX 图、把非张量逻辑（分支条件、循环边界）固化成 guard 条件。两个包装类各有分工——<code class="inline">OptimizeContext</code> 开启捕获，<code class="inline">DisableContext</code> 把一块代码明确排除在编译外（torch.compiler.disable 的落点）。</p>
+    <div class="annotation"><b>为什么选字节码而不是 AST：</b>AST 只知道「代码写了什么」，不知道「这次跑的是哪条路径、什么形状」。字节码帧带着真实的运行时状态：参数的实际值、tensor 的实际 shape。Dynamo 在字节码层面做的是「符号化重放」——控制流按本次执行路径固化，张量操作进图。这决定了它的天然边界（后面讲）：没跑过的分支没进图。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>guards：编译结果的生效条件</h2>
+    <p>Dynamo 编译出的不是「这个函数的机器码」，而是「这次执行路径的机器码 + 一组成立条件」。条件（guard）覆盖：参数的 shape/dtype/stride、Python 值（比如 batch size、flag）、全局状态。下次调用先查 guard：</p>
+    <ul>
+      <li>全过 → 直接执行已编译产物，零分析成本。</li>
+      <li>有挂 → 重新分析字节码，为「新路径」再编译一份。</li>
+    </ul>
+    <p>所以动态 shape 的默认行为是「每换一个 shape 编译一份」，而不是「编译一份通用的」。要通用就得开 dynamic=True：形状变成符号（比如 s0、s1），guard 从「shape == 128」变成「shape 是符号、满足某约束」。</p>
+    <div class="annotation"><b>符号从哪来：</b>FakeTensorMode（<code class="inline">torch/_subclasses/fake_tensor.py</code>）给每个 tensor 一个「影子」——只有形状元信息、没有数据（第 10 章的 min-cut 分区也靠它）。符号形状的推导与约束收集在 ShapeEnv（<code class="inline">torch/fx/experimental/symbolic_shapes.py</code>）里做。这两个类是 Dynamo 与 Inductor 的共享地基：前者提供「不真算也能跑图」的能力，后者保证符号形状自洽。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>8 次之后：重编译上限的取舍</h2>
+    <p>「每条新路径编译一次」策略在病态场景会失控：训练循环里若有个值总在变（比如动态 batch 的尾批），每次变化触发重编译，编译又慢（秒级），训练就卡死在编译上。Dynamo 的限流在 config 里：</p>
+    <div class="code-title">torch/_dynamo/config.py — 重编译上限（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># controls the maximum number of cache entries with a guard on same ID_MATCH'd</span>
+<span class="cmt"># object. It also controls the maximum size of cache entries if they don't have</span>
+<span class="cmt"># any ID_MATCH'd guards.</span>
+<span class="cmt"># [@compile_ignored: runtime_behaviour]</span>
+recompile_limit = 8
+
+<span class="cmt"># [@compile_ignored: runtime_behaviour] safeguarding to prevent horrible recomps</span>
+accumulated_recompile_limit = 256</pre>
+    <p>同一个代码对象 8 次重编译后放弃（后续调用静默回 eager），累计 256 次是全进程的保险丝。这两个数字解释了大量「为什么我的模型 compile 了但不快」：图根本没编几份，热路径仍走 eager。诊断入口是 <code class="inline">torch._dynamo.utils.counters</code>（或 TORCH_LOGS=recompiles）——先看重编译原因，再决定是开 dynamic 还是改代码。</p>
+    <p>与重编译上限配套的是回退面。Dynamo 里有一张跳过原因表（convert_frame.py 的 CatchErrorsWrapper，:2583）：非 Python 函数、已处于 dispatch 模式、特定字节的生成器……遇上了直接放弃编译。这套「宁可回退、不可出错」的边界和第 3 章 dispatcher 的设计同构：<strong>先保证正确，再谈加速</strong>。</p>
+    <div class="callout warn">
+      <b class="tag">演进痕迹</b>
+      训练场景里优化器默认不进图（第 7 章那行 _disable_dynamo_if_unsupported）不是能力不足，是收益判断：优化器的 foreach/fused 路径已是高度调优的 C++/CUDA，图编译能再加的不多，而 guard 维护成本真实存在。「什么值得进图」是 torch.compile 的核心产品决策，散落在各处的 disable 标记就是这份决策的记录。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>从 Dynamo 到 AOTAutograd：一次 compile 的接力</h2>
+    <p>torch.compile(backend="inductor") 的完整管线在第 10 章展开，这里先立好交接面：Dynamo 产出 FX 图（前向），AOTAutograd 接手拆成前向图 + 反向图（用的还是第 4 章那套 min-cut 思想），再分别交给 Inductor 编译。三段的分工记成三行：Dynamo 管「Python 语义 → 图」，AOTAutograd 管「图 → 前向+反向两张图」，Inductor 管「图 → kernel」。</p>
+    <p>这个接力的用户可感知面是「编译错误发生在哪一段」。报错里出现 Dynamo 字样，多半是字节码分析不支持某写法（回退或报错）；出现 AOTAutograd / partition，是联合图切分出了问题（常与 inplace/view 有关）；出现 Inductor / Triton，是 kernel 生成或 autotune 的问题。三段各自的诊断工具不同（counters、min-cut 可视化、TORCH_LOGS=graph_breaks），按报错关键词选工具能省大量时间。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      Dynamo 的本质是一套「带生效条件的缓存」：字节码 → 图 + guards，guard 全过走缓存，否则为新路径再编一份。8 次上限、回退面、dynamic 开关都是围绕这个缓存的策略参数。下一章进编译管线的下游：图怎么变成 Triton kernel。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="08-dataloader.html">← 上一章：DataLoader</a>
+    <a href="10-inductor.html">下一步：Inductor →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 09 Dynamo · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

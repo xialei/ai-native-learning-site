@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Tensor 内部 — 深入浅出PyTorch</title>
+<link rel="stylesheet" href="assets/pytorch-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>PyTorch</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="01-architecture.html">架构</a>
+      <a class="active" href="02-tensor.html">Tensor</a>
+      <a href="03-dispatcher.html">Dispatcher</a>
+      <a href="04-autograd-graph.html">计算图</a>
+      <a href="05-autograd-engine.html">反向引擎</a>
+      <a href="06-module.html">Module</a>
+      <a href="07-optimizer.html">优化器</a>
+      <a href="08-dataloader.html">数据加载</a>
+      <a href="09-dynamo.html">Dynamo</a>
+      <a href="10-inductor.html">Inductor</a>
+      <a href="11-memory.html">显存</a>
+      <a href="12-distributed.html">分布式</a>
+      <a href="13-engineering.html">训练工程</a>
+      <a href="14-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 Tensor 内部</div>
+    <h1>Tensor 内部：一个张量被拆成了三块</h1>
+    <div class="subtitle">Python 里的 <code class="inline">torch.Tensor</code> 看起来是一个对象，C++ 里其实是三块：元信息一块、数据一块、版本号一块。这个拆分解释了 view 为什么近乎免费、detach 为什么不碰数据、原地修改为什么能被 autograd 察觉。这章把三块拆开讲。</div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>为什么不是一个对象</h2>
+    <p>如果让你设计 <code class="inline">Tensor</code>，最自然的写法是一个类：形状、数据指针、步长都放里面。PyTorch 早期（TH 那一代）确实接近这个形态，但按这个形态演进会接连撞上三堵墙：</p>
+    <ul>
+      <li><strong>数据想共享。</strong><code class="inline">x.view(-1)</code>、<code class="inline">x[0:5]</code>、<code class="inline">x.t()</code> 都不该拷贝数据——所以「数据」必须是一个能被多个 tensor 同时指着的东西。</li>
+      <li><strong>元信息想独立变化。</strong>两个 tensor 可以共享同一块数据却有不同形状（view）、不同偏移（切片）。形状/步长/偏移的生命周期和数据的生命周期不同步。</li>
+      <li><strong>版本计数想跨 tensor 共享。</strong>autograd 要发现「我保存的中间结果被原地改了」，可 view 和原 tensor 共享数据，改谁都算改同一个——版本号也得跟着数据走，而不是跟着单个 tensor 走。</li>
+    </ul>
+    <p>三堵墙推出同一个结论：拆。PyTorch 的拆法是三块，全在 c10/core 下：</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
+        <title id="t21">Tensor 的三块内部结构</title>
+        <desc id="d21">Python 的 torch.Tensor 是一个瘦包装，指向 TensorImpl。TensorImpl 持有：形状/步长/存储偏移/dtype/DispatchKeySet 等元信息，一个指向 StorageImpl 的指针，以及一个 VariableVersion 版本计数器。StorageImpl 持有数据指针 DataPtr、字节数和 Allocator。两个 tensor（本体和一个 view）可以各自有 TensorImpl，但指向同一个 StorageImpl，共享同一份版本计数。</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="40" y="40" width="200" height="64" rx="8"></rect>
+        <text class="lbl" x="140" y="64" text-anchor="middle">torch.Tensor (Python)</text>
+        <text class="lbl sm" x="140" y="84" text-anchor="middle">THPVariable：薄包装</text>
+        <line class="edge" x1="240" y1="72" x2="300" y2="72"></line>
+
+        <rect class="node core" x="304" y="24" width="330" height="160" rx="8"></rect>
+        <text class="lbl" x="324" y="50" font-weight="bold">TensorImpl（c10/core/TensorImpl.h）</text>
+        <text class="lbl sm" x="324" y="72">sizes_ · strides_ · storage_offset_</text>
+        <text class="lbl sm" x="324" y="92">dtype（TypeMeta）· device</text>
+        <text class="lbl sm" x="324" y="112">key_set_（DispatchKeySet，03 章）</text>
+        <text class="lbl sm" x="324" y="132">is_contiguous_ · …（大量缓存标志）</text>
+        <rect class="node" x="324" y="142" width="140" height="30" rx="6"></rect>
+        <text class="lbl sm" x="394" y="162" text-anchor="middle">VariableVersion</text>
+
+        <line class="edge" x1="634" y1="72" x2="690" y2="72"></line>
+        <line class="edge" x1="634" y1="130" x2="690" y2="130"></line>
+
+        <rect class="node" x="694" y="40" width="220" height="64" rx="8"></rect>
+        <text class="lbl" x="804" y="64" text-anchor="middle">StorageImpl</text>
+        <text class="lbl sm" x="804" y="84" text-anchor="middle">DataPtr · size_bytes · Allocator</text>
+
+        <rect class="node warn" x="694" y="118" width="220" height="50" rx="8"></rect>
+        <text class="lbl sm" x="804" y="140" text-anchor="middle">数据只有一份</text>
+        <text class="lbl sm" x="804" y="157" text-anchor="middle">由若干 tensor 共享</text>
+
+        <rect class="node" x="304" y="222" width="330" height="76" rx="8"></rect>
+        <text class="lbl" x="469" y="246" text-anchor="middle">另一个 TensorImpl（比如 x.view 的产物）</text>
+        <text class="lbl sm" x="469" y="266" text-anchor="middle">自己的形状/步长/偏移</text>
+        <text class="lbl sm" x="469" y="284" text-anchor="middle">指向同一个 StorageImpl 和同一个版本计数器</text>
+        <polyline class="edge back" points="634,260 660,260 660,160 690,160" fill="none"></polyline>
+      </svg>
+      <div class="svg-legend">
+        <span class="lg-item"><span class="sw core"></span>TensorImpl：元信息 + 两个指针</span>
+        <span class="lg-item"><span class="sw"></span>StorageImpl：真正放数据</span>
+        <span class="lg-item"><span class="sw acc"></span>Python 可见包装</span>
+      </div>
+      <div class="fig-cap">图 2.1：一个 tensor 的三块结构。要点是中间那个 TensorImpl 身上同时攥着两条指针：往右指向数据（StorageImpl），往下指向版本计数器（VariableVersion）。view/切片产生的新 TensorImpl 换掉元信息、共用数据和版本号——这就是「拆开」的全部动机。</div>
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>TensorImpl：元信息那一块</h2>
+    <p>TensorImpl 是 PyTorch 里被摸得最多的 C++ 类——每一次算子调用都要读它的形状、dtype 和 key_set。类声明很长（实现文件三千多行），但字段可以归成四组：</p>
+    <div class="code-title">c10/core/TensorImpl.h — 类声明开头（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">C10_API TensorImpl</span> : <span class="kw">public</span> c10::intrusive_ptr_target {
+  <span class="cl">TensorImpl</span>() = <span class="kw">delete</span>;
+  ~TensorImpl() <span class="kw">override</span>;
+
+  <span class="cmt">// Note [Enum ImplType]</span>
+  <span class="cmt">// This enum is temporary. In the followup refactor we should</span>
+  <span class="cmt">// think about how to specialize TensorImpl creation for view</span>
+  <span class="cmt">// tensors. Currently we only special case its key_set_ but</span>
+  <span class="cmt">// there's also potential to share version_counter_ directly</span>
+  <span class="cmt">// without creating first and then override in as_view.</span>
+  <span class="kw">enum</span> <span class="cl">ImplType</span> { VIEW };</pre>
+    <p>四组字段，按「算子调用时被谁读」排：</p>
+    <table class="tbl">
+      <tr><th>字段组</th><th>内容</th><th>谁在用</th></tr>
+      <tr><td>形状信息</td><td>sizes_、strides_、storage_offset_、numel_、is_contiguous_ 等缓存位</td><td>每个算子；切片/reshape 只改这组，不动数据</td></tr>
+      <tr><td>类型与设备</td><td>data_type_（TypeMeta，即 dtype）、device_opt_</td><td>dispatcher 选 kernel、分配内存</td></tr>
+      <tr><td>分发标签</td><td>key_set_（DispatchKeySet）</td><td>dispatcher——第 3 章的主角</td></tr>
+      <tr><td>引用</td><td>storage（指向 StorageImpl）、version_counter（指向 VariableVersion）</td><td>数据读写与原地修改检测</td></tr>
+    </table>
+    <div class="annotation"><b>一个值得停下来看的细节：</b>构造函数被显式 <code class="inline">= delete</code> 了——不留一个「空 tensor」的默认态。源码里紧挨着有一句注释：打算消灭所有「未初始化状态」，让每个 tensor 一出生字段就是全的。一个被删掉的默认构造函数，是整个类的设计态度。</div>
+    <p>再往下是 <code class="inline">storage_offset</code>，切片功能的承重墙：</p>
+    <div class="code-title">c10/core/TensorImpl.h — storage_offset（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="cmt">/**
+   * Return the offset in number of elements into the storage that this
+   * tensor points to.  Most tensors have storage_offset() == 0, but,
+   * for example, an index into a tensor will have a non-zero storage_offset().
+   *
+   * WARNING: This is NOT computed in bytes.
+   */</span>
+  int64_t <span class="fn">storage_offset</span>() <span class="kw">const</span> {
+    <span class="cmt">// TODO: maybe this should be toggled by strides</span>
+    <span class="kw">if</span> (C10_UNLIKELY(matches_policy(SizesStridesPolicy::CustomSizes))) {
+      <span class="kw">return</span> storage_offset_custom();
+    }
+    <span class="kw">return</span> storage_offset_;
+  }</pre>
+    <p><code class="inline">x[3:5]</code> 之所以不拷贝：新 TensorImpl 的 <code class="inline">storage_offset_</code> 是 3、形状是 (2,)，数据还是原来那块。单位是元素个数不是字节，注释特意用 WARNING 标出——这是写自定义算子时的常见错误来源。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>StorageImpl：数据那一块</h2>
+    <p>StorageImpl 短得多。它只回答三个问题：数据在哪（DataPtr）、多长（size_bytes）、怎么释放（Allocator）。</p>
+    <div class="code-title">c10/core/StorageImpl.h — 类声明（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">C10_API StorageImpl</span> : <span class="kw">public</span> c10::intrusive_ptr_target {
+ <span class="kw">public</span>:
+  <span class="kw">struct</span> <span class="cl">use_byte_size_t</span> {};
+
+  <span class="cl">StorageImpl</span>(
+      use_byte_size_t <span class="cmt">/*use_byte_size*/</span>,
+      <span class="cl">SymInt</span> size_bytes,
+      at::DataPtr data_ptr,
+      at::<span class="cl">Allocator</span>* allocator,
+      <span class="kw">bool</span> resizable)
+      : data_ptr_(std::move(data_ptr)),
+        size_bytes_(std::move(size_bytes)),
+        size_bytes_is_heap_allocated_(size_bytes_.is_heap_allocated()),
+        resizable_(resizable),
+        received_cuda_(<span class="kw">false</span>),
+        allocator_(allocator) {</pre>
+    <div class="annotation"><b>类声明前残留着一段注释：</b>讲 view 之后 resize 会让数据指针重复、版本计数只按 storage 粒度追踪等坑——都是这个拆分方案的已知代价，被写下来提醒后来的维护者。DataPtr 是个值得记住的类型：它不光是 <code class="inline">void*</code>，还带着一个删除器（deleter），「怎么释放这块内存」是跟着数据走的，而不是写死在某处。CPU 上删除器走 <code class="inline">free</code>，CUDA 上走 CachingAllocator（第 11 章的主角）。</div>
+    <p>还有一个命名疑惑值得提前拆掉：C++ 里同时存在 <code class="inline">Tensor</code> 和 <code class="inline">TensorImpl</code>，训练代码里还见过 <code class="inline">Variable</code>。关系是——<code class="inline">Tensor</code> 是持有 <code class="inline">intrusive_ptr&lt;TensorImpl&gt;</code> 的外壳；<code class="inline">Variable</code> 曾是独立类型，2018 年前后和 Tensor 合并，现在的 variable.h 里只剩一行别名：</p>
+    <div class="code-title">torch/csrc/autograd/variable.h — Variable 的下落（摘录）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">using</span> <span class="cl">Variable</span> = at::Tensor;</pre>
+    <p>autograd 代码里满眼的 <code class="inline">variable_list</code>，读作 <code class="inline">std::vector&lt;Tensor&gt;</code> 即可。历史名字留在签名里，是这一代代码库的常态。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>VariableVersion：版本号那一块</h2>
+    <p>第三块最小，也最容易被忽略，直到哪天你被 <em>one of the variables needed for gradient computation has been modified by an inplace operation</em> 报错砸中。那句话的判断依据就在这：</p>
+    <div class="code-title">c10/core/TensorImpl.h — VariableVersion（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="kw">struct</span> <span class="cl">C10_API VariableVersion</span> {
+ <span class="kw">private</span>:
+  <span class="kw">struct</span> <span class="cl">VersionCounter</span> : intrusive_ptr_target {
+    <span class="cl">VersionCounter</span>(uint32_t version) : version_(version) {}
+    std::atomic&lt;uint32_t&gt; version_;
+  };
+  c10::intrusive_ptr&lt;VersionCounter&gt; version_counter_;
+
+ <span class="kw">public</span>:
+  <span class="cmt">// Note [Disabled VariableVersion]</span>
+  <span class="cmt">// VariableVersion struct has an intrusive_ptr pointing VersionCounter struct</span>
+  <span class="cmt">// with an atomic variable. Thus `VariableVersion(/*version=*/0)` is not as</span>
+  <span class="cmt">// cheap as we expected. ...</span>
+  <span class="cmt">// Example use cases are:</span>
+  <span class="cmt">//  - Inference tensors don't track version counter, so they'll just always</span>
+  <span class="cmt">//    have disabled VariableVersion.</span>
+  <span class="cmt">//  - In SavedVariable class we override version_counter_ inside its</span>
+  <span class="cmt">//  constructor</span>
+  <span class="cmt">//    so that we can use the cheap constructor there.</span>
+  <span class="kw">enum</span> <span class="cl">Disabled</span> { DISABLED };</pre>
+    <p>机制三句话：每个 tensor 带一个原子计数器；原地修改（<code class="inline">add_</code>、<code class="inline">relu_</code>……）会把它加一；反向执行时，autograd 对「保存下来的中间结果」核对版本号，对不上就报上面那个错。<strong>报错的本质是：反向需要的值，已经和你前向时算的那个不是同一份了。</strong></p>
+    <p>这个设计里有两个用心的地方。一是 <code class="inline">std::atomic</code>：源码上方有一段注释解释为什么必须原子——多线程前向时若无保护，版本计数会引入竞争，反而破坏线程安全。二是 <code class="inline">DISABLED</code> 构造：计数器分配堆内存不便宜，而推理场景根本不做原地检测，于是给了条不分配的通路。inference tensor（<code class="inline">torch.inference_mode()</code> 的产物）身上就是这条 DISABLED 计数器——它不是「版本号为 0」，是「根本没有计数器」。</p>
+    <div class="callout warn">
+      <b class="tag">困惑点</b>
+      为什么 view 和原 tensor 会「共享」版本号？因为版本计数器的粒度是 storage（见 2.3 前那段残留注释）：同一块数据上的任何改动都该被看见，无论从哪个 tensor 视角发起。detach 出来的 tensor 同理共享——这就是「detach 后原地改会污染原图」的根源。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>view、detach、inference_mode：三块结构的行为对照</h2>
+    <p>三块结构立起来之后，用户侧那些「行为各异」的操作，其实是同几个动作的不同组合。逐个对：</p>
+    <table class="tbl">
+      <tr><th>操作</th><th>TensorImpl</th><th>StorageImpl</th><th>VariableVersion</th><th>autograd 元信息</th></tr>
+      <tr><td><code class="inline">x.view(...)</code> / 切片</td><td>新建（形状/偏移不同）</td><td>共享</td><td>共享</td><td>新 grad_fn，is_view_ = true</td></tr>
+      <tr><td><code class="inline">x.detach()</code></td><td>新建（元信息照抄）</td><td>共享</td><td>共享</td><td>无（切断历史）</td></tr>
+      <tr><td><code class="inline">x.clone()</code></td><td>新建</td><td>新建</td><td>新建</td><td>新 grad_fn（clone 的反向）</td></tr>
+      <tr><td><code class="inline">torch.inference_mode()</code> 内创建</td><td>新建</td><td>新建</td><td><strong>DISABLED</strong></td><td>无</td></tr>
+    </table>
+    <p>两张表的规律一致：<strong>除了 clone 这类显式复制，所有便宜操作都只动 TensorImpl。</strong>所谓「view 是零拷贝的」，精确含义就是：只分配了一个新的元信息结构，数据和版本号都是指针共享。反过来，TensorImpl 的浅拷贝语义也就有了明确定义——源码里用一整段 NOTE 讲清楚：</p>
+    <div class="code-title">c10/core/TensorImpl.h — NOTE [ TensorImpl Shallow-Copying ]（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">cpp</span>  <span class="cmt">// TensorImpl shallow-copying is used when we want to have two Variables share</span>
+  <span class="cmt">// the same tensor metadata (e.g. sizes / strides / storage pointer /</span>
+  <span class="cmt">// storage_offset), but each with a different autograd history. Example call</span>
+  <span class="cmt">// sites:</span>
+  <span class="cmt">//</span>
+  <span class="cmt">// 1. `var_detached = var.detach()` uses `shallow_copy_and_detach()` to create</span>
+  <span class="cmt">// `var_detached` that shares the same tensor metadata with `var`, but with a</span>
+  <span class="cmt">// completely new autograd history.</span>
+  <span class="cmt">// 2. `var.set_data(tensor)` uses `shallow_copy_from()` to copy tensor</span>
+  <span class="cmt">// metadata from `tensor` into `var`, while keeping `var`'s original</span>
+  <span class="cmt">// AutogradMeta.</span></pre>
+    <p>这段 NOTE 把 detach 讲到了底：detach = 浅拷贝元信息 + 换掉 autograd 历史，数据与版本号原样共享。所以「detach 出来的张量改了会影响原张量」不是副作用，是定义使然。而 <code class="inline">set_data</code> 是另一个方向——保持 autograd 元信息、整体换掉数据本体，优化器里更新参数用的就是它。</p>
+    <div class="annotation"><b>回看 2.1 的三堵墙：</b>数据共享（view 不拷贝）、元信息独立（切片改偏移）、版本共享（原地检测跨 tensor）——三堵墙各自对应三块里的一块。当初那个「不就是一个类吗」的问题，到这里可以反过来问了：不分块，这三件事哪一个能便宜地做成？</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>性能含义：为什么这些设计值得记</h2>
+    <p>最后一节把设计换成数字。日常训练里最常见三类操作的内部成本：</p>
+    <ul>
+      <li><strong>view / reshape / 切片</strong>：一次 TensorImpl 分配（几十字节级别）+ 一次引用计数加一。与数据大小无关。这就是「reshape 不该出现在性能焦虑里」的依据——慢的是 reshape 后引起的布局变化让后续 kernel 变慢，不是 reshape 本身。</li>
+      <li><strong><code class="inline">.to(device)</code> / <code class="inline">.cpu()</code></strong>：跨设备必然拷贝数据，这层省不掉。但注意目标侧的分配走的是 CachingAllocator（第 11 章）——同一尺寸反复传输时，分配成本接近于零，剩下的就是 PCIe/NVLink 带宽本身。</li>
+      <li><strong>inference_mode 的提速</strong>：除了免掉反向记录，还免掉了版本计数器的堆分配与原子递增。张量小、算子碎的推理负载里，这笔账能省出可观的 CPU 时间。</li>
+    </ul>
+    <p>还有一条写给要读后续章节的人：第 3 章会讲到 dispatcher 拿 <code class="inline">key_set_</code> 选实现——现在只需要知道，TensorImpl 身上那个 DispatchKeySet 字段，是整个算子分发体系的钥匙。第 4 章的 AutogradMeta 也直接挂在 TensorImpl 上（成员 <code class="inline">autograd_meta_</code>，是个可空指针——不需要求导的 tensor 连这块元数据都不分配，算一种零成本优化），这三章正好构成一条完整的链：tensor 是什么 → 算子怎么找到它该跑的代码 → 代码执行时怎么顺手记下反向。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      记三块各自的名字和职责就够：TensorImpl 管形状与身份，StorageImpl 管数据，VariableVersion 管改动痕迹。所有「零拷贝」操作都只在第一块上做文章；所有「疑似灵异」的共享副作用，都发生在后两块的指针上。
+    </div>
+  </section>
+
+  <div class="arrow-nav">
+    <a href="01-architecture.html">← 上一章：整体架构</a>
+    <a href="03-dispatcher.html">下一步：Dispatcher →</a>
+  </div>
+</div>
+
+<footer>
+  深入浅出PyTorch · 02 Tensor 内部 · 版本 trunk 5eb6d3d36b2 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+</footer>
+
+</body>
+</html>

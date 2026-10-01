@@ -37,12 +37,12 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 ZeRO 1/2</div>
     <h1>ZeRO 1/2 与 Megatron 分布式优化器：同一思想的两个实现</h1>
-    <div class="subtitle">优化器状态为什么能安全地按 DP 切、切完之后梯度归约怎么改、step 只更新本卡分区的语义怎么保证一致？Megatron 不叫 ZeRO 却做了等价物——它的「bucket + range map」和 DS 的「IPG bucket」差在哪？fp16 训练的 loss scale 归谁管？</div>
+    <div class="subtitle">优化器状态为什么能安全地按 DP 切、切完之后梯度归约怎么改、step 只更新本卡分区的语义怎么保证一致？Megatron 不叫 ZeRO 却做了等价物——它的「bucket + range map」和 DS 的「IPG bucket」差在哪？换个更新规则的优化器（Muon）怎么进分片框架？fp16 训练的 loss scale 归谁管？</div>
   </div>
 
   <section class="block">
     <h2><span class="num">7.1</span>同一份优化器状态，为什么要存 N 份</h2>
-    <p>第 6 章的账本说优化器状态占 12B/参数。ZeRO-1 的主张就从这里来：每个 DP 副本的优化器状态<strong>一模一样</strong>，那为什么要存 N 份？切成 N 份，各存一份。听上去简单，但马上有一串追问：每个 DP 副本都要更新全部参数，凭什么只存 1/N 的状态，step 之后各副本参数怎么保持一致？梯度 all-reduce 之后每卡都有全量——可 ZeRO-2 说归约完就丢，用什么集合通信替换 all-reduce？Megatron 不用 DS 的 ZeRO，却实现了一个等价物，它的「bucket + range map」和 DS 的「IPG bucket」差在哪？最后，fp16 需要动态缩放、bf16 不需要，loss scale 归谁管、两库的 scaler 语义一致吗？</p>
+    <p>第 6 章的账本说优化器状态占 12B/参数。ZeRO-1 的主张就从这里来：每个 DP 副本的优化器状态<strong>一模一样</strong>，那为什么要存 N 份？切成 N 份，各存一份。听上去简单，但马上有一串追问：每个 DP 副本都要更新全部参数，凭什么只存 1/N 的状态，step 之后各副本参数怎么保持一致？梯度 all-reduce 之后每卡都有全量——可 ZeRO-2 说归约完就丢，用什么集合通信替换 all-reduce？Megatron 不用 DS 的 ZeRO，却实现了一个等价物，它的「bucket + range map」和 DS 的「IPG bucket」差在哪？再往后，换个更新规则的优化器（比如要看到完整矩阵的 Muon），分片框架还接得住吗？最后，fp16 需要动态缩放、bf16 不需要，loss scale 归谁管、两库的 scaler 语义一致吗？</p>
     <p>一句话结论先放在这：<strong>ZeRO-1/2 的全部改动收在 optimizer 侧——模型和梯度代码零改动，这是它性价比最高的原因。</strong>下面从 DeepSpeed 侧开始验证。</p>
     <h3>一分钟版本</h3>
     <ul>
@@ -62,30 +62,35 @@
     <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — DeepSpeedZeroOptimizer（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 梯度分桶：contiguous_gradients 开启时，梯度拷进一块连续 fp16 缓冲</span>
 <span class="cmt"># bucket 内按参数梯度到达顺序填充；满一块即触发一次 reduce</span>
-<span class="kw">def</span> <span class="fn">reduce_ready_partitions</span>(self, param, check_event=False):
+<span class="kw">def</span> <span class="fn">reduce_ready_partitions_and_remove_grads</span>(self, param, i):
     <span class="kw">if</span> self.<span class="fn">contiguous_gradients</span> and self.<span class="fn">overlap_comm</span>:
         <span class="cmt"># IPG bucket：梯度一就绪就拷进 bucket，异步归约</span>
         self.ipg_buffer ...
 
-<span class="cmt"># 归约入口（engine._backward_epilogue 调用链）</span>
+<span class="cmt"># 归约入口（backward 收尾时由 engine 调用链触发）</span>
 <span class="kw">def</span> <span class="fn">reduce_gradients</span>(self, pipeline_parallel=False):
-    <span class="kw">if</span> self.<span class="fn">overlap_comm</span>:
-        self.<span class="fn">reduce_ready_partitions</span>(...)   <span class="cmt"># 边算边归</span>
-    <span class="kw">else</span>:
-        <span class="kw">for</span> group <span class="kw">in</span> self.bit16_groups:
-            self.<span class="fn">averaging</span>(...)             <span class="cmt"># 一口气全归</span></pre>
-    <div class="annotation"><b>IPG（Independent Parallel Gradients）改的是归约时机：</b>把「全部 backward 结束后统一归约」改成「某个 bucket 的梯度齐了就立刻归约」——归约通信与后续层级的反向计算重叠。三个关键配置：<code class="inline">contiguous_gradients</code>（连续缓冲减少碎片）、<code class="inline">overlap_comm</code>（异步）、<code class="inline">reduce_bucket_size</code>（桶大小，KB 级调优空间）。bucket 满即触发，这是显存换通信节奏的标准手段。</div>
+    <span class="cmt"># PP 下 backward 不在 zero 内部处理，这里要先把 ipg buffer 建出来</span>
+    <span class="kw">if</span> pipeline_parallel <span class="kw">and</span> self.<span class="fn">contiguous_gradients</span>:
+        ...  <span class="cmt"># 为每个 dtype 的 bucket 补上空缓冲</span>
+    <span class="kw">if</span> <span class="kw">not</span> self.<span class="fn">overlap_comm</span>:
+        <span class="kw">for</span> i, group <span class="kw">in</span> <span class="fn">enumerate</span>(self.bit16_groups):
+            <span class="kw">for</span> param <span class="kw">in</span> group:
+                self.<span class="fn">reduce_ready_partitions_and_remove_grads</span>(param, i)
+    <span class="cmt"># hook / 非 hook 两种情形下的 pending 梯度都在这里收掉</span>
+    self.<span class="fn">overlapping_partition_gradients_reduce_epilogue</span>()</pre>
+    <div class="annotation"><b>IPG（Independent Partition Gradient）改的是归约时机：</b>把「全部 backward 结束后统一归约」改成「某个 bucket 的梯度齐了就立刻归约」——归约通信与后续层级的反向计算重叠。三个关键配置：<code class="inline">contiguous_gradients</code>（连续缓冲减少碎片）、<code class="inline">overlap_comm</code>（异步）、<code class="inline">reduce_bucket_size</code>（桶容量，按元素数计，默认 5e8 ≈ fp16 下 1GB，量级是 GB 不是 KB；调大延迟归约、调小换更细的显存占用）。bucket 满即触发，这是显存换通信节奏的标准手段。</div>
 
-    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — 优化器步进（摘录）</div>
+    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — independent_gradient_partition_epilogue（摘录，:984）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">independent_gradient_partition_epilogue</span>(self):
-    <span class="cmt"># ① 清理已归约分区的 fp16 梯度（ZeRO-2：非本卡的分区直接释放）</span>
-    self.<span class="fn">release_reduced_gradients</span>()
-    <span class="cmt"># ② 溢出检查（任一卡 NaN → 全组跳过本 step）</span>
-    <span class="kw">if</span> self.<span class="fn">overflow_sanitizer</span>(): ...
-    <span class="cmt"># ③ 只对本卡负责的分区做 optimizer.step</span>
-    <span class="kw">for</span> sub_group <span class="kw">in</span> self.<span class="fn">updated_params</span>():
-        <span class="kw">return</span> self.<span class="fn">step_with_ready_parameters</span>(sub_group)</pre>
-    <div class="annotation"><b>step 的分片语义：</b>epilogue 三步就是 ZeRO-1/2 的全部分区语义在 step 时刻的体现：释放非本卡梯度（省显存）、溢出检查（任何一卡溢出则全体跳过，保持副本一致）、只 step 本卡分区。<strong>master 权重（fp32）在这里按分区持有</strong>——本卡分区更新后，用 all-gather 把新参数广播回各卡的 fp16 副本。这一切对用户透明，engine.step() 内部完成。</div>
+    <span class="cmt"># ① 收尾本卡分区的梯度：拼出 averaged_gradients（本卡窗口内的梯度集合）</span>
+    self.<span class="fn">reduce_ipg_grads</span>()                       <span class="cmt"># IPG 尾批归约</span>
+    self.averaged_gradients[i] = self.<span class="fn">get_flat_partition</span>(...)
+    <span class="cmt"># ② overlap_comm 下清掉上一轮已归约的梯度（It is safe to clear …）</span>
+    self.<span class="fn">_clear_previous_reduced_grads</span>()
+    <span class="cmt"># ③ 释放 ipg 缓冲、清 param.grad——step 时刻只留本卡分区需要的</span>
+    self.<span class="fn">_release_ipg_buffers</span>()
+    self.<span class="fn">_clear_param_grad_only</span>()</pre>
+    <div class="annotation"><b>step 的分片语义：</b>epilogue 是 backward 的收尾（ZeRO-2 在这里丢掉非本卡分区的梯度，只留归约产物），真正的溢出检查和 step 在 <code class="inline">step()</code> 里：先 <code class="inline">check_overflow</code>（任一卡 NaN → <code class="inline">_update_scale</code> 记溢出，全组清梯度直接 return），不溢出才逐子组 <code class="inline">optimizer.step</code>——只有本卡负责的分区有 master/m/v。<strong>master 权重（fp32）按分区持有</strong>——本卡分区更新后，用 all-gather 把新参数广播回各卡的 fp16 副本。这一切对用户透明，engine.step() 内部完成。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t71 d71">
@@ -181,7 +186,42 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.5</span>loss scale：fp16 训练的最后一环</h2>
+    <h2><span class="num">7.5</span>Muon 进 ZeRO：分片框架收编新优化器</h2>
+    <p>ZeRO 的分片语义原本是照着 Adam 写的：状态按参数切、梯度按分区归约、step 只碰本卡那片。Muon 换掉了更新规则（动量 + Newton-Schulz 正交化，要看到<strong>完整矩阵</strong>才能做），进 ZeRO 框架时撞上的正是这个前提——2026-09 的 #8464 一次修了四个相关问题，把它们摆出来比任何设计文档都清楚地说明了「优化器状态分片」和「优化器算法」是两层事：</p>
+    <ul>
+      <li><strong>几何结构丢失</strong>：ZeRO 分片把参数摊平成一维段，Muon 的 Newton-Schulz 需要 2D/3D 矩阵——先按原形状复原、算完再切回去，1D 辅助参数（Adam 侧的）保持原样。</li>
+      <li><strong>offload 下的设备错位</strong>：动量在 CPU、梯度在 GPU，反向中直接调更新会跨设备报错还会重复更新——ZeRO-3 的 Muon 更新挪到 step 边界（<code class="inline">_apply_muon_to_accumulated_grads</code>，在溢出检查之后，被 loss scale 丢弃的 step 不再污染动量）。</li>
+      <li><strong>gather 缓冲无上限</strong>：all-gather 的临时缓冲没做预算管理，显存尖峰和碎片——现在用 LRU 缓存封顶（cache 总量 256MB，单次 gather 的 scratch 预算 64MB），<code class="inline">destroy()</code> 时清空。</li>
+      <li><strong>NVMe 换入的子组</strong>：动量标记 <code class="inline">swappable = False</code> 才能常驻内存；梯度仍从 NVMe 换入再算——「优化器状态常驻」不等于「梯度常驻」。</li>
+    </ul>
+    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — 有界 gather 缓冲（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每个子组的 all-gather scratch 缓冲按 cache_key 复用，总量封顶</span>
+<span class="kw">if</span> cache <span class="kw">is</span> <span class="kw">None</span>:
+    <span class="kw">while</span> (self._muon_allgather_buffers
+           <span class="kw">and</span> self._muon_allgather_buffer_bytes + cache_bytes > 256 * 1024 * 1024):
+        _, evicted = self._muon_allgather_buffers.popitem(last=<span class="kw">False</span>)   <span class="cmt"># LRU 淘汰</span>
+        self._muon_allgather_buffer_bytes -= evicted[2]
+    local_buffer = torch.empty(local_numel, ...)
+    gathered_buffer = torch.empty(gathered_numel, ...)
+    <span class="kw">if</span> cache_bytes <= 256 * 1024 * 1024:
+        self._muon_allgather_buffers[cache_key] = (local_buffer, gathered_buffer, cache_bytes)</pre>
+    <div class="annotation"><b>读法：</b>这不是「新优化器接入」的常规姿势——没有抽象出通用的「分片优化器接口」，而是在 ZeRO 引擎内部逐点适配（stage_1_and_2.py 与 stage3.py 各有一份 Muon 路径，step 里在溢出检查和子组循环之间插一步）。集成成本全部由框架承担、用户配置不变（optimizer 名改成 <code class="inline">Muon</code>），代价是每来一个非 Adam 形状的优化器都要再走一遍这个过程。<strong>Megatron 侧的回答不同</strong>：Muon 走的是独立的 emerging_optimizers 体系（<code class="inline">TensorParallelMuon</code>），从设计起就带 TP 语义，不往 DistributedOptimizer 里塞——两条路线的取舍在第 14 章的自研语境里还会回来。另外一条实用性提示：ZeRO-1/2 + CPU offload 时 Muon 只 gather 本卡拥有的梯度/动量切片，按 64MB 预算分批处理，超出预算的矩阵单独算（Newton-Schulz 必须整矩阵），这个限制不含 Newton-Schulz 自己的工作区。</div>
+    <p>同一周里的 #8633 又补了一刀，暴露的坑更隐蔽——<strong>动量的提交时机</strong>。ZeRO-1/2 的 Muon 把「梯度折进动量」这一步提前到了分区填充时（<code class="inline">get_flat_partition</code> 逐参数做 <code class="inline">muon_update</code>），但溢出检查要等 step 才知道本 step 是否作废——作废的 step 不能污染动量，可梯度折进动量已经发生了。#8633 的解法是把动量拆成「暂存/提交」两态：</p>
+    <div class="code-title">deepspeed/runtime/zero/stage_1_and_2.py — _muon_staging_momentum / step（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 每个分区只暂存一次：staging 是从已提交动量拷贝出来的，</span>
+<span class="cmt"># 逐参数暂存会把前面参数刚写进去的更新冲掉</span>
+staged_momentum = self.<span class="fn">_muon_staging_momentum</span>(flatten_copy, param_group_idx)
+<span class="cmt"># 填分区时：muon_update 直接写进 staged 副本（不碰 optimizer.state）</span>
+buffer = torch.narrow(staged_momentum, <span class="nu">0</span>, buffer_idx, tensor.numel()).view(tensor.size())
+
+<span class="cmt"># step() 里：溢出检查通过才提交</span>
+<span class="kw">if</span> <span class="kw">not</span> self.overflow:
+    self.<span class="fn">_commit_muon_momentum</span>()      <span class="cmt"># staged → optimizer.state["momentum_buffer"]</span></pre>
+    <div class="annotation"><b>为什么是暂存而不是回滚：</b>溢出后要把「梯度折进动量」撤销，最直觉的方案是保存旧动量、失败时恢复——但那要求每个被更新过的参数都留一份副本。暂存方案反过来：step 前动量照常更新，但写进的是一个<strong>副本</strong>（staged），<code class="inline">optimizer.state</code> 里的已提交动量始终不动；step 活下来才把 staged 整体 <code class="inline">copy_</code> 回去。还有个细节：<strong>staged 副本不进 optimizer.state</strong>（代码注释明说 Kept off optimizer.state so it does not travel into checkpoints）——否则 checkpoint 里会多出一份无效动量。自研时凡是「计算提前到溢出检查之前」的优化器，都要面对这个「作废 step 的状态回退」问题，暂存/提交是比回滚便宜的答案。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">7.6</span>loss scale：fp16 训练的最后一环</h2>
     <p>分片、归约都解决了，fp16 下还剩最后一环——梯度太小会下溢。bf16 和 fp16 在这里走的是两条路：</p>
     <div class="code-title">megatron/core/optimizer/__init__.py — scaler 选择（摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># _get_optimizer_config_solver 附近：fp16 → DynamicLossScaler</span>
@@ -198,7 +238,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.6</span>自研 ZeRO-1 还剩什么</h2>
+    <h2><span class="num">7.7</span>自研 ZeRO-1 还剩什么</h2>
     <p>顺带回答一个动手党的问题：bf16 训练跳过整个 scaler 模块后，自研 ZeRO-1 还剩什么？</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
@@ -207,8 +247,8 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">7.7</span>小结</h2>
-    <p>本章从「为什么要存 N 份」的疑问出发，答案逐层落地：优化器状态能切，是因为 DP 副本间它完全冗余——分片语义收在 optimizer.step 内部，模型和梯度代码零改动；梯度归约跟着改——IPG bucket 满即异步归约与反向计算重叠，ZeRO-2 用 reduce 代替 all-reduce 让梯度只在负责卡存在；Megatron 的等价物是「bucket + range map」——与 DS 的差异是按平坦缓冲窗口而非按参数分组，reduce-scatter 直达窗口；loss scale 归 optimizer 管——bf16 指数位够直接跳过，fp16 的 growth_interval + hysteresis 两库语义一致。7.4 末尾那条场景判断是本章最实用的一句：用 DS 主导的代码库就从 ZeRO-2 起步，用 Megatron 栈就常开 DistributedOptimizer，两者不要混用。</p>
+    <h2><span class="num">7.8</span>小结</h2>
+    <p>本章从「为什么要存 N 份」的疑问出发，答案逐层落地：优化器状态能切，是因为 DP 副本间它完全冗余——分片语义收在 optimizer.step 内部，模型和梯度代码零改动；梯度归约跟着改——IPG bucket 满即异步归约与反向计算重叠，ZeRO-2 用 reduce 代替 all-reduce 让梯度只在负责卡存在；Megatron 的等价物是「bucket + range map」——与 DS 的差异是按平坦缓冲窗口而非按参数分组，reduce-scatter 直达窗口；换更新规则的优化器进分片框架，撞上的全是「状态按参数切」这个预设——Muon 的四个坑加动量暂存/提交（7.5）就是预设与新算法的边界清单；loss scale 归 optimizer 管——bf16 指数位够直接跳过，fp16 的 growth_interval + hysteresis 两库语义一致。7.4 末尾那条场景判断是本章最实用的一句：用 DS 主导的代码库就从 ZeRO-2 起步，用 Megatron 栈就常开 DistributedOptimizer，两者不要混用。</p>
   </section>
 
   <div class="arrow-nav">
@@ -218,7 +258,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 07 ZeRO 1/2 · 版本锚点 v0.19.7-42-g4a5856c25 / core_v0.15.0rc7-2652-ge27e9d08f
+  深入浅出 DeepSpeed · Megatron · 07 ZeRO 1/2 · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
 </footer>
 
 </body>
