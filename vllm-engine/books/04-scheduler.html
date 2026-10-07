@@ -344,7 +344,7 @@
         <li><strong>min() 里另外两个名字先交代清楚</strong>：<code class="inline">input_budget</code> 是「一次 forward 最多算多少 token」（即 <code class="inline">max_num_batched_tokens</code>，scheduler.py；它怎么挤占显存见 8.4）；<code class="inline">draft_slots</code> 是投机解码给 draft token 预留的槽位数，不开投机时就是 0（scheduler.py）——所以平时这条约束就是 <code class="inline">input_budget</code> 本身。它与 <code class="inline">token_budget</code> 平时也是同一个数（后者默认取 <code class="inline">max_num_batched_tokens</code>，scheduler.py），分开写是因为调度预算可以被单独调小。下面 waiting 循环里那句 <code class="inline">input_budget &lt;= draft_slots</code> 说的就是「预算全被 draft 槽占走、连一个正经 token 都放不下，别再放人」。</li>
       </ul>
     </div>
-    <p>算出 <code class="inline">num_new_tokens</code> 之后还有两处补丁值得看一眼。一是它可能被再削几次：超过 <code class="inline">long_prefill_token_threshold</code> 的长 prefill 被压到阈值（min 截断；批里只剩它一个时豁免——没人可被它饿着，scheduler.py），超过 <code class="inline">max_model_len</code> 减本步已采样数的部分被砍掉（max_model_len 截断），混合模型还要求 prefill chunk 对齐 mamba 块（块对齐切分）——都是特定场景的护栏，主线逻辑不变。二是如果削完之后 <code class="inline">num_new_tokens == 0</code>，这个请求这步会被跳过，但注意跳的方式是 <code class="inline">continue</code> 而不是 <code class="inline">break</code>（scheduler.py）：</p>
+    <p>算出 <code class="inline">num_new_tokens</code> 之后还有两处补丁值得看一眼。一是它可能被再削几次：超过 <code class="inline">long_prefill_token_threshold</code> 的长 prefill 被压到阈值（min 截断；批里只剩它一个时豁免——没人可被它饿着，scheduler.py），超过 <code class="inline">max_model_len</code> 减本步已采样数的部分被砍掉（max_model_len 截断），混合模型还要求 prefill chunk 对齐 mamba 块（块对齐切分）——都是特定场景的护栏，主线逻辑不变。长 prefill 阈值还有个可选的自适应档（#58459）：配了 <code class="inline">--long-prefill-token-threshold-adaptive</code>（config/scheduler.py:87，默认关）后，生效阈值取「原阈值」与「<code class="inline">max_num_batched_tokens ÷ (running + waiting 数)</code>」中的较大者（scheduler.py:621）——阈值是给「饿别人」设的下限，批里人多时按人头把阈值抬高一点，保证每个请求至少能分到公平份额，别被压得一次只能算几个 token。mamba 对齐里还有一个 <code class="inline">prefill_end</code> 的细节（kv_cache_manager.py:517、scheduler.py:436）：「prefill 在哪结束」取的是 <code class="inline">max(num_prompt_tokens, num_tokens - 1)</code> 而不是直接用 <code class="inline">num_prompt_tokens</code>——被抢占后重算的请求要重放自己已生成的输出 token，这些输出也算进 <code class="inline">num_tokens</code>，对齐边界得跟着推到重放段的末尾，否则恢复请求的 mamba 状态检查点会错位。二是如果削完之后 <code class="inline">num_new_tokens == 0</code>，这个请求这步会被跳过，但注意跳的方式是 <code class="inline">continue</code> 而不是 <code class="inline">break</code>（scheduler.py）：</p>
     <div class="annotation"><b>为什么是 continue 不是 break：</b>注释列了五种可能（PP&gt;1 时 prompt 已全排上但没算完、异步调度到达上限、encoder 预算/缓存耗尽、mamba 块对齐放不下、MTP lookahead 窗口放不下），然后 woosuk 特别标了一句：这里用 <code class="inline">continue</code> 而不是 <code class="inline">break</code>，<strong>刻意不严格遵守 FCFS</strong>——队头请求这步塞不下，就跳过它继续试后面的请求，让后面的「小请求」先走。这和 4.5 抢占时「先让低优先级让路」是同一个思想的另一面：FCFS 只是默认策略，预算真紧张时，让资源落到能立刻用起来的人手里。</div>
     <p>拿到 <code class="inline">num_new_tokens</code> 后，下一步是找 KV cache 要块。如果 KV 不够（比如被别的请求占满），<code class="inline">allocate_slots</code> 会返回 <code class="inline">None</code>，此时调度器要么抢占一个低优先级请求腾地方，要么放弃调度当前请求：</p>
     <div class="code-title">vllm/v1/core/sched/scheduler.py — allocate_slots 失败则跳过（摘录②；对应图 4.3 第一段下半）</div>
@@ -503,7 +503,7 @@ preempted_reqs.<span class="fn">append</span>(preempted_req)</pre>
         <rect class="node core" x="120" y="38" width="180" height="52" rx="6"></rect>
         <text class="lbl sm" x="210" y="60" text-anchor="middle">同一个 vLLM 实例</text>
         <text class="lbl sm" x="210" y="78" text-anchor="middle">prefill + decode 混批</text>
-        <text class="lbl sm" x="300" y="70" text-anchor="middle" fill="#5c6b7a">← prefill 可能打断 decode（尾延迟高）</text>
+        <text class="lbl sm" x="312" y="70" fill="#5c6b7a">← prefill 可能打断 decode（尾延迟高）</text>
 
         <text class="lbl" x="30" y="146" font-weight="bold" fill="#165a7b">PD 分离（两实例）—— 目标：</text>
         <rect class="node" x="60" y="158" width="170" height="64" rx="6"></rect>
@@ -584,7 +584,7 @@ preempted_reqs.<span class="fn">append</span>(preempted_req)</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 04 调度器 · 版本 v0.30.1rc0-311-g1fde8ff7da
+  深入浅出vLLM · 04 调度器 · 版本 v0.31.0 (db9527a4687)
 </footer>
 
 </body>

@@ -41,7 +41,7 @@
   <section class="block">
     <h2><span class="num">6.1</span>① 总览：VLM 主干 + 动作专家 + 流匹配</h2>
     <p>一个 VLA 要回答的问题是：语言指令进来、机器人动作出去，中间的知识从哪来、动作怎么生成。SmolVLA 的答案是三件套——VLM 主干供理解、动作专家出动作、流匹配当生成器。先看结构。<code class="inline">SmolVLAPolicy</code> 是包在 <code class="inline">VLAFlowMatching</code> 外面的一层皮，后者才是网络本体。源码里自带的架构注释说明了全部结构：</p>
-    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:466 — VLAFlowMatching 结构注释（摘录）</div>
+    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:468 — VLAFlowMatching 结构注释（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">VLAFlowMatching</span>(nn.Module):
     <span class="cmt">"""
     Designed by Hugging Face.
@@ -124,7 +124,7 @@
         <text class="lbl sm" x="170" y="303" text-anchor="middle">· VLM 全部参数</text>
         <text class="lbl sm" x="170" y="321" text-anchor="middle">只训：动作专家 + state_proj</text>
 
-        <text class="lbl sm" x="350" y="330">注意力掩码纪律：prefix 不读 suffix（att_masks=1 分隔，modeling_smolvla.py:630,682）</text>
+        <text class="lbl sm" x="350" y="330">注意力掩码纪律：prefix 不读 suffix（att_masks=1 分隔，modeling_smolvla.py:632,684）</text>
       </svg>
       <div class="svg-legend">
         <span class="lg-item"><span class="sw"></span>VLM 塔（前缀，一次前向）</span>
@@ -132,7 +132,7 @@
       </div>
       <div class="fig-cap">图 6.1：双塔分工——「看懂」交给 VLM 塔（一次前向缓存 KV），「动手」交给小专家塔（每个去噪步只跑它）。这就是 VLA 推理能压到消费级显卡的关键：贵的部分不重复算。</div>
     </div>
-    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>核心一句话——理解不发生在专家的权重里，它发生在 VLM 的 KV cache 里，专家只是个「读缓存的小查询器」，所以天然可以窄。三个源码事实撑起这句话：① 专家从 config 随机初始化、不加载 VLM 权重（<code class="inline">smolvlm_with_expert.py:118</code> 的 <code class="inline">AutoModel.from_config</code>，出生时对图像语言一无所知）；② 它连词表都没有（<code class="inline">:138</code> <code class="inline">embed_tokens = None</code>），输入是 <code class="inline">action_in_proj</code>/<code class="inline">state_proj</code> 投影进来的连续向量（<code class="inline">modeling_smolvla.py:511-512</code>）——它对世界的全部理解只能来自每层 cross-attention 读 VLM 的 KV cache（<code class="inline">:122-135</code> 把 VLM 维度的 K/V 投影进专家的小空间），它不是知识的容器，是知识的查询器，查询器不需要跟知识库一样大；③ 它要学的函数输出低维低熵（50 步 × 几十维连续速度场），而 VLM 学的「看懂+听懂」来自数十亿 token 预训练——容量分配跟着难度走。另外，专家是每个去噪步都跑的（6.2 的循环 ×10），循环体必须小，第二个 500M 大模型直接让「prefix 算一次、suffix 十次便宜循环」的消费级显卡经济学破产。<br><br>
+    <div class="annotation"><b>为什么是「专家」而不是第二个大模型：</b>核心一句话——理解不发生在专家的权重里，它发生在 VLM 的 KV cache 里，专家只是个「读缓存的小查询器」，所以天然可以窄。三个源码事实撑起这句话：① 专家从 config 随机初始化、不加载 VLM 权重（<code class="inline">smolvlm_with_expert.py:118</code> 的 <code class="inline">AutoModel.from_config</code>，出生时对图像语言一无所知）；② 它连词表都没有（<code class="inline">:138</code> <code class="inline">embed_tokens = None</code>），输入是 <code class="inline">action_in_proj</code>/<code class="inline">state_proj</code> 投影进来的连续向量（<code class="inline">modeling_smolvla.py:510-513</code>）——它对世界的全部理解只能来自每层 cross-attention 读 VLM 的 KV cache（<code class="inline">:122-135</code> 把 VLM 维度的 K/V 投影进专家的小空间），它不是知识的容器，是知识的查询器，查询器不需要跟知识库一样大；③ 它要学的函数输出低维低熵（50 步 × 几十维连续速度场），而 VLM 学的「看懂+听懂」来自数十亿 token 预训练——容量分配跟着难度走。另外，专家是每个去噪步都跑的（6.2 的循环 ×10），循环体必须小，第二个 500M 大模型直接让「prefix 算一次、suffix 十次便宜循环」的消费级显卡经济学破产。<br><br>
     「共享结构但宽度更窄」不矛盾——这是两个独立的旋钮：<strong>结构</strong>（同）= 块的拓扑（RMSNorm、RoPE、GQA、16 层堆叠，<code class="inline">num_vlm_layers=16</code>），复用结构是省去重新设计调参——这种 block 已被 VLM 预训练验证过会收敛；<strong>宽度</strong>（窄）= 每层 <code class="inline">hidden_size = int(hidden_size * expert_width_multiplier)</code>（配置默认 0.75，<code class="inline">configuration_smolvla.py:98</code>），纯容量旋钮。还有个佐证细节：<code class="inline">self_attn_every_n_layers=2</code>——专家塔每隔一层才保留一次对自己的 self-attention，其余层纯 cross-attention；suffix 就是一个噪声动作块（约 50 个 token），自己人之间没什么好交互的，主要信息得从 prefix 拿——真正独立的第二个语言模型绝不会这么设计。参数量约 450M，微调时只训专家一半，显存进一步减半。这套「大模型管理解、小专家管动手」不是 SmolVLA 的发明：7.1 的 π0 同款——3B PaliGemma 冻结出 KV，≈300M 的 flow-matching 动作专家每步去噪时跑；SmolVLA 把这个比例推得更极端。锚点：宽度乘法器 <code class="inline">smolvlm_with_expert.py:110</code>；cross-attn 重塑 <code class="inline">smolvlm_with_expert.py:122-135</code>。</div>
     <div class="callout info"><b>KV cache 是什么：</b>transformer 注意力用到的 Key/Value 向量。若每步重算整个前缀序列的 K/V，代价随序列长度平方增长；把它们缓存起来（use_cache=True），后续只需算新 token 的注意力——这里即「VLM 看一遍图像和指令，缓存理解结果；十步去噪每步只跑小专家塔」。不熟悉的话记住结论即可：贵的部分只算一次，便宜的部分反复用。</div>
   </section>
@@ -140,7 +140,7 @@
   <section class="block">
     <h2><span class="num">6.2</span>② prefix 与 suffix：一次前向，十步去噪</h2>
     <p>知道整体是双塔，接下来该问：十步去噪每步都要跑一次网络，为什么 VLM 主干不会被算十遍？答案在 prefix 与 suffix 的切分。<code class="inline">embed_prefix</code> 把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code> 把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
-    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:744 — sample_actions：KV cache 复用（节选）</div>
+    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:728 — sample_actions：KV cache 复用（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Prefix 只前向一次，缓存 KV</span>
 prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, state=state)
 _, past_key_values = self.vlm_with_expert.forward(
@@ -158,7 +158,7 @@ _, past_key_values = self.vlm_with_expert.forward(
     noise,
     num_steps,                              <span class="cmt"># 默认 10</span>
 )</pre>
-    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:775 — denoise_step（节选）</div>
+    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:777 — denoise_step（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">denoise_step</span>(self, prefix_pad_masks, past_key_values, x_t, timestep):
     <span class="cmt">"""Apply one denoising step of the noise `x_t` at a given timestep."""</span>
     suffix_embs, ... = self.embed_suffix(x_t, timestep)      <span class="cmt"># 噪声动作 + 时间 → token</span>
@@ -178,7 +178,7 @@ _, past_key_values = self.vlm_with_expert.forward(
   <section class="block">
     <h2><span class="num">6.3</span>③ 流匹配：训练一行公式，推理一个欧拉循环</h2>
     <p>去噪十步，每一步「噪声怎么变动作」的规则就是流匹配要学的东西。它比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向只有两行核心公式：</p>
-    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:693 — forward：流匹配目标（摘录）</div>
+    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:691 — forward：流匹配目标（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> noise <span class="kw">is</span> <span class="kw">None</span>:
     noise = self.sample_noise(actions.shape, actions.device)      <span class="cmt"># x₁：标准正态噪声</span>
 <span class="kw">if</span> time <span class="kw">is</span> <span class="kw">None</span>:
@@ -253,7 +253,7 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
   <section class="block">
     <h2><span class="num">6.4</span>④ 训练侧：冻结、缺相机补位、processor 链</h2>
     <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数；专家宽度是 VLM 的 0.75 倍、参数量不与其宽度成正比）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
-    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:371 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
+    <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:374 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Create image features not present in the batch as fully 0 padded images.</span>
 <span class="kw">for</span> num_empty_cameras <span class="kw">in</span> range(len(missing_img_keys)):
     <span class="kw">if</span> num_empty_cameras &gt;= self.config.empty_cameras:
@@ -280,12 +280,12 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
     <p>6.1 开头的三个问题，答案收拢：双塔是「VLM 塔供理解、专家塔出动作」，专家经 cross-attn 读 VLM 的 KV cache；推理靠 prefix 一次前向 + KV 缓存复用，十步去噪只跑 suffix；流匹配训练一行速度场公式、推理一个欧拉积分循环；单卡微调的经济学靠 freeze_vision_encoder / train_expert_only 两个开关，缺相机时补黑帧 + mask=0 让行为平滑退化。一张表带走：</p>
     <table class="tbl">
       <tr><th>概念</th><th>要点</th><th>源码锚点</th></tr>
-      <tr><td>双塔架构</td><td>VLM 塔（SmolVLM2 500M，前 16 层）+ 动作专家塔（宽度 ×0.75）；专家 cross-attn 读 VLM KV cache</td><td>smolvla/modeling_smolvla.py:466; smolvlm_with_expert.py:74,110</td></tr>
-      <tr><td>prefix/suffix</td><td>prefix 一次前向缓存 KV；denoise_step 每步只跑 suffix 并 crop 缓存</td><td>modeling_smolvla.py:744,775,805</td></tr>
-      <tr><td>流匹配训练</td><td>x_t = t·noise + (1−t)·actions；目标 u_t = noise−actions；MSE</td><td>modeling_smolvla.py:699-701,723</td></tr>
-      <tr><td>流匹配推理</td><td>euler_integrate：t 从 1 走到 0 走 num_steps 步（SmolVLA 默认 10）；训练时间采样 Beta(1.5,1)</td><td>common/flow_matching.py:61,100; modeling_smolvla.py:550; configuration_smolvla.py:63</td></tr>
+      <tr><td>双塔架构</td><td>VLM 塔（SmolVLM2 500M，前 16 层）+ 动作专家塔（宽度 ×0.75）；专家 cross-attn 读 VLM KV cache</td><td>smolvla/modeling_smolvla.py:468; smolvlm_with_expert.py:74,110</td></tr>
+      <tr><td>prefix/suffix</td><td>prefix 一次前向缓存 KV；denoise_step 每步只跑 suffix 并 crop 缓存</td><td>modeling_smolvla.py:728,777,807</td></tr>
+      <tr><td>流匹配训练</td><td>x_t = t·noise + (1−t)·actions；目标 u_t = noise−actions；MSE</td><td>modeling_smolvla.py:701-703,725</td></tr>
+      <tr><td>流匹配推理</td><td>euler_integrate：t 从 1 走到 0 走 num_steps 步（SmolVLA 默认 10）；训练时间采样 Beta(1.5,1)</td><td>common/flow_matching.py:61,104; modeling_smolvla.py:551; configuration_smolvla.py:63</td></tr>
       <tr><td>微调冻结</td><td>vision encoder + VLM 全冻结，只训专家与 state_proj</td><td>configuration_smolvla.py:69-71</td></tr>
-      <tr><td>缺相机补位</td><td>缺失相机补黑帧 + mask=0，行为平滑退化</td><td>modeling_smolvla.py:371-379</td></tr>
+      <tr><td>缺相机补位</td><td>缺失相机补黑帧 + mask=0，行为平滑退化</td><td>modeling_smolvla.py:373-379</td></tr>
       <tr><td>processor</td><td>rename → batch → newline → tokenize → device → normalize 六步</td><td>processor_smolvla.py:65</td></tr>
     </table>
     <div class="callout warn">
@@ -301,7 +301,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
 </div>
 
 <footer>
-  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（9a6bb610）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 06 SmolVLA · 基于 huggingface/lerobot（8c920c42）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

@@ -194,7 +194,7 @@
     key = params.key
     value = params.value
     priority = params.priority
-    chunked = params.chunked
+    inserted_len = params.inserted_len
 
     key, value = key.<span class="fn">maybe_to_bigram_view</span>(self.is_eagle, value)
     key = key.<span class="fn">page_aligned</span>(self.page_size)
@@ -205,9 +205,9 @@
         value = torch.<span class="fn">tensor</span>(key.token_ids[: <span class="fn">len</span>(key)], dtype=torch.int64)
 
     prefix_len, last_node = self.<span class="fn">_insert_helper</span>(
-        self.root_node, key, value, priority, chunked
+        self.root_node, key, value, priority, inserted_len
     )</pre>
-    <div class="annotation"><b>谁在调 insert：</b> insert 的两个入口在同一个文件里：<code class="inline">cache_finished_req</code>（请求完整结束，token 序列 = 输入+输出）和 <code class="inline">cache_unfinished_req</code>（chunked prefill 的中间块）。也就是说，<strong>树上登记的都是已经算完的 KV 段</strong>；正在算的请求靠锁保护自己的前缀，而不是靠树节点。</div>
+    <div class="annotation"><b>谁在调 insert：</b>统一入口是本文件 <code class="inline">_insert_cache()</code>——它把请求的页对齐 token 序列、KV 行号打包成 <code class="inline">InsertParams</code> 调 insert，并顺手 <code class="inline">free_segment</code> 释放 insert 暴露出的重复段；而 <code class="inline">_insert_cache</code> 的两个调用方是 <code class="inline">checkpoint()</code>（chunked prefill 的中间块和请求收尾共用）与 <code class="inline">mem_cache/common.py</code> 的 <code class="inline">release_kv_cache()</code>（请求结束时落树）。也就是说，<strong>树上登记的都是已经算完的 KV 段</strong>；正在算的请求靠锁保护自己的前缀，而不是靠树节点。<br><br><b><code class="inline">inserted_len</code> 管「命中只计一次」：</b>这个参数是请求「此前已经 insert 过」的长度（挂在 <code class="inline">req.kv.cache_inserted_len</code> 上）。insert 沿途撞到已有节点时，只有 <code class="inline">total_prefix_length &gt; inserted_len</code> 的部分才 <code class="inline">_inc_hit_count</code>——源码注释一句话点透："Nodes this request already inserted were counted back then."（这个请求先前插入过的节点，当时已经计过命中了）。没有这个截断，一个请求拆成 N 个 chunk 就会把同一段前缀的命中数刷高 N 倍，前缀命中率指标直接失真。</div>
 
     <div class="callout info">
       <b class="tag">演进痕迹</b>
@@ -359,11 +359,14 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
     <p>第三个交互在 chunked prefill。长输入被切成多个块，<strong>每算完一块就登记一次树</strong>：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — stash_chunked_request（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">stash_chunked_request</span>(self, req: <span class="cl">Req</span>):
-    <span class="fn">maybe_cache_unfinished_req</span>(req, self.tree_cache, chunked=<span class="kw">True</span>)</pre>
-    <p>对应到树这边的 <code class="inline">cache_unfinished_req</code>（<code class="inline">radix_cache.py</code>）：把已算好的段 insert 进树、立刻重新 match 一次、用新 <code class="inline">prefix_indices</code> 覆盖请求的旧值，然后换锁（<code class="inline">dec_lock_ref(req.last_node)</code> → <code class="inline">inc_lock_ref(new_last_node)</code>）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
+    <span class="kw">if</span> self.disaggregation_mode == <span class="cl">DisaggregationMode</span>.PREFILL:
+        self.<span class="fn">checkpoint_disagg_prefill</span>(req)
+    <span class="kw">else</span>:
+        <span class="fn">checkpoint_kv_cache</span>(req, self.tree_cache)</pre>
+    <p>对应到树这边的 <code class="inline">RadixCache.checkpoint()</code>（<code class="inline">radix_cache.py</code>）：把已算好的段 insert 进树、立刻重新 match 一次、用新 <code class="inline">prefix_indices</code> 覆盖请求的旧值，然后换锁——锁现在是一个 <code class="inline">TreeLock</code> 对象挂在 <code class="inline">req.lock</code> 上，换锁就是 <code class="inline">self.unlock(req.lock)</code> → <code class="inline">req.lock = self.lock(new_last_node)</code>（内部还是 <code class="inline">dec_lock_ref</code>/<code class="inline">inc_lock_ref</code>，只是把节点和归还参数打了个包）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
-      <code class="inline">cache_unfinished_req</code> 里有个专门的 <code class="inline">cache_protected_len</code> 字段，注释解释了为什么需要它：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在 <code class="inline">prefix_indices</code> 里但不在树上；这半页的槽位<strong>不能</strong>在中间块结束时归还（下一个块还要接着用），也不能永远占着——所以单独记一个「受保护长度」，推迟到下一个块或最终收尾时统一释放。这是页对齐与树记账之间的一次典型补丁：先有按 token 的树，后有按页的池，接缝处需要这个字段对齐两套粒度。
+      <code class="inline">req.kv.cache_protected_len</code> 是页对齐与树记账接缝处的关键计数，checkpoint 里新写的注释把它讲透了：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在 <code class="inline">req.prefix_indices</code> 里但不在树上；checkpoint 后 <code class="inline">cache_protected_len = len(new_indices)</code> 标出「树已经接管的前缀长度」。请求结束时 <code class="inline">release_kv_cache()</code> 只释放 <code class="inline">(cache_protected_len, owned_kv_len)</code> 这一段——受保护的部分是树的，不是这个请求的（"The protected prefix is not this req's to free."），半页在下一个 checkpoint 或收尾时统一处理。这套字段都挂在 <code class="inline">req.kv</code>（<code class="inline">KVCacheState</code>）下：除了 <code class="inline">cache_protected_len</code>，还有上面提到的 <code class="inline">cache_inserted_len</code>（insert 过多少，用于命中去重计数）。先有按 token 的树，后有按页的池，接缝处的字段都挂在请求状态上对齐两套粒度。
     </div>
   </section>
 
@@ -413,7 +416,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
 </div>
 
 <footer>
-  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

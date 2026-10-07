@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ fbc169827e</span>
+    <span class="version-badge">openai/codex @ 822e58cc3d</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 上下文构建</div>
     <h1>★ 上下文构建：模型每一轮到底看到什么</h1>
     <div class="subtitle">Codex 不是简单地把会话历史拼成字符串发给模型——它把上下文拆成可组合的「片段（Fragment）」，按角色（developer/user/system）和时机注入，并在每轮 turn 重新组装。本章拆开 Fragment 体系、AGENTS.md 注入、ContextManager 与 build_prompt 的完整流水线。</div>
@@ -49,7 +49,7 @@
   <section class="block">
     <h2><span class="num">5.1</span>一个 Prompt 由什么组成</h2>
     <p>第 3 章看到 <code class="inline">run_sampling_request</code> 每轮调用 <code class="inline">build_prompt</code>。来看看它到底装了什么：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1583 — build_prompt</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1571 — build_prompt</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) fn</span> build_prompt(
     input: Vec&lt;ResponseItem&gt;,              <span class="cmt">// 会话历史（消息/工具调用/结果）</span>
     step_context: &amp;StepContext,
@@ -58,15 +58,16 @@
     <span class="kw">let</span> turn_context = &amp;step_context.turn;
     Prompt {
         input,                                        <span class="cmt">// ① 会话历史</span>
-        tools: step_context.tool_router.model_visible_specs(), <span class="cmt">// ② 工具规格</span>
+        tools: step_context.tool_router.model_visible_specs(), <span class="cmt">// ② 工具规格（节选：增量工具模式下给默认空集）</span>
         parallel_tool_calls: <span class="kw">true</span>,                    <span class="cmt">// ③ 允许并行工具</span>
-        base_instructions,                            <span class="cmt">// ④ 基础指令</span>
+        base_instructions,                            <span class="cmt">// ④ 基础指令（节选：增量工具模式下置空文本）</span>
         output_schema: turn_context.final_output_json_schema.clone(), <span class="cmt">// ⑤ 输出 schema</span>
         output_schema_strict: !is_basic_session_source(...), <span class="cmt">// ⑥ 严格 schema 校验开关</span>
         cyber_access_program: turn_context.cyber_access_program, <span class="cmt">// ⑦ cyber 访问程序（ChatGPT 认证）</span>
     }
 }</pre>
     <div class="annotation"><b>一个 Prompt 七块料：</b> 一个 Prompt 有七部分：<strong>① 会话历史 input</strong>（<code class="inline">ResponseItem</code> 列表，含已注入的 fragment）；<strong>② 工具规格</strong>（告诉模型有哪些工具可用）；<strong>③ 并行工具开关</strong>（Codex 默认允许模型一次请求多个工具）；<strong>④ base_instructions</strong>（系统级指令）；<strong>⑤ 输出 schema</strong>（结构化输出约束）；<strong>⑥ output_schema_strict</strong>（Responses API 是否严格校验 output_schema——普通会话开启，guardian/basic 会话关闭）；<strong>⑦ cyber_access_program</strong>（ChatGPT 认证下的 cyber 治理选项）。注意 <code class="inline">input</code> 不只是用户消息——它已经包含了被注入的 developer/user fragment（见 5.3）。</div>
+    <p>这七块料里 base_instructions 的<strong>投递方式</strong>值得单独说一句：#51156 之后，base instructions 不再走 <code class="inline">ResponsesApiRequest.instructions</code> 顶层字段（该字段已从 wire 上移除），而是在发送前把指令文本包装成一条 <strong>developer 角色的 message</strong>，用 <code class="inline">Uuid::new_v5</code> 从指令文本本身算出一个稳定 id，<code class="inline">splice(0..0, prefix)</code> 插到 <code class="inline">input</code> 最前面（client.rs:931-940）。稳定 id 的好处是缓存友好——同样的指令每次算出同样的 id，prompt 前缀不变。</p>
   </section>
 
   <section class="block">
@@ -135,7 +136,8 @@
     <span class="kw">fn</span> role(&amp;self) -&gt; &amp;<span class="st">'static str</span>;            <span class="cmt">// "developer" | "user" | "system"</span>
     <span class="kw">fn</span> body(&amp;self) -&gt; String;                   <span class="cmt">// 正文</span>
     <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>); <span class="cmt">// 起止标记（识别已注入片段）</span>
-    <span class="kw">fn</span> requires_separate_message(&amp;self) -&gt; bool { <span class="kw">false</span> }
+    <span class="kw">fn</span> type_markers(&amp;self) -&gt; Vec&lt;(&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>)&gt;; <span class="cmt">// 按类型打的多组标记</span>
+    <span class="kw">fn</span> matches_text(&amp;self, text: &amp;<span class="kw">str</span>) -&gt; bool;  <span class="cmt">// 判断正文是否含某文本</span>
 }</pre>
     <div class="code-title">codex-rs/core/src/context/developer_instructions.rs:5 — 一个具体 fragment</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) struct</span> DeveloperInstructions { instructions: String }
@@ -186,20 +188,21 @@
     <div class="annotation"><b>改 AGENTS.md 不用重启：</b> <code class="inline">AgentsMdManager</code> 在每个 turn 前 <code class="inline">refresh</code>——全局/线程指令通过 provider 在请求边界重读（改了全局 <code class="inline">AGENTS.md</code> 不用重启会话），环境或信任级别变了才重新扫描仓库目录。刷新用 <code class="inline">Semaphore</code> 串行化，读结果时不持锁。<strong>关键：它还解析 <code class="inline">TrustLevel</code></strong>（Trusted / Untrusted）。这直接影响安全：untrusted 项目的命令默认要审批（见第 8 章）。<strong>AGENTS.md 不只是指令，还是信任边界</strong>——上下文加载和安全策略在这里交汇。另外线程级指令超过 1 万 estimated token 会被整条拒绝（不截断）。</div>
     <div class="callout tip">
       <b class="tag">实践</b>
-      在项目根放一个 <code class="inline">AGENTS.md</code>，写上构建命令、代码规范、禁忌操作。Codex 每个 turn 都会读到它。仓库自己的 <code class="inline">AGENTS.md</code> 就是个范例——它告诉 Codex 该用 <code class="inline">just</code> 跑测试、crate 名带 <code class="inline">codex-</code> 前缀等。
+      在项目根放一个 <code class="inline">AGENTS.md</code>，写上构建命令、代码规范、禁忌操作。Codex 每个 turn 都会读到它。（这个仓库曾经也有自己的 <code class="inline">AGENTS.md</code>——告诉 Codex 该用 <code class="inline">just</code> 跑测试、crate 名带 <code class="inline">codex-</code> 前缀——后来 #49713 把它和仓库本地的 Codex 配置一起删了；机制还在，范例没了。）
     </div>
   </section>
 
   <section class="block">
     <h2><span class="num">5.5</span>ContextManager：历史的管家与增量注入</h2>
     <p><code class="inline">ContextManager</code> 是会话历史的管家——它不只存历史，还负责「该注入什么、哪些变了」的增量计算：</p>
-    <div class="code-title">codex-rs/core/src/context_manager/history.rs — ContextManager 字段（节选）</div>
+    <div class="code-title">codex-rs/core/src/context_manager/history.rs:93 — ContextManager 字段（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 会话历史的转录</span>
 <span class="kw">pub(crate) struct</span> ContextManager {
     <span class="cmt">// 最老的 item 在前面。快照共享 vector 直到需要修改，避免深拷贝。</span>
     items: Arc&lt;Vec&lt;ResponseItemEnvelope&gt;&gt;,
     <span class="cmt">// 历史被重写（压缩或回滚）时递增。</span>
     history_version: u64,
+    <span class="cmt">// 节选：中间还有 review_history / retained_context / reset_version 等字段</span>
     token_info: Option&lt;TokenUsageInfo&gt;,
     <span class="cmt">/// 用于 diffing 和生成模型可见设置更新 item 的参考上下文快照。</span>
     <span class="cmt">/// 这是下一个常规模型 turn 的基线。</span>
@@ -247,7 +250,7 @@
 </div>
 
 <footer>
-  Codex CLI · 05 上下文构建 · 源码锚点 openai/codex @ fbc169827e · 所有引用代码路径以仓库最新为准
+  Codex CLI · 05 上下文构建 · 源码锚点 openai/codex @ 822e58cc3d · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

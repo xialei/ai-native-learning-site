@@ -47,7 +47,7 @@
       <li><strong>DP（数据并行）</strong>：整个模型复制多份，每个 DP 组服务不同的请求。解决吞吐，不解决模型大小。</li>
       <li><strong>EP（专家并行）</strong>：MoE 模型把专家分到不同卡，token 按路由结果跨卡传输。解决专家参数总量放不下单卡。</li>
     </ul>
-    <p>对应到 SGLang 的进程模型（第 1 章）：<strong>每个 TP rank 一个 Scheduler 子进程</strong>，TP 组内各 rank 通过 NCCL/自定义 allreduce 同步；<code class="inline">dp_size &gt; 1</code> 时多了一个 <code class="inline">DataParallelController</code>，按负载均衡策略把请求路由到某个 DP 组；PP 有自己独立的事件循环；EP 则藏在 MoE 层内部，不改变进程结构。</p>
+    <p>对应到 SGLang 的进程模型（第 1 章）：<strong>每个 TP rank 一个 Scheduler 子进程</strong>，TP 组内各 rank 通过 NCCL/自定义 allreduce 同步；DP rank 多于一个（<code class="inline">num_dp_ranks &gt; 1</code>）时多了一个 <code class="inline">DataParallelController</code>，按负载均衡策略把请求路由到某个 DP 组；PP 有自己独立的事件循环；EP 则藏在 MoE 层内部，不改变进程结构。</p>
     <table class="tbl">
       <tr><th>维度</th><th>切什么</th><th>通信发生在哪</th><th>什么时候用</th></tr>
       <tr><td>TP</td><td>每层权重矩阵（列/行并行）</td><td>每层前向 1~2 次 allreduce（NCCL 或 custom allreduce）</td><td>单卡放不下权重或想降延迟</td></tr>
@@ -140,7 +140,7 @@
 
   <section class="block">
     <h2><span class="num">10.3</span>DataParallelController：dp_size&gt;1 时的邮差</h2>
-    <p>回顾第 1 章的 <code class="inline">_launch_scheduler_processes</code>：只要 <code class="inline">dp_size &gt; 1</code>（或弹性 EP 的 <code class="inline">ep_join_mode == "scale"</code>），进程编排就走 DataParallelController 分支。它做的事很集中——把 TokenizerManager 发来的请求按策略转发给某个 DP 组：</p>
+    <p>回顾第 1 章的 <code class="inline">_launch_scheduler_processes</code>：只要 <code class="inline">num_dp_ranks &gt; 1</code>（或弹性 EP 的 <code class="inline">ep_join_mode == "scale"</code>），进程编排就走 DataParallelController 分支。它做的事很集中——把 TokenizerManager 发来的请求按策略转发给某个 DP 组：</p>
     <div class="code-title">python/sglang/srt/managers/data_parallel_controller.py — 负载均衡方法与分发表（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LoadBalanceMethod</span>(<span class="cl">Enum</span>):
     <span class="st">"""Load balance method."""</span>
@@ -289,7 +289,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
 
   <section class="block">
     <h2><span class="num">10.5</span>dp_attention：注意力复制、MoE 分片</h2>
-    <p>DeepSeek 这类 MLA 模型有个不对称性：注意力的 KV 很小（每 token 只存一个 latent 向量加 rope），而 MoE 层的参数和计算占大头。把注意力也切成 TP 会引入频繁的 allreduce，收益却小。<code class="inline">--enable-dp-attention</code> 的思路是反着来：<strong>注意力侧按 DP 复制（每个 rank 持有自己的请求和 KV），MoE 侧仍按 TP/EP 分片</strong>。</p>
+    <p>DeepSeek 这类 MLA 模型有个不对称性：注意力的 KV 很小（每 token 只存一个 latent 向量加 rope），而 MoE 层的参数和计算占大头。把注意力也切成 TP 会引入频繁的 allreduce，收益却小。DP 注意力的思路是反着来：<strong>注意力侧按 DP 复制（每个 rank 持有自己的请求和 KV），MoE 侧仍按 TP/EP 分片</strong>。开它的方式最近变了：老的 <code class="inline">--dp-size N --enable-dp-attention</code> 写法已标弃用——<code class="inline">server_args.py</code> 里 <code class="inline">--enable-dp-attention</code> 换成了 <code class="inline">DeprecatedStoreTrueAction</code>，帮助文本直接指路 <code class="inline">--attn-dp-size &lt;dp-size&gt;</code>，注释写明 2026-12-31 之后连字段一起删。新写法下 <code class="inline">dp_size</code> 语义收窄回「纯数据并行副本数」，注意力的 DP 宽度单独用 <code class="inline">attn_dp_size</code> 表达。兼容逻辑在 <code class="inline">arg_groups/parallel_hook.py</code> 的 <code class="inline">handle_deprecated_dp_attention</code>：读到旧写法就声明 <code class="inline">attn_dp_size=旧 dp_size、dp_size=1</code>——老用户的部署拓扑不变，但两本账从此分开记。随之，全代码库凡「有几个 DP rank」的判断都改读 <code class="inline">num_dp_ranks</code>（= <code class="inline">dp_size × attn_dp_size</code>，<code class="inline">runtime_context.py</code> 的 <code class="inline">num_dp_ranks_of</code>），不再直接看 <code class="inline">dp_size</code>——第 1 章 <code class="inline">use_dp_controller</code> 那行判据就是这样改的。</p>
     <p>token 在两种并行模式之间的搬运靠一对 gather/scatter：进入 MoE 前，把各 DP rank 的本地 token 拼成一个全局缓冲区；MoE 算完后再切回各自的本地段：</p>
     <div class="code-title">python/sglang/srt/layers/dp_attention.py — dp_gather_partial 与 dp_scatter（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">dp_gather_partial</span>(
@@ -311,7 +311,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     <span class="kw">if</span> local_tokens.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
         <span class="fn">memcpy</span>(local_tokens, global_tokens,
                <span class="nu">0</span>, local_start_pos, local_num_tokens, <span class="kw">True</span>)</pre>
-    <div class="annotation"><b>每层前向的固定三步：</b> 注意力各 rank 算各自的（无通信）→ <code class="inline">dp_gather</code> 汇总 → MoE 在全局 token 上计算 → <code class="inline">dp_scatter</code> 切回。CUDA Graph 要求形状固定，所以全局/本地缓冲区长度有 max/sum 两种填充模式（<code class="inline">get_dp_padding_mode</code>）。这套机制下每张卡仍然是一个完整的 Scheduler 进程，只是并行组划分变了：<code class="inline">attn_tp_size = tp_size // attn_dp_size // attn_cp_size</code>，注意力组与 MoE 组是同一批卡的不同切法。</div>
+    <div class="annotation"><b>每层前向的固定三步：</b> 注意力各 rank 算各自的（无通信）→ <code class="inline">dp_gather</code> 汇总 → MoE 在全局 token 上计算 → <code class="inline">dp_scatter</code> 切回。CUDA Graph 要求形状固定，所以全局/本地缓冲区长度有 max/sum 两种填充模式（<code class="inline">get_dp_padding_mode</code>）。这套机制下每张卡仍然是一个完整的 Scheduler 进程，只是并行组划分变了：<code class="inline">attn_tp_size = tp_size // attn_dp_size // attn_cp_size</code>（<code class="inline">derive_attn_tp_size</code>，<code class="inline">runtime_context.py</code>），注意力组与 MoE 组是同一批卡的不同切法。</div>
     <div class="annotation"><b>布局约束常被误传：</b> 流传较广的说法是「只支持 <code class="inline">attn_tp_size == 1</code>、<code class="inline">tp_size == dp_size</code>」，但这只对了一部分。源码只断言 <code class="inline">tp_size % dp_size == 0</code>，此外 <code class="inline">tp_size % (dp_size * attn_cp_size) == 0</code>——并<strong>不要求</strong>两者相等。<code class="inline">attn_tp_size &gt; 1</code> 是一条活跃支持的路径：<code class="inline">layers/layer_boundary/fusions/allreduce.py</code> 与 <code class="inline">layers/logits_processor.py</code> 都有 <code class="inline">attn_tp_size &gt; 1</code> 的分支，还会为这种形状专门打一条提示日志（"DSA with TP mode is active… attention weights will be sharded across N ranks"）。<code class="inline">tp_size == dp_size</code> 这个约束只对 <strong>flashinfer MegaMoE</strong> 成立。<strong>「注意力 TP 与 DP 正交」才是这套设计的一般形态</strong>，tp8dp8 只是 <code class="inline">attn_tp_size=1</code> 的那个特例。锚点：断言 <code class="inline">parallel_hook.py</code>（CP 侧两条在 <code class="inline">parallel_hook.py</code>）、分支 <code class="inline">logits_processor.py</code>、提示日志 <code class="inline">model_hook.py</code>。</div>
   </section>
 
@@ -358,7 +358,7 @@ self.dispatching = dispatch_lookup[self.load_balance_method]</pre>
     self._expert_storage_rank = self.moe_ep_rank
 <span class="kw">assert</span> self._num_global_routed % storage_ep_size == <span class="nu">0</span>
 self._num_local_routed = self._num_global_routed // storage_ep_size</pre>
-    <div class="annotation"><b>两套编号并存：</b> 弹性模式下，本 rank 的专家按「初始规模 + rank 偏移」从存储定位，而路由按当前运行规模算——两套编号并存，是支撑在线扩缩的代价。这也解释了 <code class="inline">_launch_scheduler_processes</code> 里那个条件：<code class="inline">use_dp_controller = dp_size &gt; 1 or ep_join_mode == "scale"</code>——弹性 EP 扩缩需要 controller 参与进程编排，不只是路由请求。</div>
+    <div class="annotation"><b>两套编号并存：</b> 弹性模式下，本 rank 的专家按「初始规模 + rank 偏移」从存储定位，而路由按当前运行规模算——两套编号并存，是支撑在线扩缩的代价。这也解释了 <code class="inline">_launch_scheduler_processes</code> 里那个条件：<code class="inline">use_dp_controller = num_dp_ranks &gt; 1 or ep_join_mode == "scale"</code>——弹性 EP 扩缩需要 controller 参与进程编排，不只是路由请求。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       最近几笔改动都指向同一个方向——把并行状态从「模块级全局变量」收拢到「显式的上下文对象」。<code class="inline">layers/dp_attention.py</code> 里那批模块级全局（本地 rank、缓冲区张量等）被整体拆除，读写改走 <code class="inline">get_parallel().override_permanently(...)</code>（<code class="inline">runtime_context.py</code>），注意力 rank 的推导也集中成 <code class="inline">derive_attention_ranks</code>（<code class="inline">runtime_context.py</code>）一处。代价是行号大范围漂移（本章几个锚点都因此后移），收益是并行组状态有了唯一的存取入口——对自研引擎是个可以抄的结构决策：全局变量省下的样板代码，迟早要在测试和 CUDA Graph 捕获的边界上还回来。另一笔是新增了 <code class="inline">_SHARED_EXPERTS_TP</code> 并行组（<code class="inline">parallel_state.py</code>，<code class="inline">get_shared_experts_tp_group</code>，加入 <code class="inline">graph_capture</code> 的组元组）：共享专家（路由之外永远激活的那部分专家）单独成组做 TP 切分，与主 TP 组隔离，目前只对 Kimi-K3 类模型开启，且在 <code class="inline">arg_groups/parallel_hook.py</code> 里强制要求它整除 <code class="inline">tp_size</code>。MoE 的「共享专家怎么切」从此有了独立的自由度。
@@ -384,7 +384,7 @@ self._num_local_routed = self._num_global_routed // storage_ep_size</pre>
 </div>
 
 <footer>
-  深入浅出SGLang · 10 分布式 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 10 分布式 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

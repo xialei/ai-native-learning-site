@@ -182,10 +182,12 @@
     <h2><span class="num">11.4</span>传输路径：HiCacheController</h2>
     <p>L1 和 L2 之间的搬运由 <code class="inline">HiCacheController</code>（注意：在 <code class="inline">managers/cache_controller.py</code>，不在 mem_cache/ 下）完成。它的模型很朴素：两个队列 + 两个后台线程。<code class="inline">write</code> 先在 host 池里分配槽位再入队，<code class="inline">load</code> 反过来先在 device 池分配：</p>
     <div class="code-title">python/sglang/srt/managers/cache_controller.py — HiCacheController.write / load（摘录，合并了两个方法，注释保留原文）</div>
-    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">write</span>(self, device_indices, priority=<span class="kw">None</span>, node_id=-<span class="nu">1</span>):
+    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">write</span>(self, device_indices, priority=<span class="kw">None</span>, node_id=-<span class="nu">1</span>, extra_pools=<span class="kw">None</span>):
         <span class="st">"""
         Back up KV caches from device memory to host memory.
         """</span>
+        <span class="kw">if</span> extra_pools:
+            <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">"Side-pool transfers require HybridCacheController."</span>)
         host_indices = self.mem_pool_host.<span class="fn">alloc</span>(<span class="fn">len</span>(device_indices))
         <span class="kw">if</span> host_indices <span class="kw">is</span> <span class="kw">None</span>:
             <span class="kw">return</span> <span class="kw">None</span>
@@ -206,7 +208,7 @@
             <span class="cl">CacheOperation</span>(host_indices, device_indices, node_id, priority)
         )
         <span class="kw">return</span> device_indices</pre>
-    <div class="annotation"><b>三个要点：</b> 先说<strong>先分配后搬运</strong>：host/device 两边的槽位都在入队前就占好，传输失败不会留下半截状态。再说<strong>页对齐</strong>：所有索引按 <code class="inline">page_size</code> 对齐，传输以页为单位（host 池的 <code class="inline">page_num</code> 就是按页算的）。最后是<strong>分层计数器</strong>：构造函数里 <code class="inline">LayerDoneCounter(self.transfer_layer_id_max)</code> 注册到 device 池（这个字段以前叫 <code class="inline">layer_num</code>，commit 9f3d275940 改名——见本节末尾的演进痕迹）——KV 池是逐层布局的，D2H 拷贝按层推进，每层完成都计数，TP 组内各 rank 再对齐进度，保证多卡间备份进度一致。</div>
+    <div class="annotation"><b>三个要点：</b> 先说<strong>先分配后搬运</strong>：host/device 两边的槽位都在入队前就占好，传输失败不会留下半截状态。再说<strong>页对齐</strong>：所有索引按 <code class="inline">page_size</code> 对齐，传输以页为单位（host 池的 <code class="inline">page_num</code> 就是按页算的）。最后是<strong>分层计数器</strong>：构造函数里 <code class="inline">LayerDoneCounter(self.transfer_layer_id_max)</code> 注册到 device 池（这个字段以前叫 <code class="inline">layer_num</code>，commit 9f3d275940 改名——见本节末尾的演进痕迹）——KV 池是逐层布局的，D2H 拷贝按层推进，每层完成都计数，TP 组内各 rank 再对齐进度，保证多卡间备份进度一致。<code class="inline">extra_pools</code> 参数是新签名里唯一的新面孔：主 KV 之外还有 side pool（辅助池）要一起搬时，调用方会把 <code class="inline">PoolTransfer</code> 列表传进来；基类不认它，直接 raise 指路 <code class="inline">HybridCacheController</code>——「主池 + 辅助池」的传输只有混合控制器会做，接口按能力显式分家。</div>
     <div class="annotation">IO 后端有三种：<code class="inline">kernel</code>（默认；把索引搬到 GPU，用 CUDA kernel 逐层拷贝）、<code class="inline">direct</code>（CPU 直接按索引读写 pinned 内存），以及 <code class="inline">kernel_ascend</code>（华为 NPU 路径）。<code class="inline">arg_groups/hicache_hook.py</code> 的 <code class="inline">resolve_layout_io_compatibility</code> 里能看到组合约束：page_first 布局配 direct 后端时会被自动切换布局——这两个开关是联动的，不是独立的。</div>
     <div class="annotation"><b>NPU 路径上的一处分叉：</b> <code class="inline">kernel_ascend</code> 里还套着一层判断。融合的 <code class="inline">acc_offload</code> 换入换出 kernel 直接在设备上读 token 索引，索引就保持在设备上；而遗留的 <code class="inline">memcpy2d</code> 换入换出算子需要 CPU 索引，由它自己转换。前者额外走一步 pinned memory 上传——源码注释解释了原因：<code class="inline">host_indices</code> 来自基数树匹配，是一个<strong>可分页</strong>的 CPU 张量，而可分页张量的 <code class="inline">.to(device)</code> 会带一次 stream synchronize，把当前（默认）stream 上排队的全部计算都排干。<strong>一次多余的同步就足以让整个按层分组的流水线退化成串行</strong>，所以要显式绕开。</div>
     <div class="callout info">
@@ -274,8 +276,8 @@
             self.storage_prefetch_retries.<span class="fn">poll_miss</span>(req_id, storage_hit_end)
             <span class="kw">return</span>
 
-        <span class="cmt"># Cache mode pins the anchor for the storage round trip;</span>
-        <span class="cmt"># buffer mode holds no tree state during the fetch.</span>
+        <span class="cmt"># Buffer mode holds no tree state during the fetch: buffers are</span>
+        <span class="cmt"># operation-owned, so the anchor needs no pin.</span>
         anchor_lock_params = (
             <span class="kw">None</span> <span class="kw">if</span> buffer_mode
             <span class="kw">else</span> self.<span class="fn">inc_host_lock_ref</span>(last_host_node_id).<span class="fn">to_dec_params</span>()
@@ -290,6 +292,8 @@
             <span class="cmt"># sized to the hit.</span>
             ...
         <span class="kw">else</span>:
+            <span class="cmt"># Cache mode reserves the requested span up front; buffer mode</span>
+            <span class="cmt"># grants occupancy later at hit-alloc time, sized to the hit.</span>
             self.cache_controller.prefetch_tokens_occupied += <span class="fn">len</span>(prefetch_key)</pre>
     <div class="annotation"><b>三个门槛：</b> 存储未启用（或没有 controller）直接不预取；潜在命中长度低于 <code class="inline">prefetch_threshold</code>（默认 256 token）不预取；L2 里被在途预取占用的 token 数超过容量上限（<code class="inline">prefetch_rate_limited</code>）则取消。比起被删的旧实现，统一版在前面多了两道闸：同请求的在途预取直接短路（<code class="inline">get_prefetch_submission</code> / <code class="inline">ongoing_prefetch</code>），预取锚点的命名空间（extra_key / cache_salt）要与请求一致，否则 assert 拒绝——存储页按命名空间隔离后，拿错命名空间的锚点会把页写错账。发起后请求挂在 <code class="inline">ongoing_prefetch</code> 里——预取是异步的，调度器不等它，下一轮收割时再对账。<br><br><b>这里有一处容易看漏的次序：预取阶段<em>不</em>分配 host 槽位。</b><code class="inline">prefetch_from_storage</code> 只登记「要取哪些 token」（<code class="inline">PoolTransfer(host_indices=None)</code>），KV staging 的 <code class="inline">alloc</code> 延后到命中时才做——源码注释 "Size the component's staging now; it is allocated at hit time, next to the KV staging, so the query holds no host memory"（<code class="inline">unified_radix_cache.py</code> 附近）。原因是预取是乐观的：三级存储里可能只有一部分真的存在，提前按 <code class="inline">prefetch_length</code> 全额占位会浪费 host 池；等 L3 命中数确定后，<code class="inline">_drain_and_alloc_storage_hit()</code>（<code class="inline">unified_radix_cache.py</code>）按实际命中长度分配，只付真正拿到的那部分。等不了那么久也有退出机制：<code class="inline">hicache_storage_prefetch_policy</code> 支持 <code class="inline">best_effort</code>（随时可放弃）、<code class="inline">wait_complete</code>（死等）、<code class="inline">timeout</code>（按传输量线性放宽的超时）：</div>
     <div class="code-title">python/sglang/srt/mem_cache/unified_radix_cache.py — 线性超时函数（摘录，注释为译注）</div>
@@ -312,7 +316,8 @@
     <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">_build_backup_kv_action</span>(
         self, node: <span class="cl">UnifiedTreeNode</span>, write_back: <span class="cl">bool</span> = <span class="kw">False</span>
     ) -&gt; <span class="cl">BackupKV</span>:
-        <span class="cmt">"""Build the backup action for a node and its not-yet-persisted ancestors."""</span>
+        <span class="cmt">"""Build the backup action for a node; write-through also chains its
+        unbacked ancestors."""</span>
         chain = [node]
         <span class="kw">if not</span> write_back:
             ancestor = node.parent
@@ -439,7 +444,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

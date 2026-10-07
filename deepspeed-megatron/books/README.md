@@ -6,8 +6,8 @@
 
 | 仓库 | 本地路径 | 锚点 |
 |---|---|---|
-| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-68-g53e336cd5`（version.txt: 0.19.8） |
-| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2685-g07147d694`（core 包版本 0.20.0） |
+| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-86-gf0a3be9bb`（version.txt: 0.19.8） |
+| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2735-ge4294782f`（core 包版本 0.20.0） |
 
 所有引用代码路径以仓库最新为准——若源码演进导致行号偏移，以文件名 + 函数名定位。
 
@@ -44,7 +44,14 @@
 
 ## 演化记录
 
-- **2026-09-29 四次核实**（DeepSpeed 22 commits / Megatron 16 commits，重锚 `v0.19.7-68-g53e336cd5` / `core_v0.15.0rc7-2685-g07147d694`，章级最大一次改动是新增内容）：
+- **2026-10-06 六次核实**（DeepSpeed 18 commits / Megatron 50 commits，重锚 `v0.19.7-86-gf0a3be9bb` / `core_v0.15.0rc7-2735-ge4294782f`）：
+  - 4 处 pin 漂移修正：ch01 `training.py:3292→3302`（RLConfig 容器化 hunk 上移 +10）；ch07 epilogue `:984→:999`（#8632/#8655 在其前插入 ~15 行）；ch08 step `:2774→:2791`（#8655 在其前新增 `_muon_update_lacks_loss_scale` 方法段）。DS engine.py 三个 pin（3353/3413/3538）byte-identical 未动。
+  - 摘录回源全中：ch07 7.2 IPG/epilogue、7.5 LRU 缓冲与动量暂存/提交、ch08 8.3 stage3 step 子组循环、ch07 7.3 `_build_model_gbuf_param_range_map` 与 `checkpoint_fully_reshardable_formats`（现 :166）、ch10 `checkpointed_forward`（recompute.py:24）/`checkpoint_core_attention`（attention.py:393）——`recompute_modules` 可选值家族继续扩（新增 mhc/shortcut_pre_mlp_layernorm/residual_stream 等 output-discarding 档，core_attn/mlp/moe 仍走普通 checkpointing），10.3 的 selective 机制描述不变。
+  - 两个实质 commit 触及已覆盖面的邻接处但不动摇书中断言：DS #8655（Muon fp16 loss scale 修复——offload 路径 #8464 已处理，非 offload 路径在 fp32 cast 后、norm 与 `unscale_and_clip_grads` 前把 update 乘回 scale；ch07 7.5/7.6 的机制描述与此互补不冲突）+ DS #8632（ZeRO-1/2 offload 梯度生命期/流序硬化——超大梯度独立克隆、producer/reuse event、offload 拷贝跨流排序；覆盖 offload_optimizer cpu/nvme，ZenFlow 除外；ch09 9.3 的数据流叙述仍准确，本次未展开 event 细节）。Megatron #7080（DistributedOptimizer checkpoint 键从 dtype 元组改为 `param_<dtype>` 字符串，带 pre-3.1 回读兼容）——书未断言 FQN 键格式，ch12 不动。
+  - Megatron 端新增的 26.09-alpha/beta.rc1 tag 均非 HEAD 祖先（release 候选线），重锚仍取 main。其余 commits（AutoEP 系列 #8644/#8651/#8671/#8678、FP16_Optimizer MoE grad norm #8635、AutoSP 校验、fused Triton RoPE、RecipeConfig 进 run_config yaml、wide-residual [2/4][3/4][4/4]、GTP 去重、RLConfig 节等）不触及书中覆盖面，未改章。
+  - 同日 SVG 全审（用户「检查一遍，包括svg图」）：16 张 SVG 的 `<text>` 逐条回源，7 处修正——ch04 时序图 warmup 步数与同图公式自相矛盾（stage0 画 4 步改 3 步、stage1 F0..F2 改 F0..F1、desc 同步）；ch06 ZeRO 显存账两处（ZeRO-1 `2+2+16/DP`→`2+2+12/DP`、ZeRO-2 `2+4/DP`→`2+14/DP`）；index AutoTP 行指向 ch09 改 ch01；ch01 L4 行 `quantizer`→`quantization`；index SVG 同款 quantizer 改名。SVG 内目录名逐个 ls 验证存在。
+  - 同日正文路径级纠错（SVG 审计牵出的预存错误，旧锚点即错）：ch11.3 csrc 盘点树重写——`deepspeed/csrc/` 实为仓库根 `csrc/`（`deepspeed/ops/csrc` 是软链，2023-09 #672eee968 起），无 `cpu_adam/` 顶层目录（CPU Adam 在 `csrc/adam/`）、无 `quantizer/`（真名 `quantization/`）、Lion 在 `csrc/lion/`（cpu_lion 非顶层）、transformer 括注文件名换真实（`ds_transformer_cuda.cpp`、`softmax/gelu/normalize_kernels.cu`）；ch01/ch02 Ulysses 归因 `deepspeed/sequence/`→`deepspeed/runtime/sequence_parallel/`（`sequence/` 是 AutoSP）；ch09 9.2 摘录假符号 `ds_opt_adam_init` 换真实 `CPUAdamBuilder().load()` + `create_adam(...)`（cpu_adam.py:91-93）。
+- **2026-09-29 五次核实**（DeepSpeed 22 commits / Megatron 16 commits，重锚 `v0.19.7-68-g53e336cd5` / `core_v0.15.0rc7-2685-g07147d694`，章级最大一次改动是新增内容）：
   - **ch04 新增 4.5 DualPipeV**（#8576，DeepSeek-V3 调度进 DeepSpeed 主干）：`DualPipeVModule`（每卡两段，2P 切法）+ `DualPipeVSchedule`（八步 schedule、主段 nF0B1F1B0）+ `CommitP2P` 批量 p2p（schedule.py +151 行 → 全文约 650 行，4.4 数据对比更新）；4.3 表格与小结 4.6 顺延改写；index.html STEP 4 卡片补 DualPipeV。约束：`micro_batches >= 2 * stages`。
   - **ch07**：7.2 epilogue 摘录重写——旧摘录的 `release_reduced_gradients` / `overflow_sanitizer` / `step_with_ready_parameters` 三个符号在源码中不存在（换真实 `independent_gradient_partition_epilogue`（:984）结构 + step() 溢出/子组语义改写）；7.5 追加 #8633 动量暂存/提交（`_muon_staging_momentum` + step 里 `_commit_muon_momentum`，staged 副本不进 optimizer.state 不进 checkpoint）。
   - **ch08**：8.3 step 摘录补 #8625 zero_grad 挪位（子组循环前清一次，G×P→P）；8.4 增两项——零元素参数（#8467，`is_optimized_parameter` = requires_grad and numel>0，runtime/utils.py:806，零元素按 frozen 待遇进 checkpoint 保形状）、ZeRO-3 Muon 混合形状 all-gather（#8628，分轮 + pad/dummy 参与集合通信）。

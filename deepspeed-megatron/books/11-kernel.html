@@ -95,16 +95,15 @@
   <section class="block">
     <h2><span class="num">11.3</span>DeepSpeed：csrc/ 都有些什么</h2>
     <p>DS 的家底形态与 Megatron 不同——fusions 服务训练热路径，csrc 服务训练周边（optimizer、IO、offload）+ 推理 kernel：</p>
-    <div class="code-title">deepspeed/csrc/ — 自研 kernel 盘点</div>
-    <pre class="code"><span class="lang-tag">text</span>deepspeed/csrc/
+    <div class="code-title">csrc/（仓库根，deepspeed/ops/csrc 软链至此）— 自研 kernel 盘点</div>
+    <pre class="code"><span class="lang-tag">text</span>csrc/
 ├── transformer/               <span class="cmt"># 推理/训练 transformer kernel：attn/ln/gelu 融合</span>
-│   └── (ds_attention, bias_gelu, ...)   <span class="cmt"># 与 Megatron fusions 同思路、独立实现</span>
+│   └── (ds_transformer_cuda, softmax/gelu/normalize_kernels...)  <span class="cmt"># 与 Megatron fusions 同思路、独立实现</span>
 ├── adam/                      <span class="cmt"># GPU fused Adam（第 6 章 _take_model_step 调用）</span>
-│   └── (multi-tensor Adam：多参数组一次 kernel，减少 launch)
-├── cpu_adam/                  <span class="cmt"># 第 9 章的 CPU 侧 SIMD Adam</span>
+│   └── (multi_tensor_adam.cu + cpu_adam.cpp——第 9 章的 CPU 侧 SIMD Adam 也在这)
 ├── aio/                       <span class="cmt"># 第 9 章的 DeepNVMe 异步 IO</span>
-├── quantizer/                 <span class="cmt"># 量化搬运（低精度 offload 的带宽减半）</span>
-└── csrc 通用（cpu_lion, ragged 等）</pre>
+├── quantization/              <span class="cmt"># 量化 kernel（低精度 offload 的带宽减半）</span>
+└── lion/、adagrad/、lamb/…    <span class="cmt"># 其余 optimizer kernel（cpu_lion 在 csrc/lion）</span></pre>
     <div class="annotation"><b>家底形态对比：</b>Megatron 的 fusions 服务「训练前向/反向的热路径」，DS 的 csrc 服务「训练周边（optimizer、IO、offload）+ 推理 kernel」——各自补自己主打场景的短板。共同点只有一条：<strong>multi-tensor / multi-param 的 batch 化</strong>（一次 kernel 处理多个参数张量，减少 launch 开销）——DS 的 fused Adam 与 Megatron 的分布式 optimizer 步进都受益于此思路。</div>
 
     <div class="figure">
@@ -172,7 +171,7 @@
 
   <section class="block">
     <h2><span class="num">11.5</span>小结 + 自研启示</h2>
-    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、quantizer）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE；fp4/NVFP4 沿同一条路（11.2 末），连落地时的回滚反复，都是「不自研、透传 TE」这条路线的再现。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8/fp4 都直接用现成。把自研纪律归拢：</p>
+    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、量化 kernel）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE；fp4/NVFP4 沿同一条路（11.2 末），连落地时的回滚反复，都是「不自研、透传 TE」这条路线的再现。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8/fp4 都直接用现成。把自研纪律归拢：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
       kernel 层的自研纪律：<strong>先 profile 再动手</strong>——nsight 里看到 launch gap 或带宽打满才值得写融合；GEMM 与注意力的时间占比决定了自研 kernel 的天花板（通常 < 40% 时间在元素级算子上，融合的全部收益在这 40% 里）。最容易错的三点：融合 kernel 的 backward 忘了与 forward 配对（autograd 断链静默错）、用了 fp16 累加（元素级 kernel 应 fp32 累加）、融合边界跨了 TP 通信（第 10 章同款坑）。
@@ -186,7 +185,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-68-g53e336cd5 / core_v0.15.0rc7-2685-g07147d694
+  深入浅出 DeepSpeed · Megatron · 11 Kernel · 版本锚点 v0.19.7-86-gf0a3be9bb / core_v0.15.0rc7-2735-ge4294782f
 </footer>
 
 </body>

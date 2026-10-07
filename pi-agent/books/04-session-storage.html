@@ -54,6 +54,7 @@
       <li><strong>元数据与消息解耦</strong>：模型换了、思考级别改了、操作开始了——这些不是「消息」，但要可查询、可审计。</li>
     </ul>
     <p>于是「会话里发生的一切」分成两个名字空间：<strong>Entry 树</strong>装可进 LLM 的内容（四个 type），<strong>带类型地址的簿记值</strong>装不进 LLM 的一切——branch tip、lane 配置/状态、op.meta/op.state、usage 行、pending 产物。所有写入都在一个事务里按 <code class="inline">seq</code> 严格递增提交。这一句是本章的纲领，下面逐个展开。</p>
+    <div class="callout warn"><strong>路径演化注记：</strong>本章引用的实现（<code class="inline">packages/agent/src/harness/session/</code> 及其 Storage 体系）随旧 experimental harness 在 v1.0.0 整体删除，代码不再在 HEAD 上。机制与设计课原样保留——这套 append-only 树 + 事务纪律的思路在 pi-durable（第 7 章 §7.8）和生产层 SessionManager（本章 4.4 引用的 coding-agent 线）里都活着；pi-durable 的六种条目（<code class="inline">pi.user</code>/<code class="inline">pi.assistant</code>/<code class="inline">pi.tool-result</code>/<code class="inline">pi.reset</code>/<code class="inline">pi.compaction</code>/<code class="inline">pi.system</code>）就是这套 Entry 思想的接续。</div>
   </section>
 
   <style>
@@ -183,7 +184,7 @@
       </svg>
       <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#eaf2f9;border-color:#2563eb"></span>Entry（内容，进得了 LLM）</span><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#0f7d7a"></span>簿记值（不进 LLM）</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#b45309"></span>usage / 流式帧暂存</span></div><div class="fig-cap">图 4.2：Session 的两类状态 + 两种附属写入。核心纪律——所有写入（entry/usage/value/list）在同一个事务里提交，靠 <code class="inline">seq</code> 严格递增保证顺序与可恢复性。</div>
     </div>
-    <div class="code-title">packages/agent/src/harness/session/types.ts — Entry 的基类与种类</div>
+    <div class="code-title">packages/agent/src/harness/session/types.ts — Entry 的基类与种类（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">EntryType</span> = <span class="st">"message"</span> | <span class="st">"compaction"</span> | <span class="st">"branch_summary"</span> | <span class="st">"custom"</span>;
 
 <span class="kw">export interface</span> <span class="cl">EntryBase</span> {
@@ -203,9 +204,9 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">4.2b</span>Branch：命名分支 + 叶子指针（就是 lane）</h2>
-    <p>Lane 是一个「分支怎么长」的指针，存储层叫 <code class="inline">Branch</code>，运行层叫 <code class="inline">AgentLane</code>。每个 lane 的叶子存在簿记值 <code class="inline">pi.branch.tip/{lane}</code> 里；追加新 entry 时，<code class="inline">parentId</code> 取该 lane 的当前 tip，并在<strong>同一个事务</strong>里推进 tip。</p>
-    <div class="code-title">packages/agent/src/harness/session/session.ts — 追加 = 插入 entry + 推进 tip（一个事务）</div>
+    <h2><span class="num">4.2b</span>Branch：命名分支 + 叶子指针（旧线里也叫 lane）</h2>
+    <p>Lane 是一个「分支怎么长」的指针，存储层叫 <code class="inline">Branch</code>，旧 harness 运行层叫 <code class="inline">AgentLane</code>（v1.0.0 已随 experimental 线删除）。每个 lane 的叶子存在簿记值 <code class="inline">pi.branch.tip/{lane}</code> 里；追加新 entry 时，<code class="inline">parentId</code> 取该 lane 的当前 tip，并在<strong>同一个事务</strong>里推进 tip。</p>
+    <div class="code-title">packages/agent/src/harness/session/session.ts — 追加 = 插入 entry + 推进 tip（一个事务）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">async</span> appendToBranch(name, entry, context): Promise&lt;<span class="cl">string</span>&gt; {
   <span class="kw">const</span> id = <span class="kw">this</span>.idGenerator.next();
   <span class="kw">await this</span>.mutate(<span class="kw">async</span> (mutator) =&gt; {
@@ -227,7 +228,7 @@
   <section class="block">
     <h2><span class="num">4.3</span>事务提交的纪律：单调 seq、唯一 id、父必须存在</h2>
     <p>每个事务里的写入按顺序分配 <code class="inline">seq</code>（从存储的 <code class="inline">nextSeq</code> 起），提交前统一校验：seq 严格单调、entry/usage id 全局唯一（含同事务内）、entry 的父必须已存在（含同事务内先写入的）。这是恢复时「我到底写到哪了」的唯一依据。</p>
-    <div class="code-title">packages/agent/src/harness/session/commit.ts — validateCommittedWrites（节选）</div>
+    <div class="code-title">packages/agent/src/harness/session/commit.ts — validateCommittedWrites（节选）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> validateCommittedWrites(writes, firstSeq, state): <span class="kw">void</span> {
   <span class="kw">let</span> previousSeq = firstSeq - <span class="nu">1</span>;
   <span class="kw">const</span> transactionIds = <span class="kw">new</span> <span class="cl">Set</span>&lt;<span class="cl">string</span>&gt;();
@@ -252,7 +253,7 @@
   <section class="block">
     <h2><span class="num">4.4</span>Fork：从一棵树长出另一棵</h2>
     <p>fork 有两种 scope：<code class="inline">tree</code>（整树克隆，适合「保存副本」）与 <code class="inline">branch</code>（只复制到某个 entry 为止的路径，开一条新主线）。它的做法不是「产出 mutation 序列再重放」，而是先捕获一个源快照（全部 entries + 全部簿记值），再纯函数地算出目标快照，最后把目标快照一次性写成新存储。崩溃恢复的另一半——操作现场怎么接回——则放在簿记值里，见收尾。</p>
-    <div class="code-title">packages/agent/src/harness/session/fork.ts — createForkSnapshot（节选，注释为译注）</div>
+    <div class="code-title">packages/agent/src/harness/session/fork.ts — createForkSnapshot（节选，注释为译注）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> createForkSnapshot(source: <span class="cl">ForkSourceSnapshot</span>, options: <span class="cl">ForkOptions</span>): <span class="cl">ForkDestinationSnapshot</span> {
   <span class="kw">const</span> sourceEntries = <span class="kw">new</span> <span class="cl">Map</span>(source.entries.map((entry) =&gt; [entry.id, entry]));
   <span class="kw">const</span> sourceTips = storedValuesInNamespace(source.scalarValues, branchTip(<span class="st">""</span>));  <span class="cmt">// 所有分支 tip</span>
@@ -279,7 +280,7 @@
   }
   <span class="kw">return</span> { entries, scalarValues, nextSeq };
 }</pre>
-    <div class="code-title">packages/agent/src/harness/session/fork-policy.ts — projectForkCurrentStateWrite（节选，注释为译注）</div>
+    <div class="code-title">packages/agent/src/harness/session/fork-policy.ts — projectForkCurrentStateWrite（节选，注释为译注）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> projectForkCurrentStateWrite(
   write: <span class="cl">CommittedValueSetWrite</span> | <span class="cl">CommittedListAppendWrite</span>,
   plan: <span class="cl">ForkCurrentStatePlan</span>,
@@ -310,8 +311,8 @@
 
   <section class="block">
     <h2><span class="num">4.6</span>存储后端：内存 / JSONL / SQLite，共用一个 Storage 接口</h2>
-    <p><code class="inline">StorageBackedSession</code> 是门面，真正读写靠 <code class="inline">Storage</code> 接口（commit/getEntries/getValue/scanBranch/scanEntries/scanUsage/...）。核心包自带两个实现：<code class="inline">MemoryStorage</code>（测试/示范用）与 <code class="inline">JsonlStorage</code>（生产默认）；SQLite 是独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>（<code class="inline">packages/session-backends/sqlite-node</code>），避免核心包硬依赖 node:sqlite。</p>
-    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — applyValidated（节选，注释为译注）</div>
+    <p><code class="inline">StorageBackedSession</code> 是门面，真正读写靠 <code class="inline">Storage</code> 接口（commit/getEntries/getValue/scanBranch/scanEntries/scanUsage/...）。核心包自带两个实现：<code class="inline">MemoryStorage</code>（测试/示范用）与 <code class="inline">JsonlStorage</code>（生产默认）；SQLite 是独立包 <code class="inline">@earendil-works/pi-session-backend-sqlite-node</code>（<code class="inline">packages/session-backends/sqlite-node</code>，v1.0.0 随 harness 线一起删除），避免核心包硬依赖 node:sqlite。这套「门面 + 统一 Storage 接口」的分层在 pi-durable 里原样重建：Storage 接口还在，SQLite 实现挪进 <code class="inline">@earendil-works/pi-durable/storage/sqlite/node</code>（第 7.8 节 session-worker 的 import 就是它）。</p>
+    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — applyValidated（节选，注释为译注）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * Complete materialized session state for MemoryStorage and JsonlStorage.
  * This is intentionally unsuitable for database backends and long-running sessions
@@ -355,7 +356,7 @@
   <section class="block">
     <h2><span class="num">4.7</span>查询：分支视角 vs 全局视角</h2>
     <p><code class="inline">Session</code> 提供两类查询：全局 <code class="inline">findEntries</code>（整片树，按 seq）与分支 <code class="inline">branch(name).findEntries</code>（从某个叶子沿 <code class="inline">parentId</code> 一路走到根）。分支行走落在存储的 <code class="inline">scanBranch</code> 里：</p>
-    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — scanBranch（节选）</div>
+    <div class="code-title">packages/agent/src/harness/session/in-memory-storage-state.ts — scanBranch（节选）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span>scanBranch(query: <span class="cl">StorageBranchScan</span>): <span class="cl">Entry</span>[] {
   <span class="kw">const</span> path: <span class="cl">Entry</span>[] = [];
   <span class="kw">let</span> entry = <span class="kw">this</span>.entries.get(query.start);
@@ -438,7 +439,7 @@
   <section class="block">
     <h2><span class="num">4.3b</span>并发写入谁来排队，进程死在半路怎么办</h2>
     <p>追加式账本保证了「数据不会自相矛盾」，但还有两个现实问题没答：并发写入谁来排队？进程死在写文件的半路怎么办？两道防线都修在 session 层。先看第一道——一条排他互斥线，保证同一时刻只有一个读改写作业在飞：</p>
-    <div class="code-title">packages/agent/src/harness/session/mutation-line.ts — 完整源码</div>
+    <div class="code-title">packages/agent/src/harness/session/mutation-line.ts — 完整源码（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Serializes complete read-modify-write jobs for one Session. */</span>
 <span class="kw">export class</span> <span class="cl">MutationLine</span> {
   <span class="kw">private</span> tail: Promise&lt;<span class="kw">void</span>&gt; = Promise.resolve();
@@ -460,7 +461,7 @@
   }
 }</pre>
     <p><code class="inline">SessionMutation</code> 的语义由此而来：<code class="inline">beginMutation()</code> 在 MutationLine 上排队拿到一个<strong>独占能力</strong>，它<strong>只允许一次 commit</strong>（第二次直接拒绝），<code class="inline">end()</code> 等待提交落地并释放互斥线。注意 <code class="inline">run()</code> 里<strong>两处</strong>而不是一处检查 <code class="inline">sealedError</code>：入口处一次，排到队头、真正执行前再一次。作业排队期间 session 可能被 <code class="inline">seal()</code>（<code class="inline">close()</code> 就走这条路），只查入口会漏掉「排队时被关闭」的窗口。JSONL 后端再加最后一道防线——每个事务<strong>原子发布</strong>：先写 <code class="inline">{path}.tmp</code>，再 <code class="inline">rename</code> 覆盖正式文件；启动时逐行重放，<strong>不完整的最后一行（撕裂写）直接截断丢弃</strong>——半条事务永远不会被算数：</p>
-    <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — openV4() 里的撕裂处理（节选，注释为译注）</div>
+    <div class="code-title">packages/agent/src/harness/session/jsonl/storage.ts — openV4() 里的撕裂处理（节选，注释为译注）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> { lines, torn } = splitCompleteLines(content);
 <span class="cmt">// ……校验 header（format 4：v/kind/id/storageVersion/createdAt/cwd）、逐行重放事务</span>
 <span class="kw">if</span> (torn) {
@@ -472,7 +473,7 @@
       <strong>为什么应当照着做？</strong>你的 Runtime 一旦要持久化到磁盘，「单一互斥线 + 单次 commit + 原子写 + 撕裂截断」这四件套就是崩溃一致性的全部基础。追加一行 + 启动重放的账本模型，让「恢复」退化成「再读一遍文件」。
     </div>
     <p>还有一个容易想到、但 pi <strong>没有做</strong>的防线：写入前的 JSON 深度校验。早期版本在 session.ts 里确实有一段 <code class="inline">assertJsonSerializable</code>，用显式栈遍历整个待写对象，拒绝循环引用、稀疏数组、访问器属性、symbol 键、<code class="inline">NaN</code>/<code class="inline">Infinity</code>——深对象也不会爆栈。后来整段被删掉了。校验挪到了<strong>读取侧</strong>：每一行 JSONL 在启动重放时都过这道闸，</p>
-    <div class="code-title">harness/session/jsonl/io.ts — 读取侧逐字段校验（节选，注释为译注）</div>
+    <div class="code-title">harness/session/jsonl/io.ts — 读取侧逐字段校验（节选，注释为译注）（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">function</span> <span class="fn">requireSafeInteger</span>(value: <span class="kw">unknown</span>, field: <span class="kw">string</span>, minimum: <span class="kw">number</span>): <span class="kw">void</span> {
   <span class="kw">if</span> (!Number.<span class="fn">isSafeInteger</span>(value) || (value <span class="kw">as</span> <span class="kw">number</span>) &lt; minimum) <span class="kw">throw new</span> <span class="cl">Error</span>(`Invalid JSONL ${field}`);
 }
@@ -519,7 +520,7 @@
 </div>
 
 <footer>
-  Pi Agent Harness · 04 会话与存储模型 · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 04 会话与存储模型 · 版本 v1.0.4-6-g0cf65d2bf · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

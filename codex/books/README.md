@@ -64,5 +64,5 @@ python3 -m http.server
 
 ## 备注
 
-- 内容基于 `openai/codex @ fbc169827e`（完整 commit SHA，检索日期 2026-09-30；含于 rust-v0.161.0-alpha.1 标签，首次含入为 rust-v0.160.0-alpha.5）整理。章节内标注了具体文件与行号附近的要点，随主干演化可能略有出入，以源码为准。
+- 内容基于 `openai/codex @ 822e58cc3d`（完整 commit SHA，检索日期 2026-10-06；检索时主干尚未打入任何发布标签，最近的预发布线为 rust-v0.162.0-alpha.16，落后本锚点 32 个提交）整理。章节内标注了具体文件与行号附近的要点，随主干演化可能略有出入，以源码为准。
 - 配色采用 Codex 的墨绿/青色品牌色调（`assets/codex-learn.css`），结构借鉴了自建的 Pi Agent Harness 学习站模板。

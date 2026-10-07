@@ -54,17 +54,16 @@ python3 -m http.server
 
 各章引用的 Pi 关键源码位置：
 
-- 消息/循环：`packages/agent/src/`（`types.ts`、`agent.ts`、`agent-loop.ts`）
-- Harness 契约：`packages/agent/src/harness/agent-harness.ts`（纯类型契约；Result 类型在 `result.ts`）
-- Harness 运行时：`packages/agent/src/harness/runtime/`（`harness.ts`、`lane.ts`、`drive.ts` + `drive/`、`reducer.ts`、`restore.ts`）
-  - 会话存储：`packages/agent/src/harness/session/`（`session.ts`、`values.ts`、`context.ts`、`jsonl/`）
-  - 压缩：`packages/agent/src/harness/compaction/compaction.ts`
-- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`（experimental 的 Harness 消费方在 `packages/coding-agent/src/experimental/session-worker.ts`）
-- 工具：`packages/coding-agent/src/core/tools/`
-- AI 层：`packages/ai/src/`（`types.ts`、`providers/*.ts`）
+- 消息/循环：`packages/agent/src/`（`types.ts`、`agent.ts`、`agent-loop.ts`；v1.0.0 后 pi-agent-core 只剩 Agent + 循环 + proxy + 类型）
+- ~~旧 experimental harness~~：`packages/agent/src/harness/`（契约 `agent-harness.ts`、runtime/、session/、compaction/）——**v1.0.0 整体删除**，各章保留其机制讲解并标注「已删」
+- durable 后继：`packages/durable/`（`@earendil-works/pi-durable`，`src/harness/` 的 Harness.open / scheduler / registry，规格在 `docs/spec.md`；SQLite 后端在 `storage/sqlite/node`）
+- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`（durable 的消费方在 `packages/coding-agent/src/experimental/session-worker.ts`）
+- 工具：`packages/coding-agent/src/core/tools/`；暴露面（exposure/prepareLoadout）在 `core/extensions/types.ts`
+- 能力外置：`packages/codemode/`（QuickJS 沙箱）、`packages/mcp/`（MCP 客户端）；内置扩展注册在 `packages/coding-agent/src/extensions/index.ts`（`builtin:<name>`）
+- AI 层：`packages/ai/src/`（`types.ts`、`api/*.ts`）
 
 ## 备注
 
 - 内容基于当前仓库源码整理。代码引用不标行号，随版本演化可能略有出入，以源码为准。
-- 当前审核版本：`v0.87.1-66-g28fd59086`（2026-09-30 再核实：50 commits，主线是虚拟模型 #10035——选择/分发分离，ch08 路由块 + ch11 §11.1c 新节、RPC prompt 处置回执；ch10 分类器家族（llama-cpp-classify 单 token 标签）+ samplingParams 三层合并 + AssistantMessage.thinkingLevel；ch05 会话文件首个用户消息才落盘 #10000；全 14 章）。
+- 当前审核版本：`v1.0.4-6-g0cf65d2bf`（2026-10-06 再核实：206 commits，旧 experimental harness 在 v1.0.0 整体删除——ch07 保留为演化课并新增 pi-durable 接棒节 §7.8；ch09 新增工具暴露节 §9.5b（ToolExposure 五值 + ctx.executeTool + prepareLoadout）；ch11 增补 codemode/MCP 内置扩展（builtin:&lt;name&gt;）；ch10 补 samplingParamsByThinkingLevel 四层合并 #9776 与 Anthropic inline-tools-2026-09-15；ch08 四根钩子扩成六安装器）。
 - 配色沿用 Pi 的 teal / indigo 品牌色调（`assets/pi-learn.css`），结构上借鉴了此前自建的 vLLM 学习站模板。

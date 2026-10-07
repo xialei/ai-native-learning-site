@@ -318,16 +318,18 @@
     decode_wrapper = self.forward_metadata.decode_wrappers[
         self.<span class="fn">_get_wrapper_idx</span>(layer)
     ]
-    cache_loc = (
-        forward_batch.out_cache_loc
-        <span class="kw">if not</span> layer.is_cross_attention
-        <span class="kw">else</span> forward_batch.encoder_out_cache_loc
-    )
 
     <span class="kw">if</span> k <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> save_kv_cache:
-        <span class="cmt"># 把本步新 token 的 K/V 写进 KV 池（第 5 章的 set_kv_buffer）</span>
+        <span class="cmt"># 把本步新 token 的 K/V 写进 KV 池（第 5 章的 set_kv_buffer）；</span>
+        <span class="cmt"># 写入位置由 KVWriteLoc.for_layer 决定：普通层是 out_cache_loc，</span>
+        <span class="cmt"># cross-attention 层换 encoder_out_cache_loc（见下文）</span>
         self.token_to_kv_pool.<span class="fn">set_kv_buffer</span>(
-            layer, <span class="cl">KVWriteLoc</span>(cache_loc, ...), k, v, ...)
+            layer,
+            <span class="cl">KVWriteLoc</span>.<span class="fn">for_layer</span>(
+                forward_batch, layer,
+                swa_loc=self.forward_metadata.swa_out_cache_loc,
+            ),
+            k, v, ...)
 
     kv_cache = self.token_to_kv_pool.<span class="fn">get_kv_buffer</span>(layer.layer_id)
 
@@ -340,7 +342,7 @@
         v_scale=layer.v_scale_float,
     )
     <span class="kw">return</span> o.<span class="fn">view</span>(-<span class="nu">1</span>, layer.tp_q_head_num * layer.head_dim)</pre>
-    <div class="annotation"><b>这里只是「写 KV → 取 KV → 调 kernel」：</b> 每步 decode 前的 <code class="inline">init_forward_metadata</code> 已经用本 batch 的 seq_lens 更新了页表并重新 plan 出 <code class="inline">decode_wrappers</code>；这里只是「写 KV → 取 KV → 调 kernel」。注释里那行 <code class="inline">Must use _float to avoid device-to-host copy</code> 值得注意：传量化 scale 的 float 属性而不是 tensor 属性，是为了不触发 D2H 拷贝——那会破坏 CUDA Graph 捕获。这类约束遍布后端代码，是「接口为 CUDA Graph 让路」的具体表现。</div>
+    <div class="annotation"><b>这里只是「写 KV → 取 KV → 调 kernel」：</b> 每步 decode 前的 <code class="inline">init_forward_metadata</code> 已经用本 batch 的 seq_lens 更新了页表并重新 plan 出 <code class="inline">decode_wrappers</code>；这里只是「写 KV → 取 KV → 调 kernel」。注释里那行 <code class="inline">Must use _float to avoid device-to-host copy</code> 值得注意：传量化 scale 的 float 属性而不是 tensor 属性，是为了不触发 D2H 拷贝——那会破坏 CUDA Graph 捕获。这类约束遍布后端代码，是「接口为 CUDA Graph 让路」的具体表现。<br><br><b>写入位置不再由后端自己拼：</b>旧写法是每个后端自己算 <code class="inline">cache_loc = (out_cache_loc if not layer.is_cross_attention else encoder_out_cache_loc)</code>——这条三元在 flashinfer、triton 等多个后端里各抄了一份。现在统一收进 <code class="inline">KVWriteLoc.for_layer()</code>（<code class="inline">memory_pool.py</code>）：cross-attention 层返回 <code class="inline">encoder_out_cache_loc</code>，其余走 <code class="inline">for_batch()</code>。这不只是收拢：unified 内存池借此在写入口做一道门——<code class="inline">for_batch</code> 会给普通写入标上 <code class="inline">physical=True</code>，而 encoder 写入「没有任何翻译、永不标 physical」。unified 池的写路径只认 physical 位置的物理写入，encoder 写入由此被天然挡在物理池之外。后端从此不用知道「这一层该写哪个 loc」。</div>
 
     <p>prefill（extend）路径多一个分叉：有没有已缓存前缀。无前缀的新 token 用 ragged kernel（直接吃 q/k/v 三个张量），有前缀的用 paged kernel（吃整个 KV 池 + 页表）：</p>
     <div class="code-title">python/sglang/srt/layers/attention/flashinfer_backend.py — forward_extend 的两条路（摘录，注释为译注）</div>
@@ -351,7 +353,13 @@
     <span class="cmt"># use_ragged：本批没有任何已缓存前缀</span>
     <span class="kw">if not</span> self.forward_metadata.use_ragged:
         <span class="kw">if</span> k <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> save_kv_cache:
-            self.token_to_kv_pool.<span class="fn">set_kv_buffer</span>(layer, ..., k, v, ...)
+            self.token_to_kv_pool.<span class="fn">set_kv_buffer</span>(
+                layer,
+                <span class="cl">KVWriteLoc</span>.<span class="fn">for_layer</span>(
+                    forward_batch, layer,
+                    swa_loc=self.forward_metadata.swa_out_cache_loc,
+                ),
+                k, v, ...)
         o = prefill_wrapper_paged.<span class="fn">forward</span>(
             q.<span class="fn">view</span>(-<span class="nu">1</span>, layer.tp_q_head_num, layer.head_dim),
             kv_cache,
@@ -414,7 +422,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

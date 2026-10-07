@@ -135,6 +135,7 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
 ) <span class="kw">as</span> profile_result:
     self.model_runner.profile_run()</pre>
     <div class="annotation"><b>这段的重点在「顶满」二字：</b><code class="inline">profile_run</code> 内部就是 <code class="inline">_dummy_run(max_num_tokens)</code>——按 <code class="inline">max_num_batched_tokens</code> 顶满的假输入跑一次完整前向（V2 实现在 <code class="inline">vllm/v1/worker/gpu/model_runner.py</code>）。顶满而不是随便跑，量出来的才是 activation 的<strong>峰值</strong>；之后运行时无论 batch 怎么变，都不会超过这个数。<code class="inline">memory_profiling</code> 上下文负责前后快照相减，把权重（显式传入）和激活峰值分开记账。</div>
+    <div class="annotation"><b>假输入还有个容易踩的坑：全是零会骗过 MoE 的路由。</b>dummy 输入默认全零，而 MoE 的路由器是按 token 内容选 expert 的——全零的 token 长得一模一样，会<strong>全部涌进同一个 expert</strong>。profile 量出的 MoE 部分（激活、kernel 耗时）随之失真，而且这是启动期的失真，混进 KV 预算里就再也不会被纠正。vLLM 后来加了 <code class="inline">VLLM_RANDOMIZE_DP_DUMMY_INPUTS</code>（envs.py:186，默认关）来应对（#58411）：打开后 <code class="inline">profile_run</code> 会把假 input_ids 随机撒到词表上，让 token 均匀路由。注释把原因写得很直白：「All-zero input_ids route every token to the same experts.」（model_runner.py:1805）。注意它只在 DP&gt;1 时生效（gpu_worker.py 的 <code class="inline">randomize_dummy_inputs</code> 属性，:1369）——单卡没有「多个 DP rank 假输入完全相同、expert 负载全部一致偏斜」的问题，也就没必要随机。自研引擎若用假输入做 profile，MoE 模型记得这一手。</div>
     <p>量完之后，KV 预算就是三行减法：</p>
     <div class="code-title">vllm/v1/worker/gpu_worker.py — KV 预算计算（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>self.available_kv_cache_memory_bytes = (
@@ -385,6 +386,15 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
       <div class="fig-cap">图 8.4：前缀命中让第二个请求跳过整段重复 prefill，物理块引用计数体现共享。</div>
     </div>
     <div class="annotation"><b>为什么「块哈希」是关键：</b>一样的 token 序列一定算出一样的块哈希，所以 <code class="inline">BlockHashToBlockMap</code> 一查即中。默认 <code class="inline">enable_prefix_caching = True</code> 且哈希算法为 <code class="inline">"sha256"</code>（见 <code class="inline">CacheConfig</code>，可用 xxhash 提速）。命中率越高，省下的 prefill 越多——而省下的 prefill 本身就是省显存省时间。</div>
+    <p>块哈希的输入不止 token 序列。<code class="inline">generate_block_hash_extra_keys</code>（kv_cache_utils.py:614）会往哈希里追加一组 <strong>extra_keys</strong>，四路来源、每路都带着自己的标签：</p>
+    <div class="code-title">vllm/v1/core/kv_cache_utils.py — extra_keys 的四路来源（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>extra_keys = (
+    lora_extra_keys          <span class="cmt"># [("lora", lora_name, lora_path)] —— LoRA 名 + 适配器路径</span>
+    + mm_extra_keys          <span class="cmt"># [("mm", mm_id, offset - start_token_idx)] —— 块内偏移</span>
+    + cache_salt_keys        <span class="cmt"># [("cache_salt", salt)] —— 只进第一个块</span>
+    + prompt_embeds_keys     <span class="cmt"># [("prompt_embeds", embeds_hash)] —— 逐块 sha256</span>
+)</pre>
+    <div class="annotation"><b>为什么要打标：</b>这四种内容都会改变「同样 token 算出不同 KV」——挂了不同 LoRA 的同一串 prompt、同一个多模态图在不同位置、不同 cache_salt 隔离的租户，token 序列相同但算出的块不能混用，所以必须进哈希。但它们各自的结构不同：mm 要记「图在块内的偏移」，lora 要「名字和路径都算」——vLLM 曾因为只用名字、没把 <strong>lora_path</strong> 算进去，导致同名换适配器时复用了旧 KV（#59335 补上 path，docstring 写明「re-pointing a LoRA name at a different adapter does not reuse KV computed with the previous one」，kv_cache_utils.py:570）。早期这些键是裸值混在一起，按位置猜类型；#51899 把每路打上 <code class="inline">("mm",…)/("lora",…)</code> 这样的来源标签，结构一眼可辨。但 KV 事件（external consumer 监听块增删）不能跟着变——下游还在解析旧格式——于是 <code class="inline">to_event_extra_keys</code>（:655）在发布前把标签剥掉，块哈希用带标格式、对外事件保持旧格式，两边各取所需。</div>
   </section>
 
   <section class="block">
@@ -428,7 +438,7 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
 </div>
 
 <footer>
-  深入浅出vLLM · 08 内存 · 版本 v0.30.1rc0-311-g1fde8ff7da
+  深入浅出vLLM · 08 内存 · 版本 v0.31.0 (db9527a4687)
 </footer>
 
 </body>

@@ -116,7 +116,7 @@
         <!-- function call 旁路 -->
         <rect class="node acc" x="40" y="446" width="380" height="50" rx="6"></rect>
         <text class="lbl" x="230" y="466" text-anchor="middle">FunctionCallParser（serving 层）</text>
-        <text class="lbl sm" x="230" y="484" text-anchor="middle">parse_stream_chunk · ~39 种模型检测器</text>
+        <text class="lbl sm" x="230" y="484" text-anchor="middle">parse_stream_chunk · ~40 种模型检测器</text>
         <polyline class="edge back" points="850,158 850,471 424,471" fill="none"></polyline>
         <text class="lbl sm" x="640" y="463">token ids → 反分词 → 增量文本 → tool_calls / 普通文本</text>
       </svg>
@@ -174,9 +174,14 @@
     <p>概率路径先做温度缩放和 softmax，再按需选择内核：<code class="inline">simple_sampling_case</code>（top_k/top_p/min_p 全默认）直接多项式采样；否则用 flashinfer 的融合内核：</p>
     <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 的 flashinfer 分支（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">else</span>:
-    <span class="cmt"># 标准路径：除以温度，原地 softmax</span>
+    <span class="cmt"># 标准路径：除以温度，原地 softmax；确定性模式用 torch.softmax，</span>
+    <span class="cmt"># 其余走 sampler_softmax（内核注册表分派，见下文 Cake）</span>
     logits.<span class="fn">div_</span>(sampling_info.temperatures)
-    logits[:] = torch.<span class="fn">softmax</span>(logits, dim=-<span class="nu">1</span>)
+    logits[:] = (
+        torch.<span class="fn">softmax</span>(logits, dim=-<span class="nu">1</span>)
+        <span class="kw">if</span> self.enable_deterministic
+        <span class="kw">else</span> <span class="fn">sampler_softmax</span>(logits)
+    )
     probs = logits
 
     batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
@@ -198,7 +203,7 @@
         probs.contiguous(), sampling_info.top_ks, sampling_info.top_ps,
         filter_apply_order=<span class="st">"joint"</span>,
     )</pre>
-    <div class="annotation"><b>采样后端是可配的：</b> <code class="inline">get_exec().kernel.sampling_backend</code>，CUDA 上默认 flashinfer，另有 pytorch/ascend。min-p 没有融合内核，所以走「两次 renorm + 一次采样」的三步组合；top-k/top-p 用 joint 顺序的融合内核一次完成。这段代码里还留着一条演进痕迹：确定性推理（<code class="inline">enable_deterministic</code>）要求 logprob 一律取自 <code class="inline">log_softmax</code> 内核而不是 <code class="inline">log(softmax(x))</code>——两者在数学上等价，数值上有 ~1e-6 差异，足以破坏 prefill/decode 的逐位对齐，源码注释专门记录了这个坑。</div>
+    <div class="annotation"><b>采样后端是可配的：</b> <code class="inline">get_exec().kernel.sampling_backend</code>，CUDA 上默认 flashinfer，另有 pytorch/ascend。min-p 没有融合内核，所以走「两次 renorm + 一次采样」的三步组合；top-k/top-p 用 joint 顺序的融合内核一次完成。这段代码里还留着一条演进痕迹：确定性推理（<code class="inline">enable_deterministic</code>）要求 logprob 一律取自 <code class="inline">log_softmax</code> 内核而不是 <code class="inline">log(softmax(x))</code>——两者在数学上等价，数值上有 ~1e-6 差异，足以破坏 prefill/decode 的逐位对齐，源码注释专门记录了这个坑。<br><br><b>softmax 也不再只认 torch：</b><code class="inline">sampler_softmax</code> 来自 <code class="inline">sglang.kernels.ops.sampling</code>，它先查形状：fp32、二维、batch 1–64、vocab 128256–262144（且为 8 的倍数）、连续存储、SM103（Blackwell 消费卡）——全部命中才走 <code class="inline">cake_softmax</code>（flashinfer 的 Cake kernel，经 <code class="inline">sglang.kernels.registry</code> 注册表分派），否则退回 <code class="inline">torch.softmax</code>。确定性模式则强制 <code class="inline">torch.softmax</code>——Cake kernel 的浮点行为没有逐位对齐保证。一个 softmax 函数，三条路径，分派条件全部写死在 <code class="inline">supports_softmax()</code> 里：为大模型词表定制的内核，只在它被验证过的形状域里生效。</div>
 
     <p>细看签名会发现 <code class="inline">_sample_from_probs</code> 还返回第二个值 <code class="inline">sampling_mask_capture</code>：</p>
     <div class="code-title">python/sglang/srt/layers/sampler.py — _sample_from_probs 签名（摘录，注释为译注）</div>
@@ -398,9 +403,9 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
         <span class="st">"pythonic"</span>: <span class="cl">PythonicDetector</span>,
         <span class="st">"qwen25"</span>: <span class="cl">Qwen25Detector</span>,
         <span class="st">"qwen3_coder"</span>: <span class="cl">Qwen3CoderDetector</span>,
-        ...  <span class="cmt"># 共 41 个模型条目，多个模型共享同一 detector 类</span>
+        ...  <span class="cmt"># 共 42 个模型条目，多个模型共享同一 detector 类</span>
     }</pre>
-    <div class="annotation"><b>41 个条目对应 37 个 detector 类：</b> 同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
+    <div class="annotation"><b>42 个条目对应 38 个 detector 类：</b> 同一家族的模型变体（<code class="inline">glm/glm45</code>、<code class="inline">qwen/qwen25</code>）共用实现，部分模型直接别名到别人的 detector（<code class="inline">step3p5 → Qwen3CoderDetector</code>）。每个 detector 实现两个入口：<code class="inline">detect_and_parse</code>（整段解析）和 <code class="inline">parse_streaming_increment</code>（流式增量解析——每收到一段新文本就尝试识别「调用开始了没有 / 参数写完了没有」，半截调用要缓冲到 SSE 下一帧）。这份枚举表本身就可以当「各家模型工具调用格式速查表」用。</div>
     <div class="callout info">
       <b class="tag">为什么不在 Sampler 里做</b>
       采样器工作在 token id 空间，而工具调用的边界（比如 <code class="inline">&lt;tool_call&gt;</code> 标记、JSON 的完整闭合）是<strong>文本层</strong>的概念，和分词边界不对齐——一个标记可能被切成多个 token，半个 JSON 对象在 token 序列里无法判定合法性。所以解析只能等反分词之后按文本做，位置自然落在 <code class="inline">entrypoints/openai/serving_chat.py</code>（<code class="inline">FunctionCallParser</code> 在流式与非流式两个分支里分别构造）。代价是约束不「硬」：模型输出格式坏了，解析层只能尽力恢复或报错；要硬约束得靠 8.5 节的 grammar 路线。
@@ -422,7 +427,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
 </div>
 
 <footer>
-  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 08 采样 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

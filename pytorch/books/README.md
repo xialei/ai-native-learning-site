@@ -36,7 +36,7 @@ open pytorch/books/index.html
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
-- 基于 PyTorch 主干（版本戳 `trunk 5eb6d3d36b2`，2026-09-29 快照）编写。
+- 基于 PyTorch 主干（版本戳 `trunk 7b6cf4c25ce`，2026-10-05 快照）编写。
 - 站点内代码片段均摘自 pytorch/pytorch 仓库真实代码并标注文件路径；仓库持续演进，若某处函数/路径对不上，以仓库最新代码为准。
 
 ## 维护指南

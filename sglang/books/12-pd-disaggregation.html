@@ -256,22 +256,34 @@
       「收回之后 KV 放哪」最近多了一个干脆的选项（commit 7c5bdb940c，#41103）：decode 侧内存吃紧收回请求时，原来的两个保底都是「留着等复活」——<code class="inline">cpu_tensor</code> 每请求一块 CPU 张量、<code class="inline">host_pool</code> 用预留的 HiCache 池。新增的 <code class="inline">none</code>（<code class="inline">disagg.py</code> choices 三选）不备份：收回即 abort，客户端拿 503 自己重试。理由写在字段描述里——resume 一条被收回的长请求的前提是它的 KV 完整保住了，而这在紧凑部署里常常是奢望；与其挂着一堆半死的请求占元数据，不如把「这次失败」显式交给客户端。同批还把三个 PD 队列挖了子类接缝（subclass seams），各模式能改写收回/入队行为而不必复制整个队列类。紧跟着的两笔都是「释放时机」的补丁：其一，KV 页延迟释放从「仅 decode 主动 abort」扩成「任何传输失败」（2a1c477648，#41404）——prefill 侧故障、传输层报错、HiCache 恢复失败同样可能有兄弟 rank 的写还在飞向这些页，释放前要 <code class="inline">ensure_abort_notified(force_arm=True)</code> 把 abort 通知强补出去（注释解释了 force_arm：send_metadata 半途而废时 init_time 还是 None 但别的 rank 已拿到目标地址）；其二，drain 完成后的 abort ACK 要<strong>扇出给房间里每个 decode 对端</strong>（14ab74ef95，#41402）——prefill TP &lt; decode TP 时几个 decode rank 共用一个 room，注册表只留最后一个 ABORT 发送者，不扇出的话前面的 rank 会白等到超时。三个 commit 一条线：PD 的正确性不再靠「理想时序」，而是把每种非理想时序都变成显式的等待条件。
     </div>
 
-    <p>队列由 <code class="inline">process_decode_queue</code>（每轮循环驱动）串联，注意轮询频率是可配置的节流：</p>
+    <p>队列由 <code class="inline">process_decode_queue</code>（每轮循环驱动）串联。函数开头的顺序本身就是三条规则：被延迟释放的 KV 每轮都先兑现（放在所有闸门之前，超时才赶得上在内存紧张时触发）；空间够撑 <code class="inline">num_reserved_decode_tokens</code> 步时先复活被收回的请求；还有收回请求排队就不再预分配新请求。轮询频率是可配置的节流，而 <code class="inline">pop_preallocated</code> 的时机按 <code class="inline">host_receive_threshold</code> 分岔：</p>
     <div class="code-title">python/sglang/srt/disaggregation/decode.py — process_decode_queue（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">process_decode_queue</span>(self: <span class="cl">Scheduler</span>):
     ...
-    <span class="cmt"># 有被收回的请求在等空间时，不再预分配新请求</span>
+    <span class="cmt"># 每轮先兑现被延迟释放的 KV（在收回/轮询闸之前，超时才能在内存紧张时触发）</span>
+    self.disagg_decode_transfer_queue.<span class="fn">resolve_deferred_releases</span>()
+    <span class="cmt"># 空间够再撑 num_reserved_decode_tokens 步时，先复活被收回的请求</span>
+    resumed_reqs = self.disagg_decode_prealloc_queue.<span class="fn">resume_retracted_reqs</span>()
+    self.waiting_queue.<span class="fn">extend</span>(resumed_reqs)
+    <span class="cmt"># 仍有被收回的请求在等空间时，不再预分配新请求</span>
     <span class="kw">if</span> <span class="fn">len</span>(self.disagg_decode_prealloc_queue.retracted_queue) &gt; <span class="nu">0</span>:
         <span class="kw">return</span>
 
     self.polling_count = (self.polling_count + <span class="nu">1</span>) % self.polling_interval
     <span class="kw">if</span> self.polling_count % self.polling_interval == <span class="nu">0</span>:
-        req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
-        self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)
+        <span class="cmt"># host 接收阈值为 0：先取预分配的；阈值大于 0：先收已到达的、</span>
+        <span class="cmt"># 给完成中的 host 传输腾出设备空间，再放新请求进来</span>
+        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold == <span class="nu">0</span>:
+            req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
+            self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)
         transferred_reqs = (
             self.disagg_decode_transfer_queue.<span class="fn">pop_transferred</span>()
         )  <span class="cmt"># KV 已到达的请求</span>
-        self.waiting_queue.<span class="fn">extend</span>(transferred_reqs)</pre>
+        self.waiting_queue.<span class="fn">extend</span>(transferred_reqs)
+        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold &gt; <span class="nu">0</span>:
+            <span class="cmt"># 先给完成中的 host 传输腾设备空间，再收新到达的</span>
+            req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
+            self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)</pre>
     <p>KV 到达后请求进入 <code class="inline">waiting_queue</code>，由 <code class="inline">get_new_prebuilt_batch</code> 打包成 <code class="inline">ForwardMode.PREBUILT</code> 的 ScheduleBatch——名字里的「fake completed prefill」说明它的前向被跳过，直接以 decode 身份并入 <code class="inline">running_batch</code>。从这里开始，这条请求走的完全是第 2~4 章讲过的普通路径。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
@@ -345,7 +357,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

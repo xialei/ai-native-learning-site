@@ -36,15 +36,15 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
     <h1>生产 Harness：裸循环到稳定会话之间缺什么</h1>
-    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是 <code class="inline">AgentHarness</code> 契约；这一页走进 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4100 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
+    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是旧 experimental 的 <code class="inline">AgentHarness</code>（v1.0.0 已删）；这一页走进一直担任生产主力的 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4400 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
   </div>
 
   <section class="block">
     <h2><span class="num">8.1</span>从契约到实现，中间隔着什么</h2>
-    <p>第 7 章看过 <code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 契约——注意那是<strong>同包 <code class="inline">runtime/</code> 里 <code class="inline">Harness/Lane</code> 的一条实现线</strong>，而这一页的 <code class="inline">AgentSession</code> 是<strong>另一条自主实现线</strong>（直接组合 <code class="inline">Agent</code> 类 + SessionManager，不实现 <code class="inline">AgentLane</code>）。从「能跑的循环」到「跑得稳的生产会话」，中间隔着四件事：用户的一句话怎么进运行时（拦截、改写、展开、入队，先后顺序由什么决定）？模型每次看到的上下文从哪来（第 5 章的投影逻辑，谁负责装进每次 provider 请求）？扩展在哪能真正改写会话（「通知」和「可操作」的事件边界差在哪，凭什么保证扩展写不坏上下文）？一轮跑完之后谁说了算（重试、压缩、续跑、结算的顺序怎么排）？</p>
+    <p>第 7 章看过 <code class="inline">packages/agent/src/harness/agent-harness.ts</code> 里的 <code class="inline">AgentHarness</code> 契约——注意那是旧 experimental 线（v1.0.0 已整体删除，机制课保留在那一章），而这一页的 <code class="inline">AgentSession</code> 是一直活到今天的生产实现线（直接组合 <code class="inline">Agent</code> 类 + SessionManager，不实现 <code class="inline">AgentLane</code>）。从「能跑的循环」到「跑得稳的生产会话」，中间隔着四件事：用户的一句话怎么进运行时（拦截、改写、展开、入队，先后顺序由什么决定）？模型每次看到的上下文从哪来（第 5 章的投影逻辑，谁负责装进每次 provider 请求）？扩展在哪能真正改写会话（「通知」和「可操作」的事件边界差在哪，凭什么保证扩展写不坏上下文）？一轮跑完之后谁说了算（重试、压缩、续跑、结算的顺序怎么排）？</p>
     <div class="callout info">
       <b class="tag">答案地图</b>
-      输入流水线在 8.2，上下文接管在 8.2b（prepareRequest 接管 + prepareNextTurn 刷新），扩展边界在 8.4（事件桥、context 拆分、可操作边界），收敛在 8.5（收敛三段式 + agent_settled）；8.3 双队列、8.6 会话替换作为支撑件穿插。先把结论放在前面：<strong>AgentSession 不是另一个循环，而是循环外面的一层壳——它用四根接管钩子（prepareRequest / prepareNextTurnWithContext / finishTurn / transformContext）把裸循环的每个开放边界都换成自己的实现。</strong>
+      输入流水线在 8.2，上下文接管在 8.2b（prepareRequest 接管 + prepareNextTurn 刷新），扩展边界在 8.4（事件桥、context 拆分、可操作边界），收敛在 8.5（收敛三段式 + agent_settled）；8.3 双队列、8.6 会话替换作为支撑件穿插。先把结论放在前面：<strong>AgentSession 不是另一个循环，而是循环外面的一层壳——它用一组接管安装器（prepareRequest 投影 / prepareNextTurnWithContext / finishTurn / transformContext / hiddenDeclarations 投影，见 8.2b）把裸循环的每个开放边界都换成自己的实现。</strong>
     </div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
@@ -253,8 +253,8 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   </section>
 
   <section class="block">
-    <h2><span class="num">8.2b</span>模型面前的上下文：四根接管钩子</h2>
-    <p>裸 <code class="inline">Agent</code> 循环把四个边界留成了公开钩子（第 3 章）；生产 harness 在构造函数里<strong>把四根全部接管</strong>（<code class="inline">_installAgentNextTurnRefresh</code> / <code class="inline">_installAgentRequestProjection</code> / <code class="inline">_installAgentBoundaryHooks</code>，再加 8.5 提到的 <code class="inline">_installAgentForcedPromptProjection</code> 包 <code class="inline">transformContext</code>）。其中最根本的一根是 <code class="inline">prepareRequest</code> 投影——它让 <strong>SessionManager 的投影成为模型上下文的唯一来源</strong>，如今还兼任虚拟模型路由的执行点：</p>
+    <h2><span class="num">8.2b</span>模型面前的上下文：一组接管安装器</h2>
+    <p>裸 <code class="inline">Agent</code> 循环把四个边界留成了公开钩子（第 3 章）；生产 harness 在构造函数里<strong>逐根接管</strong>。构造序列连着六个安装调用（<code class="inline">_installAgentToolHooks</code> / <code class="inline">_installAgentNextTurnRefresh</code> / <code class="inline">_installAgentRequestProjection</code> / <code class="inline">_installAgentBoundaryHooks</code> / <code class="inline">_installHiddenDeclarationsProjection</code> / <code class="inline">_installAgentForcedPromptProjection</code>）——前四根在第 3 章的边界上各管一摊，第五根把「声明为 hidden 的工具」从模型可见清单里投影掉（第 9 章的工具暴露会回到它），第六根包 <code class="inline">transformContext</code> 投影强制 prompt。其中最根本的一根是 <code class="inline">prepareRequest</code> 投影——它让 <strong>SessionManager 的投影成为模型上下文的唯一来源</strong>，如今还兼任虚拟模型路由的执行点：</p>
     <div class="code-title">agent-session.ts · _installAgentRequestProjection（注释为译注）</div>
     <pre class="code"><code><span class="kw">private</span> <span class="fn">_installAgentRequestProjection</span>(): void {
   <span class="kw">const</span> previousPrepareRequest = <span class="kw">this</span>.agent.prepareRequest;
@@ -605,7 +605,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
     <h2><span class="num">8.7</span>收尾：四问的答案</h2>
     <ul>
       <li><strong>输入怎么进？</strong><code class="inline">prompt()</code> 一条固定流水线：扩展命令 → input 钩子 → 技能/模板展开 → 流式则强制入 steer/followUp 队列 → flush bash → 模型/鉴权校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>。三个可短路点（命令、钩子、入队），一个「钩子之后才归一化」的顺序决定。</li>
-      <li><strong>上下文从哪来？</strong>四根接管钩子把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源；选中虚拟模型时同一根钩子还执行路由——按 user/continuation/retry 理由分发到物理模型）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt。</li>
+      <li><strong>上下文从哪来？</strong>一组接管安装器把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源；选中虚拟模型时同一根钩子还执行路由——按 user/continuation/retry 理由分发到物理模型）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt、hiddenDeclarations 投影隐藏不该暴露的声明。</li>
       <li><strong>扩展在哪能改写会话？</strong>转换流两扇门（context 只看对话 / context_with_system 拥有完整转写）；可操作边界（turn_end / agent_before_settle）四种草稿链式累积、沙盘预演、失败整体作废，continue 需过 canContinue 校验。</li>
       <li><strong>跑完谁收敛？</strong>重试→压缩→续跑的 while 循环，配三类压缩守卫与一次性的溢出恢复；收敛到头后 agent_before_settle 仍可追加条目续跑一次，最终 agent_settled 纯通知——集成方由此知道 Pi 不会再动。</li>
     </ul>
@@ -631,7 +631,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v1.0.4-6-g0cf65d2bf · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>

@@ -164,7 +164,7 @@
     <p>子进程在 <code class="inline">Engine._launch_scheduler_processes</code> 里创建，注意循环的嵌套顺序——外层 PP rank、内层 TP rank，每个组合一个 <code class="inline">mp.Process</code>：</p>
     <div class="code-title">python/sglang/srt/entrypoints/engine.py — _launch_scheduler_processes（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>use_dp_controller = (
-    <span class="fn">get_parallel</span>().dp_size &gt; <span class="nu">1</span> <span class="kw">or</span> <span class="fn">get_exec</span>().moe.ep_join_mode == <span class="st">"scale"</span>
+    <span class="fn">get_parallel</span>().num_dp_ranks &gt; <span class="nu">1</span> <span class="kw">or</span> <span class="fn">get_exec</span>().moe.ep_join_mode == <span class="st">"scale"</span>
 )
 
 <span class="kw">if</span> <span class="kw">not</span> use_dp_controller:
@@ -180,7 +180,7 @@
             proc = mp.<span class="fn">Process</span>(
                 target=run_scheduler_process_func,
                 args=(server_args, port_args, gpu_id, tp_rank, ...), ...)</pre>
-    <div class="annotation"><b>两条分支：</b> <code class="inline">dp_size == 1</code> 时直接为每个 TP/PP rank 起 Scheduler 进程；<code class="inline">dp_size &gt; 1</code> 时改由 <code class="inline">DataParallelController</code> 统一拉起并做请求分发（第 10 章）。<code class="inline">mp.Pipe(duplex=False)</code> 的 reader 用来等子进程初始化完成，真正的请求/响应流量走 ZMQ。</div>
+    <div class="annotation"><b>两条分支：</b> <code class="inline">num_dp_ranks == 1</code> 时直接为每个 TP/PP rank 起 Scheduler 进程；<code class="inline">num_dp_ranks &gt; 1</code> 时改由 <code class="inline">DataParallelController</code> 统一拉起并做请求分发（第 10 章）。判据用 <code class="inline">num_dp_ranks</code> 而不是 <code class="inline">dp_size</code>：DP 注意力（attn DP）打开时，<code class="inline">dp_size</code> 语义收窄为纯「数据并行副本数」，真正的 DP rank 总数是 <code class="inline">dp_size × attn_dp_size</code>，<code class="inline">num_dp_ranks</code> 已把这个乘积算好（第 10 章 10.5 有专门的改名故事）。<code class="inline">mp.Pipe(duplex=False)</code> 的 reader 用来等子进程初始化完成，真正的请求/响应流量走 ZMQ。</div>
   </section>
 
   <section class="block">
@@ -226,9 +226,11 @@
   <section class="block">
     <h2><span class="num">1.5</span>事件循环在哪：dispatch_event_loop</h2>
     <p>Scheduler 的事件循环不止一种。启动时按配置分发到不同实现——普通/重叠（overlap）、流水线（PP）、prefill-decode 复用（pdmux）、PD 分离各自的前后端循环：</p>
-    <div class="code-title">python/sglang/srt/managers/scheduler.py — dispatch_event_loop（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">dispatch_event_loop</span>(scheduler: <span class="cl">Scheduler</span>):
-    disaggregation_mode = scheduler.disaggregation_mode
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — _dispatch_event_loop_once（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_dispatch_event_loop_once</span>(scheduler: <span class="cl">Scheduler</span>):
+    <span class="cmt"># PD 角色切换可让同一调度器改选另一种循环</span>
+    scheduler.enable_continuous_input_polling = <span class="kw">False</span>
+    disaggregation_mode: <span class="cl">DisaggregationMode</span> = scheduler.disaggregation_mode
     <span class="kw">if</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.NULL:
         <span class="kw">if</span> scheduler.enable_pdmux:
             scheduler.<span class="fn">event_loop_pdmux</span>()
@@ -241,10 +243,10 @@
         <span class="kw">else</span>:
             scheduler.<span class="fn">event_loop_normal</span>()
     <span class="kw">elif</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.PREFILL:
-        ...  <span class="cmt"># event_loop_*_disagg_prefill（定义在 disaggregation/prefill.py 的 mixin 里）</span>
+        ...  <span class="cmt"># pp → overlap → normal 三级（定义在 disaggregation/prefill.py 的 mixin 里）</span>
     <span class="kw">elif</span> disaggregation_mode == <span class="cl">DisaggregationMode</span>.DECODE:
         ...  <span class="cmt"># event_loop_*_disagg_decode（定义在 disaggregation/decode.py 的 mixin 里）</span></pre>
-    <div class="annotation"><b>模式矩阵：</b> PD 分离 × PP × overlap 各选一个入口。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">prefill.py</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
+    <div class="annotation"><b>模式矩阵：</b> PD 分离 × PP × overlap 各选一个入口。入口函数 <code class="inline">dispatch_event_loop</code> 本身现在只有几行：若开了 PD 角色切换（<code class="inline">enable_pd_role_switch</code>），交给 <code class="inline">role_switch.run_event_loop_supervisor</code> 包装 <code class="inline">_dispatch_event_loop_once</code>——supervisor 允许同一调度器在运行中改选循环；否则直接调 <code class="inline">_dispatch_event_loop_once</code>。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">prefill.py</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
   </section>
 
   <section class="block">
@@ -276,7 +278,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 01 整体架构 · 版本 gateway-v0.3.1-10329-g2ff52e3ceb · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 01 整体架构 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

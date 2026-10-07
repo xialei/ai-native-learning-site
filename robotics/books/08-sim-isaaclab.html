@@ -40,14 +40,14 @@
 
   <section class="block">
     <h2><span class="num">8.1</span>① monorepo 地图：四层核心包的职责</h2>
-    <p>读一个新框架，先问「代码住哪」。IsaacLab 仓库的 <code class="inline">source/</code> 下共有 15 个包，其中四个是主干，其余按职责分列（物理后端、可视化、遥操作、数据生成等）：</p>
+    <p>读一个新框架，先问「代码住哪」。IsaacLab 仓库的 <code class="inline">source/</code> 下共有 14 个包，其中四个是主干，其余按职责分列（物理后端、可视化、遥操作、数据生成等）：</p>
     <div class="code-title">IsaacLab/source/ — monorepo 包结构（主干四层）</div>
     <pre class="code"><span class="lang-tag">text</span>source/
 ├── isaaclab/              # 核心包：envs / managers / scene / assets / sim / actuators / sensors
 ├── isaaclab_assets/       # 机器人资产库：29 个官方机器人配置（FRANKA_PANDA_CFG、ANYMAL_C_CFG…）
 ├── isaaclab_tasks/        # 任务库：core/{lift,locomotion,…} + contrib/（社区贡献经典任务）
 ├── isaaclab_rl/           # RL 框架胶水：RslRlVecEnvWrapper、SkrlVecEnvWrapper、sb3、rl_games
-└── （另有 11 个）           # isaaclab_physx / _newton / _ov / _ovphysx（物理后端与 Kit 适配），
+└── （另有 10 个）           # isaaclab_physx / _newton / _ov（物理后端与 Kit 适配），
                            # isaaclab_visualizers / _teleop / _mimic / _contrib / _experimental 等</pre>
     <div class="annotation"><b>读法：</b>依赖严格单向：tasks 依赖 assets，assets 依赖核心，核心不依赖任何上层。<code class="inline">isaaclab_tasks</code> 里还有一条分界线值得注意：3.0 起任务库重组为 <code class="inline">core/</code>（官方维护、 redesigned 的任务）与 <code class="inline">contrib/</code>（沿用旧结构的贡献任务，如经典 LiftCube）两类——用 Manager 体系拼任务（适合 95% 场景）与手写 step/reset 的 DirectRLEnv（适合需要极致控制的研究原型，类在 isaaclab/envs/direct_rl_env.py）之间仍是那条分界线。本系列书聚焦前者。</div>
     <div class="figure">
@@ -128,12 +128,13 @@
     joint_vel   = <span class="fn">RewTerm</span>(func=mdp.joint_vel_l2, weight=-<span class="nu">1e-4</span>)</pre>
     <div class="annotation"><b>读法：</b><code class="inline">MISSING</code> 是 Isaac Lab 的「抽象槽位」——基类声明「任务需要一个机器人」，具体是谁由子类决定。奖励表本身就是 RL 的目标函数：正项（够近 1.0 / 抬起 15.0 / 跟踪目标 16+5）减负项（动作变化率、关节速度）——第 10 章会逐项拆它的「塑形」设计。同样 <code class="inline">ObservationsCfg</code> 声明五项观测（joint_pos/joint_vel/object_position/generated_commands/last_action），<code class="inline">EventCfg</code> 声明重置时物体位置均匀随机（pose_range x∈±0.1, y∈±0.25）——这就是域随机化的配置入口（第 10 章）。（core 新版把这套表格整个重设计了：观测三组带 5 帧历史、进度奖励、ADR 课程——第 10 章展开。）</div>
     <p>中层把槽位填成 Franka + 方块：</p>
-    <div class="code-title">isaaclab_tasks/.../contrib/lift/config/franka/joint_pos_env_cfg.py:25 — 具体化（节选）</div>
+    <div class="code-title">isaaclab_tasks/.../contrib/lift/config/franka/joint_pos_env_cfg.py:26 — 具体化（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="meta">@configclass</span>
 <span class="kw">class</span> <span class="cl">FrankaCubeLiftEnvCfg</span>(LiftEnvCfg):
     <span class="kw">def</span> <span class="fn">__post_init__</span>(self):
         super().<span class="fn">__post_init__</span>()
-        self.scene.robot = FRANKA_PANDA_CFG.replace(prim_path=<span class="st">"{ENV_REGEX_NS}/Robot"</span>)
+        self.scene.robot = <span class="kw">replace</span>(FRANKA_PANDA_CFG, prim_path=<span class="st">"{ENV_REGEX_NS}/Robot"</span>)
+        self.scene.robot.spawn.variants[<span class="st">"Physics"</span>] = <span class="st">"physx"</span>
         self.actions.arm_action = mdp.<span class="fn">JointPositionActionCfg</span>(
             asset_name=<span class="st">"robot"</span>, joint_names=[<span class="st">"panda_joint.*"</span>], scale=<span class="nu">0.5</span>, use_default_offset=<span class="kw">True</span>)
         self.actions.gripper_action = mdp.<span class="fn">BinaryJointPositionActionCfg</span>(
@@ -143,14 +144,14 @@
         self.commands.object_pose.body_name = <span class="st">"panda_hand"</span>
         self.scene.object = <span class="fn">RigidObjectCfg</span>(init_state=<span class="fn">RigidObjectCfg.InitialStateCfg</span>(pos=[<span class="nu">0.5</span>, <span class="nu">0</span>, <span class="nu">0.055</span>]),
                                            spawn=<span class="fn">UsdFileCfg</span>(usd_path=<span class="st">".../dex_cube_instanceable.usd"</span>, scale=(<span class="nu">0.8</span>,)*<span class="nu">3</span>))</pre>
-    <div class="annotation"><b>读法：</b>动作空间在这里定型——臂是 7 个关节的位置偏移（scale=0.5 把网络输出的 ±1 缩成 ±0.5 弧度），夹爪是二值开关（open/close 两个预置表达式）。同一个 LiftEnvCfg 换成 IK 动作配置就得到 <code class="inline">IsaacContrib-Lift-Cube-Franka-IK-Rel</code>（末端位姿控制），这正是配置化继承的红利：MDP 完全复用，只换「action 翻译层」。最后 gym 注册把三层焊死（config/franka/__init__.py:17）：<code class="inline">gym.register(id="IsaacContrib-Lift-Cube-Franka", entry_point="isaaclab.envs:ManagerBasedRLEnv", kwargs={"env_cfg_entry_point": ...FrankaCubeLiftEnvCfg, "rsl_rl_cfg_entry_point": ...LiftCubePPORunnerCfg})</code>——id 可被任何脚本 <code class="inline">gym.make</code>，四个 RL 库的入口配置也一并挂上（contrib 这一代 id 都没有 v0 后缀）。core 新版注册同理（core/lift/config/franka/__init__.py:27）：id 改为 <code class="inline">Isaac-Lift-Franka</code>（无 v0 后缀），并新增 <code class="inline">default_agent="rsl_rl"</code> 字段——训练脚本可据此自动选 RL 后端。</div>
+    <div class="annotation"><b>读法：</b>动作空间在这里定型——臂是 7 个关节的位置偏移（scale=0.5 把网络输出的 ±1 缩成 ±0.5 弧度），夹爪是二值开关（open/close 两个预置表达式）。同一个 LiftEnvCfg 换成 IK 动作配置就得到 <code class="inline">IsaacContrib-Lift-Cube-Franka-IK-Rel</code>（末端位姿控制），这正是配置化继承的红利：MDP 完全复用，只换「action 翻译层」。最后 gym 注册把三层焊死（config/franka/__init__.py:17）：<code class="inline">gym.register(id="IsaacContrib-Lift-Cube-Franka", entry_point="isaaclab.envs:ManagerBasedRLEnv", kwargs={"env_cfg_entry_point": ...FrankaCubeLiftEnvCfg, "rsl_rl_cfg_entry_point": ...LiftCubePPORunnerCfg})</code>——id 可被任何脚本 <code class="inline">gym.make</code>，四个 RL 库的入口配置也一并挂上（contrib 这一代 id 都没有 v0 后缀）。core 新版注册同理（core/lift/config/franka/__init__.py:16）：id 改为 <code class="inline">Isaac-Lift-Franka</code>（无 v0 后缀），并新增 <code class="inline">default_agent="rsl_rl"</code> 字段——训练脚本可据此自动选 RL 后端。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.3</span>③ SimulationContext：世界的总开关</h2>
-    <p>任务配置只描述「世界长什么样」，那「世界怎么运转」由谁管？所有仿真状态收拢在一个单例里（isaaclab/sim/simulation_context.py:89）：</p>
+    <p>任务配置只描述「世界长什么样」，那「世界怎么运转」由谁管？所有仿真状态收拢在一个单例里（isaaclab/sim/simulation_context.py:58）：</p>
     <div class="code-title">SimulationContext 职责速览（isaaclab/sim/simulation_context.py）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 一个进程只有一个实例——重复构造不报错，__new__ 返回已有实例、__init__ 直接 return</span>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 一个进程只有一个实例——重复构造直接抛 RuntimeError，取实例用 SimulationContext.instance()，替换前须 clear_instance()</span>
 sim = <span class="fn">SimulationContext</span>(<span class="fn">SimulationCfg</span>(
         dt=<span class="nu">0.01</span>, device=<span class="st">"cuda:0"</span>, render_interval=<span class="nu">2</span>,
         physics=<span class="fn">PhysxCfg</span>(gpu_total_aggregate_pairs_capacity=<span class="nu">16</span>*<span class="nu">1024</span>)))   <span class="cmt"># 传配置对象，不是关键字参数</span>
@@ -161,7 +162,7 @@ sim.<span class="fn">reset</span>()                 <span class="cmt"># 回到�
 <span class="cmt"># 世界时钟：</span>
 sim.<span class="fn">get_physics_dt</span>()   <span class="cmt"># 0.01（SimulationContext 上是方法；env 上才是 physics_dt 属性）</span>
 env.step_dt = env.physics_dt * decimation    <span class="cmt"># 0.02 —— 策略控制频率 50Hz</span></pre>
-    <div class="annotation"><b>两个必须建立的心智模型：</b>①<strong>「策略步」与「物理步」不同</strong>——物理引擎以 100Hz 推进，但策略每 decimation=2 个物理步才介入一次（50Hz 控制节拍）；期间同一动作被反复施加（apply_action→step×N，第 9 章展开）。②<strong>「渲染」是独立开关</strong>——RTX 渲染极贵，训练时不必要的渲染按 render_interval 跳过；manager_based_env.py:163-169 特别说明 render_enabled=False 时 Kit 视口与相机传感器都停摆，但物理照跑（独立的 Newton/Rerun/Viser 可视化器不受影响）。此外 contrib LiftEnvCfg 的 PhysX 微调（bounce_threshold_velocity=0.01、friction_correlation_distance=0.00625）是为了抓取任务里微小接触力的稳定性——细节在 <code class="inline">__post_init__</code>（contrib/lift/lift_env_cfg.py:218 起）。core 新版则把物理后端做成了 preset：默认 Newton+MJWarp 求解器（PhysicsCfg.default=newton_mjwarp），可切回 PhysX。</div>
+    <div class="annotation"><b>两个必须建立的心智模型：</b>①<strong>「策略步」与「物理步」不同</strong>——物理引擎以 100Hz 推进，但策略每 decimation=2 个物理步才介入一次（50Hz 控制节拍）；期间同一动作被反复施加（apply_action→step×N，第 9 章展开）。②<strong>「渲染」是独立开关</strong>——RTX 渲染极贵，训练时不必要的渲染按 render_interval 跳过；manager_based_env.py:160-166 特别说明 render_enabled=False 时 Kit 视口与相机传感器都停摆，但物理照跑（独立的 Newton/Rerun/Viser 可视化器不受影响）。此外 contrib LiftEnvCfg 的 PhysX 微调（bounce_threshold_velocity=0.01、friction_correlation_distance=0.00625）是为了抓取任务里微小接触力的稳定性——细节在 <code class="inline">__post_init__</code>（contrib/lift/lift_env_cfg.py:218 起）。core 新版则把物理后端做成了 preset：默认 Newton+MJWarp 求解器（PhysicsCfg.default=newton_mjwarp），可切回 PhysX。</div>
   </section>
 
   <section class="block">
@@ -258,7 +259,7 @@ env.step_dt = env.physics_dt * decimation    <span class="cmt"># 0.02 —— 策
 </div>
 
 <footer>
-  深入浅出具身智能 · 08 Isaac Lab 全景 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ d7cf4f111）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 08 Isaac Lab 全景 · 基于 isaac-sim/IsaacLab（v3.0.0，release/3.0.0 @ 6864dd126）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>

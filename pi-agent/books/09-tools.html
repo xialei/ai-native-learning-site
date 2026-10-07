@@ -41,9 +41,9 @@
 
   <section class="block">
     <h2><span class="num">9.1</span>工具层的四个疑问</h2>
-    <p>第 3 章里，工具只是循环里的一个环节。真要自己实现一遍，问题立刻具体起来。先是<strong>契约</strong>——一个工具最少要定义哪些字段？模型给的参数常有瑕疵（相对路径、JSON 字符串包数组），在哪一层修？接着是<strong>管线</strong>——一次工具调用从 assistant 消息到 toolResult 消息，中间要经过校验、权限、执行、后处理，这些步骤如何组织，出错时走哪条路？然后是<strong>并发</strong>——模型经常一次要调多个工具，读写文件可以并行，但两个都写同一个文件就不行，串行还是并行由谁决定？最后是<strong>权限</strong>——危险命令谁来拦？拦的逻辑放在工具里、循环里、还是外面？</p>
+    <p>第 3 章里，工具只是循环里的一个环节。真要自己实现一遍，问题立刻具体起来。先是<strong>契约</strong>——一个工具最少要定义哪些字段？模型给的参数常有瑕疵（相对路径、JSON 字符串包数组），在哪一层修？接着是<strong>管线</strong>——一次工具调用从 assistant 消息到 toolResult 消息，中间要经过校验、权限、执行、后处理，这些步骤如何组织，出错时走哪条路？然后是<strong>并发</strong>——模型经常一次要调多个工具，读写文件可以并行，但两个都写同一个文件就不行，串行还是并行由谁决定？再往后是<strong>暴露</strong>——注册了一个工具，模型就一定能看到吗？工具调工具怎么管？最后是<strong>权限</strong>——危险命令谁来拦？拦的逻辑放在工具里、循环里、还是外面？</p>
     <div class="callout">
-      <strong>答案地图：</strong>契约看 <code class="inline">AgentTool</code> + <code class="inline">prepareArguments</code> 容错（9.2）；管线是 prepare → execute → finalize 三阶段（9.3）；并发靠全局配置 + 工具自声明 <code class="inline">executionMode</code>（9.4）；权限则是个反直觉的答案——工具层不设权限，全部交给 <code class="inline">beforeToolCall</code> 钩子，生产上由扩展接管（9.5）。
+      <strong>答案地图：</strong>契约看 <code class="inline">AgentTool</code> + <code class="inline">prepareArguments</code> 容错（9.2）；管线是 prepare → execute → finalize 三阶段（9.3）；并发靠全局配置 + 工具自声明 <code class="inline">executionMode</code>（9.4）；权限则是个反直觉的答案——工具层不设权限，全部交给 <code class="inline">beforeToolCall</code> 钩子，生产上由扩展接管（9.5）；注册到可见之间还有一层暴露面，exposure 五值 + prepareLoadout（9.5b）。
     </div>
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t9b d9b">
@@ -233,9 +233,17 @@
     <div class="code-title">agent-loop.ts · executeToolCallsParallel（节选）</div>
     <pre class="code"><code><span class="cmt">// immediate 的（已直接出结果）直接归位；剩下的包成 async 函数</span>
 finalizedCalls.push(<span class="kw">async</span> () =&gt; {
-  <span class="kw">const</span> executed = <span class="kw">await</span> <span class="fn">executePreparedToolCall</span>(preparation, signal, emit);
+  <span class="cmt">// 真正执行前再查一次中止——排队期间按批次可能已经收到 abort</span>
+  <span class="kw">if</span> (signal?.aborted) {
+    <span class="kw">const</span> finalized = { toolCall, result: <span class="fn">createErrorToolResult</span>(<span class="st">"Operation aborted"</span>), isError: <span class="kw">true</span> };
+    <span class="kw">await</span> <span class="fn">emitToolExecutionEnd</span>(finalized, emit);
+    <span class="kw">return</span> finalized;
+  }
+  <span class="cmt">// 第三个参数不是裸 emit，而是包了一层的更新汇：工具中途 yield 的 partialResult</span>
+  <span class="cmt">// 会以 tool_execution_update 事件带出去（toolCallId/toolName/args/partialResult）</span>
+  <span class="kw">const</span> executed = <span class="kw">await</span> <span class="fn">executePreparedToolCall</span>(preparation, signal, <span class="fn">emitToolExecutionUpdate</span>(toolCall, emit));
   <span class="kw">const</span> finalized = <span class="kw">await</span> <span class="fn">finalizeExecutedToolCall</span>(currentContext, assistantMessage, preparation, executed, config, signal);
-  <span class="kw">await</span> emitToolExecutionEnd(finalized, emit);
+  <span class="kw">await</span> <span class="fn">emitToolExecutionEnd</span>(finalized, emit);
   <span class="kw">return</span> finalized;
 });
 <span class="cmt">// …最后：</span>
@@ -255,20 +263,31 @@ finalizedCalls.push(<span class="kw">async</span> () =&gt; {
   <section class="block">
     <h2><span class="num">9.5</span>谁来放行一个工具：钩子链与 user_bash</h2>
     <p>权限问题的答案分两半：模型发起的工具调用走 <strong>beforeToolCall 钩子链</strong>；用户亲手敲的命令走 <strong>user_bash 事件</strong>。先看前者——注意一个关键事实：<strong>pi 内核里没有内置权限确认</strong>。agent-loop 只留了钩子挂点，具体放不放行由生产层决定。生产 agent-session 把扩展的 <code class="inline">tool_call</code> 事件接到这个挂点上：</p>
-    <div class="code-title">agent-session.ts · 安装工具钩子（_installAgentToolHooks，节选）</div>
-    <pre class="code"><code><span class="cmt">// 安装一次工具钩子，复用给每个 Agent run（避免重复安装）</span>
-<span class="fn">this</span>.agent.beforeToolCall = <span class="kw">async</span> ({ toolCall, args }) =&gt; {
+    <div class="code-title">agent-session.ts · 安装工具钩子（_installAgentToolHooks + _beforeToolCall，节选）</div>
+    <pre class="code"><code><span class="cmt">// 安装是薄薄一层委托：把 agent 的钩子挂点接到 session 的处理方法上</span>
+<span class="kw">private</span> <span class="fn">_installAgentToolHooks</span>(): <span class="kw">void</span> {
+  <span class="fn">this</span>.agent.beforeToolCall = (context) =&gt; <span class="fn">this</span>.<span class="fn">_beforeToolCall</span>(context);
+  <span class="fn">this</span>.agent.afterToolCall = (context) =&gt; <span class="fn">this</span>.<span class="fn">_afterToolCall</span>(context);
+}
+
+<span class="cmt">// tool_call 处理器。parentToolCallId 只在「工具调工具」（嵌套调用）时有值</span>
+<span class="kw">private</span> <span class="kw">async</span> <span class="fn">_beforeToolCall</span>(
+  { toolCall, args }: BeforeToolCallContext,
+  parentToolCallId?: <span class="cl">string</span>,
+): Promise&lt;BeforeToolCallResult | <span class="kw">undefined</span>&gt; {
+  <span class="kw">const</span> runner = <span class="fn">this</span>._extensionRunner;
   <span class="cmt">// 没有扩展监听 tool_call 时直接放行（返回 undefined = 不干预）</span>
   <span class="kw">if</span> (!runner.hasHandlers(<span class="st">"tool_call"</span>)) <span class="kw">return</span> <span class="kw">undefined</span>;
   <span class="kw">try</span> {
     <span class="kw">return</span> <span class="kw">await</span> runner.emitToolCall({
-      type: <span class="st">"tool_call"</span>, toolName: toolCall.name, toolCallId: toolCall.id, input: args });
+      type: <span class="st">"tool_call"</span>, toolName: toolCall.name, toolCallId: toolCall.id,
+      ...(parentToolCallId ? { parentToolCallId } : {}), input: args });
   } <span class="kw">catch</span> (err) {
     <span class="cmt">// 扩展抛错 → 原样抛给 agent-loop → 工具被 block（fail-closed）</span>
     <span class="kw">if</span> (err <span class="kw">instanceof</span> <span class="cl">Error</span>) <span class="kw">throw</span> err;
     <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`Extension failed, blocking execution: ${<span class="fn">String</span>(err)}`</span>);
   }
-};</code></pre>
+}</code></pre>
     <p>「谁有权放行一个工具」在这里收敛成一条链：<strong>扩展（可 block）→ 真正 execute</strong>。没有扩展监听时全部放行；扩展想拦，就在 <code class="inline">tool_call</code> 事件里返回 <code class="inline">{ block: true, reason }</code>（官方示例 <code class="inline">examples/extensions/protected-paths.ts</code> 就是这样实现路径保护的）。扩展抛错也按 block 处理——官方文档原话：扩展文档「A <code class="inline">tool_call</code> handler failure blocks the tool as a fail-safe」。</p>
 
     <h3>9.5.1 user_bash：用户亲手执行的命令也过钩子</h3>
@@ -298,7 +317,52 @@ finalizedCalls.push(<span class="kw">async</span> () =&gt; {
   </section>
 
   <section class="block">
-    <h2><span class="num">9.5b</span>生产工具箱：七个默认核心工具</h2>
+    <h2><span class="num">9.5b</span>工具暴露：模型能看到、能调到、能搜到的各是哪些</h2>
+    <p>「注册了一个工具」到「模型能调它」之间，pi 现在隔了一整层可以调节的暴露面。定义工具时多了一个 <code class="inline">exposure</code> 字段，五个取值：</p>
+    <div class="code-title">core/extensions/types.ts · ToolExposure 五值（节选，注释为译注）</div>
+    <pre class="code"><code><span class="cmt">// "Callable" 指其他工具能经 ctx.executeTool() 调它（如 codemode 脚本）</span>
+<span class="kw">export type</span> <span class="cl">ToolExposure</span> =
+  | <span class="st">"direct"</span>      <span class="cmt">// 活跃时声明给模型，也随时可被调（默认）</span>
+  | <span class="st">"model-only"</span>  <span class="cmt">// 活跃时声明给模型，但不可被嵌套调用——适合编排/交互类工具</span>
+  | <span class="st">"codemode"</span>    <span class="cmt">// 注册即随时可被调用；不声明给模型（codemode 工具会在描述里列出它们）</span>
+  | <span class="st">"deferred"</span>     <span class="cmt">// 同 codemode，但 codemode 工具也不列出——留给工具搜索去找</span>
+  | <span class="st">"hidden"</span>;      <span class="cmt">// 注册了但完全不可达，激活也没有效果</span></code></pre>
+    <p>五个值对应三种「通道」的正交组合：<strong>声明给模型</strong>（进 tool 清单）、<strong>可被嵌套调用</strong>（codemode 脚本 / 编排工具经 <code class="inline">ctx.executeTool()</code> 调）、<strong>可被工具搜索发现</strong>。注册时的激活行为也按取值区分：<code class="inline">direct</code> 和 <code class="inline">model-only</code> 注册即活跃，其余三种永不自动激活。</p>
+    <h3>9.5b.1 嵌套调用：ctx.executeTool()</h3>
+    <p>编排类工具（典型是 codemode：模型写一段脚本，脚本里再去调别的工具）需要「工具调工具」的原语。这个原语挂在工具的 execute 上下文上：</p>
+    <div class="code-title">core/extensions/types.ts · ExtensionToolContext.executeTool（节选，注释为译注）</div>
+    <pre class="code"><code><span class="kw">export interface</span> <span class="cl">ExtensionToolContext</span> <span class="kw">extends</span> <span class="cl">ExtensionContext</span> {
+  <span class="kw">readonly</span> tools: <span class="kw">readonly</span> <span class="cl">AgentTool</span>[];  <span class="cmt">// executeTool 能调的工具</span>
+  <span class="cmt">// 跑另一个工具。嵌套调用的 id 是「&lt;调用方 id&gt;/&lt;序号&gt;」；tool_call/tool_result/</span>
+  <span class="cmt">// tool_execution_* 事件都带 parentToolCallId。它不进转写（transcript），</span>
+  <span class="cmt">// 只在父工具的结果消息上留一份有界的 nestedCalls 记录。</span>
+  <span class="cmt">// 永不因工具失败而 reject：未知工具、参数校验失败、被 block、抛错</span>
+  <span class="cmt">// 一律以 isError:true 的结果返回。</span>
+  <span class="fn">executeTool</span>(name: <span class="cl">string</span>, args: <span class="kw">unknown</span>, options?: ExecuteToolOptions): Promise&lt;<span class="cl">AgentToolCallOutcome</span>&gt;;
+}</code></pre>
+    <p>三个设计点。<strong>其一，嵌套调用走同一条门禁</strong>：validation、钩子、权限检查一样不少——不是「内部通道免检」，模型绕不到权限外面去。<strong>其二，永不 reject</strong>：失败也是返回值（<code class="inline">isError: true</code>），编排方不必为每个子调用写 try/catch。<strong>其三，留痕但有界</strong>：嵌套调用不进上下文（不占对话），但父工具的结果消息上会挂 <code class="inline">nestedCalls</code> 记录——上限 256 次调用、单次参数 8KiB、总计 32KiB（<code class="inline">nested-tool-calls.ts</code> 的 <code class="inline">NESTED_CALL_LIMITS</code>），超了就截断并标记 incomplete，usage 照常累计。事件链上的每个嵌套事件都带 <code class="inline">parentToolCallId</code>（9.5 的钩子源码里那个参数就是为它准备的），UI 因此能把嵌套调用归拢到父调用下面。</p>
+    <h3>9.5b.2 prepareLoadout：编排工具在加载时重写门面</h3>
+    <p>最后一个拼图：编排工具（如 codemode）需要在「活跃工具变化」时刷新自己的描述——比如把它能代调的工具列进去。pi 把这个时点抽成 <code class="inline">ToolDefinition.prepareLoadout</code>：</p>
+    <div class="code-title">core/extensions/types.ts · ToolLoadout 与 prepareLoadout（节选，注释为译注）</div>
+    <pre class="code"><code><span class="cmt">// prepareLoadout 看到的会话工具全貌</span>
+<span class="kw">export interface</span> <span class="cl">ToolLoadout</span> {
+  <span class="kw">readonly</span> declared: <span class="kw">readonly</span> <span class="cl">AgentTool</span>[];    <span class="cmt">// 声明给模型的（活跃工具），带原始描述</span>
+  <span class="kw">readonly</span> callable: <span class="kw">readonly</span> <span class="cl">AgentTool</span>[];   <span class="cmt">// executeTool 可调的</span>
+  <span class="kw">readonly</span> registered: <span class="kw">readonly</span> <span class="cl">AgentTool</span>[]; <span class="cmt">// 全部注册的</span>
+  <span class="fn">getExposure</span>(name: <span class="cl">string</span>): <span class="cl">ToolExposure</span>;
+  <span class="fn">getNamespace</span>(name: <span class="cl">string</span>): ToolNamespace | <span class="kw">undefined</span>;  <span class="cmt">// 如某个 MCP 服务器的工具组</span>
+  <span class="fn">getPromptGuidelines</span>(name: <span class="cl">string</span>): <span class="kw">readonly</span> <span class="cl">string</span>[];
+}
+<span class="cmt">// 它能做的改动：改写某工具的模型可见描述 / 把已声明的工具从声明里藏起来</span>
+<span class="kw">export interface</span> <span class="cl">ToolLoadoutChanges</span> {
+  descriptions?: Readonly&lt;Record&lt;<span class="kw">string</span>, <span class="cl">string</span>&gt;&gt;;
+  hiddenDeclarations?: <span class="kw">readonly</span> <span class="cl">string</span>[];  <span class="cmt">// 仍活跃可调，只是请求里不再声明</span>
+}</code></pre>
+    <div class="annotation"><b>两处值得停一下。</b>其一，<code class="inline">hiddenDeclarations</code> 是<strong>「藏声明不藏能力」</strong>：被藏的工具保持活跃、可调用，转写（transcript）里仍然声明过——所以 <code class="inline">/tree</code> 跳转和 resume 后活跃集不变形。这比「unregister 再 register」干净：后者会把工具从 active set 里真的摘掉，恢复历史时对不上。实现侧对应 agent-session 构造函数里的 <code class="inline">_installHiddenDeclarationsProjection</code>（第 8 章 8.2b 的六个安装器之一）。其二，配着 exposure 还有两个配套字段：工具可声明 <code class="inline">namespace</code>（比如它来自哪个 MCP 服务器）和 <code class="inline">outputSchema</code>——后者让工具除文本内容外再产出一份结构化结果（<code class="inline">structuredContent</code>），嵌套调用方拿到的是结构而不是要再解析的文本：内置 read 的结构化输出就是内容本身，bash 的 <code class="inline">structuredContent.output</code> 则有 1MiB 上限（<code class="inline">STRUCTURED_OUTPUT_MAX_BYTES</code>）。模型面前的工具清单不再是一开一关的布尔面，而是「谁声明、谁可调、谁可搜」的三维分配——这套面 DSL 值得抄。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5c</span>生产工具箱：七个默认核心工具</h2>
     <p>生产 harness 的工具在 <code class="inline">packages/coding-agent/src/core/tools/</code>。它们不是散装函数，而是统一通过 <code class="inline">createToolDefinition</code> / <code class="inline">createTool</code> 工厂，按需开关（读只读/编码/全部三套）：</p>
     <div class="code-title">tools/index.ts · 工具清单与分类</div>
     <pre class="code"><code><span class="kw">export type</span> ToolName = <span class="st">"read"</span> | <span class="st">"bash"</span> | <span class="st">"powershell"</span> | <span class="st">"edit"</span> | <span class="st">"write"</span> | <span class="st">"grep"</span> | <span class="st">"find"</span> | <span class="st">"ls"</span>;
@@ -390,12 +454,13 @@ fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>收尾：四个问题的答案</h2>
-    <p>回到开头的四个问题：</p>
+    <h2><span class="num">9.7</span>收尾：五个问题的答案</h2>
+    <p>回到开头的五个问题：</p>
     <ul>
       <li><strong>契约</strong>——AgentTool 五要素：label、parameters、execute(signal/onUpdate)，加可选的 prepareArguments / replay / executionMode。模型参数不可靠 → prepareArguments 归一输入形状（edit 的四路容错），不猜语义。</li>
       <li><strong>管线</strong>——prepare（校验+钩子）→ execute（可中止可流式）→ finalize（afterToolCall 改写）。错误不抛异常，变成一条错误结果喂回模型，让模型自己纠错；abort 优先于钩子放行。</li>
       <li><strong>并发</strong>——全局 toolExecution 配置为默认，单个工具声明 executionMode:"sequential" 即可把整批拉回串行；并行用 Promise.all 保证结果顺序；terminate 必须「全批一致」才提前收 turn。</li>
+      <li><strong>暴露</strong>——注册不等于可见：exposure 五值（direct/model-only/codemode/deferred/hidden）把「声明给模型」「可被嵌套调用」「可被搜索」拆成三个正交通道；嵌套调用经 ctx.executeTool() 走同一条钩子与权限链，永不 reject，留有界的 nestedCalls 记录；prepareLoadout 在每次活跃工具变化时重写模型面前的清单。</li>
       <li><strong>权限</strong>——内核只留 beforeToolCall 挂点，无内置确认；生产上由扩展在 tool_call 事件里放行或 block，扩展抛错也按 block（fail-closed）。用户手敲的 <code class="inline">!</code> 命令走 user_bash 事件，同样 fail-closed。</li>
     </ul>
     <div class="arrow-nav">
@@ -406,7 +471,7 @@ fileMutationQueues.<span class="fn">set</span>(key, chainedQueue);
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 09 工具层 · 版本 v0.87.1-66-g28fd59086 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 09 工具层 · 版本 v1.0.4-6-g0cf65d2bf · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>
