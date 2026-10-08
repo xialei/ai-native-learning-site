@@ -47,6 +47,34 @@
       <li><strong>列并行</strong>（A = [A₁, A₂] 按列切）：每个卡拿自己的 Aᵢ 算 Yᵢ = XAᵢ——<strong>不需要通信就能算</strong>，只是输出比完整 Y 窄。把结果拼起来（all-gather）或留给下一个行并行层（免通信）即可。</li>
       <li><strong>行并行</strong>（A 按行切，X 也按列切）：每个卡算部分和，<strong>必须 all-reduce</strong> 才能得到完整 Y。</li>
     </ul>
+    <p>先用一个能手算的最小例子把两种切法钉死：h=4、TP=2，X 是 2 个 token，A 是 4×4。下面每个数字都可以自己乘出来验证：</p>
+    <pre class="code"><span class="lang-tag">手算</span>X = [ 1  2  3  4 ]       # 2 个 token × h=4，两卡各持完整一份（f 算子前向 = 恒等）
+    [ 5  6  7  8 ]
+
+A = [ 1  0 | 1  1 ]       # 4x4 权重，| 是列切分线：卡0 拿左两列 A1，卡1 拿右两列 A2
+    [ 0  1 | 1  1 ]
+    [ 2  0 | 1  1 ]
+    [ 0  2 | 1  1 ]
+
+列并行（每卡算 Y 的一段特征维）——零通信：
+  卡0 持 A1，算 Y1 = X·A1:
+      [  7  10 ]
+      [ 19  22 ]
+  卡1 持 A2，算 Y2 = X·A2:
+      [ 10  10 ]
+      [ 26  26 ]
+  Y1 拼上 Y2 就是完整 Y（要拼就 all-gather；接行并行层则不拼，分片直接当输入）
+
+行并行（A 换成按行切：卡0 持上两行、卡1 持下两行；X 也按列切半）：
+  卡0 算 X1·A1，X1 = X 的左两列 [ 1 2 ; 5 6 ]:
+      [  1   2   3   3 ]
+      [  5   6  11  11 ]
+  卡1 算 X2·A2，X2 = X 的右两列:
+      [  6   8   7   7 ]
+      [ 14  16  15  15 ]
+  两块都是 2x4 的部分和，all-reduce 求和才得到:
+      [  7  10  10  10 ]
+      [ 19  22  26  26 ]    # 与列并行终点相同，但多付一次 all-reduce</pre>
     <p>transformer 的 FFN 是两个连续矩阵乘：把第一个（h→4h）<strong>按列切</strong>、第二个（4h→h）<strong>按行切</strong>，则两层的输出天然就是「切开的」——中间不需要任何通信，只在最后做一次 all-reduce。<strong>每个 transformer 层通信 2 次，而不是朴素做法的 4 次</strong>，这是 Megatron 论文的核心观察。注意力按头切同理：多头天然可分。</p>
     <div class="callout info">
       <b class="tag">命名</b>
@@ -72,7 +100,7 @@
     its first dimension and X along its second dimension.
     A = transpose([A_1 .. A_p])  X = [X_1, ..., X_p]"""</span>
     <span class="cmt"># input_is_parallel: 输入已是各卡分片（接在列并行后）→ 免切分直接算</span></pre>
-    <div class="annotation"><b>重点看两者相接处：</b>Column 并行切 A 的列 → 每卡输出是 Y 的一段特征维；Row 并行切 A 的行、同时要求 X 也按特征切 → 每卡输出是完整 Y 的<strong>部分和</strong>，需要 all-reduce。而<strong>两者相接处不需要通信</strong>——列并行的输出本来就是行并行想要的输入分片，这就是「MLP 两次 GEMM 只通信一次」的实现基础。配置里 <code class="inline">gather_output=False</code> + <code class="inline">input_is_parallel=True</code> 就是在声明「保持分片不落地」。</div>
+    <div class="annotation"><b>重点看两者相接处：</b>Column 并行切 A 的列 → 每卡输出是 Y 的一段特征维；Row 并行切 A 的行、同时要求 X 也按特征切 → 每卡输出是完整 Y 的<strong>部分和</strong>，需要 all-reduce。而<strong>两者相接处不需要通信</strong>——列并行的输出本来就是行并行想要的输入分片（上文 3.1 的手算里，Y₁/Y₂ 两块正好就是行并行要的 X 分片形状），这就是「MLP 两次 GEMM 只通信一次」的实现基础。配置里 <code class="inline">gather_output=False</code> + <code class="inline">input_is_parallel=True</code> 就是在声明「保持分片不落地」。</div>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
@@ -154,6 +182,13 @@
     <span class="kw">def</span> <span class="fn">backward</span>(ctx, grad_output):
         <span class="kw">return</span> grad_output, <span class="kw">None</span>              <span class="cmt"># 反向直接回传</span></pre>
     <div class="annotation"><b>为什么这样设计：</b>把通信藏进 autograd，模型代码 <code class="inline">ColumnParallelLinear(...)</code> 用起来跟普通 Linear 一样——切分对模型作者透明。代价是「通信发生的确切时机」被 autograd 间接化，所以 Megatron 提供 <code class="inline">forward_backward_func</code>（第 4 章）在更外层统一编排，并且靠 <code class="inline">CUDA_DEVICE_MAX_CONNECTIONS=1</code> 保证通信先于计算的 stream 顺序（下一节）。</div>
+
+    <h3>每层通信量账</h3>
+    <p>把 3.1 的结论换算成字节。设 hidden = h、序列长 s、batch × micro 合并记为 b、TP 度为 t、激活按 bf16 记 2 字节。一层 transformer 在纯 TP 下付 <strong>2 次 all-reduce</strong>（attention 出口 + MLP 出口，各对应 g 的前向与 f 的反向）；每次 all-reduce 的量都是同一块激活 <code class="inline">b×s×h</code>。ring all-reduce 每卡实际收发量是 <code class="inline">2(t−1)/t × b×s×h×2</code> 字节——所以：</p>
+    <pre class="code"><span class="lang-tag">公式</span>纯 TP：每层通信 = 2 次 all-reduce × b·s·h·2B × 2(t-1)/t
+TP+SP（3.5 节）：同样 2 次集合通信，但换成 RS + AG，每卡收发量减半：
+                 = 2 × (RS + AG) × b·s·h·2B × (t-1)/t</pre>
+    <p>代入 70B（h=8192、s=4096、b=4、t=8）：一块激活 = 4×4096×8192×2B = 256 MiB，单次 all-reduce 每卡收发 2×(7/8)×256 MiB = 448 MiB，<strong>纯 TP 每层约 896 MiB、TP+SP 每层约 448 MiB</strong>。80 层一过，纯 TP 光 TP 通信就 70 GiB/卡——这还只是带宽下限（ring 假设），没算延迟项。两个推论：① t 越大通信越贴近 b·s·h 本身，TP 轴卡在机内 NVLink 上的原因就在这（第 2 章图 2.1a 的 TP 行）；② SP 把每层通信砍半且激活减半，而集合通信次数不变——代价只是多一路 reduce-scatter 的路由开销，所以现代配置 TP+SP 总是成对开。</p>
 
     <h3>VocabParallelEmbedding：另一个「切完免通信」的例子</h3>
     <div class="code-title">megatron/core/tensor_parallel/layers.py — VocabParallelEmbedding.forward（摘录）</div>

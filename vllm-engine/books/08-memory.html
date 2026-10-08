@@ -174,6 +174,17 @@ self.requested_memory = <span class="fn">request_memory</span>(init_snapshot, se
             // max_blocks_per_req),
     )</pre>
     <div class="annotation"><b>warm-up 不只是热身：</b>它把 <code class="inline">num_blocks</code> 和 <code class="inline">max_num_seqs / max_num_batched_tokens</code> 绑在了一起：KV 块不够放要调的 batch，就<strong>不硬调</strong>。KV 预算直接决定了你能扛多大的并发。对自研引擎而言，「profile → 算剩余 → 定 KV 预算」这一整套流程，是引擎从能跑到可靠的分界线。</div>
+    <p>7B 的账好算，难的是别被它骗了——7B 模型每 token 才 128 KiB 的 KV，因为 GQA 把 KV 头压到了 8 个。换 70B 级模型，两个数一起变大：</p>
+    <table class="tbl">
+      <thead><tr><th style="width:30%">参数</th><th style="width:24%">7B（GQA-8）</th><th>70B（GQA-8，80 层）</th></tr></thead>
+      <tbody>
+        <tr><td>层数</td><td>32</td><td>80</td></tr>
+        <tr><td>每 token KV 字节（8.3 公式，bf16）</td><td>2×32×8×128×2 ≈ 128 KiB</td><td>2×80×8×128×2 ≈ 320 KiB</td></tr>
+        <tr><td>权重（FP16）</td><td>≈ 14 GiB</td><td>≈ 140 GiB——<strong>单张 80 GiB 卡根本装不下</strong></td></tr>
+        <tr><td>一条 4K 序列的 KV</td><td>≈ 512 MiB</td><td>≈ 1.25 GiB</td></tr>
+      </tbody>
+    </table>
+    <p>70B 把三个事实摆到明面上：其一，权重超过单卡显存，TP/PP 不再是「要不要」而是「不并行没得跑」（第 10 章）；其二，就算 8 卡摊开（每卡 17.5 GiB 权重），KV 也是每 token 320 KiB，一条 4K 序列 1.25 GiB，8 卡合计的块池也就多扛几十条长序列；其三，decode 每步要把整条序列的 KV 读一遍，序列越长、并发越多，显存带宽越是先于算力打满——第 4 章讲的「调度器尽量多塞请求」在 70B 上从优化手段变成了生存条件。同样的 <code class="inline">gpu_memory_utilization</code> 公式照用，只是减法里每一项都被放大，容错空间被压得更薄：70B 上把 batch 顶满测出的 activation 峰值差 10%，KV 预算就少出好几个 GiB。</p>
   </section>
 
   <section class="block">
@@ -386,6 +397,18 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
       <div class="fig-cap">图 8.4：前缀命中让第二个请求跳过整段重复 prefill，物理块引用计数体现共享。</div>
     </div>
     <div class="annotation"><b>为什么「块哈希」是关键：</b>一样的 token 序列一定算出一样的块哈希，所以 <code class="inline">BlockHashToBlockMap</code> 一查即中。默认 <code class="inline">enable_prefix_caching = True</code> 且哈希算法为 <code class="inline">"sha256"</code>（见 <code class="inline">CacheConfig</code>，可用 xxhash 提速）。命中率越高，省下的 prefill 越多——而省下的 prefill 本身就是省显存省时间。</div>
+    <p>「一样的 token 序列算出一样的哈希」这句话里藏着一个实现选择。第 1 个块没有前驱，它的哈希从哪来？如果只哈希「本块 token」，那么不同请求的两个开头相同的块倒是能命中，但也仅仅如此——第 2 个块无法确认「我前面那块」是不是同一个。vLLM 的做法是把<strong>父块哈希链进去</strong>：每块的哈希 = hash(父块哈希, 本块 token_ids, extra_keys)，一环扣一环：</p>
+    <div class="code-title">vllm/v1/core/kv_cache_utils.py — hash_block_tokens（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">hash_block_tokens</span>(hash_function, parent_block_hash,
+                      curr_block_token_ids, extra_keys=<span class="kw">None</span>):
+    <span class="cmt"># 第一个块没有父哈希，用 NONE_HASH 兜底</span>
+    <span class="kw">if not</span> parent_block_hash:
+        parent_block_hash = NONE_HASH
+    curr_block_token_ids_tuple = <span class="fn">tuple</span>(curr_block_token_ids)
+    <span class="kw">return</span> <span class="cl">BlockHash</span>(
+        <span class="fn">hash_function</span>((parent_block_hash, curr_block_token_ids_tuple, extra_keys))
+    )</pre>
+    <div class="annotation"><b>这条链给了三样东西：</b>① 前缀匹配自动逐块成立——第 n 块哈希相同 ⇔ 前n块全部相同，查找时不用回溯验证；② 哈希仍是 O(1) 查表，代价只是链式计算；③ 出现了「种子块」问题——<code class="inline">NONE_HASH</code>（kv_cache_utils.py:118）就是链的第一环，它从哪来决定了「独立进程能不能共享同一个前缀缓存」。答案是分情况的（<code class="inline">resolve_none_hash_seed</code>，kv_cache_utils.py:131）：SHA-256 这类密码学哈希用固定种子 <code class="inline">"vllm-none-hash"</code>（DEFAULT_NONE_HASH_SEED，:122），于是独立启动的两个 vLLM 进程对同一段 prompt 算出<strong>完全相同的哈希</strong>，跨节点复用 KV 不用额外约定（P2P 缓存层在握手时核对的就是这个种子，<code class="inline">get_none_hash_seed</code>）；而 xxhash 不是抗碰撞的，种子可预测会让攻击者离线预造碰撞块（#12621），所以用 <code class="inline">os.urandom(32)</code> 每进程随机——代价是两个进程的哈希互不相认。设 <code class="inline">PYTHONHASHSEED</code> 则两种算法都听你的。多租户隔离不是靠种子，是靠下一节讲的 <code class="inline">cache_salt</code>。</div>
     <p>块哈希的输入不止 token 序列。<code class="inline">generate_block_hash_extra_keys</code>（kv_cache_utils.py:614）会往哈希里追加一组 <strong>extra_keys</strong>，四路来源、每路都带着自己的标签：</p>
     <div class="code-title">vllm/v1/core/kv_cache_utils.py — extra_keys 的四路来源（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>extra_keys = (
@@ -395,6 +418,34 @@ max_num_seqs: <span class="cl">int</span> = <span class="cl">Field</span>(defaul
     + prompt_embeds_keys     <span class="cmt"># [("prompt_embeds", embeds_hash)] —— 逐块 sha256</span>
 )</pre>
     <div class="annotation"><b>为什么要打标：</b>这四种内容都会改变「同样 token 算出不同 KV」——挂了不同 LoRA 的同一串 prompt、同一个多模态图在不同位置、不同 cache_salt 隔离的租户，token 序列相同但算出的块不能混用，所以必须进哈希。但它们各自的结构不同：mm 要记「图在块内的偏移」，lora 要「名字和路径都算」——vLLM 曾因为只用名字、没把 <strong>lora_path</strong> 算进去，导致同名换适配器时复用了旧 KV（#59335 补上 path，docstring 写明「re-pointing a LoRA name at a different adapter does not reuse KV computed with the previous one」，kv_cache_utils.py:570）。早期这些键是裸值混在一起，按位置猜类型；#51899 把每路打上 <code class="inline">("mm",…)/("lora",…)</code> 这样的来源标签，结构一眼可辨。但 KV 事件（external consumer 监听块增删）不能跟着变——下游还在解析旧格式——于是 <code class="inline">to_event_extra_keys</code>（:655）在发布前把标签剥掉，块哈希用带标格式、对外事件保持旧格式，两边各取所需。</div>
+    <h3>淘汰：ref_cnt 归零之后，谁先让位</h3>
+    <p>引用计数只回答「这块能不能收」，没回答「收回来之后谁先被复用」。答案在 <code class="inline">FreeKVCacheBlockQueue</code>（kv_cache_utils.py:246）——一个手写的双向链表，不用 <code class="inline">deque</code> 的理由写在 docstring 里：要从<strong>队列中间</strong> O(1) 摘块（命中的块还在队里等着被复用，得随时摘出）。队头是 LRU 端，分配就从头弹：</p>
+    <div class="code-title">vllm/v1/core/block_pool.py — get_new_blocks：分配即淘汰（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_new_blocks</span>(self, num_blocks):
+    ret = self.free_block_queue.popleft_n(num_blocks)
+    <span class="kw">if</span> self.enable_caching:
+        <span class="kw">for</span> block <span class="kw">in</span> ret:
+            <span class="cmt"># 弹出的块若还挂着哈希，就地从哈希表里摘除——这就是淘汰</span>
+            self._maybe_evict_cached_block(block)
+            block.ref_cnt += 1</pre>
+    <div class="code-title">vllm/v1/core/block_pool.py — free_blocks：两个桶决定再入队的位置（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">free_blocks</span>(self, ordered_blocks):
+    <span class="cmt"># 无哈希块：插到队头（LIFO，刚释放的块大概率马上被复用，GPU 局部性好）</span>
+    <span class="cmt"># 有哈希块：接到队尾（FIFO，等价于 LRU——最久未命中的先被复用）</span>
+    self.free_block_queue.prepend_n(blocks_to_evict_first)
+    self.free_block_queue.append_n(blocks_to_evict_last)</pre>
+    <div class="annotation"><b>一个队列、两种入队姿势，就是全部淘汰策略：</b>分配 <code class="inline">get_new_blocks</code>（block_pool.py:669）从队头拿块，如果拿到的块还挂着哈希，<code class="inline">_maybe_evict_cached_block</code>（:732）就地把它从 <code class="inline">BlockHashToBlockMap</code> 摘掉——<strong>分配动作本身就是淘汰动作</strong>，没有独立的「清理线程」。释放时按有无哈希分两桶（free_blocks，:777）：无哈希块永远碰不到缓存查找，插队头让它尽快被复用（省 GPU cache miss）；有哈希块接队尾，等它排到队头那天，正好是它「最久没人命中」之时——LRU 就这么免费拿到了。命中时的 <code class="inline">touch</code>（:755）把 ref_cnt=0 的命中块从队列里摘出来（调用点在 single_type_kv_cache_manager.py:307，注释原文「make sure they won't be evicted」），重新挂 ref_cnt——命中的块退出淘汰候选。至于显式淘汰，<code class="inline">evict_blocks</code>（:810）只摘哈希不腾物理块（ref_cnt&gt;0 的块继续服务当前请求），<code class="inline">reset_prefix_cache</code>（:830）整表清空且<strong>只在所有块都已归还时成功</strong>（docstring 点明两个用途：RLHF 换权重后作废旧缓存、基准测试前清状态；否则记 warning 返回 False，scheduler.py:2811 处拿这个返回值决定是否报错）。</div>
+    <h3>命中率什么时候掉：四个场景</h3>
+    <p>前缀缓存的红利全押在「同一段开头反复出现」上。以下场景会把红利吃掉，运维时要能对着指标认出它们：</p>
+    <table class="tbl">
+      <thead><tr><th style="width:24%">场景</th><th>机制</th><th style="width:30%">表现与对策</th></tr></thead>
+      <tbody>
+        <tr><td>缓存压力过大</td><td>块池被大量短对话塞满，早期长 system prompt 的块被 LRU 冲走，新请求即使前缀相同也查不到</td><td>命中率随负载波动、上量就掉。对策：加显存、缩短 system prompt，或用多实例分流量</td></tr>
+        <tr><td>多租户混跑</td><td>不设 <code class="inline">cache_salt</code> 时所有租户共抢同一个 LRU 池，互相冲刷；设了则物理隔离，各自命中各自的</td><td>命中率的「量」变了，「配比」也变了。看 per-tenant 指标，别看全局平均</td></tr>
+        <tr><td>LoRA 轮换</td><td>哈希链里串着 LoRA 名+路径（extra_keys），换适配器 = 整段前缀换一套哈希，旧 KV 还在池里但永远查不中，白占空间直到被淘汰</td><td>命中率掉的同时 <code class="inline">num_cached_blocks</code> 不降。适配器频繁轮换的场景要预留更多块</td></tr>
+        <tr><td>显式重置</td><td><code class="inline">reset_prefix_cache</code> 清空整张哈希表（RLHF 换权重、压测清场）；xxhash 种子每进程随机，多进程间天然不共享</td><td>命中率瞬间归零再爬坡。压测脚本里留意是否误触了 reset 接口</td></tr>
+      </tbody>
+    </table>
   </section>
 
   <section class="block">

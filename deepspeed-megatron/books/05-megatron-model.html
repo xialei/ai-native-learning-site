@@ -118,7 +118,7 @@
 
   <section class="block">
     <h2><span class="num">5.5</span>CP 切序列：get_batch_on_this_cp_rank</h2>
-    <p>最后一块拼图是 CP。CP 切的是序列而不是 batch，那切完之后每张卡手里的张量长什么样？因果注意力的载荷是三角形，连续切会让首卡闲、尾卡忙——所以 Megatron 用 zigzag 折返切法。这里看数据侧实现：</p>
+    <p>最后一块是 CP。CP 切的是序列而不是 batch，那切完之后每张卡手里的张量长什么样？因果注意力的载荷是三角形，连续切会让首卡闲、尾卡忙——所以 Megatron 用 zigzag 折返切法。这里看数据侧实现：</p>
     <div class="code-title">megatron/core/utils.py — get_batch_on_this_cp_rank（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_batch_on_this_cp_rank</span>(batch):
     cp_size = ...
@@ -130,6 +130,19 @@
         <span class="cmt"># per-document：变体——文档边界重排后整段分配（document mask 配合）</span>
         <span class="cmt"># hybrid CP：另一变体——不同注意力后端配不同切法</span></pre>
     <div class="annotation"><b>读代码要抓的两点：</b>切的是 <code class="inline">batch</code> 里每一个 key——tokens/position_ids/labels 必须同步切，错一个 key 就是 label 对不上的静默错误；zigzag 的实现则是「第 i 段 + 第 cp_size·2−1−i 段」的配对，保证每卡两侧合计工作量相等。per-document 变体在文档数量多且长短不均时更优（避免跨文档 padding），hybrid CP 则服务于不同注意力后端的通信形态差异。哪个变体生效由配置选择，数据侧只负责按选定的方式切。</div>
+
+    <p>zigzag 值得用一个 8 个位置的序列、CP=2 手算一遍——它解决的问题是：因果注意力里位置 i 的 token 要跟前面 i 个 token 算点积，序列连续二等分（前一半给 CP0、后一半给 CP1）会让载荷严重失衡，折返配对才能把两侧拉平：</p>
+    <pre class="code"><span class="lang-tag">手算</span>s=8 切成 2×CP=4 段，每段 2 个位置：
+  s0=[0,1]  s1=[2,3]  s2=[4,5]  s3=[6,7]
+
+zigzag 配对（cp rank i 拿「第 i 段 + 第 2·cp−1−i 段」）：
+  CP0 ← s0 + s3 = 位置 [0,1,6,7]
+  CP1 ← s1 + s2 = 位置 [2,3,4,5]
+
+验算工作量（∑ 位置下标，正比于注意力计算量）：
+  连续切：CP0 = 0+1+2+3 = 6，CP1 = 4+5+6+7 = 22   → 差 3.7 倍，CP0 大量空闲
+  zigzag： CP0 = 0+1+6+7 = 14，CP1 = 2+3+4+5 = 14  → 完全均衡</pre>
+    <p>通信上 CP 不改变第 3 章每层通信的结构——TP 通信全部保留，额外多的是注意力内部 ring 交换 K/V：每层每卡收发约 <code class="inline">2(cp−1)/cp × b·(s/cp)·h×2B</code>（K 与 V 各一次 ring）。代入 70B 同款参数（h=8192、s=4096、b=4、cp=2）：每卡每层 ring 交换 2×(1/2)×4×2048×8192×2B = 128 MiB——CP=2 下注意力计算减半、通信只多了一笔 128 MiB/层，这是「序列超长时 CP 比 DP 划算」的算术基础（DP 把 h 摊薄但 batch 跟着缩水，CP 摊序列不摊 batch）。</p>
 
     <div class="figure">
       <svg class="svg-box" viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t51 d51">

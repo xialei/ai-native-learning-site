@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 采样</div>
     <h1>采样：logits 如何变成 token</h1>
-    <div class="subtitle">模型前向的终点是一个 vocab 大小的 logits 向量，但它还不是答案。这一章问：<strong>客户端要的「温度 0.7、top-p 0.9」怎么作用到这串分数上？50 个请求各要各的采样方式，怎么一次算完？什么时候停？</strong>先讲清参数怎么表达、怎么作用到 logits，再看 batch 怎么一次算完、输出怎么停；6.6–6.7 是两个延伸场景，末了拿 SGLang 对照一眼。</div>
+    <div class="subtitle">模型前向的终点是一个 vocab 大小的 logits 向量，但它还不是答案。这一章问：<strong>客户端要的「温度 0.7、top-p 0.9」怎么作用到这串分数上？50 个请求各要各的采样方式，怎么一次算完？什么时候停？</strong>先讲清参数怎么表达、怎么作用到 logits，再看 batch 怎么一次算完、输出怎么停；6.6–6.8 是三个延伸场景（多路采样、投机解码、结构化输出），末了拿 SGLang 对照一眼。</div>
   </div>
 
   <section class="block">
@@ -78,7 +78,7 @@
       </svg>
       <div class="fig-cap">图 6.1：采样即「把 logits 变成 token id」。贪心可跳过 softmax，随机才需要完整概率分布。</div>
     </div>
-    <p>本章就顺着这条流水线走：6.2 看口味怎么表达（SamplingParams），6.3 看参数怎么作用到 logits（后处理链），6.4 看一个 batch 怎么一次算完（采样元数据），6.5 看输出怎么停（解码与停止）；6.6 和 6.7 是两个延伸场景（多路采样、投机解码），6.8 拿 SGLang 对照。</p>
+    <p>本章就顺着这条流水线走：6.2 看口味怎么表达（SamplingParams），6.3 看参数怎么作用到 logits（后处理链），6.4 看一个 batch 怎么一次算完（采样元数据），6.5 看输出怎么停（解码与停止）；6.6、6.7、6.8 是三个延伸场景（多路采样、投机解码、结构化输出），6.9 拿 SGLang 对照。</p>
   </section>
 
   <section class="block">
@@ -134,7 +134,7 @@ logits = self.<span class="fn">apply_temperature</span>(logits, sampling_metadat
 random_sampled, _ = self.topk_topp_sampler(
     logits, sampling_metadata.generators,
     sampling_metadata.top_k, sampling_metadata.top_p)</pre>
-    <div class="annotation"><b>注意一个细节：</b>vLLM 的随机采样并没有显式调用 <code class="inline">torch.multinomial</code>，而是用「指数噪声技巧」——定义在 <code class="inline">vllm/v1/sample/ops/topk_topp_sampler.py</code>，先把 top-k/top-p 之外的 logits 打成 <code class="inline">-inf</code>，<code class="inline">softmax</code> 后 <code class="inline">probs.div_(q).argmax()</code> 得到采样结果。之所以绕开 <code class="inline">multinomial</code>，是为了避免它带来的 CPU-GPU 同步开销。</div>
+    <div class="annotation"><b>注意一个细节：</b>vLLM 的随机采样（CUDA 主路径）并没有显式调用 <code class="inline">torch.multinomial</code>，而是用「指数噪声技巧」——定义在 <code class="inline">vllm/v1/sample/ops/topk_topp_sampler.py</code>，先把 top-k/top-p 之外的 logits 打成 <code class="inline">-inf</code>，<code class="inline">softmax</code> 后 <code class="inline">probs.div_(q).argmax()</code> 得到采样结果。之所以绕开 <code class="inline">multinomial</code>，是为了避免它带来的 CPU-GPU 同步开销。</div>
   </section>
 
   <section class="block">
@@ -190,13 +190,30 @@ output_token_ids: <span class="cl">list[list[int]]</span>        <span class="cm
     temperature: <span class="cl">float</span> = <span class="nu">0.0</span>   <span class="cmt"># 束搜索通常是贪心的扩展</span>
     length_penalty: <span class="cl">float</span> = <span class="nu">1.0</span></pre>
     <div class="annotation"><b>辨析：</b>n 是「独立并行」，beam 是「共享搜索树」——两者要的显存/算力都随路数成倍上涨。绝大多数在线服务用 <code class="inline">n=1</code> 单路就够，beam 更适合离线评测。</div>
+    <h3>n&gt;1 在引擎里怎么走：拆成 n 个子请求</h3>
+    <p>「n 条独立采样」听起来像采样器的事，其实进调度器之前就已经变形了：<strong>AsyncLLM 收到 <code class="inline">n&gt;1</code> 的请求，直接在入口把它拆成 n 个独立子请求</strong>——调度器和 Model Runner 从头到尾只知道「有 n 个普通请求」，n 是纯 API 层的概念。拆分逻辑在 <code class="inline">vllm/v1/engine/async_llm.py</code>：</p>
+    <div class="code-title">vllm/v1/engine/async_llm.py — generate() 的 n&gt;1 分支（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> is_pooling <span class="kw">or</span> params.n == <span class="nu">1</span>:
+    <span class="kw">await</span> self._add_request(request, prompt_text, <span class="kw">None</span>, <span class="nu">0</span>, queue)
+    <span class="kw">return</span> queue
+<span class="cmt"># Fan out child requests (for n&gt;1).</span>
+parent_request = <span class="cl">ParentRequest</span>(request)
+child_requests = []
+<span class="kw">for</span> idx <span class="kw">in</span> <span class="fn">range</span>(parent_params.n):
+    request_id, child_params = parent_request.get_child_info(idx)
+    <span class="cmt"># 最后一个子请求直接复用原对象，其余浅拷贝</span>
+    child_request = request <span class="kw">if</span> idx == parent_params.n - <span class="nu">1</span> <span class="kw">else</span> copy(request)
+    child_request.request_id = request_id
+    child_request.sampling_params = child_params
+    child_requests.append(child_request)</pre>
+    <div class="annotation"><b>拆分后的一切归 <code class="inline">ParentRequest</code>（vllm/v1/engine/parallel_sampling.py:13）管：</b>它记账「这 n 个子请求同源」，子请求输出聚合回一份结果（非流式时 <code class="inline">output_aggregator</code> 按序拼）、追踪最长生成进度（流式时父请求推进到「跑得最远的那个孩子」）。两个细节值得注意：① <code class="inline">get_child_info</code> 对每个孩子生成独立 id；如果父请求带 <code class="inline">seed</code>，每个孩子的 sampling_params 单独克隆、种子各不相同（否则 n 条路会采样出完全相同的序列）；② 排队额度按 n 计——<code class="inline">check_admission(parent_params.n, ...)</code>（async_llm.py:309）的 docstring 写明「A request with n&gt;1 counts as n slots」，一个 n=8 的请求会占掉 8 个 <code class="inline">max_num_queued_reqs</code> 名额。调度器里这 n 个子请求各自参与 continuous batching，独立被抢占、独立完成；共享的前缀天然被前缀缓存接住（第 8 章），所以多路采样的边际成本主要是 KV 与算力，不是重复 prefill。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">6.7</span>投机解码与 rejection sampling：一次验证多个猜测</h2>
     <p>前六节都在回答「怎么从一份 logits 里挑一个 token」——每步一个。投机解码（speculative decoding）的回答是：<strong>一步前进多个 token，且不改变输出分布</strong>。</p>
     <p>为什么这两件事能同时成立。加速来自两半：<strong>草稿便宜</strong>——用一个便宜的来源（小模型、n-gram 匹配、Medusa 头）先猜出 k 个 token；<strong>验证几乎免费</strong>——目标模型一次 forward 本来就能对 k 个位置各出一份 logits（第 4、5 章的统一调度），猜对的部分直接保留，猜错的部分按概率规则回退。分布不变则是数学保证：<a href="https://arxiv.org/abs/2211.17192">arXiv:2211.17192</a> 证明「接受/回退」规则产出的分布与直接用大模型采样完全一致。</p>
-    <p>源码锚点。代码分草稿 proposer 和验证 rejection sampler 两块；Model Runner 有两套实现（第 5 章：V2 现在默认，V1 作回退），两套的落点不同：</p>
+    <p>源码锚点。代码分草稿 proposer 和验证 rejection sampler 两块；Model Runner 有两套实现（V2 现在默认，V1 作回退），两套的落点不同：</p>
     <ul>
       <li><strong>proposer</strong>：V1 用 <code class="inline">vllm/v1/spec_decode/</code> 下的各 proposer，统一 <code class="inline">propose()</code> 接口，由 <code class="inline">gpu_model_runner.py</code> 的 <code class="inline">propose_draft_token_ids</code> 在每步采样之后调用；V2 换成 <code class="inline">vllm/v1/worker/gpu/spec_decode/</code> 下的 <code class="inline">BaseSpeculator</code>（<code class="inline">speculator.py</code>），由 <code class="inline">self.speculator.propose(...)</code>（<code class="inline">gpu/model_runner.py</code>）调用。</li>
       <li><strong>验证</strong>：V1 是 <code class="inline">vllm/v1/sample/rejection_sampler.py</code> 的 <code class="inline">RejectionSampler.forward</code>；V2 另有一份 <code class="inline">vllm/v1/worker/gpu/spec_decode/rejection_sampler.py</code>（<code class="inline">__call__</code>，配 <code class="inline">rejection_sampler_utils.py</code> 里的 Triton kernel）。两者语义相同，V2 那份改成了「分块验证」以适配 V2 的 batch 表示。</li>
@@ -310,11 +327,57 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
     num_draft_tokens=num_draft_tokens,
     num_accepted_tokens=num_accepted, ...)</pre>
     <p>接受率会周期性打进日志（<code class="inline">vllm/v1/spec_decode/metrics.py</code>），格式是一行 <code class="inline">SpecDecoding metrics: Mean acceptance length: %.2f, Accepted throughput: %.2f tokens/s, Drafted throughput: %.2f tokens/s, ...</code>——<strong>平均接受长度</strong>（含 bonus）就是「每个 decode step 实际前进几个 token」的直观度量，也是判断该调大还是调小 k 的依据。注意投机的代价与参数：<code class="inline">num_speculative_tokens</code>（每步猜几个）越大，单步验证的 prefill 越长、KV 占用越多，而接受率通常随位置递减（Per-position acceptance rate），所以 k 不是越大越快。</p>
+    <h3>旋钮：--speculative-config 的一张配置图</h3>
+    <p>上面出现过的所有参数都从同一个入口进来。命令行上写一个 JSON，落进 <code class="inline">SpeculativeConfig</code>（vllm/config/speculative.py:388）：</p>
+    <div class="code-title">vllm/config/speculative.py — SpeculativeConfig 常用字段（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">SpeculativeConfig</span>:
+    enforce_eager: <span class="cl">bool</span> | <span class="kw">None</span> = <span class="kw">None</span>      <span class="cmt"># 覆盖主模型的 enforce_eager</span>
+    num_speculative_tokens: <span class="cl">int</span> = <span class="cl">Field</span>(default=<span class="kw">None</span>, gt=<span class="nu">0</span>)
+    <span class="cmt"># 每步猜几个 token。没给 draft 模型时必填（gt=0，投机至少要猜 1 个）</span>
+    model: <span class="cl">str</span> | <span class="kw">None</span> = <span class="kw">None</span>              <span class="cmt"># draft 模型 / eagle 头 / 额外权重</span>
+    method: <span class="cl">SpeculativeMethod</span> | <span class="kw">None</span> = <span class="kw">None</span>
+    <span class="cmt"># 草稿方法；给了 model 时能自动探测，没给则必须写明</span>
+
+    <span class="cmt"># Ngram proposer configuration</span>
+    prompt_lookup_max: <span class="cl">int</span> | <span class="kw">None</span> = <span class="cl">Field</span>(default=<span class="kw">None</span>, ge=<span class="nu">1</span>)
+    <span class="cmt"># ngram 的窗口上限；method=ngram 时必填</span>
+    prompt_lookup_min: <span class="cl">int</span> | <span class="kw">None</span> = <span class="cl">Field</span>(default=<span class="kw">None</span>, ge=<span class="nu">1</span>)
+    <span class="cmt"># ngram 的窗口下限，默认 1</span>
+
+    <span class="cmt"># Advanced control</span>
+    disable_padded_drafter_batch: <span class="cl">bool</span> = <span class="kw">False</span>
+    <span class="cmt"># 关掉草稿批的定长 padding，批内允许不同长度（只有部分 attention backend 支持）</span>
+    parallel_drafting: <span class="cl">bool</span> = <span class="kw">False</span>       <span class="cmt"># 串行自回归草稿改为并行起草</span></pre>
+    <div class="annotation"><b>读配置的顺序就是排查的顺序：</b>方法没选对，后面字段全白填——<code class="inline">method</code> 缺省靠 <code class="inline">model</code> 探测，两者都没有直接报错；<code class="inline">ngram</code> 只认 <code class="inline">prompt_lookup_max/min</code>（对 6.6 那个 numba 匹配的窗口约束），EAGLE 系只认 <code class="inline">model</code>。调参时盯着 metrics 里那行平均接受长度改 <code class="inline">num_speculative_tokens</code>，其余高级旋钮（<code class="inline">disable_padded_drafter_batch</code>、<code class="inline">parallel_drafting</code>）只在 profiling 显示草稿阶段占了大头时才值得动。另外两个容易误会的点：speculative 有自己的 <code class="inline">enforce_eager</code>，不跟主模型走；<code class="inline">draft_tensor_parallel_size</code> 只能取 1 或等于目标模型的 TP。</div>
     <div class="annotation"><b>收拢一下：</b>投机解码 = 「草稿便宜地猜 + 验证严格地收」。它能加速的本质是<strong>decode 阶段算力闲置</strong>（访存瓶颈，见第 3、4 章）：与其一次 forward 只前进 1 个位置，不如让它并行验证 k 个位置。自研启示：先别做模型类 drafter——n-gram/suffix 这类零成本草稿 + 贪心逐位验证，几十行就能实现，对重复性高的负载马上见效。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.8</span>SGLang 对照与自研启示</h2>
+    <h2><span class="num">6.8</span>结构化输出：让 logits 在采样前先「守规矩」</h2>
+    <p>客户端给了个 JSON Schema（或正则），要求模型输出合法 JSON——这件事在推理栈里的位置只有一处：<strong>采样前把会破坏语法合法性的 token 从 logits 里抹掉</strong>。抹多少、按什么依据抹，来自一个「语法自动机」：把 Schema 编译成一个逐 token 状态机，当前状态允许哪些 token，就用一个 bitmask（词表每 32 个 token 一个 int32）把不允许的位置置负无穷。vLLM 把这条链拆成 CPU 侧和 GPU 侧两半。</p>
+    <p><strong>CPU 侧：语法编译是异步的。</strong>编译一个复杂 Schema 可能要几百毫秒，比一个调度步贵几个量级，所以 <code class="inline">StructuredOutputManager</code>（vllm/v1/structured_output/__init__.py:36）不把它放进调度路径，而是<strong>提交给线程池，请求先在队列里等结果</strong>：</p>
+    <div class="code-title">vllm/v1/structured_output/__init__.py — 语法异步编译（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> self._use_async_grammar_compilation:
+    <span class="cmt"># 提交线程池编译，立刻返回 Future</span>
+    grammar = self.executor.submit(self._create_grammar, request)
+<span class="kw">else</span>:
+    grammar = self._create_grammar(request)  <span class="cmt"># 同步兜底</span>
+request.structured_output_request.grammar = grammar</pre>
+    <div class="annotation"><b>线程池大小是有讲究的（:76）：</b>语法编译是 CPU 密集任务，<code class="inline">max(1, (cpu_count+1)//2)</code> 个线程——注释直说 torch 默认的「CPU 数 × 5」对这类任务太高了。请求带着新状态 <code class="inline">WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>（scheduler.py:2380）排队，每步调度时检查 Future：编译完成就转正为 <code class="inline">WAITING</code> 参与调度（scheduler.py:3115），编译失败则记入 <code class="inline">grammar_compile_error_reqs</code> 单独报错、不连坐整批。还有个平台相关的例外：<code class="inline">external_launcher</code> 模式下每个 TP rank 有自己的调度器，异步编译会让各 rank 的「转正时机」不一致、破坏 torchrun 依赖的确定性，所以只有它强制同步（:53 的注释把因果写得很全）。</div>
+    <p><strong>GPU 侧：bitmask 走异步拷贝 + Triton kernel。</strong>每步调度器把<strong>本步被调度的</strong>结构化请求收集起来（<code class="inline">get_grammar_bitmask</code>，scheduler.py:1943——入口先看 <code class="inline">scheduler_output.has_structured_output_requests</code>，该标志在调度循环里逐请求累积，且 prefill chunk 期间不上约束），算出 int32 位掩码张量发给 worker。worker 在采样前把它作用到 logits：</p>
+    <div class="code-title">vllm/v1/worker/gpu/model_runner.py — sample() 里的施加点（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> grammar_output <span class="kw">is not None and</span> logits.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
+    <span class="cmt"># 采样前原地抹掉不合法 token —— rejection sampler 之前</span>
+    self.structured_outputs_worker.apply_grammar_bitmask(
+        logits, input_batch,
+        grammar_output.structured_output_request_ids,
+        grammar_output.grammar_bitmask)</pre>
+    <div class="annotation"><b><code class="inline">StructuredOutputsWorker</code>（vllm/v1/worker/gpu/structured_outputs.py:38）内部是一条完整的异步流水：</b>掩码和「掩码行→logit 行」的映射先在 CPU 算好，然后用独立 <code class="inline">torch.cuda.Stream()</code> 异步 host-to-device 拷贝（pin memory + non_blocking），主流 <code class="inline">wait_stream</code> 等拷贝落地后才启动 Triton kernel——大 batch 的掩码搬运被藏进了 logits 计算的时间里。掩码张量形状 <code class="inline">(max_num_logits, cdiv(vocab_size, 32))</code>，投机解码时每个草稿位置一行，被拒的行直接复制「最后一个合法状态」的行（<code class="inline">failed_index</code>，structured_output/__init__.py:388 一带）。批量再大还有一层并行：batch 超过 <code class="inline">fill_bitmask_parallel_threshold</code>（:62，默认 128）时，CPU 按每批 16 个请求分组、扔给 <code class="inline">max(1, min(cpu_count//2, 8))</code> 个线程并发填掩码。</div>
+    <div class="annotation"><b>后端是引擎级单选：</b>四个实现——xgrammar、guidance 顶层直接导入，outlines、lm-format-enforcer 懒加载——在<strong>第一个</strong>结构化请求到来时按请求里的 backend 实例化一次，之后所有请求共用（grammar_init 的注释原文：「We only support a single backend... not on a per-request basis」）。配置项 <code class="inline">--structured-outputs-config.backend</code>（StructuredOutputsBackend，config/structured_outputs.py:12）默认 <code class="inline">"auto"</code>。自研启示与投机解码同构：<strong>约束施加点是采样前的那一次 logits 修改</strong>，先做一个「正则 → 逐 token DFA → bitmask」的最小实现就能接入调度循环；Schema 编译务必异步化，否则一个复杂 Schema 就能让整批请求卡在准入。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">6.9</span>SGLang 对照与自研启示</h2>
     <p>回到 6.1 摆出的四个问题，vLLM 的答案是「SamplingParams 带进 Request → 后处理链按固定顺序压 logits → 采样元数据把逐请求参数压成 batch 向量、一次算完 → 输出处理器管解码与停止」。同一串问题，SGLang 的组织方式：</p>
     <table class="tbl">
       <tr><th>概念</th><th>vLLM 实现</th><th>你的引擎可以做</th></tr>
@@ -324,6 +387,7 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
       <tr><td>penalty / bad words</td><td><code class="inline">apply_all_penalties</code> 等</td><td>明确不需要就先跳过，靠 <code class="inline">all_greedy</code> 快路径</td></tr>
       <tr><td>多路 / beam</td><td><code class="inline">n</code> / <code class="inline">BeamSearchParams</code></td><td>最后再加；fallback 到跑 n 次即可</td></tr>
       <tr><td>投机解码</td><td><code class="inline">SpecDecodeMetadata</code> + <code class="inline">RejectionSampler</code></td><td>先用 n-gram 草稿 + 贪心逐位验证（几十行）；按平均接受长度调 k</td></tr>
+      <tr><td>结构化输出</td><td><code class="inline">StructuredOutputManager</code> 异步编译 + bitmask kernel（6.8 节）</td><td>先做「正则 → 逐 token DFA → bitmask」，施加点放在采样前；Schema 编译异步化</td></tr>
     </table>
     <div class="callout warn">
       <b class="tag">自研启示</b>

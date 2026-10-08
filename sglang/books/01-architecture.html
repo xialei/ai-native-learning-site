@@ -249,7 +249,7 @@
     <div class="annotation"><b>模式矩阵：</b> PD 分离 × PP × overlap 各选一个入口。入口函数 <code class="inline">dispatch_event_loop</code> 本身现在只有几行：若开了 PD 角色切换（<code class="inline">enable_pd_role_switch</code>），交给 <code class="inline">role_switch.run_event_loop_supervisor</code> 包装 <code class="inline">_dispatch_event_loop_once</code>——supervisor 允许同一调度器在运行中改选循环；否则直接调 <code class="inline">_dispatch_event_loop_once</code>。注意 PD 分离的循环根本不定义在 scheduler.py 里，而是 mixin（<code class="inline">prefill.py</code> 起）注入——后面第 12 章会看到这些循环长什么样。默认走 <code class="inline">event_loop_overlap</code>，第 2 章会专门拆它。</div>
   </section>
 
-  <section class="block">
+  <section class="block" id="sec-16">
     <h2><span class="num">1.6</span>一张表记牢每个部件</h2>
     <table class="tbl">
       <tr><th>部件</th><th>文件</th><th>职责</th><th>进程</th></tr>
@@ -261,6 +261,16 @@
       <tr><td>DetokenizerManager</td><td>srt/managers/detokenizer_manager.py</td><td>增量反分词、增量解码状态</td><td>子进程 ×1</td></tr>
       <tr><td>DataParallelController</td><td>srt/managers/data_parallel_controller.py</td><td>dp_size&gt;1 时拉起多组 Scheduler 并分发请求</td><td>主进程（可选）</td></tr>
     </table>
+
+    <table class="tbl" style="margin-top:14px">
+      <tr><th>维度</th><th>SGLang（四进程）</th><th>vLLM v1（EngineCore 系）</th></tr>
+      <tr><td>主进程里有什么</td><td>HTTP（FastAPI）+ TokenizerManager：协议、分词、流式分发</td><td>API 层 + AsyncLLM：协议与输出处理，不碰模型</td></tr>
+      <tr><td>引擎核心在哪</td><td><strong>每个 TP rank 一个独立 Scheduler 子进程</strong>——调度、KV 管理、前向发起同进程同线程</td><td>EngineCore（可独立成 EngineCoreProc 子进程，也能进程内内联），内含 v1 引擎核心与 KVCacheManager</td></tr>
+      <tr><td>反分词</td><td>独立进程（DetokenizerManager），id 通道/文本通道分离</td><td>输出处理在 API 进程侧（detokenizer 属于输入输出处理层）</td></tr>
+      <tr><td>进程间通道</td><td>ZMQ ipc，请求/响应双向各一条</td><td>ZMQ（v1 同为 ZMQ，tcp/ipc 视形态）</td></tr>
+      <tr><td>每 TP rank 一进程</td><td>天然如此（mp.Process × tp_size）</td><td>EngineCore 内部管理 worker，进程边界在 EngineCoreProc</td></tr>
+    </table>
+    <p class="fig-cap" style="margin-top:8px">表 1.1：与 vLLM 的进程模型对照。名字对不上没关系——对齐的是「协议层 / 调度与内存 / 前向执行」三层职责的摆放位置：SGLang 把调度和前向放进每 rank 一个的子进程，vLLM 把调度与 KV 管理集中进 EngineCore、worker 只做执行。</p>
   </section>
 
   <section class="block">

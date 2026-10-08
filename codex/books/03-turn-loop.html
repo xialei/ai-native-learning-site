@@ -322,7 +322,144 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">3.7</span>小结：turn 循环的完整心智模型</h2>
+    <h2><span class="num">3.7</span>任务组织：Submission 通道、TaskKind 与 RunningTask</h2>
+    <p>前几节一直在说「提交队列派发 → RegularTask::run」，但派发背后的结构没展开：提交怎么排队？谁在消费？一个 turn 任务被谁持有、怎么被取消？这一节把内核的并发骨架拆开。总入口是 <code class="inline">SessionIo</code>——Session 对外的「队列与生命周期端点」：</p>
+    <div class="code-title">codex-rs/core/src/session/mod.rs:414 — SessionIo：三条通道</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// Queue and lifecycle endpoints for a running [`Session`].
+///
+/// Runtime state lives on `Session`; keeping these endpoints separate lets all
+/// submission senders be dropped to terminate the session loop. The shared
+/// completion future observes that shutdown.</span>
+<span class="kw">#[derive(Clone)]</span>
+<span class="kw">pub(crate) struct</span> SessionIo {
+    <span class="kw">pub(crate)</span> tx_sub: Sender&lt;Submission&gt;,
+    <span class="kw">pub(crate)</span> rx_event: Receiver&lt;Event&gt;,
+    <span class="cmt">// Last known status of the agent.</span>
+    <span class="kw">pub(crate)</span> agent_status: watch::Receiver&lt;AgentStatus&gt;,
+    <span class="cmt">// Shared future for the background submission loop completion so multiple
+    // callers can wait for shutdown.</span>
+    <span class="kw">pub(crate)</span> session_loop_termination: SessionLoopTermination,
+}</pre>
+    <div class="annotation"><b>四条通道四种职责：</b> <code class="inline">tx_sub</code> 发 <code class="inline">Submission</code>（有界通道，容量 512——<code class="inline">SUBMISSION_CHANNEL_CAPACITY: usize = 512</code>，mod.rs:514，提交太猛时自然背压）；<code class="inline">rx_event</code> 收事件（<strong>无界</strong>——事件消费不及时也不堵内核）；<code class="inline">agent_status</code> 是 <code class="inline">watch</code> 通道（只保留最新状态，供轮询型前端查询）；<code class="inline">session_loop_termination</code> 是一个 <code class="inline">Shared&lt;BoxFuture&gt;</code>（别名在 :424），多个调用方可以一起等会话循环退场。文档注释点破了设计意图：<strong>「keeping these endpoints separate lets all submission senders be dropped to terminate the session loop」</strong>——把「发命令的口」从「运行时状态」里拆出来，所有 sender 一 drop，接收端 <code class="inline">recv()</code> 就报错退出，关闭不需要任何显式信号。通道创建在 mod.rs:602-603：<code class="inline">async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY)</code> / <code class="inline">async_channel::unbounded()</code>。</div>
+
+    <p>提交侧的封装在 <code class="inline">SessionIo::submit</code>（mod.rs:983）：给每个 op 分配 <code class="inline">new_submission_id()</code>、包成 <code class="inline">Submission</code> 塞进通道。<code class="inline">Submission</code> 不只是「一个 Op」，它还携带跨提交的元数据：</p>
+    <div class="code-title">codex-rs/core/src/session/submission.rs:10 — Submission 结构</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) struct</span> Submission {
+    <span class="kw">pub</span> id: String,
+    <span class="kw">pub</span> op: Op,
+    <span class="cmt">/// Accepted with settings, never separately from the request that supplied them.</span>
+    <span class="kw">pub</span> turn_extension_init: Option&lt;ExtensionDataInit&gt;,
+    <span class="cmt">/// Optional W3C trace carrier propagated across async submission handoffs.</span>
+    <span class="kw">pub</span> trace: Option&lt;W3cTraceContext&gt;,
+    <span class="kw">pub</span> parent_turn_id: Option&lt;String&gt;,
+    <span class="kw">pub</span> root_turn_id: Option&lt;String&gt;,
+    <span class="cmt">/// Keeps a V2 recipient resident until this submission is handled or dropped.</span>
+    <span class="kw">pub</span> residency_guard: Option&lt;OwnedRwLockReadGuard&lt;()&gt;&gt;,
+}</pre>
+    <div class="annotation"><b>提交是带谱系的：</b> 每条 Submission 带 W3C trace（跨异步边界传播追踪上下文）、<code class="inline">parent_turn_id</code>/<code class="inline">root_turn_id</code>（turn 祖先链，Debug 诊断用——字段上有 <code class="inline">#[expect(dead_code)]</code>，说明当前只在日志里露面）、以及 V2 多 Agent 的驻留锁 guard（保证收件 Agent 在处理前不被回收）。通道另一头是 <code class="inline">submission_loop</code>（handlers.rs:423），内核真正的「消息泵」：</div>
+    <div class="code-title">codex-rs/core/src/session/handlers.rs:423 — submission_loop：select! biased 三路监听（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {
+    <span class="kw">let</span> sub = tokio::select! {
+        biased;
+        _ = sess.services.local_agent_runtime.shutdown.cancelled() =&gt; {
+            shutdown_received = shutdown(&amp;sess, super::new_submission_id()).await;
+            <span class="kw">break</span>;
+        }
+        sub = rx_sub.recv() =&gt; <span class="kw">match</span> sub {
+            Ok(sub) =&gt; sub,
+            Err(_) =&gt; <span class="kw">break</span>,       <span class="cmt">// ★ 所有 sender 已 drop → 通道关闭 → 循环结束</span>
+        },
+        update = <span class="kw">async</span> {
+            <span class="kw">match</span> &amp;<span class="kw">mut</span> mailbox {
+                Some(updates) =&gt; updates.changed().await.map(|()| *updates.borrow_and_update()),
+                None =&gt; std::future::pending().await,
+            }
+        } =&gt; {
+            <span class="cmt">// 邮箱更新：通知 + 有 durable sleep 时补启 turn；不派发 Submission</span>
+            ...
+            <span class="kw">continue</span>;
+        }
+    };
+    <span class="cmt">// 按 op 分发：Op::Interrupt → interrupt(&amp;sess)、Op::TurnInput → turn_input::handle、...</span>
+}</pre>
+    <div class="annotation"><b>biased 决定优先级：</b> <code class="inline">tokio::select!</code> 加 <code class="inline">biased;</code> 表示按分支顺序轮询而非随机——<strong>shutdown 永远优先于新提交</strong>，关停请求不会被积压的提交「饿死」。三个分支各司其职：取消令牌触发会话收尾；<code class="inline">rx_sub.recv()</code> 出错（发送端全 drop）是会话循环的<strong>正常退出路径</strong>；邮箱分支只处理 Agent 间通信的到达信号，<code class="inline">continue</code> 回到顶部重新 select。Op 的真正分发在 select 之后的 match（handlers.rs:472 起）——<code class="inline">Op::Interrupt</code> 调 <code class="inline">interrupt()</code>、<code class="inline">Op::TurnInput</code> 进 <code class="inline">turn_input::handle</code>（:521）——第 3.5 节的 steering、第 3.6 节的中断都是在这里被分发的。</div>
+
+    <p>任务侧，所有在跑的工作都抽象成 <code class="inline">SessionTask</code>。这个 trait 只有三个必答问题：你是什么（kind）、tracing 里叫什么（span_name）、怎么跑（run）：</p>
+    <div class="code-title">codex-rs/core/src/tasks/mod.rs:180 — SessionTask trait（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) trait</span> SessionTask: Send + Sync + <span class="st">'static</span> {
+    <span class="cmt">/// Describes the type of work the task performs so the session can
+    /// surface it in telemetry and UI.</span>
+    <span class="kw">fn</span> kind(&amp;self) -&gt; TaskKind;
+
+    <span class="cmt">/// Returns the tracing name for a spawned task span.</span>
+    <span class="kw">fn</span> span_name(&amp;self) -&gt; &amp;'static str;
+
+    <span class="cmt">/// Executes the task until completion or cancellation.</span>
+    <span class="cmt">/// ... The provided `cancellation_token` is cancelled when the session
+    /// requests an abort; implementers should watch for it and terminate
+    /// quickly once it fires. Returning [`Some`] yields a final message ...</span>
+    <span class="kw">fn</span> run(
+        self: Arc&lt;Self&gt;,
+        session: Arc&lt;Session&gt;,
+        ctx: Arc&lt;TurnContext&gt;,
+        input: Vec&lt;TurnInput&gt;,
+        cancellation_token: CancellationToken,
+    ) -&gt; <span class="kw">impl</span> std::future::Future&lt;Output = SessionTaskResult&gt; + Send;
+
+    <span class="cmt">/// Gives the task a chance to perform cleanup after an abort.（默认 no-op）</span>
+    <span class="kw">fn</span> abort(...) { async {} }
+}</pre>
+    <div class="annotation"><b>返回值与种类：</b> <code class="inline">SessionTaskResult = CodexResult&lt;Option&lt;String&gt;&gt;</code>（tasks/mod.rs:75）——Some 是最终 agent 消息（<code class="inline">on_task_finished</code> 会发给客户端）。任务种类是三值枚举 <code class="inline">TaskKind { Regular, Review, Compact }</code>（state/turn.rs:66）：Regular 是普通对话 turn，Review 是代码审查，Compact 是压缩（第 6 章）。kind 的一个实际用途在 steering：非 Regular 任务不可插话（<code class="inline">steer_input</code> 里 match 到 Review/Compact 就返回 <code class="inline">ActiveTurnNotSteerable</code>，turn_input.rs:733）——第 3.5 节的「并非所有 turn 都可 steer」落地在任务类型上。具体的任务就是实现这个 trait 的薄壳，如 <code class="inline">RegularTask</code>（tasks/regular.rs:23）：<code class="inline">kind() → TaskKind::Regular</code>、<code class="inline">span_name() = "session_task.turn"</code>、<code class="inline">run()</code> 里就是第 3.2 节拆过的 <code class="inline">run_turn</code>。</div>
+
+    <p>跑起来的任务被包在 <code class="inline">RunningTask</code> 里，这是取消机制的实体：</p>
+    <div class="code-title">codex-rs/core/src/state/turn.rs:66 — TaskKind 与 RunningTask</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) enum</span> TaskKind { Regular, Review, Compact }
+
+<span class="kw">pub(crate) struct</span> RunningTask {
+    <span class="kw">pub(crate)</span> done: Arc&lt;Notify&gt;,          <span class="cmt">// 完成通知（等待者挂这里）</span>
+    <span class="kw">pub(crate)</span> kind: TaskKind,
+    <span class="kw">pub(crate)</span> task: Arc&lt;dyn AnySessionTask&gt;,
+    <span class="kw">pub(crate)</span> cancellation_token: CancellationToken,
+    <span class="kw">pub(crate)</span> handle: AbortOnDropHandle&lt;()&gt;,
+    <span class="kw">pub(crate)</span> turn_context: Arc&lt;TurnContext&gt;,
+    <span class="kw">pub(crate)</span> _agent_execution_guard: Option&lt;AgentExecutionGuard&gt;,
+    <span class="kw">pub(crate)</span> _diagnostics_guard: GaugeGuard,
+    <span class="cmt">// Timer recorded when the task drops to capture the full turn duration.</span>
+    <span class="kw">pub(crate)</span> _timer: Option&lt;codex_otel::Timer&gt;,
+}</pre>
+    <div class="annotation"><b>drop 即取消：</b> <code class="inline">AbortOnDropHandle</code>（tokio_util 提供）包住 <code class="inline">tokio::spawn</code> 的 JoinHandle（tasks/mod.rs:404）——<strong>持有者一被 drop，任务自动 abort</strong>。这是用类型系统编码的「生命周期即取消」：RunningTask 存在 active_turn 里，换 turn 时旧的被拿走、丢弃，任务跟着终止，不存在「忘了 abort」的泄漏路径。字段里还有一对守卫（<code class="inline">_agent_execution_guard</code> / <code class="inline">_diagnostics_guard</code>）：下划线前缀 + 无读取点，纯靠 drop 时机生效——任务结束时（无论正常还是 panic）自动释放并发额度、活跃计数。</div>
+
+    <p>最后是启动与中止的完整闭环：</p>
+    <div class="code-title">codex-rs/core/src/tasks/mod.rs:272 — spawn_task：先顶替，再启动</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> spawn_task&lt;T: SessionTask&gt;(
+    self: &amp;Arc&lt;Self&gt;, turn_context: Arc&lt;TurnContext&gt;, input: Vec&lt;TurnInput&gt;, task: T,
+) {
+    self.abort_all_tasks(TurnAbortReason::Replaced).<span class="kw">await</span>;   <span class="cmt">// ① 全部旧任务标记 Replaced
+</span>    self.clear_connector_selection().await;
+    self.start_task(turn_context, input, task).<span class="kw">await</span>;        <span class="cmt">// ② 再启动新任务</span>
+}</pre>
+    <div class="code-title">codex-rs/core/src/tasks/mod.rs:287 — start_task：spawn 与收尾（节选）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="kw">let</span> task_cancellation_token = cancellation_token.child_token();  <span class="cmt">// :346 子令牌</span>
+<span class="cmt">// ... turn span、计时、token 快照 ...</span>
+<span class="kw">let</span> handle = tokio::spawn(storage_originator.scope(task_future));  <span class="cmt">// :404</span>
+<span class="kw">let</span> running_task = RunningTask {
+    done,
+    handle: AbortOnDropHandle::new(handle),
+    kind: task_kind,
+    task,
+    cancellation_token,
+    ...
+};
+turn.task = Some(running_task);</pre>
+    <div class="annotation"><b>先杀后启 + 令牌级联：</b> <code class="inline">spawn_task</code> 的第一步永远是 <code class="inline">abort_all_tasks(TurnAbortReason::Replaced)</code>——<strong>一个会话同时只有一个活动任务，新任务来了旧任务让路</strong>，而不是排队。这也是第 3.5 节 <code class="inline">ContinueIfIdle</code> 返回 <code class="inline">Superseded</code> 的原因：<code class="inline">start_if_idle</code> 先检查上一个 turn id，发现不符就走拒绝路径，而不是挤掉正在跑的任务。取消则靠令牌树：<code class="inline">start_task</code> 里 <code class="inline">cancellation_token.child_token()</code> 生子令牌传给任务（:346），run_sampling_request 再往下派孙令牌（第 3.3 节的采样循环）——<strong>父令牌一取消，整棵子树齐灭</strong>；而任务自身结束只影响自己的子树。任务完成时的收尾也统一：spawn 侧的 task_future 末尾检查「未被取消」才调 <code class="inline">on_task_finished</code>（:398），随后 <code class="inline">done.notify_waiters()</code>（:401）唤醒所有等 <code class="inline">RunningTask.done</code> 的调用方（比如等 turn 结束再做事的测试或 host）。被 abort 的任务另有 <code class="inline">SessionTask::abort()</code> 清理钩子（默认 no-op），由 <code class="inline">abort_all_tasks</code>（:537）统一触发——注释强调「Let interrupted tasks observe cancellation before dropping pending approvals」，先给任务一个观察取消的机会，再清审批等挂起状态，避免 in-flight 审批被误判成模型可见的拒绝。</div>
+    <div class="callout info">
+      <b class="tag">分层</b>
+      把这几块拼起来，内核的并发分工是：<strong>SessionIo</strong> 是队列端点（提交通道 + 事件通道 + 状态 watch + 终止 future），<strong>submission_loop</strong> 是单线程消息泵（biased select：停机 &gt; 提交 &gt; 邮箱），<strong>SessionTask/RunningTask</strong> 是任务抽象（kind 分类 + AbortOnDropHandle 托底 + CancellationToken 级联）。通道用 async_channel（兼容 async-std/tokio 双生态）、通知用 tokio 原语（watch/Notify/oneshot）、取消用 tokio_util 的 CancellationToken——每类原语只用一处，不混。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.8</span>小结：turn 循环的完整心智模型</h2>
     <div class="callout warn">
       <b class="tag">一张图记牢</b>
       <code class="inline">run_turn</code>（准备：压缩 / step context / 记录输入）→ <code class="inline">run_turn</code> 的 <code class="inline">loop {}</code>（取 pending 输入 → 捕获 step context → 克隆历史 → 调 <code class="inline">run_sampling_request</code>：在其重试循环里 build_prompt → 流式调 LLM → 产 ResponseItem → 发 Event → 若有 FunctionCall 则执行工具、结果回填历史 → 返回 <code class="inline">needs_follow_up</code>）→ 有工具调用或有待处理输入则回到 loop 顶部再采样，否则 <code class="inline">TurnComplete</code>。

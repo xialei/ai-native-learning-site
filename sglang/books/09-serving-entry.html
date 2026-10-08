@@ -35,7 +35,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 服务入口</div>
     <h1>服务入口：HTTP、OpenAI 兼容层与离线 Engine</h1>
-    <div class="subtitle">第 2 章已经跟过一条请求从进入引擎到流式输出的完整路径。这一章看入口本身：http_server.py 里 80 多条路由怎么组织、/v1/* 兼容层做了什么、离线 Engine 如何绕开 HTTP 直接驱动同一套进程，以及 ServerArgs → runtime_context 的配置体系。</div>
+    <div class="subtitle">第 2 章已经跟过一条请求从进入引擎到流式输出的完整路径。这一章看入口本身：http_server.py 里 80 多条路由怎么组织、/v1/* 兼容层做了什么、离线 Engine 如何绕开 HTTP 直接驱动同一套进程、论文里的前端语言（gen/fork/select）如何编译成对运行时的请求，以及 ServerArgs → runtime_context 的配置体系。</div>
   </div>
 
   <section class="block">
@@ -46,6 +46,7 @@
       <li><strong>OpenAI 兼容层（<code class="inline">/v1/chat/completions</code> 等）</strong>：不是独立服务，而是 HTTP 路由后挂的一组 <code class="inline">OpenAIServing*</code> 适配器，把 OpenAI 请求翻译成 <code class="inline">GenerateReqInput</code>。</li>
       <li><strong>离线 Engine（<code class="inline">sgl.Engine</code>）</strong>：拉起完全相同的进程结构，但不启动 HTTP——Python 代码直接调用 <code class="inline">tokenizer_manager.generate_request()</code>。</li>
     </ul>
+    <p>在这三扇门之外还有一个<strong>客户端侧</strong>的老入口：论文里的前端语言（<code class="inline">sgl.gen</code> / <code class="inline">s.fork</code> / <code class="inline">sgl.select</code>，§9.6）。它不发新协议，就是把多段生成程序组织成一连串对 /generate 的调用，靠 radix tree 吃掉公共前缀——所以放在这一章末尾讲：它只是第一扇门上多挂的一种用法。</p>
     <p>所有入口最终都汇到同一个调用：<code class="inline">tokenizer_manager.generate_request(obj)</code>。这意味着协议层的差异（SSE 帧、chat 模板、tool call 解析）全部被挡在 TokenizerManager 之外——调度器和 GPU 不关心请求来自 curl 还是 OpenAI SDK。</p>
   </section>
 
@@ -357,7 +358,93 @@ context_before_publish = <span class="fn">snapshot_context</span>()
   </section>
 
   <section class="block">
-    <h2><span class="num">9.6</span>配置体系：ServerArgs 与 runtime_context</h2>
+    <h2><span class="num">9.6</span>前端语言：gen / fork / select 怎么落到 /generate</h2>
+    <p>上面四节讲的都是「一次请求一个响应」的形态。SGLang 还有一套更老的前端——论文里那门「结构化生成语言」：<code class="inline">sgl.gen</code>、<code class="inline">s.fork</code>、<code class="inline">sgl.select</code>，让多轮生成、分支探索、多项选择写成一段普通 Python。它不在 <code class="inline">srt/</code> 目录下，而在 <code class="inline">python/sglang/lang/</code>（642 行的 <code class="inline">ir.py</code> 定义表达式，<code class="inline">interpreter.py</code> 负责解释执行）。注意它至今仍是发布的一部分——只是如今绝大多数用户走 OpenAI 兼容层，这条线被冷落了；要理解「一个推理引擎的 API 能长成什么样」，它比 /v1/* 更有启发性：</p>
+    <div class="code-title">python/sglang/lang/api.py — 一段多分支程序（示意，run 于任意 backend 之上）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">@sgl.function</span>
+<span class="kw">def</span> <span class="fn">multi_choice</span>(s, question, choices):
+    s += <span class="cl">system</span>(<span class="st">"请仔细回答。"</span>) + <span class="cl">user</span>(question)
+    <span class="kw">with</span> s.<span class="fn">fork</span>(<span class="fn">len</span>(choices)) <span class="kw">as</span> exes:
+        <span class="kw">for</span> i, choice <span class="kw">in</span> <span class="fn">enumerate</span>(choices):
+            exes[i] += <span class="cl">assistant</span>() + sgl.<span class="fn">gen</span>(<span class="st">"answer"</span>, max_tokens=<span class="nu">64</span>, stop=[<span class="st">"\n"</span>])
+    <span class="kw">for</span> i, choice <span class="kw">in</span> <span class="fn">enumerate</span>(choices):
+        exes[i] += sgl.<span class="fn">gen</span>(<span class="st">"score"</span>, choices=[<span class="st">"A"</span>, <span class="st">"B"</span>])
+    branches = exes.<span class="fn">join</span>(<span class="st">"gather_variable"</span>)   <span class="cmt"># 收回分支里的变量</span></pre>
+    <p>把它编译到运行时的，是三层各司其职的组件。用户函数先被 <code class="inline">@sgl.function</code> 包成 <code class="inline">SglFunction</code>（<code class="inline">lang/ir.py</code>，构造时用 <code class="inline">inspect.getfullargspec</code> 校验第一个参数必须叫 <code class="inline">s</code>）；调用 <code class="inline">run()</code> 时 <code class="inline">run_program</code>（<code class="inline">lang/interpreter.py</code>）为它开一个 <code class="inline">StreamExecutor</code>——每条执行流一个，内部一根工作线程从队列里逐个取表达式执行：</p>
+    <div class="code-title">python/sglang/lang/interpreter.py — StreamExecutor 的分发核心（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_execute</span>(self, other):
+    <span class="kw">if</span> isinstance(other, str):
+        other = <span class="cl">SglConstantText</span>(other)
+
+    <span class="kw">if</span> isinstance(other, SglConstantText):
+        self.<span class="fn">_execute_fill</span>(other.value)          <span class="cmt"># 拼进 text_，不发请求</span>
+    <span class="kw">elif</span> isinstance(other, SglGen):
+        self.<span class="fn">_execute_gen</span>(other)                 <span class="cmt"># → backend.generate → POST /generate</span>
+    <span class="kw">elif</span> isinstance(other, SglSelect):
+        self.<span class="fn">_execute_select</span>(other)              <span class="cmt"># → backend.select → 多路 logprob</span>
+    <span class="kw">elif</span> isinstance(other, SglConcateAndAppend):
+        ...                                      <span class="cmt"># fork 分支的 KV 拼接（见下）</span>
+    <span class="kw">elif</span> isinstance(other, SglRoleBegin):
+        self.<span class="fn">_execute_role_begin</span>(other)          <span class="cmt"># chat 模板的角色包裹</span>
+    ...</pre>
+    <div class="annotation"><b>不是先编译成 AST 再执行，是边解释边发请求：</b> <code class="inline">s += sgl.gen(...)</code> 这一句，语义就是「把当前累计文本发给 /generate，生成结果存进变量」。两个执行时的支撑结构值得记：<code class="inline">variables</code> 字典保存每个 <code class="inline">gen(name=...)</code> 的产物，<code class="inline">variable_event</code> 让跨分支读取变量时能等待生成完成（fork 出的分支读一个还没算完的变量，会先阻塞在 event 上）；工作线程 + 队列让流式场景下主线程拿 token 的同时生成还在继续。</div>
+
+    <p><code class="inline">fork</code> 的实现直白得令人愉快——深拷贝执行器状态，各分支从分叉点各自生长：</p>
+    <div class="code-title">python/sglang/lang/interpreter.py — StreamExecutor.fork（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">fork</span>(self, size=<span class="nu">1</span>, position_ids_offset=<span class="kw">None</span>):
+    <span class="kw">if</span> size &gt; <span class="nu">1</span> <span class="kw">and</span> str(self.text_):
+        self.<span class="fn">submit</span>(<span class="cl">SglCommitLazy</span>())    <span class="cmt"># 先把公共前缀算进 KV（commit_lazy_operations）</span>
+    self.<span class="fn">sync</span>()
+
+    exes = [<span class="cl">StreamExecutor</span>(self.backend, self.arguments, ...) <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(size)]
+    <span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(size):
+        exes[i].variables = <span class="fn">dict</span>(self.variables)
+        exes[i].text_ = str(self.text_)            <span class="cmt"># 分支继承全部已生成文本</span>
+        exes[i].fork_start_text_pos = len(self.text_)  <span class="cmt"># 记下分叉点，join 时用</span>
+        ...
+    <span class="kw">return</span> exes</pre>
+    <div class="annotation"><b>fork 的第一件事是 commit：</b> 分支各自向前生成后，共享前缀只有一份 KV——前缀复用不靠前端做什么特殊事，靠的正是第 3 章那棵树：每个分支的 <code class="inline">generate</code> 都把「整段 text_」发给 /generate，公共前缀在 radix tree 上命中，后端只对增量做 prefill。<strong>这就是「前端语言如何复用前缀」的答案：前缀复用不是前端的能力，是它敢于「每次都发全文」的底气。</strong> fork 时 <code class="inline">SglCommitLazy</code> 先把没提交的文本推成一次真实请求（max_new_tokens=0 的 /generate，只进树不生成），确保分叉点之前的 KV 已在树上。<br><br><b>join 的两种模式：</b> <code class="inline">ProgramStateGroup.join("gather_variable")</code> 是默认——把各分支新产生的变量收回主分支；<code class="inline">join("concate_and_append")</code> 则调 <code class="inline">/concate_and_append_request</code>，让引擎在 KV 层把各分支的 token 直接拼回主分支（<code class="inline">_execute_concatenate_and_append_kv_cache</code>，runtime 后端才支持）——分支重汇合时免去重算拼接段，这是只有自控引擎的前端才做得出的操作。</div>
+
+    <p><code class="inline">select</code> 最能看出「前端语言」和「裸 API」的差距。它要在多个候选里挑一个概率最高的，却不做任何新内核，只是把请求组织得聪明：</p>
+    <div class="code-title">python/sglang/lang/backend/runtime_endpoint.py — RuntimeEndpoint.select（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">select</span>(self, s, choices, temperature, choices_method):
+    <span class="cmt"># ① 先把公共前缀算进缓存：max_new_tokens=0 的 /generate</span>
+    data = {<span class="st">"text"</span>: s.text_, <span class="st">"sampling_params"</span>: {<span class="st">"max_new_tokens"</span>: <span class="nu">0</span>}}
+    obj = self.<span class="fn">_generate_http_request</span>(s, data)
+    prompt_len = obj[<span class="st">"meta_info"</span>][<span class="st">"prompt_tokens"</span>]
+
+    <span class="cmt"># ② 一次请求批量给「前缀+候选 c」逐个打分（list 批量形式）</span>
+    data = {
+        <span class="st">"text"</span>: [s.text_ + c <span class="kw">for</span> c <span class="kw">in</span> choices],
+        <span class="st">"sampling_params"</span>: {<span class="st">"max_new_tokens"</span>: <span class="nu">0</span>, <span class="st">"temperature"</span>: <span class="nu">0</span>},
+        <span class="st">"return_logprob"</span>: <span class="kw">True</span>,
+        <span class="st">"return_text_in_logprobs"</span>: <span class="kw">True</span>,
+        <span class="cmt"># logprob_start_len 收在 prompt 末尾附近——token healing 的回退空间</span>
+        <span class="st">"logprob_start_len"</span>: logprob_start_len,
+    }
+    obj = self.<span class="fn">_generate_http_request</span>(s, data)
+    ...
+    <span class="kw">return</span> choices_method(choices=choices, normalized_prompt_logprobs=..., ...)</pre>
+    <div class="annotation"><b>select 是三个动作的组合：</b> 缓存公共前缀（①）→ 批量打分（②，一次 /generate 发 N 条变体，依赖引擎对批量 text 的支持）→ 归一化比较（choices_method 决定按 token 长度归一还是直接加和）。另有一处容易被略过的细节：候选的第一个 token 可能和前文「黏」成一个不同分词的 token（token healing），所以 <code class="inline">logprob_start_len = max(prompt_len - 2, 0)</code> 多退两步，把「被切分方式改变的那个 token」也纳入比较窗口，失配时把它的 logprob 从归一化里剔掉。全部逻辑在客户端——引擎只要会返回 logprob，select 就成立了。这一节的模板价值不在功能，在思路：<strong>高级原语可以用「聪明地组织朴素请求」来实现，前提是引擎把 match_prefix + 批量 + logprob 三件事做扎实。</strong></div>
+
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      这套语言和 vLLM 的「前端」是什么关系？vLLM 没有对应物——它的可编程面就是 OpenAI 协议 + 离线 LLM 类；把「多步生成程序」作为一等公民、在客户端库层做编排，是 SGLang 论文（2023）的原始出发点，也是项目名字的来源。后来工程重心移到 SRT 运行时（本书主体），这套语言退守为 <code class="inline">sgl.RuntimeEndpoint</code> 上的可选客户端：同样的原语也可以对着 openai/litellm/anthropic 等 API 后端跑（<code class="inline">lang/backend/</code> 下六七个实现），只是 fork/join 的 KV 级拼接只有在自家 runtime 上才成立。读 SRT 源码时不必找它对调度的影响——没有；它是纯粹的客户端构造层。
+    </div>
+
+    <table class="tbl">
+      <tr><th>前端原语</th><th>编译成什么</th><th>复用了什么</th></tr>
+      <tr><td><code class="inline">sgl.gen(...)</code></td><td>POST /generate，text = 当前全部文本，采样参数内联</td><td>公共前缀经 radix tree 命中（第 3 章）；regex/json_schema 走第 8 章 grammar</td></tr>
+      <tr><td><code class="inline">s.fork(n)</code> + <code class="inline">join("gather_variable")</code></td><td>n 个独立执行器各自发 /generate；join 把新变量收回</td><td>分叉点之前只算一次——树上共享节点</td></tr>
+      <tr><td><code class="inline">join("concate_and_append")</code></td><td><code class="inline">/concate_and_append_request</code>，KV 层拼接分支</td><td>免重算拼接段（仅 runtime 后端）</td></tr>
+      <tr><td><code class="inline">sgl.select(...)</code></td><td>max_new_tokens=0 预填前缀 + 批量 logprob 比较</td><td>公共前缀一次进树，N 条变体只算尾巴</td></tr>
+      <tr><td><code class="inline">run_batch</code>（批量跑同一段程序）</td><td><code class="inline">cache_program</code> 先用 tracer 跑一遍提取公共前缀并 cache_prefix（&gt;64 字符才发）</td><td>整批共享的 system prompt / few-shot 头，第一批就进树</td></tr>
+    </table>
+    <p class="fig-cap" style="margin-top:8px">表 9.1：前端原语 → 运行时请求的编译表。前缀复用全部落在 radix tree 侧，前端只负责「组织请求」。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.7</span>配置体系：ServerArgs 与 runtime_context</h2>
     <p>SGLang 的启动参数有 200 多个，全部收在 <code class="inline">ServerArgs</code> 一个 msgspec Struct 里。它的字段声明方式有个特点：CLI flag 直接从字段名推导，帮助文本写在类型注解里：</p>
     <div class="code-title">python/sglang/srt/server_args.py — ServerArgs 的字段注解约定（摘录，docstring 译文）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ServerArgs</span>:
@@ -405,7 +492,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
   </section>
 
   <section class="block">
-    <h2><span class="num">9.7</span>对「自研引擎」的启示</h2>
+    <h2><span class="num">9.8</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
       最值得迁移的是三个决定。首先是<strong>离线 Engine 先行</strong>——先把 generate() 做对，HTTP 层只是它的一层皮，两边共用同一协程入口，压测和服务行为才不会分叉。其次是<strong>路由薄、适配层厚</strong>——路由只做参数解析和转发，chat 模板、tool call、reasoning 分离这类协议工作收敛到独立的 serving 对象；SGLang 的路由清单已经长到 80 多条，靠的就是每条路由都足够薄。最后是<strong>配置可以全局读，但要把「谁读什么」写成表</strong>——全局包省掉了参数传递的机械劳动，角色-命名空间表让这种妥协保持可审计。下一步进入 <a href="10-distributed.html">第 10 章：分布式推理</a>。

@@ -182,6 +182,54 @@
   </section>
 
   <section class="block">
+    <h2><span class="num">4.5b</span>prompt caching：把「不变的」钉在前面</h2>
+    <p>每轮调用都重发整段消息列表，但列表开头几万字几乎不变——系统提示、工具定义、CLAUDE.md。Anthropic API 的<strong>prompt caching</strong>让这些前缀在服务端缓存（默认 5 分钟，可延长到 1 小时），命中部分按约 1/10 计价。Claude Code 的上下文构建处处围绕「<strong>缓存边界</strong>」组织：稳定内容在前，易变内容在后，一次边界之内的重排都会让整段缓存作废、按全价重写。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t45b d45b">
+        <title id="t45b">消息列表与缓存边界</title>
+        <desc id="d45b">稳定前缀命中缓存，易变后缀每次重算</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path>
+          </marker>
+        </defs>
+        <rect class="node core" x="30" y="30" width="560" height="36" rx="6"></rect>
+        <text class="lbl" x="310" y="53" text-anchor="middle">系统提示（固定）</text>
+        <rect class="node core" x="30" y="74" width="560" height="36" rx="6"></rect>
+        <text class="lbl" x="310" y="97" text-anchor="middle">工具定义（所有工具的 name/description/schema）</text>
+        <rect class="node core" x="30" y="118" width="560" height="36" rx="6"></rect>
+        <text class="lbl" x="310" y="141" text-anchor="middle">CLAUDE.md + 注入的环境信息</text>
+        <line class="edge" x1="610" y1="94" x2="640" y2="94"></line>
+        <text class="lbl sm" x="620" y="82">缓存边界</text>
+        <rect class="node acc" x="640" y="30" width="200" height="124" rx="6"></rect>
+        <text class="lbl sm" x="740" y="55" text-anchor="middle">命中缓存</text>
+        <text class="lbl sm" x="740" y="75" text-anchor="middle">只要前缀逐字节不变</text>
+        <text class="lbl sm" x="740" y="92" text-anchor="middle">且在 TTL 内</text>
+        <text class="lbl sm" x="740" y="133" text-anchor="middle">≈ 原价 1/10</text>
+        <rect class="node warn" x="30" y="170" width="560" height="36" rx="6"></rect>
+        <text class="lbl" x="310" y="193" text-anchor="middle">对话历史 + 本轮 tool_result（每轮追加，易变）</text>
+        <rect class="node" x="640" y="170" width="200" height="36" rx="6"></rect>
+        <text class="lbl sm" x="740" y="193" text-anchor="middle">每次重算/增量</text>
+        <text class="lbl sm" x="30" y="234">前缀里动一个字，边界内整段缓存作废、按全价重写——所以稳定的要钉死在前。</text>
+      </svg>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#2f6f8f"></span>稳定前缀（缓存段）</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#c15f3c"></span>易变后缀</span></div><div class="fig-cap">图 4.2b：缓存边界前是稳定前缀，边界后是每轮变化的对话历史。</div>
+    </div>
+    <p>源码里能直接看到「为缓存做工程」的痕迹：</p>
+    <ul>
+      <li><strong>工具与技能声明钉在首轮前缀</strong>：团队模式里队友若每轮重发自己的工具/技能声明，缓存必碎——引擎因此把 hook 上下文与预载技能固定钉进提示前缀（§7.7）；恢复的子代理也必须<strong>原样重发首战用过的工具列表</strong>，重建定义就破缓存（2.1.280、2.1.277 各修过一处）。</li>
+      <li><strong>会话级钩子不进缓存段</strong>：SessionStart hook 在续接会话时若改动首条消息，会打掉全量缓存（2.1.277 修过该 bug）——引擎把跨会话稳定的内容排在边界前、逐会话的内容排在边界后。</li>
+      <li><strong>易变字段不进前缀</strong>：压缩/恢复后，记忆文件的「年龄注记」这类每次渲染都可能变的文本，一处变动就废掉后段缓存（2.1.275 修过）；MCP 服务器中途断连会整体丢缓存（2.1.281 修过），工具搜索关闭时也一样。</li>
+      <li><strong>TTL 可见、可调</strong>：状态栏有提示缓存时钟（VS Code/桌面端），agent frontmatter 支持 <code class="inline">experimental.cacheTtl: "5m" | "1h"</code>（2.1.248）为单个子代理选缓存时长。</li>
+    </ul>
+    <div class="callout info">
+      <b class="tag">怎么观察</b>
+      <code class="inline">/cost</code> 有逐会话的缓存行（命中率、miss 数、重写 token 数、warm/cold，2.1.251 起），缓存未命中时还会给出疑似原因——工具定义或系统提示变了、空闲超过 TTL（2.1.260）。转录 jsonl 里每条 assistant 行的 <code class="inline">message.usage</code> 也能直接看到 <code class="inline">cache_read_input_tokens</code> / <code class="inline">cache_creation_input_tokens</code>（存储见 §5.5e）。给子代理加一行总结也可能把缓存打掉（2.1.128 修过，省了约 3 倍 <code class="inline">cache_creation</code>）——<strong>任何「顺手改一下开头」的操作都在烧钱</strong>。
+    </div>
+    <div class="annotation"><b>可借鉴的设计：</b> 长会话 Agent 的成本大头是重复的前缀。把「不随轮次变的内容」全部前移、把「每轮必变的内容」全部推到末尾，是一个适用面极宽的工程约束——往消息列表里插任何东西之前，先问它属于边界的哪一侧。Claude Code 的做法更进一步：<strong>把缓存边界变成产品里可见的东西</strong>（/cost 缓存行、状态栏时钟），让「缓存为什么破了」可诊断，而不是一个玄学。
+    </div>
+  </section>
+
+  <section class="block">
     <h2><span class="num">4.6</span>子代理：用独立窗口隔离上下文</h2>
     <p>当主代理需要做一件<strong>信息量大、可能污染主线</strong>的事（比如全仓库搜索、读一堆文件做调研），与其把这些全堆进主上下文，不如派一个<strong>子代理</strong>：它有自己的上下文窗口，干完只把<strong>结论</strong>回传给主代理。</p>
     <div class="figure">

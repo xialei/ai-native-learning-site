@@ -316,7 +316,7 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
     <div class="annotation"><b>它挂在 batch 的生命周期上：</b> 惩罚器要跟着 batch 的增删同步状态（请求结束后从 batch 里 filter 掉，两个 batch 合并时要 merge 惩罚累积量），所以它挂在 <code class="inline">SamplingBatchInfo</code> 的生命周期上，而不是散在请求对象里。这是「batch 级状态收口」的又一次体现。</div>
   </section>
 
-  <section class="block">
+  <section class="block" id="sec-85">
     <h2><span class="num">8.5</span>grammar 约束生成：FSM 位掩码</h2>
     <p>当请求带 <code class="inline">json_schema</code> / <code class="inline">regex</code> 等 <code class="inline">custom_params</code> 时，TokenizerManager 会为它编译一个 grammar 对象。后端可插拔，注册表在 <code class="inline">constrained/base_grammar_backend.py</code>：</p>
     <div class="code-title">python/sglang/srt/constrained/base_grammar_backend.py — create_grammar_backend（摘录，注释为译注）</div>
@@ -376,7 +376,16 @@ penalizer_orchestrator = penaltylib.<span class="cl">BatchedPenalizerOrchestrato
     <span class="kw">if</span> self.grammar_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
         self.grammar_mask.<span class="fn">apply</span>(logits)                <span class="cmt"># 非法 token → -inf</span>
     self._apply_post_grammar_logits_transforms(logits)</pre>
-    <div class="annotation"><b>一个 batch 可以混装约束与放行：</b> 掩码按行填，没 grammar 的行保持初始的「全放行」。应用之后掩码立即释放——<code class="inline">ModelRunner._preprocess_logits</code> 末尾有一行 <code class="inline">sampling_info.grammar_mask = None</code>，源码注释写明：overlap 调度下 sampling_info 会被 delay_sample 闭包多持有一步，不释放就是稳定的显存泄漏。这是结构化输出 + 重叠调度交叉处的一个真实事故痕迹。</div>
+    <div class="annotation"><b>一个 batch 可以混装约束与放行：</b> 掩码按行填，没 grammar 的行保持初始的「全放行」。应用之后掩码立即释放——<code class="inline">ModelRunner._preprocess_logits</code> 末尾有一行 <code class="inline">sampling_info.grammar_mask = None</code>，源码注释写明：overlap 调度下 sampling_info 会被 delay_sample 闭包多持有一步，不释放就是稳定的显存泄漏。这是结构化输出 + 重叠调度交叉处的一个真实事故痕迹。
+    <br><br>与 vLLM 的结构化输出实现放一张表看（细节见站内《深入浅出vLLM》第 6 章）：
+    <table class="tbl" style="margin-top:10px">
+      <tr><th>维度</th><th>SGLang</th><th>vLLM</th></tr>
+      <tr><td>后端选择</td><td>outlines / xgrammar（默认）/ llguidance，启动参数选一个</td><td>同样插件化：outlines / xgrammar / guidance 等后端，按请求或全局配置指定</td></tr>
+      <tr><td>约束的落点</td><td>Sampler 内 apply_logits_bias 一步掩码，掩码用完即释放（overlap 显存纪律）</td><td>采样管线同类位置：logit processor 掩掉非法 token，FSM 状态由 structured output manager 维护</td></tr>
+      <tr><td>增量推进</td><td>batch 级 fill_vocab_mask_batched——整批一次填掩码，约束与放行行混装</td><td>逐请求 FSM 推进，再合并出批级位掩码</td></tr>
+      <tr><td>与工具调用</td><td>token 级硬约束（grammar）+ 文本级软约束（detector 解析）两层并存，见 §8.6</td><td>guided decoding 与 tool parser 同样分层，位置在 API 适配层与采样之间</td></tr>
+    </table>
+    <p class="fig-cap" style="margin-top:8px">表 8.1：与 vLLM 的结构化输出对照。两边收敛到同一个形状——「FSM 编译成词表位掩码、采样前一步 apply」；差别在后端取舍与批级掩码的归约路径。</p></div>
   </section>
 
   <section class="block">

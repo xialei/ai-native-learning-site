@@ -19,12 +19,12 @@ open sglang/books/index.html
 | `01-architecture.html` | 整体架构与进程模型 | SRT 四进程（HTTP/TokenizerManager、Scheduler×tp、Detokenizer）、ZMQ 通道、事件循环分发 |
 | `02-request-lifecycle.html` | 请求生命周期 | /generate → 分词 → 调度 → 前向 → 反分词 → SSE 流式输出的全链路；abort 传播 |
 | `03-radix-cache.html` | RadixCache 前缀缓存 | 基数树 match/insert/evict、锁引用、页对齐与 extra_key 命名空间、RadixAttention 名字辨析 |
-| `04-scheduler.html` | 调度器与调度策略 | PrefillAdder 三本预算账、cache-aware 排序（LPM/DFS/HRRN）、chunked prefill、retract 抢占 |
+| `04-scheduler.html` | 调度器与调度策略 | PrefillAdder 三本预算账、cache-aware 排序（LPM/DFS/HRRN）、零开销调度（overlap 事件循环：result_queue + FutureMap + WAR 屏障）、chunked prefill、retract 抢占 |
 | `05-memory.html` | 内存池与显存预算 | ReqToTokenPool、MHATokenToKVPool/MLA、分页分配器 alloc_extend/alloc_decode、mem_fraction_static profiling |
 | `06-model-runner.html` | ModelRunner 与 CUDA Graph | ScheduleBatch→ForwardBatch、forward 三级路径（graph 回放/分段图/eager）、capture 与 replay |
 | `07-attention-backends.html` | 注意力后端 | 注册表机制、AttentionBackend 三段初始化契约、flashinfer/fa3 实现、MHA vs MLA |
 | `08-sampling.html` | 采样与结构化输出 | Sampler 贪心/概率路径、SamplingBatchInfo、grammar 约束（xgrammar 等）、function call 解析 |
-| `09-serving-entry.html` | 服务入口 | HTTP 路由、OpenAI 兼容层、离线 Engine、ServerArgs 与 runtime_context 配置体系 |
+| `09-serving-entry.html` | 服务入口 | HTTP 路由、OpenAI 兼容层、离线 Engine、前端语言（gen/fork/select 编译为运行时请求）、ServerArgs 与 runtime_context 配置体系 |
 | `10-distributed.html` | 分布式 | TP/PP/DP/EP、DataParallelController 四种负载均衡、GroupCoordinator 自定义 allreduce、dp_attention |
 | `11-hicache.html` | HiCache 分层缓存 | L1/L2/L3 分层、HiRadixTree、预取与回写策略、存储后端（mooncake/hf3fs/nixl/aibrix） |
 | `12-pd-disaggregation.html` | PD 分离部署 | bootstrap 房间握手、KV 传输（Mooncake/NIXL）、prefill/decode 两套事件循环与三个队列 |

@@ -50,10 +50,42 @@
       <li><strong>ZeRO-2</strong>：再加一条——反向传播时每个参数的梯度最终只需要在<strong>负责它的那张卡</strong>上存在，其他卡的副本归约完即可丢弃 → 梯度也分片（reduce-scatter 代替 all-reduce）。</li>
       <li><strong>Megatron DistributedOptimizer</strong>：不叫 ZeRO，但等价于 ZeRO-1——fp32 主参数和梯度缓冲按 DP 分片，蓝图是「bucket + range map」。</li>
     </ul>
+    <p>第 6 章图 6.1 画过这份字节账，这里把「三个阶段分别切了什么」收进一张表，并对上具体的类和方法——后面三节展开的代码，入口都在这张表里。</p>
+    <table class="tbl">
+      <tr><th>阶段</th><th>按 DP 切了什么</th><th>每卡剩余（B/参数）</th><th>70B、DP=8 时每卡</th><th>DeepSpeed 实现入口</th><th>Megatron 等价物</th></tr>
+      <tr>
+        <td>不开 ZeRO</td><td>什么都不切</td><td>2+2+4+4+4 = 16</td><td>1120 GB</td><td>——</td><td>——</td>
+      </tr>
+      <tr>
+        <td>ZeRO-1</td><td>fp32 master + m + v（12B 部分）</td><td>2+2+12/DP = 5.5</td><td>385 GB</td><td><code class="inline">stage_1_and_2.py</code> 的 <code class="inline">DeepSpeedZeroOptimizer</code>：归约入口 <code class="inline">reduce_ready_partitions_and_remove_grads</code>（IPG bucket，§7.2），backward 收尾 <code class="inline">independent_gradient_partition_epilogue</code>（:1000），<code class="inline">step</code> 只更新本卡分区的 master/m/v</td>
+        <td><code class="inline">distrib_optimizer.py</code> 的 <code class="inline">DistributedOptimizer</code>：<code class="inline">_build_model_gbuf_param_range_map</code> 算每卡窗口（§7.3），缓冲由 <code class="inline">_ParamAndGradBuffer</code> 分配</td>
+      </tr>
+      <tr>
+        <td>ZeRO-2</td><td>再加梯度（fp16 grad 2B 部分）</td><td>2+14/DP = 3.75</td><td>262.5 GB</td><td>同上，<code class="inline">independent_gradient_partition_epilogue</code> 里多一步：非本卡分区的梯度归约完即清（<code class="inline">_clear_param_grad_only</code>）</td>
+        <td>无对应——Megatron 梯度始终全量存在 <code class="inline">grad_data</code>，见 §7.4 差异表</td>
+      </tr>
+      <tr>
+        <td>ZeRO-3</td><td>再加参数（fp16 param 2B 部分）</td><td>16/DP = 2</td><td>140 GB</td><td><code class="inline">stage3.py</code> 的 <code class="inline">DeepSpeedZeroOptimizer_Stage3</code>：<code class="inline">_pre_step</code> → 逐子组 <code class="inline">_prepare_sub_group</code> →（前向/反向经 <code class="inline">PartitionedParameterCoordinator.fetch_sub_module</code> 借参数、<code class="inline">release_sub_module</code> 还）→ <code class="inline">unscale_and_clip_grads</code> → <code class="inline">_optimizer_step</code> → <code class="inline">_release_sub_group</code>（§8.3）</td>
+        <td>无对应——Megatron 侧参数分片靠 Virtual Pipeline / 手动放 target，不自动 fetch</td>
+      </tr>
+    </table>
     <div class="callout info">
       <b class="tag">为什么 ZeRO-2 止步于此</b>
       参数不能像梯度那样「归约完就丢」——前向每一步都要用全部参数。参数分片意味着每次前向都要现场拼装（fetch），这就是 ZeRO-3，第 8 章专门讲它的代价与工程。
     </div>
+
+    <h3>显存省下了，通信多付多少</h3>
+    <p>显存账上面这张表已经给出，代价在通信侧。设参数量为 P、DP 度为 d，bf16 记 2 字节。梯度侧每步从「1 次 all-reduce」变成「reduce-scatter」：ring RS 每卡收发 2(d−1)/d × P×2B；之后各卡还要 all-gather 完整更新后的参数，量同为 2(d−1)/d × P×2B。代入 70B、d=8：每卡每步梯度归约收发 2×(7/8)×140 GB = <strong>245 GB</strong>，参数 all-gather 同样 245 GB——比不开 ZeRO 的 1 次 all-reduce（140 GB）翻倍不止。再看每个阶段的增量：</p>
+    <pre class="code"><span class="lang-tag">通信账</span>（每卡每 step 的收发字节，P=70B 参数、d=DP 度、ring 估算 2(d-1)/d 因子）
+
+不开 ZeRO：  all-reduce(2B 梯度)      = 2(d-1)/d · 2P = 245 GB
+ZeRO-1：    同上 + step 后 AG(2B 参数) = 同上 + 2(d-1)/d · 2P = +245 GB
+             # fp32 master/m/v 各存 1/d，AG 的是更新后的 bf16 参数
+ZeRO-2：    梯度改 RS，量与 all-reduce 相同（RS 是 AR 的前半程）
+             # 显存省在「归约完即丢」，通信量不变
+ZeRO-3：    前向整模型 AG(2B 参数) 1 遍 + 反向再 AG 1 遍
+             = 2 × 245 GB 的额外参数搬运（开激活重算再加倍；prefetch 可与计算重叠）</pre>
+    <p>代入 70B、d=8：ZeRO-1/2 的参数同步 AG = 2×(7/8)×140 GB = <strong>245 GB</strong>，ZeRO-3 的参数 fetch 另加 2×245 GB = <strong>490 GB/卡/步</strong>（开激活重算则逼近 1 TB）——这就是第 8 章 prefetch 窗口与 overlap 存在的理由：不重叠的话这笔账直接吃掉全部带宽预算。也再次印证第 2 章的选型直觉：<strong>ZeRO 的度数受 DP 组网络带宽约束，TP/PP 的度数受卡间带宽约束</strong>——前者拆优化器状态（大头），后者拆激活。</p>
   </section>
 
   <section class="block">

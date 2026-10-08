@@ -153,6 +153,27 @@
       <b class="tag">通信形状</b>
       AlltoAll 的通信量 = 每 token 发往 EP 组内其他卡的部分（top-k 决定）。它与 TP 的 all-reduce 不同：<strong>没有求和语义</strong>，纯路由——所以无法像 RS/AG 那样与 SP 合并。MoE + TP 时 Megatron 强制开 SP（第 3 章图 3.2 的注），就是为了把 token 路由与激活切分解耦。
     </div>
+
+    <p>用一个能手算的小例子把 AlltoAll dispatch 钉死：EP=2（4 个专家每卡 2 个）、top-k=2、本卡 4 个 token，hidden 记作 t₁…t₄。router 的得分决定每个 token 去哪两个专家：</p>
+    <pre class="code"><span class="lang-tag">手算</span>专家布局：卡0 持 E0、E1；卡1 持 E2、E3（EP=2，num_local_experts=2）
+
+本卡 token 与各自的 top-2：
+  t₁ → {E0, E2}      # 一半在本卡（E0），一半要去卡1（E2）
+  t₂ → {E1, E2}
+  t₃ → {E0, E3}
+  t₄ → {E2, E3}      # 两个专家都在卡1，本 token 整个发走
+
+token_permutation 做两件事：
+  1) 按目的地重排：发往卡1 的 5 份（t₁→E2, t₂→E2, t₂→E3, t₄→E2, t₄→E3）
+     （注意 top-k=2 意味着一份 token 可能复制两份——每个目的地各一份）
+  2) all-to-all：本卡发 5 份出去、收 3 份回来（t₁→E0、t₂→E1、t₃→E0 都落本卡）
+     本卡专家 E0/E1 收到 3 份 token：t₁(E0)、t₃(E0)、t₂(E1)
+
+compute：E0 算 t₁、t₃；E1 算 t₂ —— 就是普通 MLP
+
+combine（token_unpermutation）：结果 all-to-all 送回原卡，
+  t₁ 拿到 E0 和 E2 的输出，按 probs 加权求和——一次 unpermute 还原到原位置</pre>
+    <p>通信量账：AlltoAll 每跳的本卡收发量 = 发出的份数 × hidden×2B。上例每跳发 5 份 × 每 token 8192×2B（接第 3 章的 h=8192）≈ 80 KiB——单层看似不大，但按 token 总量算：EP 度为 e、top-k=k 时，平均每 token 发出约 <code class="inline">k×(e−1)/e</code> 份跨卡。代入一个 671B 风格的配置（e=64、k=8、s=4096、b=4、h=7168、bf16）：本卡每层要发 4×4096×8×(63/64) ≈ 12.9 万份 token×h，即 <strong>dispatch 约 1.7 GiB、combine 回程同量，每层 two-hop 合计约 3.4 GiB</strong>——是第 3 章纯 TP 每层 896 MiB 的近 4 倍，且没有 RS/AG 的原语可拆、无法与计算重叠到无感，这就是「MoE 的代价全在 token 往返」的量级来源。</p>
   </section>
 
   <section class="block">

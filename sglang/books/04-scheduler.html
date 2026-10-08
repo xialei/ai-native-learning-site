@@ -35,7 +35,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 调度器与调度策略</div>
     <h1>调度器：每一步该跑谁，内存不够先踢谁</h1>
-    <div class="subtitle">第 2 章看了事件循环的主干，这一章拆其中最重的两步：get_next_batch_to_run 怎么从等待队列里挑请求组成 prefill 批（PrefillAdder 的预算制准入），以及 running batch 内存不够时怎么收缩（retract_decode 抢占）。</div>
+    <div class="subtitle">第 2 章看了事件循环的主干，这一章拆其中最重的三步：get_next_batch_to_run 怎么从等待队列里挑请求组成 prefill 批（PrefillAdder 的预算制准入）、默认启用的 overlap 事件循环怎么把 CPU 调度藏进 GPU 前向的影子里，以及 running batch 内存不够时怎么收缩（retract_decode 抢占）。</div>
   </div>
 
   <section class="block">
@@ -343,8 +343,93 @@ waiting_queue.<span class="fn">sort</span>(key=_key)</pre>
     </div>
   </section>
 
+  <section class="block" id="sec-45">
+    <h2><span class="num">4.5</span>零开销调度：overlap 事件循环</h2>
+    <p>第 2 章给出过直觉：默认启用的不是 §2.5 讲的 <code class="inline">event_loop_normal</code>，而是 <code class="inline">event_loop_overlap</code>——「零开销调度」指的就是它。先把名字说准：CPU 调度本身当然有开销，被「零掉」的是<strong>「GPU 等下一批输入」</strong>这段空闲——上一批的前向还在 GPU 上跑时，CPU 已经在挑下一批、为它分配 KV 槽位；上一批算完的 token 不经过 CPU 中转，直接作为下一批 decode 的输入。控制开关在 <code class="inline">Scheduler.__init__</code>：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — enable_overlap 的来源（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 默认开：--disable-overlap-schedule 才关（arg_groups/fields/schedule.py，默认 False）</span>
+self.enable_overlap = (
+    <span class="kw">not</span> get_schedule().disable_overlap_schedule <span class="kw">and not</span> use_mlx()
+)</pre>
+    <p>两条事件循环并排看。normal 版每轮严格串行——收请求、挑批次、<code class="inline">run_batch</code>、<strong>当场</strong> <code class="inline">process_batch_result</code>：GPU 算 batch N 时 CPU 什么也不干，batch N 的输出处理完才能发起 batch N+1 的前向。overlap 版把「收尾」从关键路径上摘下来，扔进一个 <code class="inline">result_queue</code>，让下一轮的 CPU 调度和上一轮的 GPU 前向并行：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — event_loop_overlap（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">event_loop_overlap</span>(self):
+    <span class="st">"""A scheduler loop that overlaps the CPU processing and GPU computation."""</span>
+    <span class="cmt"># 结果队列：本批前向一发出，(batch, result) 就先进队，处理被推迟</span>
+    self.result_queue: Deque[Tuple[ScheduleBatch, ...]] = <span class="cl">deque</span>()
+
+    <span class="kw">def</span> <span class="fn">pop_and_process</span>():
+        tmp_batch, tmp_result = self.result_queue.<span class="fn">popleft</span>()
+        self.<span class="fn">process_batch_result</span>(tmp_batch, tmp_result)
+
+    <span class="kw">while</span> <span class="kw">True</span>:
+        self.<span class="fn">ingest_requests</span>()
+        ...
+        plan = self.<span class="fn">get_next_batch_to_run</span>(...)   <span class="cmt"># 与上一批的 GPU 前向并行</span>
+
+        <span class="cmt"># 某些 batch 形态不重叠时，上一批的结果当场处理</span>
+        <span class="kw">if</span> disable_overlap_for_batch:
+            <span class="fn">pop_and_process</span>()
+
+        <span class="cmt"># 发射本批：run_batch 只「点火」，不等结果</span>
+        <span class="kw">if</span> batch:
+            batch_result = self.<span class="fn">run_batch</span>(batch)
+            self.<span class="fn">_apply_war_barrier</span>()
+            self.result_queue.<span class="fn">append</span>((batch.<span class="fn">copy</span>(), batch_result))
+
+        <span class="cmt"># 处理上一批——此时 GPU 正在跑本批，CPU 的处理完全重叠</span>
+        <span class="kw">if</span> self.last_batch <span class="kw">and not</span> disable_overlap_for_batch:
+            <span class="fn">pop_and_process</span>()
+
+        <span class="cmt"># 采样可能被延迟到上一批处理完之后（grammar 掩码依赖它）</span>
+        <span class="kw">if</span> self.is_generation:
+            self.<span class="fn">launch_batch_sample_if_needed</span>(batch_result, batch)
+
+        self.last_batch = batch</pre>
+    <div class="annotation"><b>「只点火，不等结果」是整个机制的关键：</b> <code class="inline">run_batch</code> 把前向发射到另一条 CUDA stream 后立即返回，返回的 <code class="inline">batch_result</code> 里很多字段此刻还没有真实值——它只是<strong>期货</strong>。正常路径直接调 <code class="inline">process_batch_result</code> 会当场阻塞等结果；overlap 路径把它存进 <code class="inline">result_queue</code>，处理时机顺延一轮。CPU 于是永远在 GPU 前面跑：GPU 算 batch N 时，CPU 已经在为 batch N+1 做调度决策。结构上 normal/overlap 只差三处：结果先进队再出队、多了 <code class="inline">is_disable_overlap_for_batch</code> 闸、末尾多了 <code class="inline">launch_batch_sample_if_needed</code>。</div>
+
+    <p>并行不是白拿的，三个支撑件各管一件事。第一个是<strong>流</strong>：调度决策跑在 <code class="inline">schedule_stream</code>，前向跑在 <code class="inline">forward_stream</code>，结果 D2H 拷贝有专门的 <code class="inline">copy_stream</code>——三条流的接力关系在 <code class="inline">launch_batch_sample_if_needed</code> 里最完整：</p>
+    <div class="code-title">python/sglang/srt/managers/scheduler.py — launch_batch_sample_if_needed（摘录，注释为译注）</div>
+    <pre class="code"><span class="kw">def</span> <span class="fn">launch_batch_sample_if_needed</span>(self, batch_result, cur_batch):
+    <span class="kw">if</span> batch_result <span class="kw">is None or</span> batch_result.delay_sample_func <span class="kw">is</span> <span class="kw">None</span>:
+        <span class="kw">return</span>
+
+    <span class="kw">with</span> self.forward_stream_ctx:
+        <span class="cmt"># 前向流先等调度流就绪，再执行延迟的采样闭包</span>
+        self.forward_stream.<span class="fn">wait_stream</span>(self.schedule_stream)
+        _batch_result = batch_result.<span class="fn">delay_sample_func</span>()
+        <span class="cmt"># 把采样出的 bonus token 转发给下一批（spec v2 的接力）</span>
+        self.<span class="fn">_relay_forward_payload</span>(cur_batch, batch_result.future_indices, batch_result)
+
+    <span class="cmt"># D2H 拷贝单开一条流：等采样结果，与后续前向并行，不堵 forward 流</span>
+    self.copy_stream.<span class="fn">wait_stream</span>(self.forward_stream)
+    <span class="kw">with</span> self.copy_stream_ctx:
+        batch_result.<span class="fn">copy_to_cpu</span>(return_logprob=cur_batch.return_logprob, ...)
+
+    <span class="cmt"># 释放闭包和 GPU 大张量——不释放就是随 result_queue 走的显存泄漏</span>
+    batch_result.delay_sample_func = <span class="kw">None</span>
+    <span class="kw">if</span> batch_result.logits_output <span class="kw">is not</span> <span class="kw">None</span>:
+        batch_result.logits_output.next_token_logits = <span class="kw">None</span></pre>
+    <div class="annotation"><b>第二个支撑件是 FutureMap：</b> overlap 下 batch N+1 组批时，batch N 的采样结果还没出来，那 decode 的 <code class="inline">input_ids</code> 从哪来？答案是按 req_pool 下标索引的常驻中转池 <code class="inline">FutureMap</code>（<code class="inline">managers/overlap_utils.py</code>）：前向一发完，采样侧就 <code class="inline">publish</code> 把新 token 写进 <code class="inline">output_tokens_buf</code> 的对应行；下一批组批时 <code class="inline">resolve_forward_inputs</code> 直接从 buf 里 gather 出输入——CPU 组批从没碰过 GPU 张量，「等待上一批结果」这一步被压缩成设备上的一次索引读。slot 0 恒等于 KV padding 行，CUDA Graph 填充进来的伪请求（req_pool_idx == 0）读它无害。</div>
+    <div class="annotation"><b>第三个是 WAR 屏障：</b> 调度流上「下一批要写」的共享缓冲，可能正是前向流上「这一批还在读」的——读写竞争（Write-After-Read）。<code class="inline">_apply_war_barrier</code> 在每次 <code class="inline">run_batch</code> 后让调度流等前向流的 shared-read 事件，普通路径是一次 <code class="inline">wait_stream</code>。第 6 章还会见到它的另一面：<code class="inline">ScheduleBatch</code> 在调度流上继续被改写、<code class="inline">ForwardBatch</code> 在前向流上被消费，所以两界之间「谁拥有哪个字段」的规矩比 normal 模式严得多。</div>
+
+    <div class="callout info">
+      <b class="tag">困惑点</b>
+      什么情况下会主动退回串行？<code class="inline">is_disable_overlap_for_batch</code>（scheduler.py）列了两类。一是<strong>连续两个 prefill 批</strong>：overlap 会让第二个 prefill 的调度决策看不到第一个的结果，压低首个 batch 的 TTFT，所以有 <code class="inline">SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP</code> 开关专门关掉这个场景（默认不开——关 overlap 损吞吐，取舍写在注释里）。二是 <code class="inline">need_grammar_sync</code>：投机解码 + grammar 同时开时，FSM 的推进必须赶在下一批组 bitmask 之前落地，这个 batch 退回同步。对照第 8 章那条「grammar_mask 不释放就是显存泄漏」的事故痕迹，可以看到同一条主线：overlap 是默认态，凡是「需要上一批结果才能继续」的逻辑都要显式声明自己站在同步这一边。
+    </div>
+
+    <table class="tbl">
+      <tr><th>维度</th><th>SGLang（overlap 事件循环）</th><th>vLLM v1（busy-loop 调度）</th></tr>
+      <tr><td>并行形态</td><td>调度流/前向流/copy 流三条 CUDA stream，CPU 组批 N+1 与 GPU 算 batch N 并行</td><td>单线程 step 循环尽可能快速轮转，靠「v1 删掉所有 Python 侧重活」把串行开销压小，而非并行</td></tr>
+      <tr><td>下一步的输入从哪来</td><td><code class="inline">FutureMap.output_tokens_buf</code> 按池下标 gather，采样结果设备间直递，不过 CPU</td><td>采样结果先回 CPU，拼进下一轮 <code class="inline">SchedulerOutput</code> 再下发</td></tr>
+      <tr><td>退回串行的时机</td><td>连续 prefill（可开关）、投机+grammar 的 FSM 同步</td><td>无此概念——每步本来就是「调度完再前向」</td></tr>
+      <tr><td>共享状态的纪律</td><td>WAR 屏障 + ScheduleBatch/ForwardBatch 两界所有权，出错形态是跨流读写竞争</td><td>单线程串行，天然无竞争</td></tr>
+    </table>
+    <p class="fig-cap" style="margin-top:8px">表 4.1：与 vLLM 的对照——同一个问题（CPU 调度不该打断 GPU），SGLang 用并行，vLLM v1 用提速。</p>
+  </section>
+
   <section class="block">
-    <h2><span class="num">4.5</span>chunked prefill：长请求怎么切</h2>
+    <h2><span class="num">4.6</span>chunked prefill：长请求怎么切</h2>
     <p>没有 chunked prefill 时，一个 30k token 的 prompt 会独占 GPU 一整轮，同期的所有 decode 请求 ITL 全部爆炸。SGLang 的处理：把长 prefill 按 <code class="inline">rem_chunk_tokens</code> 切成若干步，每步只算一段，切点请求记在 <code class="inline">chunked_req</code> 字段上。已算完的部分不浪费——每切一段就 stash 进基数树，下一段可以匹配自己前面那部分：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_policy.py — add_chunked_req（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>cand_extend_input_len = <span class="fn">len</span>(req.full_untruncated_fill_ids) - <span class="fn">len</span>(
@@ -374,7 +459,7 @@ self.<span class="fn">_update_prefill_budget</span>(
   </section>
 
   <section class="block">
-    <h2><span class="num">4.6</span>抢占：decode 内存不够时收缩</h2>
+    <h2><span class="num">4.7</span>抢占：decode 内存不够时收缩</h2>
     <p>prefill 收得再准，decode 是长跑：请求越跑 KV 越长，总有可能把池子跑穿。每轮 <code class="inline">update_running_batch</code> 先做体检，体检不过就抢占：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — update_running_batch（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 检查 decode 是否要 OOM</span>
@@ -428,10 +513,10 @@ self.<span class="fn">_update_prefill_budget</span>(
   </section>
 
   <section class="block">
-    <h2><span class="num">4.7</span>对「自研引擎」的启示</h2>
+    <h2><span class="num">4.8</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：先搭三本账的最简版（只算 rem_total），再加 CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入，cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。下一步进入 <a href="05-memory.html">第 5 章：内存池与显存预算</a>。
+      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：先搭三本账的最简版（只算 rem_total），再加 CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入，cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。CPU 调度与 GPU 前向的并行不必一开始就上：先把 normal 循环做对（它最容易读、最好调试），等调度开销真的进入瓶颈曲线，再按 §4.5 的三件套（result_queue、FutureMap、WAR 屏障）搬 overlap——顺序反过来，调试成本会翻倍。下一步进入 <a href="05-memory.html">第 5 章：内存池与显存预算</a>。
     </div>
     <p style="font-size:13.5px;color:#6b5d54">关联阅读：预算里的 <code class="inline">evictable_size()</code> 来自第 3 章的基数树；<code class="inline">check_decode_capacity</code> 的实现和 mem_fraction_static 的显存划分在第 5 章。</p>
   </section>

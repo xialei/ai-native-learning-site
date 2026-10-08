@@ -36,7 +36,7 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 实战 · 模型权重加载</div>
     <h1>实战：vLLM 是怎么把开源模型权重加载起来、并让它跑得又快又好的</h1>
-    <div class="subtitle">前面 11 章讲的是「模型已经装好之后」怎么推理。这一章回答另一头的问题：<strong>当你说 <code class="inline">vllm serve deepseek-ai/… --quantization fp8</code> 时，那几 GB～几百 GB 的 safetensors 是怎么从 HF 变成显存里一个能算的模型的？</strong>先看 from_pretrained 搞不定的三个障碍，再沿「认模型 → 选加载器 → 进显存 → 重映射参数」走完加载管线，然后是「跑得好」的调优与真实 checkpoint 目录，末了三模型实战收尾。例子用仓库真实支持的 <strong>DeepSeek-V4</strong>、<strong>GLM-5.2</strong>、<strong>Kimi-K2.5 / K3</strong>。</div>
+    <div class="subtitle">前面 11 章讲的是「模型已经装好之后」怎么推理。这一章回答另一头的问题：<strong>当你说 <code class="inline">vllm serve deepseek-ai/… --quantization fp8</code> 时，那几 GB～几百 GB 的 safetensors 是怎么从 HF 变成显存里一个能算的模型的？</strong>先看 from_pretrained 搞不定的三个障碍，再沿「认模型 → 选加载器 → 进显存 → 重映射参数」走完加载管线，然后是「跑得好」的调优与真实 checkpoint 目录，以及启动之后仍在动的 LoRA 挂载与量化注册表，末了三模型实战收尾。例子用仓库真实支持的 <strong>DeepSeek-V4</strong>、<strong>GLM-5.2</strong>、<strong>Kimi-K2.5 / K3</strong>。</div>
   </div>
 
   <section class="block">
@@ -47,7 +47,7 @@
       <li><strong>要能分片与精简</strong>：权重要按 TP/PP/EP 切到多卡，还要做算子融合、丢掉推理用不到的张量（<code class="inline">filter_files_not_needed_for_inference</code>）。</li>
       <li><strong>要能量化</strong>：FP8、MXFP4、INT4 等都要在<strong>加载时</strong>做转换，不是先无损加载再转换——否则显存峰值扛不住。</li>
     </ul>
-    <p>所以 vLLM 把「加载」拆成了一条可插拔的管线，三个障碍各有对应的节作答：最先发生的一步是「认出这是哪个模型」（12.2）；要分片与精简，先挑加载器、再让权重从磁盘进显存，两站接力（12.3、12.4）；参数名对不上靠重映射（12.5）；要量化则和 kernel 协同调优（12.6）。</p>
+    <p>所以 vLLM 把「加载」拆成了一条可插拔的管线，三个障碍各有对应的节作答：最先发生的一步是「认出这是哪个模型」（12.2）；要分片与精简，先挑加载器、再让权重从磁盘进显存，两站接力（12.3、12.4）；参数名对不上靠重映射（12.5）；要量化则和 kernel 协同调优（12.6）。管线的尽头还有两个「启动之后仍在动」的机制：LoRA 适配器按请求挂载（12.7）、量化方法的注册与逐层分派（12.8）。</p>
   </section>
 
   <section class="block">
@@ -343,11 +343,66 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
   </section>
 
   <section class="block">
-    <h2><span class="num">12.7</span>开源权重仓库长什么样：三个真实 checkpoint 的目录结构</h2>
+    <h2><span class="num">12.7</span>运行时还能挂东西：LoRA 适配器的加载与运行路径</h2>
+    <p>前六节处理的都是「启动时一次性装完」的权重。LoRA 不一样：适配器在<strong>请求到达时才指定</strong>、可能<strong>随时增删</strong>，而主模型权重早就在显存里了。所以它不走 12.4 的加载管线，而有一套独立的运行时机制。接口面很小——每个请求带一个 <code class="inline">LoRARequest</code>：</p>
+    <div class="code-title">vllm/lora/request.py — LoRARequest（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LoRARequest</span>(msgspec.Struct, ...):
+    <span class="cmt"># lora_int_id 必须全局唯一标识一个适配器（vLLM 目前不强制检查）</span>
+    lora_name: <span class="cl">str</span>
+    lora_int_id: <span class="cl">int</span>
+    lora_path: <span class="cl">str</span> = <span class="st">""</span>
+    load_inplace: <span class="cl">bool</span> = <span class="kw">False</span>
+    <span class="cmt"># True = 同 id 也强制重载并原地替换；False（默认）= 已加载就直接复用</span>
+
+    <span class="kw">def</span> <span class="fn">__post_init__</span>(self):
+        <span class="kw">if</span> self.lora_int_id &lt; <span class="nu">1</span>:
+            <span class="kw">raise</span> <span class="cl">ValueError</span>(...)
+        assert self.lora_path, <span class="st">"lora_path cannot be empty"</span></pre>
+    <p>引擎侧由 <code class="inline">--enable-lora</code>（arg_utils.py:667，默认关）打开，参数在 <code class="inline">LoRAConfig</code>（vllm/config/lora.py:30）：最重要的两个是 <code class="inline">max_loras</code>（默认 1——<strong>一个 batch 里最多容纳几个不同适配器</strong>）和 <code class="inline">max_lora_rank</code>（默认 16，预分配 LoRA 权重的上限秩）。</p>
+    <p>路径分四步走。<strong>第一步，worker 加载时替换模块</strong>：开了 LoRA 的 runner 在 load_model 之后调 <code class="inline">load_lora_model</code>（gpu_model_runner.py:5282，V2 在 gpu/model_runner.py:384），把模型里的每个线性层包上一层 LoRA 壳——管理类是 <code class="inline">LRUCacheWorkerLoRAManager</code>（lora/worker_manager.py:247），docstring 说明了它怎么管缓存：「请求到来时装载请求的 LoRA（已加载则跳过），缓存超容时卸载最久未用的」。<strong>第二步，调度器保证 batch 不超限</strong>：</p>
+    <div class="code-title">vllm/v1/core/sched/scheduler.py — max_loras 约束（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>scheduled_loras: <span class="fn">set</span>[<span class="cl">int</span>] = <span class="fn">set</span>()
+<span class="cmt"># 调度循环里，waiting 队列逐请求检查：</span>
+<span class="kw">if</span> (<span class="fn">len</span>(scheduled_loras) == self.lora_config.max_loras
+    <span class="kw">and</span> request.lora_request.lora_int_id <span class="kw">not in</span> scheduled_loras):
+    skip_request(request_queue)   <span class="cmt"># 新适配器挤不进来 → 这一步先不调它</span></pre>
+    <p><strong>第三步，每步前向把「哪个 token 用哪个适配器」告诉 kernel</strong>：<code class="inline">_set_active_loras</code>（lora_model_runner_mixin.py:58）把逐 token 的 lora 映射压成 <code class="inline">LoRAMapping</code> 张量。实际的乘法发生在 punica 系列 kernel 里——LoRA 的数学是 <code class="inline">y = Wx + BAx</code>，其中 <code class="inline">B(Ax)</code> 分成两步：shrink（A 矩阵降维，多个适配器用 SGMV 批量算）和 expand（B 矩阵升维），入口在 <code class="inline">vllm/lora/punica_wrapper/punica_gpu.py</code> 的 <code class="inline">add_shrink</code>（:91）/<code class="inline">add_expand</code>（:124），MoE 模型另有 <code class="inline">add_lora_fused_moe</code> 等专用入口。<strong>第四步，CUDA graph 按活跃 LoRA 数分档捕获</strong>：</p>
+    <div class="code-title">vllm/v1/worker/gpu/lora_utils.py — get_lora_capture_cases（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># cudagraph_specialize_lora=True（默认）：</span>
+<span class="cmt">#     2 的幂直到 max_loras，再加 max_loras+1 —— 每档单独捕获一张图</span>
+<span class="cmt"># False：只捕 [0, max_loras+1] 两档</span></pre>
+    <div class="annotation"><b>几个容易踩的坑：</b>① <code class="inline">lora_int_id</code> 要自己保证全局唯一——vLLM 的注释明说「currently not enforced」；要用新权重顶掉旧适配器，得显式 <code class="inline">load_inplace=True</code>。② <code class="inline">max_loras</code> 直接限制单批多样性：来了第 5 个不同适配器而 max_loras=4，调度器就让它在队列里等（scheduler.py:911 附近的 gate），不是报错而是<strong>延迟调度</strong>。③ 非 CUDA 平台走 SGMV kernel 的原因写在 <code class="inline">_set_active_loras</code> 的注释里：「so we always use the SGMV kernels on non-cuda platforms」（is_prefill 恒为 True）。④ CUDA graph 捕获案例随 LoRA 配置变多，启动时间和显存都涨——<code class="inline">cudagraph_specialize_lora</code>（config/compilation.py:659，默认 True）就是这笔开销的开关。自研启示：LoRA 服务化的最小闭环 = 「请求带适配器 id + worker 里 LRU 缓存适配器权重 + 逐 token 映射张量」三件事，SGMV kernel 可以先不做。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.8</span>量化的注册表：--quantization 后面有多少个名字</h2>
+    <p>12.6 讲了量化怎么「协同调优」，但没讲机制：<code class="inline">--quantization fp8</code> 里的 <code class="inline">fp8</code> 是怎么变成显存里那个 kernel 的？答案是一张两层注册表。<strong>第一层是名字清单</strong>——<code class="inline">QuantizationMethods</code>（vllm/model_executor/layers/quantization/__init__.py:9）是个 Literal，列了约 30 个方法名：awq / auto_awq / fp8 / gptq / gptq_marlin / compressed-tensors / modelopt 系列 / mxfp4 / deepseek_v4_fp8……末尾还挂着一组「在线量化速记名」（fp8_per_tensor、nvfp4_per_token 等，注释写明与 config 里的 _ONLINE_SHORTHANDS 由断言保持同步）。<strong>第二层是名字 → 配置类</strong>：</p>
+    <div class="code-title">vllm/model_executor/layers/quantization/__init__.py — get_quantization_config（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_quantization_config</span>(quantization: <span class="cl">str</span>) -&gt; type[<span class="cl">QuantizationConfig</span>]:
+    <span class="kw">if</span> quantization == <span class="st">"fp8"</span>:
+        <span class="kw">return</span> <span class="cl">Fp8Config</span>
+    <span class="kw">elif</span> quantization <span class="kw">in</span> (<span class="st">"awq"</span>, <span class="st">"auto_awq"</span>, ...):   <span class="cmt"># 同义归并到 AutoAWQConfig</span>
+        <span class="kw">return</span> <span class="cl">AutoAWQConfig</span>
+    <span class="kw">elif</span> quantization <span class="kw">in</span> (<span class="st">"gptq"</span>, <span class="st">"auto_gptq"</span>, <span class="st">"gptq_marlin"</span>, ...):
+        <span class="kw">return</span> <span class="cl">AutoGPTQConfig</span>
+    <span class="cmt"># …自定义方法先查 register_quantization_config 装饰器注册的表…</span></pre>
+    <p>有名字还不够——<strong>真正的分派发生在每个线性层构造时</strong>。这层比注册表隐蔽，却决定了「同一个引擎里哪些层被量化、哪些没有」：</p>
+    <div class="code-title">vllm/model_executor/layers/linear.py — LinearBase.__init__ 的 quant_method 指派（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> quant_config <span class="kw">is</span> <span class="kw">None</span>:
+    self.quant_method = <span class="cl">UnquantizedLinearMethod</span>()   <span class="cmt"># 普通矩阵乘</span>
+<span class="kw">elif</span> quant_method := resolve_quant_method(quant_config, self, prefix=prefix):
+    self.quant_method = quant_method
+<span class="kw">else</span>:
+    <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">"All linear layers should support quant method."</span>)</pre>
+    <div class="annotation"><b>forward 只认 <code class="inline">quant_method</code> 这个接口：</b>LinearBase.forward（linear.py:417）里就一句 <code class="inline">output = self.quant_method.apply(self, x, bias)</code>——上层模型代码完全不知道权重是 bf16 还是 fp8 还是 marlin 打包的 int4，多态全在这一个方法调用里。<code class="inline">resolve_quant_method</code>（base_config.py:285）则是 12.6 说的「在线量化」的入口：checkpoint 本身没量化时它可以套一层 online quantization 配置（对 LinearBase/RoutedExperts 生效，重复量化直接报错）。选哪个 kernel 还有第三层：以 FP8 为例，<code class="inline">Fp8LinearMethod.__init__</code>（fp8.py:241）按「块量化走 deep_gemm；逐 token 动态量化走 cutlass_fp8_supported() 的 token 对称 kernel，不支持则退 tensor 对称；无 FP8 硬件的老卡整条换成 marlin weight-only」逐级下落。自研启示：名字注册表 + 层级 quant_method 多态 + kernel 分级，三层各管一件事——照这个形状抄，以后加一种量化格式只动第一层和第三层，模型代码零改动。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.9</span>开源权重仓库长什么样：三个真实 checkpoint 的目录结构</h2>
     <p>前面 12.3–12.6 讲的是加载管线怎么「吞下」权重。那权重本身，在 HuggingFace / ModelScope 仓库里到底长什么样？这一节拿三个真实 checkpoint 的目录结构做对照——它们恰好覆盖了「标准仓库 / 带 chat_template / 需远程代码」三种典型形态，每一种都会在加载管线上踩到不同的坑。</p>
     <div class="callout info">
       <b class="tag">模型名对齐</b>
-      这三个 checkpoint 与本章所用模型家族的对应：DeepSeek-V4-Flash-0731 是 <strong>DeepSeek-V4（DSA）</strong>系列的一个具体版本；GLM-5.2 即 12.6 / 12.8 的 GLM-5.2；Kimi-K3 是比 12.8 表中 K2.5 更新的一代（K2.5 已原生进 vLLM，K3 仓库自带自定义建模代码，集成路径见下）。注意 DeepSeek-V4-<strong>Flash</strong> 里的「Flash」是 <strong>checkpoint 命名</strong>（该版本主打 FlashMLA 稀疏后端），与 12.6 的 FlashMLA <strong>后端</strong>同名但所指不同——这个 checkpoint 仍由 DeepSeek-V4（DSA）模型代码服务。
+      这三个 checkpoint 与本章所用模型家族的对应：DeepSeek-V4-Flash-0731 是 <strong>DeepSeek-V4（DSA）</strong>系列的一个具体版本；GLM-5.2 即 12.6 / 12.9 的 GLM-5.2；Kimi-K3 是比 12.9 表中 K2.5 更新的一代（K2.5 已原生进 vLLM，K3 仓库自带自定义建模代码，集成路径见下）。注意 DeepSeek-V4-<strong>Flash</strong> 里的「Flash」是 <strong>checkpoint 命名</strong>（该版本主打 FlashMLA 稀疏后端），与 12.6 的 FlashMLA <strong>后端</strong>同名但所指不同——这个 checkpoint 仍由 DeepSeek-V4（DSA）模型代码服务。
     </div>
 
     <p>三个仓库各自的形态，按「结论（它长什么样）→ 为什么（对你部署意味着什么）→ 线索（目录里的证据）」展开。</p>
@@ -423,7 +478,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
   </section>
 
   <section class="block">
-    <h2><span class="num">12.8</span>三模型实战对比 + 自研启示</h2>
+    <h2><span class="num">12.10</span>三模型实战对比 + 自研启示</h2>
     <p>回到 12.1 的三个障碍：「参数名对不上」由 12.5 的重映射解决，「分片与精简」由 12.3/12.4 的加载器管线解决，「量化」由 12.6 的协同调优解决。三个真实模型把这条管线各走了一遍：</p>
     <table class="tbl">
       <tr><th>模型</th><th>架构/后端</th><th>HF 架构名（示例）</th><th>加载要点</th></tr>

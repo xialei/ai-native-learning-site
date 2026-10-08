@@ -472,6 +472,49 @@ currentMessages = handlerResult?.messages ?? currentMessages;
       <b class="tag">边界为什么这么设计</b>
       每个草稿都即时重算预览，等于<strong>「先在沙盘上推演，推演失败就整体撤销」</strong>——扩展永远不能把「模型面前的上下文」写坏，最多是自己的提案被丢弃。<code class="inline">continue: true</code> 的语义与第 3 章 finishTurn 相同：保证一次下一请求，且 AgentSession 会校验「当前上下文确实跑得动一次请求」（canContinue 检查，见 <code class="inline">_buildBoundaryContext</code>）——凭空 <code class="inline">continue</code> 而上下文以 assistant 结尾、也没有排队消息，会被拒绝并报错。
     </div>
+    <p>事件桥讲的是扩展「跑起来之后」的行为；还剩半张图——扩展、技能、模板这些资源<strong>从哪来、怎么装、怎么换</strong>。这条装载线的第一环是接口：<code class="inline">ResourceLoader</code>。AgentSession 不自己去翻目录找资源，它只依赖下面这个小接口（注意它管的不止扩展——技能、提示词模板、主题、系统提示词都从这进）：</p>
+    <div class="code-title">core/resource-loader.ts · ResourceLoader 接口（摘录）</div>
+    <pre class="code"><code><span class="kw">export interface</span> <span class="fn">ResourceLoader</span> {
+  getExtensions(): LoadExtensionsResult;
+  getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
+  getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
+  getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
+  getAgentsFiles(): { agentsFiles: Array&lt;{ path: string; content: string }&gt; };
+  getSystemPrompt(): string | <span class="kw">undefined</span>;
+  getSystemPromptSource(): { path: string } | <span class="kw">undefined</span>;
+  getAppendSystemPrompt(): string[];
+  getAppendSystemPromptSources(): Array&lt;{ path: string }&gt;;
+  extendResources(paths: ResourceExtensionPaths): <span class="kw">void</span>;
+  reload(options?: ResourceLoaderReloadOptions): Promise&lt;<span class="kw">void</span>&gt;;
+}</code></pre>
+    <p><strong>发现：目录约定，不靠配置文件。</strong>默认实现按固定目录扫描——用户级 <code class="inline">~/.pi/agent/{extensions,skills,prompts,themes}</code>，项目级 <code class="inline">.pi/{extensions,skills,prompts,themes}</code>，外加 AGENTS.md/CLAUDE.md 一类上下文文件。扩展入口的解析顺序是：package.json 里的 <code class="inline">pi.extensions</code> 字段 → <code class="inline">index.ts</code> → <code class="inline">index.js</code>，命中即止（注释原文「1. package.json with "pi.extensions" field → returns declared paths; 2. index.ts or index.js → returns the index file」）。</p>
+    <p><strong>加载：jiti 直接吃 TypeScript。</strong>扩展源码用 jiti 加载，不需要编译步骤——文件头注释「loads TypeScript extension modules using jiti」。加载结果进一个模块级缓存（Map + cwd + 代数 generation）；<code class="inline">clearExtensionCache()</code> 一口气清 Map、清 cwd、把代数 +1，任何引用旧代数的缓存条目自然失效。扩展的工厂函数在加载时执行一次，产出 ExtensionAPI（registerTool / registerCommand / registerShortcut / registerFlag / registerProvider / registerMcpServer / registerVirtualModel）；工厂里不该开进程、起 socket——会话生命周期钩子（<code class="inline">session_start</code> / <code class="inline">session_shutdown</code>，reason 区分 <code class="inline">startup / reload / new / resume / fork</code>）才是干这些事的地方。每个扩展拿到的 <code class="inline">ctx</code> 是有时效的：session 替换或 reload 之后旧 ctx 直接作废，运行时调用会抛出一段很长的报错原文（「This extension ctx is stale after session replacement or reload…For reload, do not use the old ctx after await ctx.reload()」）。</p>
+    <p><strong>技能：渐进披露。</strong>技能不进系统提示词正文。系统提示词里只放一张「货架清单」，用 <code class="inline">&lt;available_skills&gt;</code> XML 列出每个技能的 <code class="inline">name / description / location</code> 三行元数据，并附一句指令：「Use the read tool to load a skill's file when the task matches its description.」——模型判断任务匹配时，自己用 read 工具把 SKILL.md 读进来。展开成正文发生在用户敲 <code class="inline">/skill:name args</code> 时：</p>
+    <div class="code-title">core/agent-session.ts · _expandSkillCommand（摘录）</div>
+    <pre class="code"><code><span class="kw">const</span> content = readFileSync(skill.filePath, <span class="st">"utf-8"</span>);
+<span class="kw">const</span> body = stripFrontmatter(content).trim();
+<span class="kw">const</span> skillBlock = <span class="st">`&lt;skill name="${skill.name}" location="${skill.filePath}"&gt;</span>
+<span class="cmt">References are relative to ${skill.baseDir}.</span>
+
+${body}
+<span class="st">&lt;/skill&gt;`</span>;
+<span class="kw">return</span> args ? <span class="st">`${skillBlock}\n\n${args}`</span> : skillBlock;</code></pre>
+    <p>两条路径的分工值得注意：模型自发的「按需读文件」零展开成本，但每次都要花一轮工具调用；用户敲命令则把全文（frontmatter 已剥掉）包进 <code class="inline">&lt;skill&gt;</code> 块直接进上下文，一步到位但占 token。另一个开关是 frontmatter 里的 <code class="inline">disable-model-invocation</code>——设了它的技能<strong>整个从 <code class="inline">&lt;available_skills&gt;</code> 清单里排除</strong>（源码注释：「Skills with disableModelInvocation=true are excluded from the prompt (they can only be invoked explicitly via /skill:name commands)」），模型看不到它，只有用户敲命令这一条路径。提示词模板与之同构：<code class="inline">/name args</code> 展开时 <code class="inline">substituteArgs</code> 支持 <code class="inline">$1..$N</code>、<code class="inline">$@</code>（全部参数）、<code class="inline">${N:-default}</code>（缺省值）、<code class="inline">${@:N}</code> 和 <code class="inline">${@:N:L}</code>（bash 风格切片，把第 N 个参数开始的 L 个拼回去），替换不递归——展开结果里再有 <code class="inline">$1</code> 不会再被展开。</p>
+    <p><strong>reload：先退场、再换资源、再进场。</strong>改完扩展代码想让它生效，不用重启，敲 <code class="inline">/reload</code>。整个流程严格排队：</p>
+    <div class="code-title">core/agent-session.ts · reload()（摘录，注释为译注）</div>
+    <pre class="code"><code><span class="kw">await</span> emitSessionShutdownEvent(oldRunner, { type: <span class="st">"session_shutdown"</span>, reason: <span class="st">"reload"</span> });
+oldRunner.invalidate();               <span class="cmt">// 旧 ctx 全部作废（见上）</span>
+<span class="kw">await</span> <span class="kw">this</span>.settingsManager.reload();
+resetApiProviders();
+<span class="kw">await</span> <span class="kw">this</span>._resourceLoader.reload();  <span class="cmt">// 重新扫描目录 + 清缓存 + 重新加载</span>
+<span class="cmt">// ……新默认工具补齐、_buildRuntime 重建运行时……</span>
+<span class="kw">await</span> <span class="kw">this</span>._extensionRunner.emit({ type: <span class="st">"session_start"</span>, reason: <span class="st">"reload"</span> });
+<span class="kw">await</span> <span class="kw">this</span>.extendResourcesFromExtensions(<span class="st">"reload"</span>);</code></pre>
+    <p>顺序是硬约束：<strong>先把旧扩展体面送走</strong>（session_shutdown 事件让它收尾），<strong>再换资源</strong>（settings → API providers → ResourceLoader 逐级 reload），<strong>最后让新扩展进场</strong>（session_start, reason "reload"）。flag 值单独搬运——上一轮扩展解析出的 flag 值被显式带过桥，用户改的开关不因 reload 丢失。内置扩展（第 11 章的 codemode / tool-search / mcp）也走同一条装载线，只是路径是 <code class="inline">builtin:&lt;name&gt;</code>；资源名撞车时第三方顶掉内置版（<code class="inline">replaceable</code>）并给出警告，这就是「内核零改动」能兑现的机制后盾。</p>
+    <div class="callout info">
+      <b class="tag">装载线给自研的启示</b>
+      资源发现靠目录约定而不是注册表文件，用户「放进目录就有」的心智最省事；TS 源码免编译加载（jiti）把扩展门槛从「会打包」降到「会写函数」；生命周期钩子 + 作废机制保证了「换资源不断电」。这三件事都没有任何一件依赖 pi 的其他部分——是三个可以单独抄走的通用模式。
+    </div>
   </section>
 
   <section class="block">

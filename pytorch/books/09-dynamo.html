@@ -84,12 +84,56 @@ accumulated_recompile_limit = 256</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">9.4</span>从 Dynamo 到 AOTAutograd：一次 compile 的接力</h2>
-    <p>torch.compile(backend="inductor") 的完整管线在第 10 章展开，这里先立好交接面：Dynamo 产出 FX 图（前向），AOTAutograd 接手拆成前向图 + 反向图（用的还是第 4 章那套 min-cut 思想），再分别交给 Inductor 编译。三段的分工记成三行：Dynamo 管「Python 语义 → 图」，AOTAutograd 管「图 → 前向+反向两张图」，Inductor 管「图 → kernel」。</p>
-    <p>这个接力的用户可感知面是「编译错误发生在哪一段」。报错里出现 Dynamo 字样，多半是字节码分析不支持某写法（回退或报错）；出现 AOTAutograd / partition，是联合图切分出了问题（常与 inplace/view 有关）；出现 Inductor / Triton，是 kernel 生成或 autotune 的问题。三段各自的诊断工具不同（counters、min-cut 可视化、TORCH_LOGS=graph_breaks），按报错关键词选工具能省大量时间。</p>
+    <h2><span class="num">9.4</span>graph break：一张图从哪里断开、怎么接上</h2>
+    <p>9.3 讲的是整段放弃：某个代码对象压根不编。但更常见的现象是「编是编了，trace 中途断一下」——这就是 graph break。它和整段回退的差别在于：断裂点之前的算子已经进图，Dynamo 把这半截先编译掉，再从断裂点之后继续接着 trace，一个函数最终产出多段图。9.1 的注记留了个尾巴——「没跑过的分支没进图」——分支条件是张量时怎么办？断开、把条件求值留在 eager、前后各接一段图，这正是本节要展开的机制。</p>
+    <p>哪些写法会触发断裂？Dynamo 维护了一份注册表（torch/_dynamo/graph_break_registry.json，600 项左右，每项一个编号、一段解释、几条修改建议）。高频触发写法就这几类：</p>
+    <ul>
+      <li><strong>张量当分支条件</strong>：<code class="inline">if loss.sum() > 0:</code>。图里没有 loss 的值，跳转方向定不下来。这是最高频的一类，注册表编号 GB0170，报错名 Data-dependent branching，建议里给了替代写法：能写成 shape guard 的改用普通 Python int，动态分支用 torch.cond，纯条件取值用 torch.where。</li>
+      <li><strong>取值出图</strong>：<code class="inline">loss.item()</code>、Tensor.numpy()、print(tensor)。数据从张量世界回到 Python 世界，trace 断（GB0124：config.capture_scalar_outputs 默认关着，想捕获得设环境变量 TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1）。</li>
+      <li><strong>改图输入的元数据</strong>：<code class="inline">x.transpose_(1, 2)</code>、requires_grad_()。输入 tensor 的 shape/标志是 guard 的一部分，原地改等于让 guard 失效（GB0125 报 requires_grad_；inplace view 的建议是换成 <code class="inline">x = x.transpose(1, 2)</code> 这种非原地写法）。</li>
+      <li><strong>别的语言/别的表示</strong>：Tensor.numpy()（trace_numpy 默认关，GB0105）、sparse tensor。</li>
+      <li><strong>默认断裂的 print()</strong>：print 是个普通内置调用，trace 不动它就断。想不断，用 torch._higher_order_ops.print（以 HOP 形式进图），或把自定义日志函数加进 config.reorderable_logging_functions 让 Dynamo 挪到编译区末尾重放。</li>
+    </ul>
+    <p>断开之后怎么接上？Dynamo 生成一组<strong>续跑函数</strong>。看数据依赖分支的处理（symbolic_convert.py 的 generic_jump，一条 <code class="inline">if</code> 断裂后产出两个续跑点）：</p>
+    <div class="code-title">torch/_dynamo/symbolic_convert.py — generic_jump 里生成两个续跑点（摘录）</div>
+    <pre class="code"><span class="lang-tag">python</span>if_next = self.create_call_resume_at(
+    self.next_instruction,
+    all_stack_locals_metadata,
+)
+...
+if_jump = self.create_call_resume_at(
+    inst.target,
+    all_stack_locals_metadata,
+)
+
+jump_inst = create_instruction(inst.opname, target=if_jump[0])
+...
+self.output.add_output_instructions([jump_inst] + if_next + if_jump)</pre>
+    <p>编译产物里出现两个 <code class="inline">__resume_at_&lt;字节码偏移&gt;</code> 函数（名字就带断点位置，trace 里能看到），中间由一条真实的 Python 条件跳转指令连接——条件成立走 if_next 指向的继续点，不成立走 if_jump 指向的。也就是说断裂不是「断」，是 Python 函数之间的正常调用：前半段图跑完，条件在 eager 里求值，然后调进对应的 resume 函数继续跑后半段图。不涉及跳转的断裂（比如一个不支持的 CALL）同样收尾，只是只生成一个续跑点，那条不支持的字节码本身原样执行（eager），再从下一条接着编译。</p>
+    <div class="annotation"><b>断裂的判定先于断裂：</b>Dynamo 不是等撞上不支持的写法才停。trace 过程中维护一份推测记录（speculation log），第一次编译把「可以从哪里恢复」的候选点都记下来；真正断的时候重放这份记录，在第一个失效点停下、就地切图。所以断裂位置看起来在「行 N」，实际编译可能早就在为「行 N 之后的某处」做准备了。断裂也可以被禁掉：fullgraph=True（或 error_on_graph_break=True）把断裂从「容忍」改成「报错」——torch.export 就工作在这个模式下，导出要求整段一张图，dynamic 写法必须先处理干净。</div>
+    <p>诊断从两个入口进。第一个是 <code class="inline">TORCH_LOGS=graph_breaks</code>，实际输出长这样（以 loss.item() 为例）：</p>
+    <div class="code-title">TORCH_LOGS=graph_breaks 的输出结构（格式按源码，内容有删节）</div>
+    <pre class="code"><span class="lang-tag">text</span>Graph break in user code at model.py:57
+Graph Break Reason: Unsupported Tensor.item() call with capture_scalar_outputs=False
+  Explanation: Dynamo does not support tracing `Tensor.item()` with config.capture_scalar_outputs=False.
+  Hint: Set `torch._dynamo.config.capture_scalar_outputs = True` or `export TORCHDYNAMO_CAPTURE_SCALAR_OUTPUTS=1` ...
+
+User code traceback: (略)</pre>
+    <p>读法：第一行定位到你的源码行；Reason 段的几行是模板化的——报错名（拿这个名字去注册表里能对上编号）、Explanation 说 Dynamo 拒绝的理由、Hint 给替代写法或开关，末尾还有一段 Developer debug context 和文档链接。多数 graph break 靠 Hint 就能解。</p>
+    <p>第二个入口是 <code class="inline">torch._dynamo.explain(fn)(*args)</code>：不装 Inductor，只让 Dynamo 跑一遍分析，返回一份 ExplainOutput——编出了几段图、每段有哪些算子、guard 是什么、断裂原因列表。快速回答「我这段代码到底编成了几块」用这个最省事。</p>
     <div class="callout info">
       <b class="tag">要点</b>
-      Dynamo 的本质是一套「带生效条件的缓存」：字节码 → 图 + guards，guard 全过走缓存，否则为新路径再编一份。8 次上限、回退面、dynamic 开关都是围绕这个缓存的策略参数。下一章进编译管线的下游：图怎么变成 Triton kernel。
+      graph break 不是 bug，是「Python 太动态」这个前提下的正常分工：图编得动的进图，编不动的留在 eager，用续跑函数把两段缝起来。性能问题的信号是断裂次数和位置——torch._dynamo.explain 一看便知；两条经验是热路径尽量别断（一次断裂引入一次 eager 往返），修法优先选 Hint 里的改写而不是关断裂（error_on_graph_break=True 让断裂直接报错，逼你把动态写法处理干净）。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.5</span>从 Dynamo 到 AOTAutograd：一次 compile 的接力</h2>
+    <p>torch.compile(backend="inductor") 的完整管线在第 10 章展开，这里先立好交接面：Dynamo 产出 FX 图（前向），AOTAutograd 接手拆成前向图 + 反向图（用的还是第 4 章那套 min-cut 思想），再分别交给 Inductor 编译。三段的分工记成三行：Dynamo 管「Python 语义 → 图」，AOTAutograd 管「图 → 前向+反向两张图」，Inductor 管「图 → kernel」。</p>
+    <p>这个接力的用户可感知面是「编译错误发生在哪一段」。报错里出现 Dynamo 字样，多半是字节码分析不支持某写法（回退或报错）；出现 AOTAutograd / partition，是联合图切分出了问题（常与 inplace/view 有关）；出现 Inductor / Triton，是 kernel 生成或 autotune 的问题。三段各自的诊断工具不同：Dynamo 用 counters 与 TORCH_LOGS=graph_breaks（9.4），AOTAutograd 用 min-cut 可视化，Inductor 用 TORCH_COMPILE_DEBUG 导出的编译产物目录，按报错关键词选工具能省大量时间。</p>
+    <div class="callout info">
+      <b class="tag">要点</b>
+      Dynamo 的本质是一套「带生效条件的缓存」：字节码 → 图 + guards，guard 全过走缓存，否则为新路径再编一份。8 次上限、回退面、graph break 的接缝、dynamic 开关都是围绕这个缓存的策略参数。下一章进编译管线的下游：图怎么变成 Triton kernel。
     </div>
   </section>
 

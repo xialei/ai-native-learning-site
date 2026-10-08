@@ -90,6 +90,17 @@
       <tr><td>backward 前段长时间无 kernel</td><td>反向引擎的依赖等待（05 章，可能是图宽度过小）</td></tr>
       <tr><td>数据加载间隙 GPU 空闲</td><td>8 章 prefetch 不足，worker 数不够</td></tr>
     </table>
+    <p>这张表读起来有个前提：得知道 CPU 行和 kernel 行是同一件事的两面，还是两件不相干的事。配对靠 correlation id：每个 CPU 算子开始记录时（collection.cpp 的 begin_op），profiler 往 Kineto 压入一个自增的整数；随后这个算子触发的 cudaLaunchKernel 和 GPU kernel 事件由 Kineto 带着同一个 id 收上来。导出的 Chrome trace 里，kernel 行的 args 里那个 "External id" 就是对应 CPU 算子的 correlation id。源码里把配对规则讲得直白（torch/csrc/profiler/collection.cpp，:1057 起）：</p>
+    <div class="code-title">torch/csrc/profiler/collection.cpp — CPU 算子与 Kineto 事件的两种配对机制（原文摘录）</div>
+    <pre class="code"><span class="lang-tag">cpp</span><span class="cmt">// Consider a call to `torch.add`.</span>
+<span class="cmt">// Three events will be collected:</span>
+<span class="cmt">//   `aten::add`          (TorchOp, collected by profiler)</span>
+<span class="cmt">//   `cudaLaunchKernel`   (CUDA runtime event, collected by Kineto)</span>
+<span class="cmt">//   `at::vectorized_...` (GPU kernel, collected by Kineto)</span>
+<span class="cmt">// If we only relied on correlation IDs we would set both Kineto events as</span>
+<span class="cmt">// children of the `at::add`, rather than the correct</span>
+<span class="cmt">//   `at::add -> cudaLaunchKernel -> at::vectorized_...`</span></pre>
+    <p>单靠 correlation id 分不清「launch 是算子自己发的」和「kernel 是 launch 发的」，所以还有第二层 flow：launch 事件开启一个 flow，kernel 沿用同一 flow id。拼树时先按 flow 接 launch→kernel 这条边，接不上的再退回 correlation id。对使用者的意义：在 trace 视图（chrome://tracing、Perfetto）里点一个 GPU kernel，看它的 "External id" 或向上追一层，就能找到触发它的 CPU 算子和 Python 行号——11 章的显存暴涨、9 章的图断裂，最终都要落回这种「kernel → CPU 算子 → 源码行」的反向追查。</p>
     <p>这张表的用法是反过来的：先看 trace 找到最大的一块空隙或最长的一串 kernel，再对照左列定位机制，最后决定动哪一层。跳过测量直接猜优化方向，是训练工程里最常见的时间浪费。</p>
     <div class="callout info">
       <b class="tag">要点</b>

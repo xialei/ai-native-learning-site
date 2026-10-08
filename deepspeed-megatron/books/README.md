@@ -44,6 +44,12 @@
 
 ## 演化记录
 
+- **2026-10-09 目标对标补齐**（对照「读完目标/章节主线/特别要求」四条逐项核对，补 ①②③④ 四项缺口；版本锚点不变）：
+  - **④ ZeRO 三阶段表**（ch07 7.1）：「一分钟版本」后新增六列表——阶段 × 按 DP 切了什么 × 每卡剩余字节 × 70B/DP=8 数值 × DS 实现入口（类/方法 + 行号）× Megatron 等价物；四个 stage 的类名与方法入口逐一 grep 回源核对（stage_1_and_2.py/stage3.py/distrib_optimizer.py/param_and_grad_buffer.py）。
+  - **③ process group 拓扑图**（ch02 2.2）：新增图 2.1a——64 卡（TP=4×PP=4×DP=4，8 机 × 8 卡）全 64 rank 网格：每机器盒内 8 个 rank 小格（全局 rank + TP 位次）、TP 行着色、PP 跨机器对标条、DP 虚线框（ranks 0/4/8/12 一列）；原图 2.1 改称图 2.1b（16 卡 TP×PP 切片放大）并在图内脚注回指 2.1a；图 2.2 后新增 4D callout（64 卡 = TP2×CP2×PP2×DP8，order 前轴吃机内带宽、CP 机内相邻、EP 跨机 all-to-all）——满足「16 卡/64 卡拓扑图」要求，未独立成章（强化 ch2 免重编号）。
+  - **② 显存账/通信量账逐章公式 + 70B 代入**：ch03 3.3 新增「每层通信量账」（纯 TP 2×AR 与 TP+SP 2×(RS+AG) 两式 + 2(t−1)/t ring 因子；70B h=8192/s=4096/b=4/t=8 → 每层 896/448 MiB、80 层 70 GiB/卡）；ch04 4.2 图后补 pp=4/m=8 的 stage0 全 step 手算（warmup 3 + steady 5 轮 + cooldown 3，空闲率 6/22=27% 验证公式）+ 70B（pp=8/m=64 气泡 10%、每边界 32 GiB p2p 流量/步）；ch13 13.3 补 AlltoAll 通信量账（671B 风格 e=64/k=8/h=7168 → dispatch+combine 每层约 3.4 GiB，对比 TP 每层 896 MiB 的近 4 倍）；ch07 7.1 表后补「显存省下了，通信多付多少」节（RS/AG 通信账，70B/d=8：AR 245 GB、ZeRO-1 参数 AG +245 GB、ZeRO-3 fetch 2×245=490 GB/卡/步、开重算逼近 1 TB——与 ch08「通信时长 ≈ 参数全量/带宽」口径核对一致）。
+  - **① 小矩阵手算例子**：ch03 3.1（4×4 权重 TP=2：列并行 Y₁/Y₂ 分片 vs 行并行两块部分和 all-reduce，全数字 NumPy 复算精确吻合；3.2 annotation 回指该例）；ch04 4.2（1F1B 逐拍时间线）；ch05 5.5（zigzag：s=8/CP=2 连续切 6:22 失衡 → zigzag 14:14 均衡，配 70B 的 K/V ring 128 MiB/层通信账）；ch13 13.3（EP=2/top-k=2/4 token 的 dispatch 明细：5 份发出 3 份收回，top-k 复制语义 + unpermute 加权还原）。
+  - 终扫：五章禁语零残留（清理新写文案中的 白捡/拼图/账单 三处）；五个 HTML parse-check 全过；新增数字全部脚本复算（ch3 矩阵、ch4 时长账、ch5 zigzag 与 ring、ch13 token 份数、ch7 通信账）；算例统一锚 70B（h=8192/s=4096/b=4），MoE 处用 671B 风格参数（h=7168）并在文中标注风格差异。
 - **2026-10-06 六次核实**（DeepSpeed 18 commits / Megatron 50 commits，重锚 `v0.19.7-86-gf0a3be9bb` / `core_v0.15.0rc7-2735-ge4294782f`）：
   - 4 处 pin 漂移修正：ch01 `training.py:3292→3302`（RLConfig 容器化 hunk 上移 +10）；ch07 epilogue `:984→:999`（#8632/#8655 在其前插入 ~15 行）；ch08 step `:2774→:2791`（#8655 在其前新增 `_muon_update_lacks_loss_scale` 方法段）。DS engine.py 三个 pin（3353/3413/3538）byte-identical 未动。
   - 摘录回源全中：ch07 7.2 IPG/epilogue、7.5 LRU 缓冲与动量暂存/提交、ch08 8.3 stage3 step 子组循环、ch07 7.3 `_build_model_gbuf_param_range_map` 与 `checkpoint_fully_reshardable_formats`（现 :166）、ch10 `checkpointed_forward`（recompute.py:24）/`checkpoint_core_attention`（attention.py:393）——`recompute_modules` 可选值家族继续扩（新增 mhc/shortcut_pre_mlp_layernorm/residual_stream 等 output-discarding 档，core_attn/mlp/moe 仍走普通 checkpointing），10.3 的 selective 机制描述不变。

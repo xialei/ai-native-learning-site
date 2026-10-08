@@ -214,6 +214,88 @@ createAllToolDefinitions(cwd, options)</code></pre>
   </section>
 
   <section class="block">
+    <h2><span class="num">11.3b</span>TUI 外壳内部：一个独立的终端 UI 库</h2>
+    <p>上面说外壳「订阅事件、画界面」，但「画」这件事本身值得单独拆开——interactive 外壳底下是一个独立仓库包 <code class="inline">@earendil-works/pi-tui</code>（<code class="inline">packages/tui</code>），自述只有一句：「<em>Minimal TUI implementation with differential rendering</em>」。它与 coding-agent 之间是干净的包边界：tui 不认识 agent，coding-agent 只消费 <code class="inline">Component</code> 与 <code class="inline">TUI</code> 两个接口。自己写 agent 外壳时，这条「核心不渲染、渲染库不认识核心」的分界线可以直接照抄。</p>
+    <p><strong>第一块积木：组件 = 「给定宽度，吐出若干行」。</strong>整个库的能力从两个接口长出来。<code class="inline">Component</code> 的全部渲染契约是一个纯函数式的方法：</p>
+    <div class="code-title">packages/tui/src/tui.ts · Component 接口（摘录）</div>
+    <pre class="code"><code><span class="kw">export interface</span> <span class="fn">Component</span> {
+  <span class="cmt">/** Render the component to lines for the given viewport width */</span>
+  <span class="fn">render</span>(width: number): string[];
+  <span class="cmt">/** Optional handler for keyboard input when component has focus. */</span>
+  handleInput?(data: string): void;
+  <span class="cmt">/**
+   * Invalidate any cached rendering state.
+   * Called when theme changes or when component needs to re-render from scratch.
+   */</span>
+  invalidate(): void;
+}</code></pre>
+    <p><code class="inline">render(width)</code> 返回一个字符串数组——每个元素是终端里的一行。没有虚拟 DOM、没有响应式系统，「界面」就是「这次宽度下所有行的文本」。容器组件（VStack、Container）只是把子组件的行数组拼接起来；组件自己负责缓存：渲染结果与 <code class="inline">invalidate()</code> 何时清缓存都是组件的私事。典型的缓存实现如 Markdown 组件——命中条件是「文本没变、宽度没变」，而解析出的 token 树用 <code class="inline">WeakRef</code> 弱引用持有（token 树约为源文十倍大，长会话里每条消息都有一个 Markdown 组件，弱引用让主题预览这类突发重渲染之后内存能被回收）。</p>
+    <p><strong>第二块积木：渲染请求的合并与节流。</strong>事件驱动的界面最怕「每个小改动都立刻重画」。pi-tui 的答案是把「请求重画」与「真的重画」拆开：</p>
+    <div class="code-title">packages/tui/src/tui.ts · requestRender 与节流调度（摘录）</div>
+    <pre class="code"><code><span class="kw">private</span> renderRequested = <span class="kw">false</span>;
+<span class="kw">private static readonly</span> MIN_RENDER_INTERVAL_MS = <span class="nu">16</span>;   <span class="cmt">// 约一帧 60fps</span>
+
+<span class="fn">requestRender</span>(force = <span class="kw">false</span>): <span class="kw">void</span> {
+  <span class="kw">if</span> (force) { <span class="kw">this</span>.resetRenderState(); <span class="kw">this</span>.requestImmediateRender(); <span class="kw">return</span>; }
+  <span class="kw">if</span> (<span class="kw">this</span>.renderRequested) <span class="kw">return</span>;          <span class="cmt">// 已经排了队 → 本次请求合并掉（译注）</span>
+  <span class="kw">this</span>.renderRequested = <span class="kw">true</span>;
+  process.nextTick(() => <span class="kw">this</span>.scheduleRender());
+}
+
+<span class="kw">private</span> <span class="fn">scheduleRender</span>(): <span class="kw">void</span> {
+  <span class="kw">if</span> (<span class="kw">this</span>.stopped || <span class="kw">this</span>.renderTimer || !<span class="kw">this</span>.renderRequested) <span class="kw">return</span>;
+  <span class="kw">const</span> elapsed = performance.now() - <span class="kw">this</span>.lastRenderAt;
+  <span class="kw">const</span> delay = Math.max(<span class="nu">0</span>, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);  <span class="cmt">// 距上次渲染不足 16ms 就推迟</span>
+  <span class="kw">this</span>.renderTimer = setTimeout(() => { ... <span class="kw">this</span>.doRender(); ... }, delay);
+}</code></pre>
+    <p>一帧之内来十个事件也只有一次真实渲染。两个例外都走 <code class="inline">requestImmediateRender</code> 的单独通道：显式 <code class="inline">force</code>（同时清掉全部组件缓存），以及<strong>用户输入</strong>——注释写明「User input must preempt that throttled frame」，节流可以推迟模型输出的绘制，但不能让敲键的回显等超过一帧。</p>
+    <p><strong>第三块积木：行级差分。</strong>每次 <code class="inline">doRender()</code> 把整棵组件树渲染成新的行数组，与上一帧的行数组逐行比较：</p>
+    <div class="code-title">packages/tui/src/tui-main-screen.ts · 差分循环与全量重画触发（摘录，编号为注）</div>
+    <pre class="code"><code><span class="cmt">// ① 全量重画的触发条件（依次检查，命中即整屏重画）</span>
+<span class="kw">if</span> (<span class="kw">this</span>.previousLines.length === <span class="nu">0</span> ...)        <span class="cmt">// 首帧</span>
+<span class="kw">if</span> (widthChanged)                                 <span class="cmt">// 宽度变了——换行整体作废</span>
+<span class="kw">if</span> (heightChanged &amp;&amp; !isTermuxSession())          <span class="cmt">// 高度变了（Termux 软键盘除外）</span>
+<span class="kw">if</span> (clearOnShrink &amp;&amp; newLines.length &lt; maxLinesRendered ...)  <span class="cmt">// 内容变短，残留行要清</span>
+<span class="kw">if</span> (firstChanged &lt; prevViewportTop)               <span class="cmt">// 变化在视口上方，差分够不着</span>
+<span class="cmt">// Differential rendering can only touch what was actually visible.</span>
+
+<span class="cmt">// ② 行差分：找首尾两个变化的行号</span>
+<span class="kw">let</span> firstChanged = -<span class="nu">1</span>, lastChanged = -<span class="nu">1</span>;
+<span class="kw">const</span> maxLines = Math.max(newLines.length, <span class="kw">this</span>.previousLines.length);
+<span class="kw">for</span> (<span class="kw">let</span> i = <span class="nu">0</span>; i &lt; maxLines; i++) {
+  <span class="kw">const</span> oldLine = i &lt; <span class="kw">this</span>.previousLines.length ? <span class="kw">this</span>.previousLines[i] : <span class="st">""</span>;
+  <span class="kw">const</span> newLine = i &lt; newLines.length ? newLines[i] : <span class="st">""</span>;
+  <span class="kw">if</span> (oldLine !== newLine) { <span class="kw">if</span> (firstChanged === -<span class="nu">1</span>) firstChanged = i; lastChanged = i; }
+}
+
+<span class="cmt">// ③ 部分更新：只写 [firstChanged, lastChanged] 这一段</span>
+<span class="cmt">// Only render changed lines (firstChanged to lastChanged), not all lines to end</span>
+<span class="cmt">// This reduces flicker when only a single line changes (e.g., spinner animation)</span>
+<span class="kw">const</span> renderEnd = Math.min(lastChanged, newLines.length - <span class="nu">1</span>);
+<span class="kw">for</span> (<span class="kw">let</span> i = firstChanged; i &lt;= renderEnd; i++) { ... output.append(line) ... }</code></pre>
+    <p>注释「This reduces flicker when only a single line changes (e.g., spinner animation)」点出了动机：spinner 每几十毫秒变一格，如果每次都往终端整屏重写，画面会闪；只重写变化的那几行，肉眼就只看到那一格在动。另外两个工程细节：全量重画和部分更新都包在 <code class="inline">\x1b[?2026h</code> / <code class="inline">\x1b[?2026l</code>（synchronized output）里，让终端把这一帧当原子操作显示，避免用户看见「画了一半」的中间态；还有一道自检——任何一行超过终端宽度（应测量可见宽度而非字符数）就写崩溃日志 <code class="inline">pi-tui-crash.log</code> 并提示「Use visibleWidth() to measure and truncateToWidth() to truncate lines」，宽字符算一列还是两列出错时 fail-fast 而不是静默错位。</p>
+    <p><strong>组装：滚动区 + 固定停靠栏。</strong>interactive 外壳的布局只有两层：</p>
+    <div class="code-title">packages/coding-agent/src/modes/interactive/chat-viewport.ts（摘录）</div>
+    <pre class="code"><code><span class="kw">const</span> transcript = <span class="kw">new</span> <span class="fn">ScrollView</span>(options.document, {
+  follow: <span class="st">"end"</span>,        <span class="cmt">// 默认跟着最新输出走</span>
+  primary: <span class="kw">true</span>,        <span class="cmt">// 接收滚轮/翻页</span>
+  overscroll: <span class="st">"chain"</span>,
+  scrollbar: <span class="st">"auto"</span>,
+});
+<span class="kw">const</span> dock = <span class="kw">new</span> <span class="fn">VStack</span>([
+  { component: options.pendingMessages, shrink: <span class="nu">1</span>, minSize: <span class="nu">0</span> },
+  { component: options.status,          shrink: <span class="nu">1</span>, minSize: <span class="nu">0</span> },
+  { component: options.editor,          shrink: <span class="nu">1</span>, minSize: <span class="nu">3</span> },
+  { component: options.footer,          shrink: <span class="nu">1</span>, minSize: <span class="nu">0</span> },
+]);</code></pre>
+    <p>整个界面 = 一个占满剩余空间的 <code class="inline">ScrollView</code>（transcript，<code class="inline">basis:0, grow:1</code> 吃掉所有富余高度）+ 底部一条可压缩的 VStack（待发消息 / 状态 / 输入框 / footer）。流式输出推进时，只有 transcript 的尾部在动；VStack 用 <code class="inline">shrink/minSize</code> 表达「优先压缩谁、压到几行为止」——比如输入框 <code class="inline">shrink:1, minSize:3</code>：可以压，但不能低于三行。</p>
+    <p><strong>事件怎么变成画面：</strong>事件处理函数只做三件事——改组件状态、<code class="inline">invalidate()</code>、<code class="inline">requestRender()</code>。<code class="inline">handleEvent</code> 的开头固定是一句 <code class="inline">this.footer.invalidate()</code>（任何事件都可能改变 footer 内容）；<code class="inline">message_start</code> 收到 assistant 消息就 new 一个 <code class="inline">AssistantMessageComponent</code> 挂进 chatContainer 并 <code class="inline">updateContent(msg, true)</code>；<code class="inline">message_update</code> 流式期间反复调 <code class="inline">updateContent(msg, true)</code>——这个方法把容器里的子组件清掉重建，所以流式期间每个 token 到达都是「重建这一个组件的子树」，而其他几百个组件的缓存原封不动；<code class="inline">queue_update</code> 刷新待发消息栏后 <code class="inline">requestRender()</code>。渲染频率与事件频率解耦：事件可以一秒来几百次，绘制最多每 16ms 一次。</p>
+    <div class="callout">
+      <strong>你自己写外壳时的最小方案：</strong>pi-tui 的三个积木——「render(width) → string[] 的纯函数组件 + invalidate 缓存失效」「requestRender 合并 + 16ms 节流」「新旧行数组逐行 diff、只写变化段」——机制都不复杂，却覆盖了一个流式 agent 界面的全部骨架。甚至有一个更便宜的起点：如果你的界面只是「追加日志」，跳过差分，只做「事件 → 组件树渲染成行 → 每帧重画一次」就能跑；等 spinner 闪烁、滚动条抖动这些症状出现时，再补 invalidate 和行 diff。
+    </div>
+  </section>
+
+  <section class="block">
     <h2><span class="num">11.4</span>产品外壳的演进：外壳如何不碰内核长能力</h2>
     <p>三种外壳里，interactive（TUI）迭代最快，因为它离用户最近。这里挑几个最近加入的特性——它们都不改内核契约，而是<strong>在 AgentSession 的事件流上做更聪明的呈现与会话级策略</strong>，正好说明「外壳如何在不碰内核的前提下长能力」。</p>
     <ul>

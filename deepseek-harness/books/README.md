@@ -28,7 +28,7 @@ open ai-native-learning-site/deepseek-harness/books/index.html
 | `10-seams.html` | 能力缝 | shell/fs/web/skill/jobs 五条缝的注册表语义与失败契约、新增的 MCP/SSH/browser-use 缝 |
 | `11-compaction.html` | Compaction | 压缩事件编舞、影子定价、溢出恢复（含 image-offload 恢复链）、检查点来源 |
 | `12-orchestration.html` | 编排 | 委派缝多 provider、continuable 子 agent、工作流 PTC 引擎、ralph |
-| `13-roadmap.html` | 自制 Harness | profile bundle / SDK（JSON-RPC stdio）/ Web host 三张面孔、能力缝配方、八里程碑路线图 |
+| `13-roadmap.html` | 自制 Harness | profile bundle / SDK（JSON-RPC stdio）/ Web host 三张面孔、能力缝配方、八里程碑路线图、dsh / Codex / Claude Code 三运行时对照（§13.7） |
 
 共享样式：`assets/dsh-learn.css`。所有架构图/流程图均为**内联 SVG**。
 

@@ -153,6 +153,10 @@
   }
 }</pre>
     <div class="annotation"><b>唯一性是硬约束：</b> <strong>① 唯一性是硬约束</strong>——<code class="inline">old_string</code> 必须在文件里唯一匹配，否则 Edit 报错不改。这逼着模型定位到足够具体的上下文，避免改错地方。<strong>② 偏向 Edit 而非 Write</strong>——改现有文件优先用 Edit（小而准），Write 留给新建文件或整体重写，这是文件变更的纪律。<strong>③ 改前先读</strong>——模型通常先 Read 看准上下文再 Edit，盲改会被唯一性约束挡住。</div>
+    <div class="callout info">
+      <b class="tag">检索为什么走专用工具：Grep 与 Glob</b>
+      找内容不靠 <code class="inline">Bash(grep)</code>，而靠两个内置检索工具：<strong>Grep</strong>（按内容正则搜文件）与 <strong>Glob</strong>（按文件名模式列文件）。设计取舍有三：<strong>① 输出干净</strong>——直接回文件路径与匹配行，没有终端转义/分页噪音，省 token；<strong>② 引擎可控</strong>——内置 ripgrep，权限系统可以把 <code class="inline">Read(...)</code> 的 deny 规则一并应用到经符号链接搜到的文件（2.1.251），二进制损坏时能回退系统 <code class="inline">rg</code> 自愈（2.1.101），权限把 Bash 全关时它们也独立可用（2.1.119 修过随之消失的问题）——这些都是 shell 命令做不到的集成；<strong>③ 失败语义明确</strong>——系统资源耗尽时明确报错而非谎报「无匹配」（2.1.277）。 §5.7 那个「把 grep 改劝成 rg」的 Hook 范例，恰是在专用 Grep 成熟之前的历史遗风——设计自己的 Agent 时，检索类操作值得做成一等工具而非命令拼接。
+    </div>
   </section>
 
   <section class="block">
@@ -180,6 +184,10 @@
       <tr><td><strong>AskUserQuestion / EnterPlanMode</strong> 等</td><td>向用户提问、进入/退出计划模式的结构化交互</td><td>不再是「模型在文本里问」，而是引擎渲染的选择框——答案结构化回灌</td></tr>
     </table>
     <div class="annotation"><b>怎么读这张表：</b> 工具箱的扩张方向有两个：一是<strong>让模型自己管时间</strong>（Monitor、Cron——不用人盯着，到点它自己醒）；二是<strong>让多个会话/代理互通</strong>（SendMessage、团队模式）。对照 §5.1 的「工具 = 接口」：每加一种，模型能触达的世界就大一圈，相应地权限与审计的表面积也大一圈。</div>
+    <div class="callout info">
+      <b class="tag">任务清单如何影响模型行为</b>
+      任务清单（TodoWrite 与 TaskCreate 族）不只是给用户看的进度条，更是<strong>给模型自己看的外部状态</strong>——模型每轮都能看到清单，长任务里它相当于把「接下来做什么」写进上下文，跨压缩（1.0.11 起对压缩有专门处理）与跨轮保持目标不漂。引擎用它影响行为的抓手：清单项完成情况随 task-reminder 类系统注入回灌给模型；派遣子代理、团队协作时，清单是共享的任务簿（TaskCreated / TeammateIdle 事件挂钩，见 §7.7、§8.2）。供给策略是刻意收紧的：2.1.268 起这组工具只在较新模型上提供，老模型要 <code class="inline">CLAUDE_CODE_ENABLE_TODO_TOOLS=1</code> 显式打开，更新的模型（Opus 4.8、Sonnet 5、Fable 5 等）反而默认去掉——2.1.233 起可加环境变量找回。取舍逻辑：行为约束交给模型本身的规划能力，而不是靠清单工具的鞭策，老模型的「自控力」不够才需要工具补。
+    </div>
   </section>
 
   <section class="block">
@@ -195,6 +203,68 @@
       <b class="tag">和 git 什么关系</b>
       检查点<strong>不替代 git</strong>：它按会话记录「Claude 动过什么」，粒度是「回到这轮对话之前」；git 记录的是工程史的正式版本。典型分工是——模型改砸了先 /rewind 快速回退，确认方向后再 git commit 落定。两者一个保护过程，一个保护成果。
     </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5d</span>会话存储与恢复：transcript 就是数据库</h2>
+    <p>会话不是关掉终端就没了——每场会话是一条<strong>落盘的 JSONL 转录</strong>（transcript），一行一个事件。恢复、回退、fork、子代理记录，全部建立在它之上：</p>
+    <table class="tbl">
+      <tr><th>路径</th><th>存什么</th></tr>
+      <tr><td><code class="inline">~/.claude/projects/&lt;斜杠转义的项目路径&gt;/</code></td><td>该项目所有会话，每场会话一个 <code class="inline">&lt;session-id&gt;.jsonl</code>（UUID 命名）</td></tr>
+      <tr><td><code class="inline">&lt;会话目录&gt;/subagents/</code></td><td>子代理各自的转录（<code class="inline">agent-*.jsonl</code> + <code class="inline">.meta.json</code> 元数据）</td></tr>
+      <tr><td><code class="inline">~/.claude/history.jsonl</code></td><td>跨会话的输入历史（你敲过的每条提示，供 ↑ 回溯）</td></tr>
+      <tr><td><code class="inline">~/.claude/todos/</code> · <code class="inline">shell-snapshots/</code></td><td>任务清单、shell 快照等按会话 id 存放的伴生状态</td></tr>
+    </table>
+    <p>转录里的行不止 user/assistant——还有权限模式切换、文件快照、钩子输出、排队命令等<strong>伴随事件</strong>，恢复会话时逐行重放。这也解释了 resume 的各种边角 bug 的形态：</p>
+    <ul>
+      <li><strong>重放必须逐字节还原</strong>——恢复时若把早前消息以任何改动过的形式重发（并行工具批、MCP 输入、附件重渲染、hook 输出丢失），API 会丢弃之前的推理，缓存也全灭（2.1.275–282 连修多例）。5 MB 以上大转录曾整批丢并行结果（2.1.267）。</li>
+      <li><strong>元数据也入行</strong>——每行带 <code class="inline">sessionId/parentUuid/timestamp/gitBranch/version</code>，靠 parentUuid 链成树；<code class="inline">isSidechain</code> 标记子代理支线。<code class="inline">--session-id</code> + <code class="inline">--resume/--continue --fork-session</code>（2.0.73）能以自定义 id 分叉出新会话。</li>
+      <li><strong>生命周期有界</strong>——<code class="inline">cleanupPeriodDays</code>（默认 30 天）定期清扫旧转录及 <code class="inline">~/.claude/tasks/</code>、<code class="inline">shell-snapshots/</code> 等（2.1.117 扩大范围）；设 0 会被校验拒绝——官方不允许「悄悄不落盘」（2.1.89）。</li>
+      <li><strong>恢复与 /rewind 同族</strong>——<code class="inline">claude --continue</code>（接着最近一场）/ <code class="inline">--resume &lt;id&gt;</code>（选择器挑一场）恢复转录继续循环；转录里的文件快照正是 §5.5c 回退选择器的数据源。后台运行中的会话也能被 resume 直接接管（2.1.285）。</li>
+    </ul>
+    <div class="annotation"><b>可借鉴的设计：</b> 「append-only 的 JSONL + 每行带血缘字段」是 Agent 会话存储的通用解：崩溃后可重放、按 parentUuid 分叉出树、副作用（文件快照、成本）与消息同层记录。Claude Code 连文件快照（checkpoint）、成本（cost-state 行）都写进同一条转录——<strong>一种格式承载会话的全部状态</strong>，恢复逻辑因此只有一个入口。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5e</span>成本与 token 追踪：每轮都有账本</h2>
+    <p>模型 API 按 token 计费，而一次工具调用动辄几十万 token（大部分是重复发的前缀）。Claude Code 把账本做成了<strong>三层可见</strong>：</p>
+    <table class="tbl">
+      <tr><th>入口</th><th>看到什么</th></tr>
+      <tr><td><code class="inline">/cost</code>（并入 <code class="inline">/usage</code>，2.1.118）</td><td>当前会话累计费用、时长、行数增删；按模型分列（2.1.92），含缓存命中拆解与命中率（2.1.251）；未命中会给出疑似原因（工具定义/系统提示变了、超 TTL，2.1.280）</td></tr>
+      <tr><td><code class="inline">/context</code>（1.0.86 起）</td><td>当前上下文的分类构成：系统提示、工具定义、MCP 指令（2.1.283）、消息、各工具组占用——调上下文时的「体检表」</td></tr>
+      <tr><td><code class="inline">/usage</code>（2.0.0 起）</td><td>订阅计划的用量与限额（5 小时/7 天窗口）</td></tr>
+      <tr><td>状态栏字段</td><td>脚本可读的 <code class="inline">context_window.used_percentage</code>（2.1.6）、<code class="inline">rate_limits</code>（2.1.80）、<code class="inline">prompt_cache</code> 对象（2.1.251）</td></tr>
+    </table>
+    <p>程序化侧同样记账。SDK 的 result 事件带 <code class="inline">total_cost_usd</code> 与逐模型 <code class="inline">modelUsage</code>（1.0.22 更名）；转录每行 assistant 的 <code class="inline">message.usage</code> 记录本轮 input/output 与缓存读写 token；无人值守可设 <code class="inline">--max-budget-usd</code>（2.0.28），到顶后拒绝再派后台子代理并停掉在跑的（2.1.217）。企业还可用 <code class="inline">modelPricing</code> 托管键把合同价喂给成本估算（2.1.243）。</p>
+    <div class="figure">
+      <svg class="svg-box" viewBox="0 0 880 210" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t55e d55e">
+        <title id="t55e">token 与成本账本的三层</title>
+        <desc id="d55e">从 API usage 字段到转录行、再到 /cost 与状态栏</desc>
+        <rect class="node core" x="30" y="30" width="250" height="90" rx="8"></rect>
+        <text class="lbl" x="155" y="56" text-anchor="middle" font-weight="bold">API 响应</text>
+        <text class="lbl sm" x="155" y="76" text-anchor="middle">message.usage</text>
+        <text class="lbl sm" x="155" y="93" text-anchor="middle">input / output / cache read+create</text>
+
+        <path class="edge core" d="M280 75 L350 75" marker-end="url(#arrow)"></path>
+
+        <rect class="node acc" x="350" y="30" width="240" height="90" rx="8"></rect>
+        <text class="lbl" x="470" y="56" text-anchor="middle" font-weight="bold">逐轮累积</text>
+        <text class="lbl sm" x="470" y="76" text-anchor="middle">转录行 message.usage（逐轮）</text>
+        <text class="lbl sm" x="470" y="93" text-anchor="middle">cost-state：总费用 / API / 工具耗时</text>
+
+        <path class="edge core" d="M590 75 L660 75" marker-end="url(#arrow)"></path>
+
+        <rect class="node" x="660" y="30" width="210" height="90" rx="8"></rect>
+        <text class="lbl" x="780" y="56" text-anchor="middle" font-weight="bold">呈现层</text>
+        <text class="lbl sm" x="780" y="76" text-anchor="middle">/cost /context /usage</text>
+        <text class="lbl sm" x="780" y="93" text-anchor="middle">状态栏字段 + result 事件</text>
+
+        <rect class="node warn" x="30" y="150" width="830" height="40" rx="8"></rect>
+        <text class="lbl sm" x="445" y="175" text-anchor="middle">--max-budget-usd 读这本账 → 到顶拒绝新派遣、停在跑的后台代理</text>
+      </svg>
+      <div class="fig-cap">图 5.2：成本数据从 API usage 字段出发，逐轮累积进转录与 cost-state，向上汇成命令、状态栏与预算闸。</div>
+    </div>
+    <div class="annotation"><b>读法：</b> 账本的<strong>原始数据只有一处</strong>——每轮 API 响应里的 usage；其余都是它的视图。transcript 里一行 cost-state 汇总总费用、API/工具耗时、模型分列用量；/cost 和状态栏再把这个总量按「会话内缓存命中率」「上下文占比」等角度切开。分层的好处：转录可回放重算（headless 会话退出时也把总额落盘，2.1.277），任何一层坏了都能从原始 usage 重建。<strong>缓存行是三层里信息量最大的</strong>：命中率骤降往往不是费用问题，而是 §4.5b 的缓存边界被什么动了。</div>
   </section>
 
   <section class="block">

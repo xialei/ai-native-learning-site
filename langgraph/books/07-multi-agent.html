@@ -103,7 +103,7 @@
 
     <p>在 LangGraph 里，最直接的实现方式是：每个 worker 用 <code class="inline">create_react_agent</code> 包成一个独立子图（它本身是一个 <code class="inline">CompiledStateGraph</code>），再把这些子图作为节点 <code class="inline">add_node</code> 进外层图；supervisor 节点是一个调 LLM 的函数，返回 <code class="inline">Command(goto=..., update=...)</code> 同时指定下一跳并写入状态。</p>
 
-    <p>写 supervisor 函数时有一个容易忽略的细节：LLM 回 <code class="inline">FINISH</code> 时，<code class="inline">goto</code> 要给 <code class="inline">END</code>，而不是原样转发 <code class="inline">FINISH</code>。<code class="inline">FINISH</code> 不是注册过的节点，原样转发不会报错——运行时只打一条 warning 然后忽略（<code class="inline">_algo.py:312</code>），但图不会结束，supervisor 会被再次触发，要么死循环到 <code class="inline">recursion_limit</code>，要么行为不可预测。这类「图不停但不报错」的症状，排查时先检查 goto 的哨兵值有没有翻译成 <code class="inline">END</code>。</p>
+    <p>写 supervisor 函数时有一个容易忽略的细节：LLM 回 <code class="inline">FINISH</code> 时，<code class="inline">goto</code> 要给 <code class="inline">END</code>，而不是原样转发 <code class="inline">FINISH</code>。<code class="inline">FINISH</code> 不是注册过的节点，原样转发不会报错——运行时只打一条 warning 然后忽略（<code class="inline">_algo.py:311</code>），但图不会结束，supervisor 会被再次触发，要么死循环到 <code class="inline">recursion_limit</code>，要么行为不可预测。这类「图不停但不报错」的症状，排查时先检查 goto 的哨兵值有没有翻译成 <code class="inline">END</code>。</p>
 
     <div class="code-title">Supervisor 模式：子图即节点 + Command 路由</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> typing <span class="kw">import</span> Annotated, Literal
@@ -585,12 +585,12 @@ agent = create_react_agent(model, tools=[...], state_schema=MyWorkerState)
 <span class="cmt"># 以及如果 goto 了一个完全没注册的节点名（如拼错），</span>
 <span class="cmt"># 只会在运行时看到一条 warning：</span>
 <span class="cmt">#   "Task coder ... wrote to unknown channel branch:to:ghost, ignoring it."</span>
-<span class="cmt">#   （_algo.py:312）——节点被静默跳过，图提前结束。</span>
+<span class="cmt">#   （_algo.py:311）——节点被静默跳过，图提前结束。</span>
 <span class="cmt">#</span>
 <span class="cmt"># ✓ goto 的所有可能目标都要进 Literal 注解：</span>
 <span class="kw">def</span> <span class="fn">supervisor</span>(state) -> <span class="cl">Command</span>[<span class="cl">Literal</span>[<span class="st">"researcher"</span>, <span class="st">"coder"</span>, <span class="st">"reviewer"</span>, <span class="st">"__end__"</span>]]:
     ...</pre>
-    <div class="annotation"><b>踩坑点：</b> 先说实测结论（很多教程把这条坑讲反了）：<code class="inline">Command(goto="X")</code> 的 X <strong>不在 Literal 里也能路由成功</strong>——前提是 X 是一个已注册节点。机制是：goto 在运行时被 <code class="inline">map_command</code> 转成对 <code class="inline">branch:to:X</code> 通道的写入，进而调度 X 节点；这条路不查 Literal。那 Literal 到底管什么？它决定<strong>图拓扑</strong>——Literal 的值被设为 <code class="inline">ends</code>，静态注册 coder→X 的条件边：漏写后 <code class="inline">get_graph()</code>/mermaid 里少这条边，可视化、静态校验都会失真。而真正的静默炸弹是<strong>goto 一个没注册的节点名</strong>（拼错、删了节点忘改）：不会抛 <code class="inline">InvalidUpdateError</code>，只会打一条 warning 然后跳过——图「无声地」提前结束。所以纪律是两条：<strong>Literal 要列全</strong>（为了拓扑完整性）；<strong>上线前跑一遍冒烟测试</strong>（防止 goto 目标拼错时只有 warning 没有异常）。锚点：<code class="inline">map_command</code> 在 <code class="inline">_io.py:69</code>、ends 注册在 <code class="inline">state.py:850-856</code>、warning 在 <code class="inline">_algo.py:312</code>。</div>
+    <div class="annotation"><b>踩坑点：</b> 先说实测结论（很多教程把这条坑讲反了）：<code class="inline">Command(goto="X")</code> 的 X <strong>不在 Literal 里也能路由成功</strong>——前提是 X 是一个已注册节点。机制是：goto 在运行时被 <code class="inline">map_command</code> 转成对 <code class="inline">branch:to:X</code> 通道的写入，进而调度 X 节点；这条路不查 Literal。那 Literal 到底管什么？它决定<strong>图拓扑</strong>——Literal 的值被设为 <code class="inline">ends</code>，静态注册 coder→X 的条件边：漏写后 <code class="inline">get_graph()</code>/mermaid 里少这条边，可视化、静态校验都会失真。而真正的静默炸弹是<strong>goto 一个没注册的节点名</strong>（拼错、删了节点忘改）：不会抛 <code class="inline">InvalidUpdateError</code>，只会打一条 warning 然后跳过——图「无声地」提前结束。所以纪律是两条：<strong>Literal 要列全</strong>（为了拓扑完整性）；<strong>上线前跑一遍冒烟测试</strong>（防止 goto 目标拼错时只有 warning 没有异常）。锚点：<code class="inline">map_command</code> 在 <code class="inline">_io.py:69</code>、ends 注册在 <code class="inline">state.py:850-856</code>、warning 在 <code class="inline">_algo.py:311</code>。</div>
 
     <div class="code-title">③ 拿 Command.PARENT 却手动 invoke 子图 → 跳转穿不过边界，落到哪层全凭运气</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ✗ 在节点里手动调子图， 期望它用 Command.PARENT 改父图的道</span>
@@ -604,7 +604,7 @@ agent = create_react_agent(model, tools=[...], state_schema=MyWorkerState)
 <span class="cmt"># 实测三：手动 invoke 发生在中间层（父图→子图A→子图B 手动调 A）→ 跳转被</span>
 <span class="cmt">#   中间层消化，目标 parent_final 不存在 → 只有一条 warning：</span>
 <span class="cmt">#   "Task mid_first ... wrote to unknown channel branch:to:parent_final, ignoring it."</span>
-<span class="cmt">#   （_algo.py:312）——图无声地跑完，改道根本没有发生。</span>
+<span class="cmt">#   （_algo.py:311）——图无声地跑完，改道根本没有发生。</span>
 <span class="cmt">#</span>
 <span class="cmt"># ✓ 子图作为节点挂进父图， 走图执行栈 (见 §7.4 的 图 7.5):</span>
 parent.<span class="fn">add_node</span>(<span class="st">"child"</span>, child_graph)   <span class="cmt"># 而非在 parent_first 里手动 invoke</span></pre>
@@ -618,10 +618,10 @@ parent.<span class="fn">add_node</span>(<span class="st">"child"</span>, child_g
       <div class="a">输出 <code class="inline">['messages']</code>——子图只订阅自己 input schema 声明的通道（state.py:1517），parent_only 在边界处就被过滤掉了，不会出现在子图状态里。拼成 msgs 时：编译不报错（schema 各自合法），运行也不报错（两侧都没有「字段必须对上」的校验；只有父图向子图输入时多出的键会打一条 warning，_io.py:97）。表现是 worker 收到的 messages 永远是空的——每次调用都像失忆。这类坑的排查入口就是 7.3 的双向过滤图：字段对接完全靠名字，编译期不会替你兜底。</div>
     </details>
     <details class="q"><summary><b>Q2</b> · 图 7.5 说 Command.PARENT 走的是图执行栈。如果子图 A 里手动 invoke 了子图 B，B 里返回了 <code class="inline">Command(graph=Command.PARENT, goto="x")</code>，这条 goto 最终由谁处理？如果 A 和 B 挂在同一个父图下、A 里 goto 的目标 "x" 其实是父图的另一个节点呢？</summary>
-      <div class="a">由最近一层的图执行栈处理——也就是承载「A 里那次手动 invoke」的图（子图 A）自己的执行层，而不是你想指挥的父图。ParentCommand 抛上来，先被 A 所在层的异常处理接住，goto 被换算成 A 命名空间里的跳转。此时 "x" 在 A 里未必是注册过的节点：如果 A 里没有 x，就是一条 warning 加静默忽略（_algo.py:312），图无声地继续；如果 A 里恰好有同名的 x（比如 A 也有个叫 x 的节点），会更糟——跳转被 A 的节点消化，父图上那个真正的 x 根本没被触发。手动 invoke 的跳转语义永远落在最近一层，这是「手动调子图时 Command.PARENT 不可靠」的机制根源。</div>
+      <div class="a">由最近一层的图执行栈处理——也就是承载「A 里那次手动 invoke」的图（子图 A）自己的执行层，而不是你想指挥的父图。ParentCommand 抛上来，先被 A 所在层的异常处理接住，goto 被换算成 A 命名空间里的跳转。此时 "x" 在 A 里未必是注册过的节点：如果 A 里没有 x，就是一条 warning 加静默忽略（_algo.py:311），图无声地继续；如果 A 里恰好有同名的 x（比如 A 也有个叫 x 的节点），会更糟——跳转被 A 的节点消化，父图上那个真正的 x 根本没被触发。手动 invoke 的跳转语义永远落在最近一层，这是「手动调子图时 Command.PARENT 不可靠」的机制根源。</div>
     </details>
     <details class="q"><summary><b>Q3</b> · supervisor 的 LLM 回了 "FINISH"，代码却原样 <code class="inline">Command(goto="FINISH")</code>。图会怎么表现——报错、正常结束，还是别的？如果这个 bug 一直没被发现，你最先观察到的症状是什么？</summary>
-      <div class="a">不报错，也「不结束」。FINISH 不是注册过的节点，运行时把 goto 变成对 branch:to:FINISH 通道的写，发现没有节点订阅它，只打一条 warning（_algo.py:312）就继续推进。而 supervisor 没有任何回边让自己结束——它会被再次触发（取决于图的边结构：有回边就循环，没回边这一轮就自然结束）。最常见的情况是带 researcher→supervisor 回边的 Supervisor 图：LLM 说 FINISH 后 supervisor 再次被唤醒，反复消耗 recursion_limit，最后以 GraphRecursionError 收场。症状「图跑很久最后报 recursion 错误、日志里全是 ignored branch:to:FINISH」就是这条坑的指纹。</div>
+      <div class="a">不报错，也「不结束」。FINISH 不是注册过的节点，运行时把 goto 变成对 branch:to:FINISH 通道的写，发现没有节点订阅它，只打一条 warning（_algo.py:311）就继续推进。而 supervisor 没有任何回边让自己结束——它会被再次触发（取决于图的边结构：有回边就循环，没回边这一轮就自然结束）。最常见的情况是带 researcher→supervisor 回边的 Supervisor 图：LLM 说 FINISH 后 supervisor 再次被唤醒，反复消耗 recursion_limit，最后以 GraphRecursionError 收场。症状「图跑很久最后报 recursion 错误、日志里全是 ignored branch:to:FINISH」就是这条坑的指纹。</div>
     </details>
     <details class="q"><summary><b>Q4</b> · 7.7② 说 goto 目标不进 Literal 也能路由成功。那为什么还要维护 Literal？至少说出两个「少了它你会付出代价」的具体场景。</summary>
       <div class="a">Literal 决定的是图拓扑，运行时路由走的是另一条路（branch:to: 通道写入），所以两者解耦。代价场景：① 可视化与静态分析失真——get_graph()/mermaid 里没有那条边，读图的人（和依赖图结构做校验、代码生成的工具）都不知道这条路径存在；② checkpointer 断点续跑受影响——拓扑里的边是恢复执行时计算「下一步该触发谁」的依据之一，缺边会让恢复后的路由行为和首次执行不一致；③ 团队协作时接口失约——函数签名声明的 Literal 就是「我这个节点可能去哪」的契约，漏列等于契约撒谎，下游按图排错的人会被 topology 引偏。纪律是：Literal 列全 + 冒烟测试兜住 goto 目标拼错只有 warning 没异常的情形。</div>
