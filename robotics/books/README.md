@@ -32,6 +32,16 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 
 共享样式：`assets/robotics-learn.css`。所有架构图/流程图均为**内联 SVG**。
 
+## 页面结构（书式叙事层）
+
+每章采用统一的页面结构：
+
+- `page-header`：breadcrumb + `chap-meta`（章号小标）+ 大标题 + `lede`（章首导语：本章讲什么、不打算讲什么）
+- `section.block`：整章一块纸面，靠 h2 分隔线分节（不再各自成卡片）
+- `chapter-summary`：章末「本章小结」收拢块
+- `pagenav`：上下章书式导航（带章题）
+- 宽 SVG/图卡标 `figure breakout`——窄栏（760px）正文下向两侧溢出到 ~960px 保持可读
+
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
@@ -40,7 +50,7 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
-- 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、`page-header`（chap-meta + lede）与 `pagenav`。
+- 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`；宽图卡外层用 `<div class="figure breakout">`。
 - 代码片段：务必从源码摘录并标注路径，不要凭记忆杜撰函数签名。
 - 如需在 `index.html` 的路径卡片增删条目，同步调整对应页面即可。

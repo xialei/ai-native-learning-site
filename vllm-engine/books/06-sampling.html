@@ -206,7 +206,7 @@ child_requests = []
     child_request.request_id = request_id
     child_request.sampling_params = child_params
     child_requests.append(child_request)</pre>
-    <div class="annotation"><b>拆分后的一切归 <code class="inline">ParentRequest</code>（vllm/v1/engine/parallel_sampling.py:13）管：</b>它记账「这 n 个子请求同源」，子请求输出聚合回一份结果（非流式时 <code class="inline">output_aggregator</code> 按序拼）、追踪最长生成进度（流式时父请求推进到「跑得最远的那个孩子」）。两个细节值得注意：① <code class="inline">get_child_info</code> 对每个孩子生成独立 id；如果父请求带 <code class="inline">seed</code>，每个孩子的 sampling_params 单独克隆、种子各不相同（否则 n 条路会采样出完全相同的序列）；② 排队额度按 n 计——<code class="inline">check_admission(parent_params.n, ...)</code>（async_llm.py:309）的 docstring 写明「A request with n&gt;1 counts as n slots」，一个 n=8 的请求会占掉 8 个 <code class="inline">max_num_queued_reqs</code> 名额。调度器里这 n 个子请求各自参与 continuous batching，独立被抢占、独立完成；共享的前缀天然被前缀缓存接住（第 8 章），所以多路采样的边际成本主要是 KV 与算力，不是重复 prefill。</div>
+    <div class="annotation"><b>拆分后的一切归 <code class="inline">ParentRequest</code>（vllm/v1/engine/parallel_sampling.py:13）管：</b>它记账「这 n 个子请求同源」，子请求输出聚合回一份结果（非流式时 <code class="inline">output_aggregator</code> 按序拼）、追踪最长生成进度（流式时父请求推进到「跑得最远的那个孩子」）。两个细节值得注意：① <code class="inline">get_child_info</code> 对每个孩子生成独立 id；如果父请求带 <code class="inline">seed</code>，每个孩子的 sampling_params 单独克隆、种子各不相同（否则 n 条路会采样出完全相同的序列）；② 排队额度按 n 计——<code class="inline">check_admission(parent_params.n, ...)</code>（async_llm.py:316）的 docstring 写明「A request with n&gt;1 counts as n slots」，一个 n=8 的请求会占掉 8 个 <code class="inline">max_num_queued_reqs</code> 名额。调度器里这 n 个子请求各自参与 continuous batching，独立被抢占、独立完成；共享的前缀天然被前缀缓存接住（第 8 章），所以多路采样的边际成本主要是 KV 与算力，不是重复 prefill。</div>
   </section>
 
   <section class="block">
@@ -299,6 +299,7 @@ child_requests = []
         input_batch,
         <span class="cmt"># Draft logits are needed for probabilistic rejection sampling.</span>
         self.speculator.draft_logits,
+        invalid_drafts,   <span class="cmt"># 译注：草稿被上游判废时跳过验证（新增第 4 参）</span>
     )</pre>
     <p><code class="inline">RejectionSampler</code> 的 docstring 把三个关键词定义得很清楚（<code class="inline">vllm/v1/sample/rejection_sampler.py</code>）：<strong>accepted</strong>（草稿与目标概率关系成立、直接采纳）、<strong>recovered</strong>（被拒后按「目标分布减去草稿分布的残差」重新采样一个补偿 token）、<strong>bonus</strong>（k 个草稿全部接受时额外奖励 1 个，只由目标模型采样）。最终 <code class="inline">output = accepted + recovered + bonus</code>。贪心请求有专门一条快路径 kernel，逐位「草稿 == 目标 argmax 才接受」（下面这段取自 V1 的那份，V2 把同样的逻辑收进了 <code class="inline">_rejection_kernel</code>，读法一样）：</p>
     <div class="code-title">vllm/v1/sample/rejection_sampler.py — rejection_greedy_sample_kernel（摘录，V1）</div>
@@ -363,8 +364,8 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
 <span class="kw">else</span>:
     grammar = self._create_grammar(request)  <span class="cmt"># 同步兜底</span>
 request.structured_output_request.grammar = grammar</pre>
-    <div class="annotation"><b>线程池大小是有讲究的（:76）：</b>语法编译是 CPU 密集任务，<code class="inline">max(1, (cpu_count+1)//2)</code> 个线程——注释直说 torch 默认的「CPU 数 × 5」对这类任务太高了。请求带着新状态 <code class="inline">WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>（scheduler.py:2380）排队，每步调度时检查 Future：编译完成就转正为 <code class="inline">WAITING</code> 参与调度（scheduler.py:3115），编译失败则记入 <code class="inline">grammar_compile_error_reqs</code> 单独报错、不连坐整批。还有个平台相关的例外：<code class="inline">external_launcher</code> 模式下每个 TP rank 有自己的调度器，异步编译会让各 rank 的「转正时机」不一致、破坏 torchrun 依赖的确定性，所以只有它强制同步（:53 的注释把因果写得很全）。</div>
-    <p><strong>GPU 侧：bitmask 走异步拷贝 + Triton kernel。</strong>每步调度器把<strong>本步被调度的</strong>结构化请求收集起来（<code class="inline">get_grammar_bitmask</code>，scheduler.py:1943——入口先看 <code class="inline">scheduler_output.has_structured_output_requests</code>，该标志在调度循环里逐请求累积，且 prefill chunk 期间不上约束），算出 int32 位掩码张量发给 worker。worker 在采样前把它作用到 logits：</p>
+    <div class="annotation"><b>线程池大小是有讲究的（:88）：</b>语法编译是 CPU 密集任务，<code class="inline">max(1, (cpu_count+1)//2)</code> 个线程——注释直说 torch 默认的「CPU 数 × 5」对这类任务太高了。请求带着新状态 <code class="inline">WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>（scheduler.py:2449）排队，每步调度时检查 Future：编译完成就转正为 <code class="inline">WAITING</code> 参与调度（scheduler.py:3201），编译失败则记入 <code class="inline">grammar_compile_error_reqs</code> 单独报错、不连坐整批。还有个平台相关的例外：<code class="inline">external_launcher</code> 模式下每个 TP rank 有自己的调度器，异步编译会让各 rank 的「转正时机」不一致、破坏 torchrun 依赖的确定性，所以只有它强制同步（:58 的注释把因果写得很全）。</div>
+    <p><strong>GPU 侧：bitmask 走异步拷贝 + Triton kernel。</strong>每步调度器把<strong>本步被调度的</strong>结构化请求收集起来（<code class="inline">get_grammar_bitmask</code>，scheduler.py:2005——入口先看 <code class="inline">scheduler_output.has_structured_output_requests</code>，该标志在调度循环里逐请求累积，且 prefill chunk 期间不上约束），算出 int32 位掩码张量发给 worker。worker 在采样前把它作用到 logits：</p>
     <div class="code-title">vllm/v1/worker/gpu/model_runner.py — sample() 里的施加点（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> grammar_output <span class="kw">is not None and</span> logits.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
     <span class="cmt"># 采样前原地抹掉不合法 token —— rejection sampler 之前</span>
@@ -418,7 +419,7 @@ request.structured_output_request.grammar = grammar</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 06 采样 · 版本 v0.31.0 (db9527a4687)
+  深入浅出vLLM · 06 采样 · 版本 v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)
 </footer>
 
 </body>

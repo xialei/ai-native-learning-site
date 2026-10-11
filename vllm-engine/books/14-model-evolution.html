@@ -41,7 +41,7 @@
 
   <div class="callout info">
     <b class="tag">本章材料从哪来</b>
-    模型侧事实（参数量、训练配方、benchmark）来自各团队的发布材料；引擎侧事实（类名、文件、行号）全部核对自本仓库 vLLM 源码（版本 <code class="inline">v0.31.0 (db9527a4687)</code>，与前 13 章同一锚点）。本章不复述模型发布稿——那不是 vLLM 这本书该干的事——只回答一个问题：<strong>这些新架构到达引擎时，长成了什么样的代码？</strong>
+    模型侧事实（参数量、训练配方、benchmark）来自各团队的发布材料；引擎侧事实（类名、文件、行号）全部核对自本仓库 vLLM 源码（版本 <code class="inline">v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)</code>，与前 13 章同一锚点）。本章不复述模型发布稿——那不是 vLLM 这本书该干的事——只回答一个问题：<strong>这些新架构到达引擎时，长成了什么样的代码？</strong>
   </div>
 
   <section class="block">
@@ -430,11 +430,12 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
   <section class="block">
     <h2><span class="num">14.5</span>Qwen：小模型先探路，Flash-Next 把三条新机制凑齐</h2>
     <p>Qwen3.8-27B 是这一批里最小的模型（dense，27B），架构试探反而最激进：每 4 层配 3 层 GDN（GatedDeltaNet，线性注意力——解决的问题与 14.4 的 KDA 同源，机制见该节）+ 1 层 GQA 的 3:1 混排，外加 YaRN 长文本扩展。到 Flash-Next（125B/6B 激活），Qwen 把散落在各家的新机制一次凑齐：块级 QSA 稀疏注意力（按 micro-block 选块的稀疏化）、GatedResidual 残差变体（多分支 + 逐支路标量门，mHC 的简化版）、n-gram PLE 嵌入（2000 万行的 n-gram 查表，让小激活模型能直接从上下文抄表面模式），外加 51B 的 n-gram 草稿模型和 4B MTP 头。</p>
-    <p>模型落在 <code class="inline">vllm/models/qwen4_exp/</code>，配置类 <code class="inline">Qwen4ExpTextConfig</code> 继承自 Qwen3NextConfig（<code class="inline">config.py</code>）；<code class="inline">hc_count</code>、<code class="inline">hc_lowrank</code>、<code class="inline">ple_layer_ids</code>、<code class="inline">ngram_size</code>、<code class="inline">ngram_vocab_size_base</code> 这些关键字段的取值，随下文各机制首次用到时给出。</p>
+    <p>模型落在 <code class="inline">vllm/models/qwen4_exp/</code>，配置类 <code class="inline">Qwen4ExpTextConfig</code> 来自上游 transformers（vLLM 仓库内的 <code class="inline">config.py</code> 已删，<code class="inline">from transformers import Qwen4ExpTextConfig</code> 直接用）；<code class="inline">hc_count</code>、<code class="inline">hc_lowrank</code>、<code class="inline">ple_layer_ids</code>、<code class="inline">ngram_size</code>、<code class="inline">ngram_vocab_size_base</code> 这些关键字段的取值，随下文各机制首次用到时给出。</p>
     <p><strong>先看残差。</strong>同样的「单条残差流不够用」问题（14.2），DeepSeek 和 GLM 用 mHC（Sinkhorn 约束的路由矩阵做跨层混合），Qwen4Exp 用的是更简单的 GatedResidual——4 条并行分支，每条一个 learned gate，没有跨层路由：</p>
     <div class="code-title">vllm/models/qwen4_exp/nvidia/model.py — 残差变体挂到注意力与 MLP 两条通路（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 同一个 GatedResidual 类，同时用作 attn_hyper_connection 与 mlp_hyper_connection</span>
-<span class="cmt"># （实现见 nvidia/hyperconnection.py:53，hc_lowrank=320 控制门控投影的秩）</span></pre>
+<span class="cmt"># （实现见 nvidia/hyperconnection.py:53，hc_lowrank=320 控制门控投影的秩——</span>
+<span class="cmt">#   默认值随配置上移到 transformers 的 Qwen4ExpTextConfig：hc_lowrank: int = 320）</span></pre>
     <p><strong>再看 QSA</strong>（Queried Sparse Attention）。GLM 的两条路线都在 token 粒度上做文章，QSA 把稀疏化的粒度抬到 micro-block：索引器（<code class="inline">QSAIndexer</code>）用 MQA 形态算块分数，预算是 <code class="inline">token_topk=config.indexer_budget</code>（512 块 / 2048 token）。它对精度形态挑剔——要求 BF16 和 paged KV，注意力后端是专门的 <code class="inline">Qwen4ExpQSAFlashAttentionBackend</code>（继承 FlashAttentionBackend）。锚点：索引器 <code class="inline">nvidia/indexer_qsa.py</code>（预算与精度约束见构造函数）、后端 <code class="inline">nvidia/qsa.py</code>。</p>
     <p>挑剔最近松了一半：QSA 路径的主 KV cache 现在可以是 fp8_e4m3（<code class="inline">dff1bde84d</code>）。分三段看这件事——先说结论，再说 QSA 为什么能绕开常规 fp8 后端的限制，最后看 kernel 与权重侧的配套改动。</p>
     <p><strong>结论</strong>：模型 dtype 仍锁 BF16（indexer_qsa.py 的门没动），变的只是主 KV cache 的存储精度——写入仍是常规 <code class="inline">reshape_and_cache</code>，读侧才见反量化。</p>
@@ -636,7 +637,7 @@ recurrent_state_shape = (divide(num_heads, tp), head_dim, head_dim)</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 14 实战·国产开源模型架构变迁 · vLLM 侧版本 v0.31.0 (db9527a4687)
+  深入浅出vLLM · 14 实战·国产开源模型架构变迁 · vLLM 侧版本 v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)
 </footer>
 </body>
 </html>

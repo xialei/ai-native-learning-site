@@ -150,12 +150,13 @@
         <span class="kw">return</span> self._empty_match_result
 
     value, last_node = self.<span class="fn">_match_prefix_helper</span>(self.root_node, key)
-    <span class="kw">if</span> value:
-        value = torch.<span class="fn">cat</span>(value)
-    <span class="kw">else</span>:
-        value = self._empty_match_result.device_indices
-    <span class="kw">return</span> <span class="cl">MatchResult</span>(device_indices=value, last_device_node=last_node, ...)</pre>
-    <div class="annotation"><b>两个决定复用粒度的细节：</b> 其一是 <code class="inline">page_aligned</code>：开启分页（page_size&gt;1）后，匹配长度向下取整到整页——因为 KV 池按页分配，半页的复用会让后缀 prefill 的页对齐变复杂，宁可少复用几个 token。其二是命中结果 <code class="inline">device_indices</code>：它是把沿途每个节点的 value 段 <code class="inline">torch.cat</code> 成的一个一维下标 tensor，调度器拿去直接当 <code class="inline">prefix_indices</code> 用。</div>
+    <span class="kw">return</span> <span class="cl">MatchResult</span>(
+        device_prefix_len=<span class="fn">sum</span>(<span class="fn">len</span>(v) <span class="kw">for</span> v <span class="kw">in</span> value),
+        last_device_node=last_node,
+        last_host_node=last_node,
+        best_match_node=last_node,
+    )</pre>
+    <div class="annotation"><b>两个决定复用粒度的细节：</b> 其一是 <code class="inline">page_aligned</code>：开启分页（page_size&gt;1）后，匹配长度向下取整到整页——因为 KV 池按页分配，半页的复用会让后缀 prefill 的页对齐变复杂，宁可少复用几个 token。其二是命中结果只带<strong>长度不带张量</strong>：<code class="inline">device_prefix_len</code> 是一个 int，<code class="inline">_match_prefix_helper</code> 沿途攒下的 value 段只用来求和，返回后就丢弃。槽位下标不在这时物化——等到真要分配时（<code class="inline">alloc_for_extend</code>），再沿 <code class="inline">last_node</code> 的节点路径把下标走一遍取出来（<code class="inline">path_device_indices</code>）。匹配在调度早期、分配在组批之后，中间隔着预算检查和排队，很多请求根本走不到分配那一步——只回长度让没走到的请求省掉一次 <code class="inline">torch.cat</code>。</div>
 
     <p>逐层下行的辅助函数里能看到「劈节点」的时机：</p>
     <div class="code-title">python/sglang/srt/mem_cache/radix_cache.py — _match_prefix_helper（摘录，注释为译注）</div>
@@ -289,42 +290,55 @@
   <section class="block">
     <h2><span class="num">3.5</span>与调度的配合：从 match 到 prefill 只剩后缀</h2>
     <p>把视角拉回调度链路。每个请求入队时（<code class="inline">Req.init_next_round_input</code>，<code class="inline">schedule_batch.py</code>）先做一次前缀匹配，把结果写回 <code class="inline">Req</code> 自己身上：</p>
-    <div class="code-title">python/sglang/srt/managers/schedule_batch.py — init_next_round_input 中的匹配（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span>match_result = tree_cache.<span class="fn">match_prefix</span>(
-    <span class="cl">MatchPrefixParams</span>(
-        key=<span class="cl">RadixKey</span>(
-            token_ids=token_ids_to_match,
-            extra_key=self.extra_key,
-            limit=key_limit,
-            cache_salt=self.cache_salt,
-        ),
-        req=self,
-        cow_mamba=cow_mamba,
+    <div class="code-title">python/sglang/srt/mem_cache/common.py — match_kv_cache（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">match_kv_cache</span>(
+    req: <span class="cl">Req</span>, tree_cache: <span class="cl">BasePrefixCache</span>, token_ids=<span class="kw">None</span>, *,
+    cow_mamba: <span class="cl">bool</span> = <span class="kw">False</span>, max_prefix_len: Optional[<span class="cl">int</span>] = <span class="kw">None</span>,
+) -&gt; <span class="cl">MatchResult</span>:
+    <span class="cmt"># 用请求自己的 token 序列去树上匹配，把命中结果「收养」为前缀</span>
+    <span class="kw">if</span> token_ids <span class="kw">is</span> <span class="kw">None</span>:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    match_result = tree_cache.<span class="fn">match_prefix</span>(
+        <span class="cl">MatchPrefixParams</span>(
+            key=<span class="cl">RadixKey</span>(
+                token_ids=token_ids,
+                extra_key=req.extra_key,
+                limit=key_limit,
+                cache_salt=req.cache_salt,
+            ),
+            req=req,
+            cow_mamba=cow_mamba,
+        )
     )
-)
-...
-(
-    self.prefix_indices,          <span class="cmt"># 命中的 KV 槽位下标</span>
-    self.last_node,               <span class="cmt"># 匹配终点节点（锁要加在它身上）</span>
-    self.last_host_node,
-    self.best_match_node,
-    self.host_hit_length,         <span class="cmt"># HiCache 的 L2 命中长度（第 11 章）</span>
-    self.swa_host_hit_length,     <span class="cmt"># 滑动窗口层的 L2 命中长度</span>
-    self.swa_branching_seqlen,
-    self.mamba_host_hit_length,   <span class="cmt"># Mamba/线性层的 L2 命中长度</span>
-    self.mamba_branching_seqlen,
-) = (
-    match_result.device_indices,
-    match_result.last_device_node,
-    match_result.last_host_node,
-    match_result.best_match_node,
-    match_result.host_hit_length,
-    match_result.swa_host_hit_length,
-    match_result.swa_branching_seqlen,
-    match_result.mamba_host_hit_length,
-    match_result.mamba_branching_seqlen,
-)</pre>
-    <div class="annotation"><b>已就绪 KV 清单：</b> <code class="inline">prefix_indices</code> 从这一刻起就是请求的「已就绪 KV 清单」。后面所有环节都在它上面做减法，而不再碰树。<br><br><b>这个元组为什么这么长：</b>它已经从一个「匹配结果」长成了一个「按层类型分类的匹配结果」。最初只有前两项（槽位 + 终点节点），后来 HiCache 加进来长了 <code class="inline">host_hit_length</code>，再后来<strong>滑动窗口层</strong>（<code class="inline">swa_*</code>）和 <strong>Mamba/线性注意力层</strong>（<code class="inline">mamba_*</code>）各自有了独立的命中长度——因为这三类层能复用的历史长度不一样：全注意力层能复用整段前缀，滑动窗口层只能复用最后 <code class="inline">window_size</code> 个 token，Mamba 类层的状态则有个「分支点」概念（<code class="inline">branching_seqlen</code>，超过它状态就不能直接续用，必须重算）。如果你在别的分支上看到过只有 5 项的版本，那是这个元组扩张过程中的中间形态。</div>
+    ...
+    <span class="cmt"># 长度写回请求；槽位下标不在这时取，分配时沿节点路径再拿</span>
+    req.prefix_len = match_result.device_prefix_len
+    (
+        req.last_node,          <span class="cmt"># 匹配终点节点（锁要加在它身上）</span>
+        req.last_host_node,
+        req.best_match_node,
+        req.host_hit_length,    <span class="cmt"># HiCache 的 L2 命中长度（第 11 章）</span>
+        req.swa_host_hit_length,  <span class="cmt"># 滑动窗口层的 L2 命中长度</span>
+        req.mamba_host_hit_length,  <span class="cmt"># Mamba/线性层的 L2 命中长度</span>
+    ) = (
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.best_match_node,
+        match_result.host_hit_length,
+        match_result.swa_host_hit_length,
+        match_result.mamba_host_hit_length,
+    )
+    req.num_matched_prefix_tokens = <span class="fn">min</span>(
+        req.prefix_len + req.host_hit_length, max_len)
+    req.swa_branching_seqlen = match_result.swa_branching_seqlen
+    <span class="cmt"># 探测式匹配保留未上报的分支点；新一轮则两者都重置</span>
+    <span class="kw">if</span> match_result.mamba_branching_seqlen <span class="kw">is not</span> <span class="kw">None</span>:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    <span class="kw">if</span> match_result.cache_protected_len <span class="kw">is not</span> <span class="kw">None</span>:
+        req.kv.cache_protected_len = match_result.cache_protected_len
+    <span class="kw">return</span> match_result</pre>
+    <div class="annotation"><b>已就绪 KV 的账本从张量变成一个 int：</b> <code class="inline">match_kv_cache</code>（<code class="inline">mem_cache/common.py</code>）把「匹配 + 写回」收成一个函数：请求的 <code class="inline">prefix_len</code> 从这一刻起就是「前 <code class="inline">prefix_len</code> 个 token 的 KV 已就绪」的承诺，后面所有环节都在它上面做减法，而不再碰树。槽位下标本身不再存在请求上——需要时（<code class="inline">alloc_for_extend</code>）沿 <code class="inline">last_node</code> 的节点路径现算（<code class="inline">path_device_indices</code>），或直接读请求在 <code class="inline">req_to_token</code> 池里的那一行。两处取法的分工：<code class="inline">req.kv.holds_kv</code> 为真（后续 chunk、借来的 session 行）时行里已经是自己的前缀，直接读行；新请求则读树。<br><br><b>这个结果为什么字段这么多：</b>它已经从一个「匹配结果」长成了一个「按层类型分类的匹配结果」。最初只有长度 + 终点节点，后来 HiCache 加进来长了 <code class="inline">host_hit_length</code>，再后来<strong>滑动窗口层</strong>（<code class="inline">swa_*</code>）和 <strong>Mamba/线性注意力层</strong>（<code class="inline">mamba_*</code>）各自有了独立的命中长度——因为这三类层能复用的历史长度不一样：全注意力层能复用整段前缀，滑动窗口层只能复用最后 <code class="inline">window_size</code> 个 token，Mamba 类层的状态则有个「分支点」概念（<code class="inline">branching_seqlen</code>，超过它状态就不能直接续用，必须重算）。如果你在别的分支上看到过只有几项的版本，那是这个结构扩张过程中的中间形态。调度侧的包装是 <code class="inline">init_next_round_input</code>（<code class="inline">schedule_batch.py</code>）：它准备 token 序列和 key_limit，然后调 <code class="inline">match_kv_cache</code>，再把 mamba 分支点之类只有它关心的字段补上。</div>
 
     <p>第一个减法在准入阶段。<code class="inline">PrefillAdder.add_one_req</code>（<code class="inline">schedule_policy.py</code>）按「还剩多少 token 真的要算」扣预算：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_policy.py — add_one_req 的预算段（摘录，注释为译注）</div>
@@ -333,8 +347,8 @@ max_new = <span class="fn">min</span>(
     <span class="fn">max</span>(req.sampling_params.max_new_tokens - <span class="fn">len</span>(req.output_ids), <span class="nu">0</span>),
     CLIP_MAX_NEW_TOKENS,
 )
-cand_extend_input_len = <span class="fn">len</span>(req.full_untruncated_fill_ids) - <span class="fn">len</span>(req.prefix_indices)
-total_tokens = cand_extend_input_len + max_new + self.page_size
+cand_extend_input_len = <span class="fn">len</span>(req.full_untruncated_fill_ids) - req.prefix_len
+total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
 ...
 <span class="kw">if</span> total_tokens &gt;= self.rem_total_tokens:
     <span class="kw">return</span> <span class="cl">AddReqResult</span>.NO_TOKEN</pre>
@@ -346,15 +360,15 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
     self.forward_mode = <span class="cl">ForwardMode</span>.EXTEND
     reqs = self.reqs
     <span class="cmt"># 填充 id 序列减去已缓存前缀：模型只见后缀</span>
-    input_ids = [r.<span class="fn">get_fill_ids</span>()[<span class="fn">len</span>(r.prefix_indices) :] <span class="kw">for</span> r <span class="kw">in</span> reqs]
+    input_ids = [r.<span class="fn">get_fill_ids</span>()[r.prefix_len :] <span class="kw">for</span> r <span class="kw">in</span> reqs]
     extend_num_tokens = <span class="fn">sum</span>(<span class="fn">len</span>(ids) <span class="kw">for</span> ids <span class="kw">in</span> input_ids)
-    seq_lens = [r.extend_range.end <span class="kw">for</span> r <span class="kw">in</span> reqs]
-    prefix_lens = [<span class="fn">len</span>(r.prefix_indices) <span class="kw">for</span> r <span class="kw">in</span> reqs]
-    extend_lens = [r.extend_range.length <span class="kw">for</span> r <span class="kw">in</span> reqs]
+    seq_lens = [r.extend_end <span class="kw">for</span> r <span class="kw">in</span> reqs]
+    prefix_lens = [r.prefix_len <span class="kw">for</span> r <span class="kw">in</span> reqs]
+    extend_lens = [r.extend_len <span class="kw">for</span> r <span class="kw">in</span> reqs]
     ...
     <span class="cmt"># 分配内存（含前缀占用的槽位）</span>
     out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = <span class="fn">alloc_for_extend</span>(self)</pre>
-    <div class="annotation"><b>槽位记账是全长的：</b> 注意 <code class="inline">alloc_for_extend</code> 仍要为<strong>整个序列</strong>准备槽位记账——前缀槽位已经存在（复用），后缀槽位新分配。前缀的槽位号来自 <code class="inline">prefix_indices</code>，后缀的来自分配器，两者拼成该请求完整的 <code class="inline">req_to_token</code> 行。</div>
+    <div class="annotation"><b>槽位记账是全长的：</b> 注意 <code class="inline">alloc_for_extend</code> 仍要为<strong>整个序列</strong>准备槽位记账——前缀槽位已经存在（复用），后缀槽位新分配。前缀的槽位号这时才物化：<code class="inline">req.kv.holds_kv</code> 为真就直接读 <code class="inline">req_to_token</code> 行，否则调 <code class="inline">tree_cache.prefix_device_indices(req)</code> 沿 <code class="inline">last_node</code> 的节点路径把下标走一遍；后缀的来自分配器，两者拼成该请求完整的 <code class="inline">req_to_token</code> 行。三个长度的关系是恒等式：<code class="inline">extend_end = prefix_len + extend_len</code>——<code class="inline">extend_end</code> 是「含前缀算到哪」（seq_lens 的语义），<code class="inline">extend_len</code> 是「这一步真要算几个 token」。</div>
 
     <p>第三个交互在 chunked prefill。长输入被切成多个块，<strong>每算完一块就登记一次树</strong>：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — stash_chunked_request（摘录，注释为译注）</div>
@@ -363,10 +377,10 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
         self.<span class="fn">checkpoint_disagg_prefill</span>(req)
     <span class="kw">else</span>:
         <span class="fn">checkpoint_kv_cache</span>(req, self.tree_cache)</pre>
-    <p>对应到树这边的 <code class="inline">RadixCache.checkpoint()</code>（<code class="inline">radix_cache.py</code>）：把已算好的段 insert 进树、立刻重新 match 一次、用新 <code class="inline">prefix_indices</code> 覆盖请求的旧值，然后换锁——锁现在是一个 <code class="inline">TreeLock</code> 对象挂在 <code class="inline">req.lock</code> 上，换锁就是 <code class="inline">self.unlock(req.lock)</code> → <code class="inline">req.lock = self.lock(new_last_node)</code>（内部还是 <code class="inline">dec_lock_ref</code>/<code class="inline">inc_lock_ref</code>，只是把节点和归还参数打了个包）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
+    <p>对应到树这边的 <code class="inline">RadixCache.checkpoint()</code>（<code class="inline">radix_cache.py</code>）：把已算好的段 insert 进树、立刻重新 match 一次、沿新终点节点的路径取出槽位下标，写进请求在 <code class="inline">req_to_token</code> 池里的那一行（从 <code class="inline">cache_protected_len</code> 起覆盖到新长度），然后换锁——锁现在是一个 <code class="inline">TreeLock</code> 对象挂在 <code class="inline">req.lock</code> 上，换锁就是 <code class="inline">self.unlock(req.lock)</code> → <code class="inline">req.lock = self.lock(new_last_node)</code>（内部还是 <code class="inline">dec_lock_ref</code>/<code class="inline">inc_lock_ref</code>，只是把节点和归还参数打了个包）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
-      <code class="inline">req.kv.cache_protected_len</code> 是页对齐与树记账接缝处的关键计数，checkpoint 里新写的注释把它讲透了：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在 <code class="inline">req.prefix_indices</code> 里但不在树上；checkpoint 后 <code class="inline">cache_protected_len = len(new_indices)</code> 标出「树已经接管的前缀长度」。请求结束时 <code class="inline">release_kv_cache()</code> 只释放 <code class="inline">(cache_protected_len, owned_kv_len)</code> 这一段——受保护的部分是树的，不是这个请求的（"The protected prefix is not this req's to free."），半页在下一个 checkpoint 或收尾时统一处理。这套字段都挂在 <code class="inline">req.kv</code>（<code class="inline">KVCacheState</code>）下：除了 <code class="inline">cache_protected_len</code>，还有上面提到的 <code class="inline">cache_inserted_len</code>（insert 过多少，用于命中去重计数）。先有按 token 的树，后有按页的池，接缝处的字段都挂在请求状态上对齐两套粒度。
+      <code class="inline">req.kv.cache_protected_len</code> 是页对齐与树记账接缝处的关键计数，checkpoint 里新写的注释把它讲透了：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在<strong>请求的 req_to_token 行里</strong>但不在树上；checkpoint 后 <code class="inline">cache_protected_len = len(new_indices)</code> 标出「树已经接管的前缀长度」。请求结束时 <code class="inline">release_kv_cache()</code> 只释放 <code class="inline">(cache_protected_len, owned_kv_len)</code> 这一段——受保护的部分是树的，不是这个请求的（"The protected prefix is not this req's to free."），半页在下一个 checkpoint 或收尾时统一处理。这套字段都挂在 <code class="inline">req.kv</code>（<code class="inline">KVCacheState</code>）下：除了 <code class="inline">cache_protected_len</code>，还有上面提到的 <code class="inline">cache_inserted_len</code>（insert 过多少，用于命中去重计数）。先有按 token 的树，后有按页的池，接缝处的字段都挂在请求状态上对齐两套粒度。
     </div>
   </section>
 
@@ -426,7 +440,7 @@ total_tokens = cand_extend_input_len + max_new + self.page_size
 </div>
 
 <footer>
-  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-11113-g22d63f5e43 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

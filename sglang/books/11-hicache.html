@@ -222,7 +222,7 @@
     <p><strong>预取（L3→L2）</strong>发生在调度阶段。Scheduler 的 <code class="inline">_prefetch_kvcache</code>（<code class="inline">scheduler.py</code>）在给 waiting 队列里的请求做前缀匹配时，若存储后端启用，顺手发起一次预取——把「当前匹配不到、但 L3 可能有」的那段 token 提前拉到 L2：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — _prefetch_kvcache（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_prefetch_kvcache</span>(self, req, storage_hit_end=<span class="kw">None</span>):
-    <span class="kw">if</span> self.enable_hicache_storage:
+    <span class="kw">if</span> self.enable_hicache_storage <span class="kw">or</span> self.enable_lmcache:
         req.init_next_round_input(self.tree_cache, cow_mamba=<span class="kw">False</span>)
         tree_cache = self.tree_cache
         buffer_mode = get_memory().hicache_host_memory_mode == <span class="st">"buffer_only"</span>
@@ -230,6 +230,10 @@
         <span class="cmt"># Buffer mode host-backups nothing, so match_prefix anchors at</span>
         <span class="cmt"># root; re-anchor on the deepest device node.</span>
         ...
+        matched_len = req.prefix_len + req.host_hit_length
+        <span class="cmt"># 记下本次匹配长度，L3 重试策略靠它判断值不值得再试</span>
+        req.storage_prefetch_last_match_len = matched_len
+
         <span class="cmt"># 只有锚点已在 L2 备份好（或就是根）才值得预取：</span>
         <span class="cmt"># write-through 的备份从根连续，锚点没备份 = 存储必然未命中</span>
         <span class="kw">if</span> (
@@ -237,12 +241,25 @@
             <span class="kw">or</span> tree_cache.<span class="fn">is_root</span>(last_host_node)
             <span class="kw">or</span> (buffer_mode <span class="kw">and</span> ...):
         ):
-            matched_len = <span class="fn">len</span>(req.prefix_indices) + req.host_hit_length
+            match_end = req._compute_max_prefix_len(<span class="fn">len</span>(req.full_untruncated_fill_ids))
             new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+            <span class="cmt"># 可选：带上沿途节点的哈希链（页级校验用）</span>
+            prefix_keys = (
+                tree_cache.<span class="fn">get_prefix_hash_values</span>(last_host_node)
+                <span class="kw">if</span> tree_cache.hicache_storage_pass_prefix_keys
+                <span class="kw">else</span> <span class="kw">None</span>
+            )
             <span class="kw">return</span> tree_cache.<span class="fn">prefetch_from_storage</span>(
                 req.cache_request_handle,
                 last_host_node,
-                new_input_tokens, ...)</pre>
+                new_input_tokens,
+                tree_cache.<span class="fn">get_last_hash_value</span>(last_host_node),
+                prefix_keys,
+                matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+                storage_hit_end=storage_hit_end,
+            )</pre>
     <p>真正发不发，由 <code class="inline">prefetch_from_storage</code>（<code class="inline">unified_radix_cache.py</code>）里的门槛把关——注意第一个参数是 <code class="inline">CacheRequestHandle</code>（预取记账按「这次请求尝试」而非裸 rid 键控，重试/重入队时同一 rid 的新尝试不会串到旧账上）：</p>
     <div class="code-title">python/sglang/srt/mem_cache/unified_radix_cache.py — prefetch_from_storage 的门槛（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>        req_id = request.rid
@@ -425,7 +442,7 @@
     <div class="annotation"><b>键里没写的维度就共享不了：</b> 非 MLA 模型下每个 TP rank 持有不同的 KV 分片，所以键里必须带 <code class="inline">tp_rank/tp_size</code>；CP（context parallel）下每个 rank 持有每页的一个不相交切片，注释说明了为什么必须再按 CP rank 拆键——否则多 rank 写同一文件就是写冲突。共享是有条件的：键设计里没覆盖的并行维度，L3 就共享不了。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      这张注册表之外最近多了一条不走它的通路（commit cf5df82680，#38652）：开 <code class="inline">--enable-lmcache</code> 时，建树逻辑在 <code class="inline">registry.py</code> 直接返回 <code class="inline">LMCacheUnifiedRadixCache</code>——<code class="inline">UnifiedRadixCache</code> 的子类（<code class="inline">lmcache_unified_radix_cache.py</code>，docstring 自述「device-direct LMCache MP KV/state I/O」），而且优先级排在 unified_cache_external_linker（<code class="inline">registry.py</code>）<strong>之前</strong>，<code class="inline">kv_cache_hook.py</code> 明确两者互斥——同样是「L3 接外部存储」，链接器是挂在树外的旁路，LMCache 则整棵树被替换成自带连接器的版本（按 FULL / SWA / MAMBA 组件选择 tree_components，<code class="inline">registry.py</code>）。它对树协议只动了两个方法，两个都值得记。<code class="inline">is_backuped</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）无条件返回 True，注释一句话讲透：「LMCache rebuilds lookup keys from tokens, so any L1 node is valid」——调度器的存储预取锚点检查（<code class="inline">scheduler.py</code>）原来要求「锚点节点已备份到 host」，否则连哈希都懒得算（必然 miss）；LMCache 按 token 重建查找键，跟树内备份状态无关，任何 L1 节点都配当锚点。<code class="inline">match_prefix</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）则把「外部存储的命中」伪装成 L2 命中：LMCache 查到了、GPU 槽位还没就位时，先借 MatchResult 的 host 字段报告命中（<code class="inline">host_hit_length=external_hit</code>、SWA/Mamba 各自的 host 字段），调度器按「L2 回载」的既有路径发配额、拉数据；H2D 载入已提交时改为把已载槽位直接拼进 <code class="inline">device_indices</code>（并发下被树内插入抢走的私有槽位还要记 <code class="inline">skip</code> 排除）。命中语义统一从「数据在哪个池子里」回到「数据在不在、怎么拿到」——第 11.2 节的三种节点状态是树内视角，这里相当于给 MatchResult 加了一层「外部也算数」的解释。
+      这张注册表之外最近多了一条不走它的通路（commit cf5df82680，#38652）：开 <code class="inline">--enable-lmcache</code> 时，建树逻辑在 <code class="inline">registry.py</code> 直接返回 <code class="inline">LMCacheUnifiedRadixCache</code>——<code class="inline">UnifiedRadixCache</code> 的子类（<code class="inline">lmcache_unified_radix_cache.py</code>，docstring 自述「device-direct LMCache MP KV/state I/O」），而且优先级排在 unified_cache_external_linker（<code class="inline">registry.py</code>）<strong>之前</strong>，<code class="inline">kv_cache_hook.py</code> 明确两者互斥——同样是「L3 接外部存储」，链接器是挂在树外的旁路，LMCache 则整棵树被替换成自带连接器的版本（按 FULL / SWA / MAMBA 组件选择 tree_components，<code class="inline">registry.py</code>）。它对树协议只动了两个方法，两个都值得记。<code class="inline">is_backuped</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）无条件返回 True，注释一句话讲透：「LMCache rebuilds lookup keys from tokens, so any L1 node is valid」——调度器的存储预取锚点检查（<code class="inline">scheduler.py</code>）原来要求「锚点节点已备份到 host」，否则连哈希都懒得算（必然 miss）；LMCache 按 token 重建查找键，跟树内备份状态无关，任何 L1 节点都配当锚点。<code class="inline">match_prefix</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）则把「外部存储的命中」伪装成 L2 命中：LMCache 查到了、GPU 槽位还没就位时，先借 MatchResult 的 host 字段报告命中（<code class="inline">host_hit_length=external_hit</code>、SWA/Mamba 各自的 host 字段），调度器按「L2 回载」的既有路径发配额、拉数据；H2D 载入已提交时改为从已载槽位表里切出后缀，把命中长度直接累加进 <code class="inline">device_prefix_len</code>（并发下被树内插入抢走的私有槽位还要记 <code class="inline">skip</code> 排除）。命中语义统一从「数据在哪个池子里」回到「数据在不在、怎么拿到」——第 11.2 节的三种节点状态是树内视角，这里相当于给 MatchResult 加了一层「外部也算数」的解释。
     </div>
   </section>
 
@@ -444,7 +461,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-11113-g22d63f5e43 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

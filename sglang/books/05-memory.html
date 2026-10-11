@@ -155,7 +155,7 @@
 
         <!-- arrows -->
         <line class="edge" x1="352" y1="406" x2="516" y2="416"></line>
-        <text class="lbl sm code" x="380" y="398">out_cache_loc / prefix_indices</text>
+        <text class="lbl sm code" x="380" y="398">out_cache_loc / prefix_len</text>
         <line class="edge back" x1="700" y1="492" x2="352" y2="466"></line>
         <text class="lbl sm" x="560" y="486">请求结束 / 被抢占 → 页归还</text>
       </svg>
@@ -260,6 +260,14 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
       <b class="tag">演进痕迹</b>
       池子家族里还有一排刚建好、但还没有生产入口的成员：<code class="inline">mem_cache/page_interleave_pool.py</code> 与 <code class="inline">allocator/page_interleave.py</code> 实现了「KV 按 shard 组分片存储」——把 N 个连续物理页组成一个逻辑页、每组内各 rank 存自己那一份（GQA/MHA 沿注意力 CP 组、MLA 沿注意力 TP 组，因为这两处 KV 本来就是复制的，直接条带化就能省显存）。树、分配器、<code class="inline">req_to_token</code>、调度预算全都在逻辑槽位上看世界，只有池子底层做逻辑页→本 rank 物理页的双射换算；attention 侧经 <code class="inline">kv_shard_hooks.py</code> 的 <code class="inline">get_kv_shard_pool</code> 探测接线（目前只挂了 flashattention 与 trtllm_mla 两个后端）。这条轨道最近开始铺调度侧的第一段铁轨（commit df1fc6ab64，#39964）：PrefillAdder 构造时探测分片尺寸（<code class="inline">page_interleave_shard_size</code>，<code class="inline">schedule_policy.py</code>），大于 1 就记账三件事——准入粒度从物理页升到 <code class="inline">N×page_size</code> 的逻辑页（<code class="inline">per_req_token_overhead</code>，:736）、每次准入预留一份「组装暂存区」配额（<code class="inline">_kv_shard_reserve_scratch</code>，:1029：前缀按 <code class="inline">N×Σ⌈页/N⌉</code> 计、chunk 按 <code class="inline">⌈len/ps⌉</code> 计，装不下就 defer、空批都装不下直接报错——「分片 KV 要求 chunked prefill 适配组装暂存区」）；分配时还要带每请求的<strong>旋转基</strong>（<code class="inline">_kv_shard_rotation_bases</code>，<code class="inline">allocation.py</code>）：位置页 P 归哪个 shard 类由 <code class="inline">(b_i + P) % N</code> 决定，基从树上节点读（<code class="inline">rotation_base_of</code>，<code class="inline">unified_radix_cache.py</code>）而不是缓存在请求上——因为 checkpoint 可能在 chunk 之间把请求改挂到另一条链上（换锁即换节点）。生产构造点依然为零，但调度器已经开始为它算账——离启用就差一个开池子的开关。
     </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      「槽位号」这一层最近长出了第二个翻译面。unified 内存池（<code class="inline">--enable-unified-memory</code>，把静态切分的多个池子合成一块按需切分的字节缓冲）下，调度器发的槽位号是<strong>虚拟 id</strong>，每个子池的 kernel 要的是各自的<strong>物理 id</strong>——中间隔着一层 <code class="inline">KVIndexTranslator</code>。它原本是「谁用谁翻译」：每个后端取 KV 前各拼一次页表，草稿模型和目标模型对同一段槽位各翻各的。#42753 把它重组成 <code class="inline">kv_loc_plan.py</code>（约 350 行）的<strong>每迭代一份翻译计划</strong>：写入窗口按子池（<code class="inline">IdSpaceKind.FULL</code> / <code class="inline">SLIDING_WINDOW</code>）各翻译一次（<code class="inline">pack_read_stream</code>），一次迭代里的所有写者——目标的 prefill/decode、共享写窗口的融合草稿（见下一段）、验证批——都绑定同一份结果；读路径则只许翻译器自己的读原语翻译，消费者永远不碰翻译。<code class="inline">ForwardBatch</code> 因此多了 <code class="inline">kv_loc_plan</code>/<code class="inline">kv_loc_cols</code> 两个字段。提炼一下这个约束的形状：虚拟 id 与物理 id 的映射在迭代中途不失效（压缩不会动在飞页面的页），所以「一次迭代翻译一次」是合法的——这和第 6 章 CUDA Graph「按地址捕获」是同一家族的前提：一段窗口期内承认「地址不变」，机制才能把翻译成本摊薄。投机侧的对应物是 <code class="inline">prepare_for_draft</code> 拿着 target 的翻译器把整个写窗口（verify + draft extend 共用的那 <code class="inline">num_draft_tokens</code> 个槽位）一次规划好、草稿只写前 <code class="inline">num_steps</code> 列——窗口的三段写入共享同一份翻译。
+    </div>
+    <div class="callout info">
+      <b class="tag">演进痕迹</b>
+      草稿模型的 KV 也有了新的去处：住进目标模型的页里。unified 内存池开启 + 草稿是 EAGLE/DFLASH 家族 + 草稿是稠密 MHA 注意力时，<code class="inline">_fused_draft_decision</code>（<code class="inline">kv_cache_configurator.py</code>）会批准「融合草稿 KV」：草稿各层的 K/V 变成目标每个槽位条目里最后几段（布局文档里的原话：<code class="inline">[ K_0 | V_0 | ... | dK_0 | dV_0 | ... | pad ]</code>），宿主子池（mamba-MHA 或 MLA host）的槽位步长不变，草稿视图与宿主视图用<strong>同一个物理 token id</strong>、只差偏移。实现是 <code class="inline">unified_draft_pool.py</code> 的 <code class="inline">UnifiedDraftKVPool</code>——它继承 MHA 池但 k/v buffer 只是宿主子池条目里草稿部分的<strong>视图</strong>，并带一个标志位 <code class="inline">requires_physical_write_loc</code>：写入必须用翻译过的物理 id，虚拟 id 一律拒收。收益是两层的：草稿不用自建池子（省一份 KV 显存），草稿 KV 跟着宿主条目一起搬（压缩/换出时不会散架——所以 <code class="inline">move_kv_cache</code> 对这种布局直接 raise，逐槽搬运会把融合布局弄坏，要搬就整页信封一起搬）。门控清单也值得读：草稿后端必须在 <code class="inline">TRANSLATED_MHA_RAILS</code>（triton/flashinfer/fa3）里——因为融合草稿全靠 KV 索引翻译器读自己的行，没上「已审计翻译轨道」的后端会在某条草稿路径上读错。
+    </div>
   </section>
 
   <section class="block">
@@ -275,40 +283,64 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
     num_new_pages: <span class="cl">int</span> = <span class="kw">None</span>,
 ):
     bs = <span class="fn">len</span>(prefix_lens)
-    <span class="kw">if</span> extend_num_tokens <span class="cmt">//</span> self.page_size + bs + <span class="nu">1</span> &gt; <span class="fn">len</span>(self.free_pages):
+    <span class="cmt"># 新页数的严格上界：每请求新增页数 &lt; extend_len/page_size + 1</span>
+    max_new_pages = extend_num_tokens <span class="cmt">//</span> self.page_size + bs + <span class="nu">1</span>
+    <span class="kw">if</span> max_new_pages &gt; <span class="fn">len</span>(self.free_pages):
         self.<span class="fn">merge_and_sort_free</span>()
+
+    <span class="kw">if</span> max_new_pages &gt; <span class="fn">len</span>(self.free_pages):
+        <span class="cmt"># 上界证明不了池子够深时，先精确算一次页数——</span>
+        <span class="kw">if</span> num_new_pages <span class="kw">is</span> <span class="kw">None</span>:
+            num_new_pages = <span class="fn">get_num_new_pages</span>(
+                seq_lens=seq_lens_cpu, page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+        <span class="kw">if</span> num_new_pages &gt; <span class="fn">len</span>(self.free_pages):
+            <span class="kw">return</span> <span class="kw">None</span>
 
     out_indices = torch.<span class="fn">empty</span>((extend_num_tokens,), dtype=torch.int64, device=...)
 
-    <span class="cmt"># 一次 Triton 启动算出整批 token 的槽位号</span>
-    <span class="fn">alloc_extend_kernel</span>[(bs,)](
-        prefix_lens, seq_lens, last_loc, self.free_pages,
-        out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size,
-    )
+    <span class="cmt"># 一次 Triton 启动算出整批 token 的槽位号；不能跑 Triton 时有 naive 回退</span>
+    <span class="kw">if</span> self.use_triton_kernels:
+        <span class="fn">alloc_extend_kernel</span>[(bs,)](
+            prefix_lens, seq_lens, last_loc, self.free_pages,
+            out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size,
+        )
+    <span class="kw">else</span>:
+        <span class="fn">alloc_extend_naive</span>(
+            prefix_lens, seq_lens, last_loc, self.free_pages,
+            out_indices, self.page_size, self.device,
+        )
 
-    <span class="cmt"># 本批实际消耗的新页数；不够就返回 None（触发上层淘汰或回退）</span>
+    <span class="cmt"># 本批实际消耗的新页数（调用方没传就精确算一次）</span>
     <span class="kw">if</span> num_new_pages <span class="kw">is</span> <span class="kw">None</span>:
         num_new_pages = <span class="fn">get_num_new_pages</span>(
             seq_lens=seq_lens_cpu, page_size=self.page_size,
             prefix_lens=prefix_lens_cpu,
         )
-    <span class="kw">if</span> num_new_pages &gt; <span class="fn">len</span>(self.free_pages):
-        <span class="kw">return</span> <span class="kw">None</span>
     self.free_pages = self.free_pages[num_new_pages:]
     <span class="kw">return</span> out_indices</pre>
-    <div class="annotation"><b>一次 kernel 算完整个 batch：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">allocator.py</code>）每个请求一个 program，把槽位计算拆成三段：先<strong>填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>），再<strong>申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移），最后<strong>开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现留在调用方文件里（<code class="inline">paged.py</code>），两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。</div>
+    <div class="annotation"><b>一次 kernel 算完整个 batch：</b> <code class="inline">alloc_extend_kernel</code>（<code class="inline">sglang.kernels.ops.memory.allocator</code>）每个请求一个 program，把槽位计算拆成三段：先<strong>填满上一个未满页</strong>（接续 <code class="inline">last_loc</code>），再<strong>申请若干整页</strong>（从 <code class="inline">free_pages</code> 取页号乘 <code class="inline">page_size</code> 加页内偏移），最后<strong>开新页放尾巴</strong>。全部向量化，一个 batch 一次 kernel，不再有 Python 循环。纯 torch 的 <code class="inline">alloc_extend_naive</code> 参考实现和 kernel 并排放在 <code class="inline">paged.py</code> 里，两版并存——加向量化内核时的对照物，读代码时值得互相对一遍。这段最近的演化值得看一眼：<strong>预算检查从「算完再查」挪到了「启动 kernel 之前」</strong>——<code class="inline">max_new_pages</code> 这个上界（每请求新页数 &lt; extend_len/page_size + 1，求和后加 2 的余量）证明不了池子够深时，先用 CPU 张量精确算一遍本批要几页、不够直接返回 None，再启动 kernel。源码注释把理由说得很直白：两个 kernel 在 free_pages 不足时都会越界读（Triton 越界、native 一版钳位到重复行），与其让它们带病运行，不如先付一次精确计数。上界证明不了 ≠ 一定不够——多数请求安全通过，精确计数只在边界情况才付。</div>
 
     <p>decode 每步每请求至多消耗一页，kernel 更简单；释放则要把 token 槽位号折算回页号并去重：</p>
     <div class="code-title">python/sglang/srt/mem_cache/allocator/paged.py — alloc_decode 与 free（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">alloc_decode</span>(self, seq_lens, seq_lens_cpu, last_loc):
     bs = <span class="fn">len</span>(seq_lens)
     ...
-    <span class="fn">alloc_decode_kernel</span>[(bs,)](seq_lens, last_loc, self.free_pages,
-                               out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size)
+    <span class="cmt"># decode 每请求至多消耗一页，先查够不够再启动 kernel</span>
+    <span class="kw">if</span> bs &gt; <span class="fn">len</span>(self.free_pages):
+        self.<span class="fn">merge_and_sort_free</span>()
     num_new_pages = <span class="fn">get_num_new_pages</span>(seq_lens=seq_lens_cpu,
                                       page_size=self.page_size, decode=<span class="kw">True</span>)
     <span class="kw">if</span> num_new_pages &gt; <span class="fn">len</span>(self.free_pages):
         <span class="kw">return</span> <span class="kw">None</span>
+    out_indices = torch.<span class="fn">empty</span>((bs,), dtype=torch.int64, device=...)
+    <span class="kw">if</span> self.use_triton_kernels:
+        <span class="fn">alloc_decode_kernel</span>[(bs,)](seq_lens, last_loc, self.free_pages,
+                                   out_indices, <span class="fn">next_power_of_2</span>(bs), self.page_size)
+    <span class="kw">else</span>:
+        <span class="fn">alloc_decode_naive</span>(seq_lens, last_loc, self.free_pages,
+                           out_indices, self.page_size, num_new_pages)
     self.free_pages = self.free_pages[num_new_pages:]
     <span class="kw">return</span> out_indices
 
@@ -383,7 +415,7 @@ self.<span class="fn">_store_kv_layer</span>(layer_id - self.start_layer, loc, c
 </div>
 
 <footer>
-  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 05 内存池 · 版本 gateway-v0.3.1-11113-g22d63f5e43 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

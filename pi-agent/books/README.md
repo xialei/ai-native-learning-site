@@ -65,5 +65,5 @@ python3 -m http.server
 ## 备注
 
 - 内容基于当前仓库源码整理。代码引用不标行号，随版本演化可能略有出入，以源码为准。
-- 当前审核版本：`v1.0.4-6-g0cf65d2bf`（2026-10-06 再核实：206 commits，旧 experimental harness 在 v1.0.0 整体删除——ch07 保留为演化课并新增 pi-durable 接棒节 §7.8；ch09 新增工具暴露节 §9.5b（ToolExposure 五值 + ctx.executeTool + prepareLoadout）；ch11 增补 codemode/MCP 内置扩展（builtin:&lt;name&gt;）；ch10 补 samplingParamsByThinkingLevel 四层合并 #9776 与 Anthropic inline-tools-2026-09-15；ch08 四根钩子扩成六安装器）。
+- 当前审核版本：`v1.1.0-22-gea448f454`（2026-10-11 再核实：自 v1.0.4-6-g0cf65d2bf 起 69 commits，含 v1.1.0 正式版；ch07 修 Harness.open close-catch 摘录 + Conversation.context 增 {at}、§7.8 补 durable 嵌套调用/structuredOutputSchema/callers 与调度器索引瘦身 cb4375493/ea448f454；ch10 分类器三值改四值（+openai-decisions / classifier-shared.ts 搬家）+ 摘录 input 字段改 ModelInputModality + 10.2 补 #9880 配置 schema 化演化痕迹（compat-schema.ts / model-schema.ts 拆分）；ch08 agent_settled 补 aborted（#10607）；ch11 11.2 补 +name/-name 工具修饰符、11.4 增补 OSC 7501 程序状态；ch06 chars/4 复核不受 pi-ai 估算 3.5 变更影响）。
 - 配色沿用 Pi 的 teal / indigo 品牌色调（`assets/pi-learn.css`），结构上借鉴了此前自建的 vLLM 学习站模板。

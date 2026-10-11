@@ -197,7 +197,7 @@
     <span class="cmt"># 所以在第一个 batch 上把驻留前缀快照下来。非 staging 则读实时前缀。</span>
     <span class="kw">if</span> self.enable_staging <span class="kw">and</span> req.early_send_prefix_end <span class="kw">is</span> <span class="kw">None</span>:
         req.early_send_prefix_end = <span class="fn">max</span>(
-            <span class="nu">0</span>, <span class="fn">len</span>(req.prefix_indices) - req.host_hit_length
+            <span class="nu">0</span>, req.prefix_len - req.host_hit_length
         )
 
     <span class="kw">if</span> req.pending_bootstrap:
@@ -207,7 +207,7 @@
     cached_end = (
         req.early_send_prefix_end
         <span class="kw">if</span> self.enable_staging
-        <span class="kw">else</span> <span class="fn">len</span>(req.prefix_indices) - req.host_hit_length
+        <span class="kw">else</span> req.prefix_len - req.host_hit_length
     )
     <span class="kw">if</span> cached_end &lt;= req.start_send_idx:
         <span class="kw">return</span>
@@ -224,7 +224,7 @@
         req.disagg_kv_sender._early_send_wait_event = ev
     self.<span class="fn">send_kv_chunk</span>(req, last_chunk=<span class="kw">False</span>, end_idx=cached_end)</pre>
     <div class="annotation"><b>三个细节都有生产含义：</b> 边界只发页对齐的（传输协议按页为单位）；overlap 调度下「读 KV」和「写 KV」在不同 CUDA stream 上，必须用 event 先后排序；这段优化由 <code class="inline">SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX</code> 控制，<strong>默认开着</strong>（<code class="inline">EnvBool(True)</code>）——它是快路径而非实验开关，所以上面那两个 <code class="inline">return</code> 的保守语义很重要：宁可少发这一次，也不留半页歧义，因为常规的最终发送会兜住全量。</div>
-    <div class="annotation"><b>staging 带来的额外一层：</b> 开头那段快照逻辑是后加的。非 staging 时 <code class="inline">cached_end</code> 直接读 <code class="inline">len(req.prefix_indices)</code> 的实时值；staging 路径不行，因为它的暂存缓冲是<strong>按位置切格</strong>的：一个网格槽的宽度是 <code class="inline">staging_grid_tokens(chunked_prefill_size, page_size)</code>（即 chunked prefill 大小按页对齐，默认 8192 对齐到页），<code class="inline">compute_grid_segments</code> 在 <code class="inline">base + k * grid_tokens</code> 这些网格边界上切段，「每段恰好落进一个暂存槽」。而一个请求要占几个网格槽（<code class="inline">num_chunks</code>）是在预取时<strong>按传输总页数一次算定的</strong>——所以此前发送的边界必须在请求的各 batch 之间保持稳定，否则前后两次发送对不上同一套槽位。源码那两行注释写的就是这个约束。于是改成在第一个 batch 上把 <code class="inline">early_send_prefix_end</code> 快照一次，后续 batch 都读这个定值。<code class="inline">req.pending_bootstrap</code> 的提前返回也是同一类考虑：握手还没完成，decode 侧根本没有可以接收的槽位。<strong>同一个函数里，「实时值」和「快照值」两种取法并存</strong>——这是加 staging 时留下的形状，不是冗余。</div>
+    <div class="annotation"><b>staging 带来的额外一层：</b> 开头那段快照逻辑是后加的。非 staging 时 <code class="inline">cached_end</code> 直接读 <code class="inline">req.prefix_len</code> 的实时值；staging 路径不行，因为它的暂存缓冲是<strong>按位置切格</strong>的：一个网格槽的宽度是 <code class="inline">staging_grid_tokens(chunked_prefill_size, page_size)</code>（即 chunked prefill 大小按页对齐，默认 8192 对齐到页），<code class="inline">compute_grid_segments</code> 在 <code class="inline">base + k * grid_tokens</code> 这些网格边界上切段，「每段恰好落进一个暂存槽」。而一个请求要占几个网格槽（<code class="inline">num_chunks</code>）是在预取时<strong>按传输总页数一次算定的</strong>——所以此前发送的边界必须在请求的各 batch 之间保持稳定，否则前后两次发送对不上同一套槽位。源码那两行注释写的就是这个约束。于是改成在第一个 batch 上把 <code class="inline">early_send_prefix_end</code> 快照一次，后续 batch 都读这个定值。<code class="inline">req.pending_bootstrap</code> 的提前返回也是同一类考虑：握手还没完成，decode 侧根本没有可以接收的槽位。<strong>同一个函数里，「实时值」和「快照值」两种取法并存</strong>——这是加 staging 时留下的形状，不是冗余。</div>
   </section>
 
   <section class="block">
@@ -271,19 +271,25 @@
 
     self.polling_count = (self.polling_count + <span class="nu">1</span>) % self.polling_interval
     <span class="kw">if</span> self.polling_count % self.polling_interval == <span class="nu">0</span>:
-        <span class="cmt"># host 接收阈值为 0：先取预分配的；阈值大于 0：先收已到达的、</span>
-        <span class="cmt"># 给完成中的 host 传输腾出设备空间，再放新请求进来</span>
-        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold == <span class="nu">0</span>:
+        <span class="cmt"># host 接收阈值为 1（关闭 host 接收，默认）：先取预分配的；</span>
+        <span class="cmt"># 阈值小于 1（开 host 接收）：先收已到达的、给完成中的 host 传输</span>
+        <span class="cmt"># 腾出设备空间，再放新请求进来</span>
+        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold == <span class="nu">1</span>:
             req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
             self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)
         transferred_reqs = (
             self.disagg_decode_transfer_queue.<span class="fn">pop_transferred</span>()
         )  <span class="cmt"># KV 已到达的请求</span>
+        <span class="kw">if</span> self.enable_hisparse:
+            <span class="kw">for</span> req <span class="kw">in</span> transferred_reqs:
+                <span class="cmt"># 直达 host：KV 数据已在 host 池里，跳过 staging</span>
+                self.hisparse_coordinator.<span class="fn">admit_request_direct</span>(req)
         self.waiting_queue.<span class="fn">extend</span>(transferred_reqs)
-        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold &gt; <span class="nu">0</span>:
+        <span class="kw">if</span> get_disagg().disaggregation_decode_host_receive_threshold &lt; <span class="nu">1</span>:
             <span class="cmt"># 先给完成中的 host 传输腾设备空间，再收新到达的</span>
             req_conns, _ = self.disagg_decode_prealloc_queue.<span class="fn">pop_preallocated</span>()
             self.disagg_decode_transfer_queue.<span class="fn">extend</span>(req_conns)</pre>
+    <div class="annotation"><b>阈值翻了个面：</b> 这两个分岔条件最近整体翻转过（commit f6c848c882，#43407）。<code class="inline">disaggregation_decode_host_receive_threshold</code> 是「设备 token 占用率达到多少时，进来的 KV 改收进 decode 收回用的 host 池」的分数阈值，语义没变，变的是两个端点的含义和默认值：字段描述现在写的是「Range [0, 1]; 1 disables host receive (default), 0 always uses host receive」——以前默认 0.0（永远走 host 接收、先收已到达的），现在默认 1.0（不开 host 接收，预分配请求优先放行），分岔从 <code class="inline">== 0</code> / <code class="inline">&gt; 0</code> 对应地改成 <code class="inline">== 1</code> / <code class="inline">&lt; 1</code>。读这段代码时别把「1 是关闭」当成笔误。顺带一提，描述末尾还挂着一句诚实的声明：「No built-in backend currently supports this」——目前没有内置传输后端支持 host 目的地，这个阈值暂时是给未来后端预留的旋钮。另外中间新插的一段 <code class="inline">hisparse</code> 直通分支：开 <code class="inline">--enable-hisparse</code> 时 KV 已落在 host 池里，到达的请求走 <code class="inline">admit_request_direct</code> 绕过设备侧的收货路径。</div>
     <p>KV 到达后请求进入 <code class="inline">waiting_queue</code>，由 <code class="inline">get_new_prebuilt_batch</code> 打包成 <code class="inline">ForwardMode.PREBUILT</code> 的 ScheduleBatch——名字里的「fake completed prefill」说明它的前向被跳过，直接以 decode 身份并入 <code class="inline">running_batch</code>。从这里开始，这条请求走的完全是第 2~4 章讲过的普通路径。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
@@ -367,7 +373,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-10731-gbb4d0a13c1 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 12 PD 分离 · 版本 gateway-v0.3.1-11113-g22d63f5e43 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

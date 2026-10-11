@@ -34,22 +34,18 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构</div>
+    <div class="chap-meta">Chapter 01 · Architecture</div>
     <h1>整体架构：on-device 推理到底难在哪</h1>
-    <div class="subtitle">云端引擎（vLLM 那一类）的约束是「吞吐」；on-device 引擎的约束是「这台机器只有这么多显存、这么多带宽」。先把两个约束讲清楚，再看两个引擎各自怎么拆系统。</div>
+    <div class="lede">
+      <p>云端引擎（vLLM 那一类）的约束是「吞吐」；on-device 引擎的约束是「这台机器只有这么多显存、这么多带宽」。这一章先把两个约束讲清楚，再看两个引擎各自怎么拆系统——后面十二章讲的都是这一章画出的某一块的细节。</p>
+      <p>本章不讲模型结构，也不讲单个算子怎么实现；只画边界：问题是什么、两个引擎各自怎么拆、一次请求在两边长什么样。</p>
+    </div>
   </div>
 
   <section class="block">
     <h2><span class="num">1.1</span>两堵墙</h2>
-    <p>on-device 推理与数据中心推理面对的不是一个问题。数据中心里你可以堆 8 张 H100；而一台游戏本、一块 RTX 4070、甚至一部手机，资源上限是固定的。具体来说有两堵墙：</p>
-    <ul>
-      <li><strong>容量墙</strong>：70B 模型即使 4-bit 量化也要 ~40GB，超过多数消费级 GPU 的 8~24GB 显存。放不下，就要决定「放多少层进显存、剩下留给谁」。</li>
-      <li><strong>带宽墙</strong>：decode 阶段每生成一个 token 都要把全部权重读一遍（memory-bound）。显存带宽 250~1000 GB/s，比 HBM3e 的 3~8 TB/s 低一个数量级。CPU 内存带宽（~50-100 GB/s）更低一个台阶。</li>
-    </ul>
-    <p>两个引擎对这两堵墙的答案完全不同，这正是本书分两条线讲的原因：</p>
-    <ul>
-      <li><strong>llama.cpp</strong>：通用轻量级。核心思路是「压缩到放得下 + 按层切分到多设备 + CPU 兜底」。它不假设你有什么硬件——CUDA、Metal、Vulkan、SYCL、OpenCL、WebGPU，甚至纯 CPU 都能跑同一个 GGUF。</li>
-      <li><strong>FreeToken</strong>：消费级 GPU 的 MoE 专用。MoE 模型（DeepSeek-V4、Qwen3.6、GLM-5.2 这类）总参数巨大但每个 token 只激活少数专家——于是它把<strong>全部专家权重放内存（pinned）、GPU 显存只留一个 LRU 槽池</strong>，缺谁补谁，再用 CPU 和 PCIe 带宽把补不上的缺口填掉。前提是你有一块像样的 NVIDIA 卡。</li>
-    </ul>
+    <p>on-device 推理与数据中心推理面对的不是一个问题。数据中心里你可以堆 8 张 H100；而一台游戏本、一块 RTX 4070、甚至一部手机，资源上限是固定的。具体来说有两堵墙。第一堵是<em>容量墙</em>：70B 模型即使 4-bit 量化也要 ~40GB，超过多数消费级 GPU 的 8~24GB 显存——放不下，就要决定「放多少层进显存、剩下留给谁」。第二堵是<em>带宽墙</em>：decode 阶段每生成一个 token 都要把全部权重读一遍（memory-bound），而消费级显存带宽 250~1000 GB/s，比 HBM3e 的 3~8 TB/s 低一个数量级，CPU 内存带宽（~50-100 GB/s）又更低一个台阶。</p>
+    <p>两个引擎对这两堵墙的答案完全不同，这正是本书分两条线讲的原因。llama.cpp 走<strong>通用轻量级</strong>路线，核心思路是「压缩到放得下 + 按层切分到多设备 + CPU 兜底」——它不假设你有什么硬件，CUDA、Metal、Vulkan、SYCL、OpenCL、WebGPU，甚至纯 CPU 都能跑同一个 GGUF。FreeToken 则押注<strong>消费级 GPU 的 MoE</strong>：DeepSeek-V4、Qwen3.6、GLM-5.2 这类模型总参数巨大但每个 token 只激活少数专家，于是它把全部专家权重放内存（pinned）、GPU 显存只留一个 LRU 槽池，缺谁补谁，再用 CPU 和 PCIe 带宽把补不上的缺口填掉——前提是你有一块像样的 NVIDIA 卡。</p>
     <div class="callout info">
       <b class="tag">怎么读</b>
       第 1~9 章走 llama.cpp 线：加载、decode 循环、KV、图、多设备、采样、投机、server。第 10~12 章走 FreeToken 线：引擎分层、专家缓存、CPU/GPU 协同。第 13 章把两边放回一张对照表，并给出自研路线。两线之间不要求先后——但第 2 章的量化概念在 FreeToken 章节里会反复出现。
@@ -58,7 +54,7 @@
 
   <section class="block">
     <h2><span class="num">1.2</span>llama.cpp 分层</h2>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
         <title id="t12">llama.cpp 架构分层</title>
         <desc id="d12">从 tools 到 ggml 的四层结构</desc>
@@ -131,7 +127,7 @@
   <section class="block">
     <h2><span class="num">1.3</span>FreeToken 分层</h2>
     <p>FreeToken 是一个 Python 包（<code class="inline">freetoken</code>），但热路径全部下沉到 CUDA/Triton kernel 和 C++ 扩展。它的分层依据是仓库自己的说明（<code class="inline">AGENTS.md</code>）：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 488" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t13 d13">
         <title id="t13">FreeToken 架构分层</title>
         <desc id="d13">从 HTTP API 到 kernel 的五层结构</desc>
@@ -192,14 +188,22 @@
     <div class="callout warn">
       <b class="tag">要点</b>
       先回答「你的模型是什么形状」。稠密模型 + 想覆盖所有硬件 → 走 llama.cpp 路线（量化 + 分层 + 通用后端）；MoE + 只针对 NVIDIA 消费卡 → 走 FreeToken 路线（槽池 + 带宽协同）。两条路线没有优劣，只有目标硬件和模型形态的区别。
-      下一步进入 <a href="02-gguf-loading.html">第 2 章：GGUF 与模型加载</a>。
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="index.html">← 返回索引</a>
-    <a href="02-gguf-loading.html">下一步：GGUF 与模型加载 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>on-device 与云端推理面对的不是同一个问题：容量墙与带宽墙。llama.cpp 用「压缩到放得下 + 按层切分 + CPU 兜底」换覆盖面，FreeToken 用「专家进内存 + 槽池 + 带宽协同」换单点延迟。四层与五层的分层图、一张请求路径表，是后面十二章反复回来看的底稿。</p>
+    <p>下一章从加载讲起：权重怎么从磁盘落到这台机器 → <a href="02-gguf-loading.html">第 2 章：GGUF 与模型加载</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="placeholder">&nbsp;</a>
+    <a class="next" href="02-gguf-loading.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 2 章 · GGUF 与模型加载</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

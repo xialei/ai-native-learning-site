@@ -358,8 +358,8 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
         <span class="kw">if</span> self.lora_int_id &lt; <span class="nu">1</span>:
             <span class="kw">raise</span> <span class="cl">ValueError</span>(...)
         assert self.lora_path, <span class="st">"lora_path cannot be empty"</span></pre>
-    <p>引擎侧由 <code class="inline">--enable-lora</code>（arg_utils.py:667，默认关）打开，参数在 <code class="inline">LoRAConfig</code>（vllm/config/lora.py:30）：最重要的两个是 <code class="inline">max_loras</code>（默认 1——<strong>一个 batch 里最多容纳几个不同适配器</strong>）和 <code class="inline">max_lora_rank</code>（默认 16，预分配 LoRA 权重的上限秩）。</p>
-    <p>路径分四步走。<strong>第一步，worker 加载时替换模块</strong>：开了 LoRA 的 runner 在 load_model 之后调 <code class="inline">load_lora_model</code>（gpu_model_runner.py:5282，V2 在 gpu/model_runner.py:384），把模型里的每个线性层包上一层 LoRA 壳——管理类是 <code class="inline">LRUCacheWorkerLoRAManager</code>（lora/worker_manager.py:247），docstring 说明了它怎么管缓存：「请求到来时装载请求的 LoRA（已加载则跳过），缓存超容时卸载最久未用的」。<strong>第二步，调度器保证 batch 不超限</strong>：</p>
+    <p>引擎侧由 <code class="inline">--enable-lora</code>（arg_utils.py:669，默认关）打开，参数在 <code class="inline">LoRAConfig</code>（vllm/config/lora.py:30）：最重要的两个是 <code class="inline">max_loras</code>（默认 1——<strong>一个 batch 里最多容纳几个不同适配器</strong>）和 <code class="inline">max_lora_rank</code>（默认 16，预分配 LoRA 权重的上限秩）。</p>
+    <p>路径分四步走。<strong>第一步，worker 加载时替换模块</strong>：开了 LoRA 的 runner 在 load_model 之后调 <code class="inline">load_lora_model</code>（gpu_model_runner.py:5233，V2 在 gpu/model_runner.py:401），把模型里的每个线性层包上一层 LoRA 壳——管理类是 <code class="inline">LRUCacheWorkerLoRAManager</code>（lora/worker_manager.py:245），docstring 说明了它怎么管缓存：「请求到来时装载请求的 LoRA（已加载则跳过），缓存超容时卸载最久未用的」。<strong>第二步，调度器保证 batch 不超限</strong>：</p>
     <div class="code-title">vllm/v1/core/sched/scheduler.py — max_loras 约束（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span>scheduled_loras: <span class="fn">set</span>[<span class="cl">int</span>] = <span class="fn">set</span>()
 <span class="cmt"># 调度循环里，waiting 队列逐请求检查：</span>
@@ -371,7 +371,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># cudagraph_specialize_lora=True（默认）：</span>
 <span class="cmt">#     2 的幂直到 max_loras，再加 max_loras+1 —— 每档单独捕获一张图</span>
 <span class="cmt"># False：只捕 [0, max_loras+1] 两档</span></pre>
-    <div class="annotation"><b>几个容易踩的坑：</b>① <code class="inline">lora_int_id</code> 要自己保证全局唯一——vLLM 的注释明说「currently not enforced」；要用新权重顶掉旧适配器，得显式 <code class="inline">load_inplace=True</code>。② <code class="inline">max_loras</code> 直接限制单批多样性：来了第 5 个不同适配器而 max_loras=4，调度器就让它在队列里等（scheduler.py:911 附近的 gate），不是报错而是<strong>延迟调度</strong>。③ 非 CUDA 平台走 SGMV kernel 的原因写在 <code class="inline">_set_active_loras</code> 的注释里：「so we always use the SGMV kernels on non-cuda platforms」（is_prefill 恒为 True）。④ CUDA graph 捕获案例随 LoRA 配置变多，启动时间和显存都涨——<code class="inline">cudagraph_specialize_lora</code>（config/compilation.py:659，默认 True）就是这笔开销的开关。自研启示：LoRA 服务化的最小闭环 = 「请求带适配器 id + worker 里 LRU 缓存适配器权重 + 逐 token 映射张量」三件事，SGMV kernel 可以先不做。</div>
+    <div class="annotation"><b>几个容易踩的坑：</b>① <code class="inline">lora_int_id</code> 要自己保证全局唯一——vLLM 的注释明说「currently not enforced」；要用新权重顶掉旧适配器，得显式 <code class="inline">load_inplace=True</code>。② <code class="inline">max_loras</code> 直接限制单批多样性：来了第 5 个不同适配器而 max_loras=4，调度器就让它在队列里等（scheduler.py:897 附近的 gate），不是报错而是<strong>延迟调度</strong>。③ 非 CUDA 平台走 SGMV kernel 的原因写在 <code class="inline">_set_active_loras</code> 的注释里：「so we always use the SGMV kernels on non-cuda platforms」（is_prefill 恒为 True）。④ CUDA graph 捕获案例随 LoRA 配置变多，启动时间和显存都涨——<code class="inline">cudagraph_specialize_lora</code>（config/compilation.py:663，默认 True）就是这笔开销的开关。自研启示：LoRA 服务化的最小闭环 = 「请求带适配器 id + worker 里 LRU 缓存适配器权重 + 逐 token 映射张量」三件事，SGMV kernel 可以先不做。</div>
   </section>
 
   <section class="block">
@@ -394,7 +394,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     self.quant_method = quant_method
 <span class="kw">else</span>:
     <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">"All linear layers should support quant method."</span>)</pre>
-    <div class="annotation"><b>forward 只认 <code class="inline">quant_method</code> 这个接口：</b>LinearBase.forward（linear.py:417）里就一句 <code class="inline">output = self.quant_method.apply(self, x, bias)</code>——上层模型代码完全不知道权重是 bf16 还是 fp8 还是 marlin 打包的 int4，多态全在这一个方法调用里。<code class="inline">resolve_quant_method</code>（base_config.py:285）则是 12.6 说的「在线量化」的入口：checkpoint 本身没量化时它可以套一层 online quantization 配置（对 LinearBase/RoutedExperts 生效，重复量化直接报错）。选哪个 kernel 还有第三层：以 FP8 为例，<code class="inline">Fp8LinearMethod.__init__</code>（fp8.py:241）按「块量化走 deep_gemm；逐 token 动态量化走 cutlass_fp8_supported() 的 token 对称 kernel，不支持则退 tensor 对称；无 FP8 硬件的老卡整条换成 marlin weight-only」逐级下落。自研启示：名字注册表 + 层级 quant_method 多态 + kernel 分级，三层各管一件事——照这个形状抄，以后加一种量化格式只动第一层和第三层，模型代码零改动。</div>
+    <div class="annotation"><b>forward 只认 <code class="inline">quant_method</code> 这个接口：</b>LinearBase.forward（linear.py:417）里就一句 <code class="inline">output = self.quant_method.apply(self, x, bias)</code>——上层模型代码完全不知道权重是 bf16 还是 fp8 还是 marlin 打包的 int4，多态全在这一个方法调用里。<code class="inline">resolve_quant_method</code>（base_config.py:292）则是 12.6 说的「在线量化」的入口：checkpoint 本身没量化时它可以套一层 online quantization 配置（对 LinearBase/RoutedExperts 生效，重复量化直接报错）。选哪个 kernel 还有第三层：以 FP8 为例，<code class="inline">Fp8LinearMethod.__init__</code>（fp8.py:241）按「块量化走 deep_gemm；逐 token 动态量化走 cutlass_fp8_supported() 的 token 对称 kernel，不支持则退 tensor 对称；无 FP8 硬件的老卡整条换成 marlin weight-only」逐级下落。自研启示：名字注册表 + 层级 quant_method 多态 + kernel 分级，三层各管一件事——照这个形状抄，以后加一种量化格式只动第一层和第三层，模型代码零改动。</div>
   </section>
 
   <section class="block">
@@ -518,7 +518,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
 </div>
 
 <footer>
-  深入浅出vLLM · 12 实战·权重加载 · 版本 v0.31.0 (db9527a4687)
+  深入浅出vLLM · 12 实战·权重加载 · 版本 v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)
 </footer>
 
 </body>
