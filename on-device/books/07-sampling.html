@@ -45,7 +45,7 @@
   <section class="block">
     <h2><span class="num">7.1</span>责任链：一个数组走到底</h2>
     <p>llama.cpp 采样的核心数据结构只有一个：llama_token_data_array（id、logit、p 三元组数组）。每个 sampler 实现 apply(cur_p)，按序施加。链的组装在 common/sampling.cpp：</p>
-    <div class="code-title">common/sampling.cpp:344-404 — 链的组装（摘录，注释为译注）</div>
+    <div class="code-title">common/sampling.cpp:344-407 — 链的组装（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (params.mirostat == <span class="nu">0</span>) {
 
     <span class="kw">bool</span> use_adaptive_p = <span class="kw">false</span>;
@@ -90,17 +90,21 @@
     <span class="kw">if</span> (use_adaptive_p) {
         samplers.push_back(llama_sampler_init_adaptive_p(...));
     } <span class="kw">else</span> {
-        <span class="cmt">// 默认：从分布中抽一个 token</span>
-        samplers.push_back(<span class="fn">llama_sampler_init_dist</span>(params.seed));
+        <span class="cmt">// 默认：从分布中抽一个 token；但链尾是 temp=0（或 top_k=1）时</span>
+        <span class="cmt">// 改放 greedy——dist 的过一遍采样没有必要（#29797，2026-10）</span>
+        <span class="kw">const bool</span> greedy =
+            (链尾 == TEMPERATURE &amp;&amp; params.temp == <span class="nu">0.0f</span> &amp;&amp; params.dynatemp_range == <span class="nu">0.0f</span>) ||
+            (链尾 == TOP_K &amp;&amp; params.top_k == <span class="nu">1</span>);
+        samplers.push_back(greedy ? <span class="fn">llama_sampler_init_greedy</span>() : <span class="fn">llama_sampler_init_dist</span>(params.seed));
     }
 }</pre>
-    <div class="annotation">组装逻辑里有三个容易看漏的地方。链头其实还有 logit_bias——合并用户偏置与模型 suppress tokens（置 -INFINITY），在 mirostat==0 分支之前就 push 进去了。链尾的 dist 是默认值：过滤链只<strong>改数组</strong>不选 token，总得有人掷骰子。mirostat 则不走这条链——分支里直接替换整条链，mirostat v1/v2 各自与 temp 组成两件套。</div>
+    <div class="annotation">组装逻辑里有三个容易看漏的地方。链头其实还有 logit_bias——合并用户偏置与模型 suppress tokens（置 -INFINITY），在 mirostat==0 分支之前就 push 进去了。链尾的 dist 是默认值：过滤链只<strong>改数组</strong>不选 token，总得有人掷骰子——2026-10 起有个例外：链尾已经是 temperature=0（或 top_k=1）时直接换 greedy（#29797），省掉一次归一化+掷骰子的开销，语义完全等价。mirostat 则不走这条链——分支里直接替换整条链，mirostat v1/v2 各自与 temp 组成两件套。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.2</span>运行时：apply 顺序即加工顺序</h2>
-    <p>链的运行时入口是 common_sampler_sample（common/sampling.cpp:602-684）：</p>
-    <div class="code-title">common/sampling.cpp:617-668 — 采样主流程（摘录，注释为译注）</div>
+    <p>链的运行时入口是 common_sampler_sample（common/sampling.cpp:605-687）：</p>
+    <div class="code-title">common/sampling.cpp:620-671 — 采样主流程（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 1) 后端采样器可能已经在 GPU 图里选好了 token —— 直接返回</span>
 id = <span class="fn">llama_get_sampled_token_ith</span>(ctx, idx);
 <span class="kw">if</span> (id != LLAMA_TOKEN_NULL) {
@@ -130,13 +134,13 @@ id = cur_p.data[cur_p.selected].id;
     <span class="kw">if</span> (is_valid) { <span class="kw">return</span> id; }
 }
 <span class="cmt">// 6) 不合法 → 重置 logits，grammar 先行，重新走一遍链</span></pre>
-    <div class="annotation">这段主流程最值得注意的是开头的 backend sampler：新版把部分采样搬进了 GPU 计算图（llama-context.cpp:256 注释「Initialize backend samplers here so they are part of the sampling graph」），链在 CPU 走完之前 GPU 可能已经出 token——grammar 相关逻辑此时被完全跳过。grammar 自己的默认模式是「先采样后校验」：链选出 token，grammar 只说行/不行，不行就重置 logits 重新走一遍链。还有个容易看漏的：reasoning budget（控制思考长度）永远最先施加——它管「思考块抑制」，是逻辑层不是分布层。</div>
+    <div class="annotation">这段主流程最扎眼的是开头的 backend sampler：新版把部分采样搬进了 GPU 计算图（llama-context.cpp:257 注释「Initialize backend samplers here so they are part of the sampling graph」），链在 CPU 走完之前 GPU 可能已经出 token——grammar 相关逻辑此时被完全跳过。grammar 自己的默认模式是「先采样后校验」：链选出 token，grammar 只说行/不行，不行就重置 logits 重新走一遍链。还有个容易看漏的：reasoning budget（控制思考长度）永远最先施加——它管「思考块抑制」，是逻辑层不是分布层。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.3</span>三个新 sampler 的算法</h2>
     <p>近年加入的几个 sampler 各有巧思，值得单独看一眼。</p>
-    <p><strong>top_n_sigma</strong>（src/llama-sampler.cpp:3237）：按统计截断——</p>
+    <p><strong>top_n_sigma</strong>（src/llama-sampler.cpp:3243）：按统计截断——</p>
     <div class="code-title">src/llama-sampler.cpp — top_n_sigma（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">if</span> (ctx-&gt;n &lt;= <span class="nu">0.0f</span> || cur_p-&gt;size &lt;= <span class="nu">1</span>) { <span class="kw">return</span>; }
 
@@ -145,7 +149,7 @@ id = cur_p.data[cur_p.selected].id;
 ...
 <span class="kw">float</span> mean = valid_count &gt; <span class="nu">0</span> ? logits_sum/valid_count : <span class="nu">0</span>;
 <span class="cmt">// 算标准差，只保留 [max - n*sigma, +inf) 的候选</span></pre>
-    <p><strong>mirostat v2</strong>（src/llama-sampler.cpp:2573）：自适应截断，目标「把每次选择的意外度钉在 tau」：</p>
+    <p><strong>mirostat v2</strong>（src/llama-sampler.cpp:2579）：自适应截断，目标「把每次选择的意外度钉在 tau」：</p>
     <div class="code-title">src/llama-sampler.cpp — mirostat v2（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="fn">llama_sampler_softmax_impl</span>(cur_p, <span class="kw">true</span>);
 
@@ -166,8 +170,8 @@ cur_p-&gt;selected = idx;
 <span class="kw">float</span> e = observed_surprise - ctx-&gt;tau;
 ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
     <div class="annotation">mirostat v2 说穿了就是一个一维控制器：mu 是「当前容忍的意外度上限」，实际意外度高于目标就调低 mu（变保守）、低于就调高（变奔放）。对比固定 top_p 的问题：不同位置的概率分布尖锐程度天差地别，固定比例截断时而过严时而过松——mirostat 用反馈回路替代静态阈值。</div>
-    <p><strong>DRY</strong>（Don't Repeat Yourself，src/llama-sampler.cpp:3317 起）：针对<strong>逐字重复</strong>——最近输出里出现过的序列若正被延续（重复长度超过 allowed_length），按指数衰减惩罚其下一个 token。与 penalties 的区别：penalties 惩罚 token 出现次数（不管上下文），DRY 惩罚「正在形成重复序列」——所以它需要 sequence breakers（换行、章节号等「合理重复」的分隔符）。</p>
-    <p><strong>adaptive-p</strong>（src/llama-sampler.cpp:3727 起）：比 mirostat 更新的思路——按目标 p 值直接挑「累计概率刚好达到目标」的候选集，无需训练地把输出分布的熵稳定在目标附近。</p>
+    <p><strong>DRY</strong>（Don't Repeat Yourself，src/llama-sampler.cpp:3323 起）：针对<strong>逐字重复</strong>——最近输出里出现过的序列若正被延续（重复长度超过 allowed_length），按指数衰减惩罚其下一个 token。与 penalties 的区别：penalties 惩罚 token 出现次数（不管上下文），DRY 惩罚「正在形成重复序列」——所以它需要 sequence breakers（换行、章节号等「合理重复」的分隔符）。</p>
+    <p><strong>adaptive-p</strong>（src/llama-sampler.cpp:3733 起）：比 mirostat 更新的思路——按目标 p 值直接挑「累计概率刚好达到目标」的候选集，无需训练地把输出分布的熵稳定在目标附近。</p>
   </section>
 
   <section class="block">
@@ -241,7 +245,7 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 07 采样 · llama.cpp b11439 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 07 采样 · llama.cpp b11552 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

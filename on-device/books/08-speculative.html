@@ -165,7 +165,7 @@ batch.<span class="fn">set_embd</span>(idx, { pending_g_last[seq_id].data(), <sp
 
   <section class="block">
     <h2><span class="num">8.5</span>验证与回滚：server 端的簿记</h2>
-    <p>草稿串进入 target 模型一次 decode，逐位置与 target 采样对比：一致则接受，首个不一致处截断、回滚 KV。server 端的簿记逻辑（tools/server/server-context.cpp:3268-3279）：</p>
+    <p>草稿串进入 target 模型一次 decode，逐位置与 target 采样对比：一致则接受，首个不一致处截断、回滚 KV。server 端的簿记逻辑（tools/server/server-context.cpp:3420-3431）：</p>
     <div class="code-title">tools/server/server-context.cpp — 投机检查点（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// TODO: avoid restoring the draft context and re-evaluating the drafted</span>
 <span class="cmt">// tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]</span>
@@ -173,7 +173,9 @@ batch.<span class="fn">set_embd</span>(idx, { pending_g_last[seq_id].data(), <sp
 
 <span class="kw">if</span> (ctx_dft) {
     <span class="kw">if</span> (use_ckpt_dft) {
-        ckpt.<span class="fn">load_dft</span>(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        <span class="cmt">// 2026-10 起（#26004）load_dft 返回 bool，必须显式消费——</span>
+        <span class="cmt">// 静默丢检查点会让回滚读到过期 KV</span>
+        GGML_ASSERT(ckpt.<span class="fn">load_dft</span>(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
     }
     <span class="cmt">// 草稿区 KV 删掉（保留 prompt KV：seq_rm 下界从检查点之后算）</span>
     <span class="kw">if</span> (!<span class="fn">llama_memory_seq_rm</span>(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + <span class="nu">1</span>, -<span class="nu">1</span>)) {
@@ -194,12 +196,12 @@ batch.<span class="fn">set_embd</span>(idx, { pending_g_last[seq_id].data(), <sp
 
   <section class="block">
     <h2><span class="num">8.6</span>对照：FreeToken 的空白</h2>
-    <p>FreeToken 目前没有任何投机解码实现。有一个耐人寻味的痕迹：DeepSeek-V4 的配置里有 <code class="inline">n_mtp_layers: int = 1</code>（python/freetoken/models/deepseek_v4/args.py:33），但全仓只有这一个定义、没有任何消费方；weight.py 加载专家库时明确跳过 MTP 层：</p>
-    <div class="code-title">python/freetoken/models/deepseek_v4/weight.py:176-178 — MTP 被跳过（摘录，注释为译注）</div>
+    <p>FreeToken 目前没有任何投机解码实现。有一个耐人寻味的痕迹：V4 的配置里有 <code class="inline">n_mtp_layers: int = 1</code>（python/freetoken/models/deepseek_v4/args.py:33），2026-10 新增的 V4.1 配置里也有 <code class="inline">n_mtp_layers: int = 3</code>（deepseek_v41/args.py:72）——两个定义、仍然没有任何消费方；weight.py 加载专家库时明确跳过 MTP 层：</p>
+    <div class="code-title">python/freetoken/models/deepseek_v4/weight.py:240-242 — MTP 被跳过（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">iter_expert_pieces</span>(model_path, config, kind, *, parallel=False, workers=8, chunk=8 &lt;&lt; <span class="nu">20</span>):
     <span class="cmt">"""Routed experts, one piece per expert: ``{gate, up, down}`` e2m1 pairs and their e8m0</span>
 <span class="cmt">    ``_scale`` companions (``w1`` / ``w3`` / ``w2``). The MTP layer's experts are skipped."""</span></pre>
-    <div class="annotation">这个空缺不是疏忽而是排序：FreeToken 的 decode 路径被 CUDA Graph 焊死成固定形状（第 5 章），草稿串长度可变的投机验证会把形状打碎——要么每档草稿长度再录一批图（显存爆炸），要么放弃图。CUDA Graph 与投机解码在当前实现下<strong>互斥</strong>。反过来，llama.cpp 的动态图（第 5 章 can_reuse）恰好天然支持「草稿长度每次都变」——两种图策略的优势互换了一次。自研引擎若两条都要，得在 graph capture 时把草稿长度也做成档位（FreeToken 的 bs 档位思路可以平移过来）。</div>
+    <div class="annotation">这个空缺不是疏忽而是排序：FreeToken 的 decode 路径被 CUDA Graph 焊死成固定形状（第 5 章），草稿串长度可变的投机验证会把形状打碎——要么每档草稿长度再录一批图（显存爆炸），要么放弃图。CUDA Graph 与投机解码在当前实现下<strong>互斥</strong>——V4.1 的配置把 n_mtp_layers 提到 3，像是在为 MTP 铺路，但消费方还没落地。反过来，llama.cpp 的动态图（第 5 章 can_reuse）恰好天然支持「草稿长度每次都变」——两种图策略的优势互换了一次。自研引擎若两条都要，得在 graph capture 时把草稿长度也做成档位（FreeToken 的 bs 档位思路可以平移过来）。</div>
   </section>
 
   <div class="chapter-summary">
@@ -221,7 +223,7 @@ batch.<span class="fn">set_embd</span>(idx, { pending_g_last[seq_id].data(), <sp
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 08 投机解码 · llama.cpp b11439 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 08 投机解码 · llama.cpp b11552 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
