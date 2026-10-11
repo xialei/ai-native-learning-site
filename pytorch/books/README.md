@@ -31,7 +31,7 @@ open pytorch/books/index.html
 | `13-engineering.html` | 训练工程 | DCP 检查点（save/async_save/planner）、流水线调度（GPipe/1F1B/Interleaved/ZeroBubble）、torchrun 弹性、profiler 对号入座 |
 | `14-build-own.html` | 自研路线 | 扩展档位表（define→dispatch→backend）、自研里程碑清单、torch.export 与 AOTInductor、核心文件收口 |
 
-共享样式：`assets/pytorch-learn.css`。所有架构图/流程图均为**内联 SVG**。
+共享样式：`assets/pytorch-learn.css`。所有架构图/流程图均为**内联 SVG**。版式为书页式双区：760px 窄栏正文，宽图通过 `.figure.breakout` 溢出到 ~960px；每章配章首导语（lede）、章末小结（chapter-summary）与上下章书式导航（pagenav）。
 
 ## 技术说明
 
@@ -41,7 +41,7 @@ open pytorch/books/index.html
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 14 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
-- 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 14 个导航链接不变，更新 `<title>`、页头（chap-meta + lede）、章末小结（chapter-summary）与 `pagenav`。
+- 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，外层用 `<div class="figure breakout">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
 - 代码片段：务必从真实源码摘录并标注路径，不要凭记忆杜撰函数签名。
 - 如需在 `index.html` 的 `pathgrid` 增删卡片，同步调整对应页面即可。

@@ -35,8 +35,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 分布式</div>
+    <div class="chap-meta">Chapter 12 · Distributed</div>
     <h1>分布式：把多台机器藏进一个 Tensor 子类</h1>
-    <div class="subtitle">分布式并行先回答「设备怎么分组」（DeviceMesh），再回答「数据怎么切」（Placement），然后让一个 Tensor 子类 DTensor 把切分逻辑藏进 dispatch——上层代码写的还是单机程序。这章按这三层往下讲，最后落到 FSDP2：它现在不是 wrapper 类，而是一个每次前向自动 all-gather、反向自动 reduce-scatter 的模块装饰。</div>
+    <div class="lede">
+      <p>分布式并行先回答「设备怎么分组」（DeviceMesh），再回答「数据怎么切」（Placement），然后让一个 Tensor 子类 DTensor 把切分逻辑藏进 dispatch——上层代码写的还是单机程序。这章按这三层往下讲，最后落到 FSDP2：它现在不是 wrapper 类，而是一个每次前向自动 all-gather、反向自动 reduce-scatter 的模块装饰。</p>
+      <p>这一章是把第 3 章和第 6 章的两条线拧在一起的地方：DTensor 走的是 __torch_dispatch__ 拦截（03），FSDP2 是 Module 装饰（06）。读过前两章，这章的机制都不新。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -75,7 +79,7 @@
     </table>
     <p>关键机制在 dispatch：DTensor 覆写 <code class="inline">__torch_dispatch__</code>，任何算子作用在它上面都会被截住，先按 placements 重排输入（ redistribute，需要时发起通信），再在本地分片上执行真正的 kernel，最后为新输出推导 placements。这个模式眼熟吗？03 章 Dispatcher 的扩展位正好留在这里——DTensor 就是通过 __torch_dispatch__ 这个 Python 侧挂钩接入的。注释里还有一条演进痕迹：基类 DTensor 的常规算子如今走 C++ 快速路径（#167051），Python 的 __torch_dispatch__ 仅为子类兜底保留。</p>
     <div class="annotation"><b>为什么「藏进 dispatch」重要：</b>张量并行曾需要为每个模型手写「哪层怎么切、切完怎么通信」。DTensor 之后，切分规则跟着算子语义走——mm 的输入是 Shard(1) 输出就是 Partial，这条规则写一次，所有模型受益。上层训练框架从「手写通信」转向「声明布局」，底层依据就是这一层。</div>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t121 d121">
         <title id="t121">DTensor 算子执行流程</title>
         <desc id="d121">一次 DTensor 算子调用：用户代码 op(W, x) 进入 __torch_dispatch__；由 placements 判断需要通信时先 redistribute（如 Shard 参数 all-gather 成 Replicate、或 Partial 梯度 reduce-scatter 成 Shard/Replicate）；对本地分片执行 ATen 算子得到本地输出；由算子语义推导输出 placements（如 Shard(0)×Shard(0)→Partial），包成新 DTensor 返回。通信被藏在 dispatch 内，用户视角始终是单机程序。</desc>
@@ -163,16 +167,24 @@
         :meth:`set_keep_unsharded_storage` to preserve it.
         """</span></pre>
     <p>通信落地的三个层次也顺带看一眼：默认走 ProcessGroup 的 NCCL 后端；同机型高速互联时可用 SymmMem（对称内存）分配路径（<code class="inline">_fsdp_collectives.py</code> 的 SymmMemAllocMixin）减少一次拷贝。FSDP2 的「自动策略选路 + 允许手动换」与 11 章 SDPA 的「自动优先级 + 手动限定」结构一致——PyTorch 处理可替换机制的惯用形态。</p>
-    <div class="callout info">
-      <b class="tag">要点</b>
-      这章的三层模型：DeviceMesh 管拓扑，Placement 管布局，DTensor 把两者塞进 Tensor 的 dispatch 里。FSDP2 是这套基础设施上最重的用户——读它的源码，实际上是在读 DTensor 怎么被用成并行框架。张量并行（torch.nn.parallel 下的 TP API）、上下文并行也建在同一层上，机制相通。
-    </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="11-memory.html">← 上一章：显存</a>
-    <a href="13-engineering.html">下一步：训练工程 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这章的三层模型：DeviceMesh 管拓扑，Placement 管布局，DTensor 把两者塞进 Tensor 的 dispatch 里。FSDP2 是这套基础设施上最重的用户——读它的源码，实际上是在读 DTensor 怎么被用成并行框架：参数、梯度、优化器状态都按 mesh 分片，前向临时 all-gather、用完立刻释放，对应 ZeRO-3 的思路。张量并行（torch.nn.parallel 下的 TP API）、上下文并行也建在同一层上，机制相通。</p>
+    <p>机制讲完，下一章看这些机制跑起来之后的工程问题：checkpoint、流水线、弹性、测量。<a href="13-engineering.html">第 13 章：训练工程</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="11-memory.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 11 章 · 显存与 CUDA Graphs</span>
+    </a>
+    <a class="next" href="13-engineering.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 13 章 · 训练工程</span>
+    </a>
+  </nav>
 </div>
 
 <footer>
