@@ -38,7 +38,7 @@
     <h1>服务入口：HTTP、OpenAI 兼容层与离线 Engine</h1>
     <div class="lede">
       <p>第 2 章已经跟过一条请求从进入引擎到流式输出的完整路径。这一章看入口本身：http_server.py 里 80 多条路由怎么组织、/v1/* 兼容层做了什么、离线 Engine 如何绕开 HTTP 直接驱动同一套进程、论文里的前端语言（gen/fork/select）如何编译成对运行时的请求，以及 ServerArgs → runtime_context 的配置体系。</p>
-      <p>本章是横向的一章：前面各章的机制都在这一章的入口后面排队——看完你会知道 80 多条路由为什么能保持薄、OpenAI 协议层做了什么协议之外的事、以及为什么离线 Engine 先于 HTTP 层存在；gen/fork/select 一节是 SGLang 论文留下的独特资产，别的推理引擎没有对应物。</p>
+      <p>本章是横向的一章：前面各章的机制都在这一章的入口后面排队——看完你会知道 80 多条路由为什么能保持薄、OpenAI 协议层做了什么协议之外的事、以及离线 Engine 和 HTTP 服务怎么共用同一套进程结构；gen/fork/select 一节是 SGLang 论文留下的独特资产，别的推理引擎没有对应物。</p>
     </div>
   </div>
 
@@ -349,7 +349,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
     <div class="annotation"><b>role 不只是元数据：</b> <code class="inline">publish(role="tokenizer")</code> 之后，主进程内所有 <code class="inline">get_schedule()</code> 式的读取都有了着落。每个角色有一张「允许读取哪些配置命名空间」的表（<code class="inline">ROLE_NAMESPACE_SETS</code>），<code class="inline">SGLANG_ROLE_NAMESPACES=enforce</code> 时表外的读取直接报错——这是把「哪类进程依赖哪些配置」显式写进了代码。</div>
     <div class="annotation"><b>这张表目前还很宽松，原因写在注释里：</b> 查表会发现，<code class="inline">scheduler</code>、<code class="inline">tokenizer</code>、<code class="inline">detokenizer</code>、<code class="inline">encoder</code> 等角色的值都是 <code class="inline">None</code>——<code class="inline">None</code> 的语义是<strong>整棵树都可以读</strong>，不是「什么都不能读」。真正被收窄的只有一个：<code class="inline">dp_controller</code>，限定在 <code class="inline">{"exec", "parallel", "device", "disagg", "observability", "serving"}</code> 六个命名空间。<code class="inline">tokenizer</code> 那一项旁边留了一段注释解释为什么不收窄：做记录模式审计时只跑通了文本模型的几个端点，多模态处理器、LoRA / score 端点、disagg 角色、gRPC 桥都没覆盖到，「<strong>收窄需要把这些形态也审计完；写错的集合会让请求失败，而不是让测试失败</strong>」。所以这张表现在的实际作用是：框架就位、失败关闭（fail-closed）已经生效，但生产角色还没有一个真正被限制住。</div>
 
-    <p>离线 Engine 还补齐了一块与 <code class="inline">sglang serve</code> 的能力差：多 tokenizer 进程。此前 <code class="inline">--tokenizer-worker-num &gt; 1</code> 只在 HTTP 服务路径生效（uvicorn worker 各挂一个 TokenizerWorker），Engine 构造时拿到 <code class="inline">MultiTokenizerRouter</code> 就没辙了——它只负责把多个 worker 桥到 scheduler，自己没有 <code class="inline">generate_request</code>，调用方拿到的是个空壳。#40260 后 Engine 检测到这个形态会自己补齐（commit 66454d704b）：</p>
+    <p>离线 Engine 还补齐了一块与 <code class="inline">sglang serve</code> 的能力差：多 tokenizer 进程。此前 <code class="inline">--tokenizer-worker-num &gt; 1</code> 只在 HTTP 服务路径生效（uvicorn worker 各挂一个 TokenizerWorker），Engine 构造时拿到 <code class="inline">MultiTokenizerRouter</code> 就没辙了——它的职责只是把多个 worker 桥到 scheduler，自己没有 <code class="inline">generate_request</code>，调用方拿到的是个空壳。#40260 后 Engine 检测到这个形态会自己补齐（commit 66454d704b）：</p>
     <div class="code-title">python/sglang/srt/entrypoints/engine.py — Engine 检测 MultiTokenizerRouter（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> isinstance(tokenizer_manager, <span class="cl">MultiTokenizerRouter</span>):
     <span class="cmt"># --tokenizer-worker-num &gt; 1：router 只桥接，没有 generate_request；</span>

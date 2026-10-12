@@ -38,7 +38,7 @@
     <h1>PD 分离：prefill 和 decode 拆成两套实例</h1>
     <div class="lede">
       <p>prefill 吃算力、decode 吃显存带宽，两者的资源画像相反。PD 分离把两个阶段部署在独立实例池上，中间传 KV。SGLang 的实现方式很克制：不是另写一套引擎，而是在同一个 Scheduler 里加了两条事件循环和三个队列。</p>
-      <p>实现克制是本章的关键词：同一个 Scheduler、两条专用事件循环、三个队列，没有第三套引擎——读完对照第 4 章的主循环，你会发现 PD 分离只是把「一轮调度」拆成了两种角色各自的一轮；传输细节（Mooncake/NIXL）与第 11 章共用同一套 KVArgs 描述语言。</p>
+      <p>实现克制是本章的关键词：同一个 Scheduler、两条专用事件循环、三个队列，没有第三套引擎——读完对照第 4 章的主循环，你会发现 PD 分离只是把「一轮调度」拆成了两种角色各自的一轮；传输细节（Mooncake/NIXL）自成一套，和第 11 章 HiCache 的页哈希存储是两条独立的搬运线。</p>
     </div>
   </div>
 
@@ -260,7 +260,7 @@
       「收回之后 KV 放哪」最近多了一个干脆的选项（commit 7c5bdb940c，#41103）：decode 侧内存吃紧收回请求时，原来的两个保底都是「留着等复活」——<code class="inline">cpu_tensor</code> 每请求一块 CPU 张量、<code class="inline">host_pool</code> 用预留的 HiCache 池。新增的 <code class="inline">none</code>（<code class="inline">disagg.py</code> choices 三选）不备份：收回即 abort，客户端拿 503 自己重试。理由写在字段描述里——resume 一条被收回的长请求的前提是它的 KV 完整保住了，而这在紧凑部署里常常是奢望；与其挂着一堆半死的请求占元数据，不如把「这次失败」显式交给客户端。同批还把三个 PD 队列挖了子类接缝（subclass seams），各模式能改写收回/入队行为而不必复制整个队列类。紧跟着的两笔都是「释放时机」的补丁：其一，KV 页延迟释放从「仅 decode 主动 abort」扩成「任何传输失败」（2a1c477648，#41404）——prefill 侧故障、传输层报错、HiCache 恢复失败同样可能有兄弟 rank 的写还在飞向这些页，释放前要 <code class="inline">ensure_abort_notified(force_arm=True)</code> 把 abort 通知强补出去（注释解释了 force_arm：send_metadata 半途而废时 init_time 还是 None 但别的 rank 已拿到目标地址）；其二，drain 完成后的 abort ACK 要<strong>扇出给房间里每个 decode 对端</strong>（14ab74ef95，#41402）——prefill TP &lt; decode TP 时几个 decode rank 共用一个 room，注册表只留最后一个 ABORT 发送者，不扇出的话前面的 rank 会白等到超时。三个 commit 一条线：PD 的正确性不再靠「理想时序」，而是把每种非理想时序都变成显式的等待条件。
     </div>
 
-    <p>队列由 <code class="inline">process_decode_queue</code>（每轮循环驱动）串联。函数开头的顺序本身就是三条规则：被延迟释放的 KV 每轮都先兑现（放在所有闸门之前，超时才赶得上在内存紧张时触发）；空间够撑 <code class="inline">num_reserved_decode_tokens</code> 步时先复活被收回的请求；还有收回请求排队就不再预分配新请求。轮询频率是可配置的节流，而 <code class="inline">pop_preallocated</code> 的时机按 <code class="inline">host_receive_threshold</code> 分岔：</p>
+    <p>队列由 <code class="inline">process_decode_queue</code>（每轮循环驱动）串联。函数开头的顺序本身就是三条规则：被延迟释放的 KV 每轮都先兑现（放在所有检查之前，超时才赶得上在内存紧张时触发）；空间够撑 <code class="inline">num_reserved_decode_tokens</code> 步时先复活被收回的请求；还有收回请求排队就不再预分配新请求。轮询频率是可配置的节流，而 <code class="inline">pop_preallocated</code> 的时机按 <code class="inline">host_receive_threshold</code> 分岔：</p>
     <div class="code-title">python/sglang/srt/disaggregation/decode.py — process_decode_queue（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">process_decode_queue</span>(self: <span class="cl">Scheduler</span>):
     ...
@@ -356,7 +356,7 @@
     <h2><span class="num">12.7</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      PD 分离是运维面翻倍的架构决策：两套实例、一套传输引擎、router 配置、RDMA 组网，都是新增故障点。自研引擎在单实例的混合调度调优（chunked prefill 配比、priority scheduling）走到头之前，不值得上。但有两个设计现在就能记下：一个是 <strong>bootstrap 房间握手</strong>——用唯一 id（room）让两侧队列在无共享状态下对齐，这个模式适用于任何「生产者算完再交给消费者」的跨进程交接；另一个是 <strong>先占坑再收货</strong>——接收侧先预留资源再收数据，失败时退资源而不是扔数据。传输部分（逐层 RDMA 写、预注册缓冲）本质是把第 11 章 HiCache 的「显存↔外部」搬运换成了「显存↔显存」，两者共用同一套 KVArgs 描述语言。
+      PD 分离是运维面翻倍的架构决策：两套实例、一套传输引擎、router 配置、RDMA 组网，都是新增故障点。自研引擎在单实例的混合调度调优（chunked prefill 配比、priority scheduling）走到头之前，不值得上。但有两个设计现在就能记下：一个是 <strong>bootstrap 房间握手</strong>——用唯一 id（room）让两侧队列在无共享状态下对齐，这个模式适用于任何「生产者算完再交给消费者」的跨进程交接；另一个是 <strong>先占坑再收货</strong>——接收侧先预留资源再收数据，失败时退资源而不是扔数据。传输部分（逐层 RDMA 写、预注册缓冲）本质是把第 11 章 HiCache 的「显存↔外部」搬运换成了「显存↔显存」，但走的是自己的一套 KVArgs 描述（disaggregation/base/conn.py），和 HiCache 的页哈希存储是两条独立的搬运线。
     </div>
     <p style="font-size:13.5px;color:#6b5d54">vLLM v1 的 PD 分离思路（细节见站内《深入浅出vLLM》第 2 章结尾）：</p>
     <table class="tbl">
@@ -372,7 +372,7 @@
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>PD 分离用 --disaggregation-mode prefill/decode 启动两套实例，粘合点是 DisaggregationMode 枚举 + 两条专用事件循环 + 三个队列（bootstrap/prealloc/transfer），全部内联在同一个 Scheduler 里。prefill 侧走 bootstrap 房间握手对齐两侧队列，算完 KV 逐层经 RDMA 写出；decode 侧先占坑（预留资源）再收货，失败退资源而不是扔数据。动机是混合部署的两个已知问题：长 prefill 打断 decode 的 ITL、dp_attention 下快慢 rank 互等；传输引擎（Mooncake、NIXL）把第 11 章的「显存↔外部」搬运换成「显存↔显存」，共用同一套 KVArgs 描述。</p>
+    <p>PD 分离用 --disaggregation-mode prefill/decode 启动两套实例，粘合点是 DisaggregationMode 枚举 + 两条专用事件循环 + 三个队列（bootstrap/prealloc/transfer），全部内联在同一个 Scheduler 里。prefill 侧走 bootstrap 房间握手对齐两侧队列，算完 KV 逐层经 RDMA 写出；decode 侧先占坑（预留资源）再收货，失败退资源而不是扔数据。动机是混合部署的两个已知问题：长 prefill 打断 decode 的 ITL、dp_attention 下快慢 rank 互等；传输引擎（Mooncake、NIXL）把第 11 章的「显存↔外部」搬运换成「显存↔显存」，走 PD 自己的 KVArgs 描述。</p>
     <p>下一章 → <a href="13-speculative.html">第 13 章 · 投机解码：一次前向换多个 token</a>。</p>
   </div>
 
