@@ -35,8 +35,16 @@
   <div class="page-header">
     <span class="version-badge">openai/codex @ 8c0f701167</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 Turn 循环</div>
-    <h1>★ Turn 循环：一个 prompt 在 Codex 里到底怎么跑</h1>
-    <div class="subtitle">这是整个代码库最核心的执行路径。一个 turn 不是一次 LLM 调用，而是一个「采样 → 解析工具 → 执行工具 → 把结果塞回历史 → 再采样」的循环，直到模型不再请求工具为止。本章从 CodexThread 一路追到 run_turn 的 loop {}，看清流式、重试、中断、steering 分别发生在哪个环节。</div>
+    <div class="chap-meta">Chapter 03 · The Turn Loop</div>
+    <h1>Turn 循环：一个 prompt 在 Codex 里到底怎么跑</h1>
+  </div>
+  <div class="lede">
+    <p>你在 TUI 敲下一行 prompt 之后，心里大概冒出过这几个问题：这行字要经过多少层才变成一次 LLM 调用？模型说要调工具时，谁来执行、结果怎么塞回去？为什么有的回答是边生成边显示的，重试发生在哪？Agent 已经在跑了，我又敲了一句新指令会怎样？按 Ctrl-C 的那一瞬间，代码里究竟发生了什么？</p>
+    <p>这些问题的答案全部落在一条执行路径上：turn 循环。这是整个代码库最核心的一段——一个 turn 不是一次 LLM 调用，而是「采样 → 解析工具 → 执行工具 → 把结果塞回历史 → 再采样」的循环，直到模型不再请求工具为止。本章从 CodexThread 一路追到 run_turn 的 loop {}，看清流式、重试、中断、steering 分别发生在哪个环节。</p>
+  </div>
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是：① Op::TurnInput 从提交队列走到 run_turn 的完整调用链（3.1）；② 工具调用在 run_turn 的 loop {} 里执行、结果回填历史后触发再采样（3.3）；③ 流式边产边发靠 Event 流，重试在 run_sampling_request 自己的 loop {} 里（3.3 / 3.4）；④ 插话靠 steering、中断靠令牌树，二者都发生在任务调度层（3.5 / 3.6）。
   </div>
 
   <div class="epigraph">
@@ -49,7 +57,7 @@
   <section class="block">
     <h2><span class="num">3.1</span>调用链总览：从 Op 到 LLM 再回来</h2>
     <p>一个 turn 的完整调用链如下（从外到内）：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
         <title id="t31">Turn 调用链</title>
         <desc id="d31">从 Op::TurnInput 到 LLM 流式的完整调用链</desc>
@@ -210,7 +218,7 @@
   <section class="block">
     <h2><span class="num">3.4</span>流式：LLM 回答怎么边产边发</h2>
     <p><code class="inline">try_run_sampling_request</code> 内部调用 <code class="inline">client.rs</code> 的流式接口。LLM 的回答不是一次性返回，而是<strong>逐个产出 ResponseItem</strong>，每产出一个就发对应的 <code class="inline">EventMsg</code>：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t34 d34">
         <title id="t34">流式产出时序</title>
         <desc id="d34">LLM 流式产出 ResponseItem 并发 Event</desc>
@@ -429,7 +437,7 @@
 }</pre>
     <div class="annotation"><b>drop 即取消：</b> <code class="inline">AbortOnDropHandle</code>（tokio_util 提供）包住 <code class="inline">tokio::spawn</code> 的 JoinHandle（tasks/mod.rs:404）——<strong>持有者一被 drop，任务自动 abort</strong>。这是用类型系统编码的「生命周期即取消」：RunningTask 存在 active_turn 里，换 turn 时旧的被拿走、丢弃，任务跟着终止，不存在「忘了 abort」的泄漏路径。字段里还有一对守卫（<code class="inline">_agent_execution_guard</code> / <code class="inline">_diagnostics_guard</code>）：下划线前缀 + 无读取点，纯靠 drop 时机生效——任务结束时（无论正常还是 panic）自动释放并发额度、活跃计数。</div>
 
-    <p>最后是启动与中止的完整闭环：</p>
+    <p>最后把启动与中止连起来看一遍：</p>
     <div class="code-title">codex-rs/core/src/tasks/mod.rs:272 — spawn_task：先顶替，再启动</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> spawn_task&lt;T: SessionTask&gt;(
     self: &amp;Arc&lt;Self&gt;, turn_context: Arc&lt;TurnContext&gt;, input: Vec&lt;TurnInput&gt;, task: T,
@@ -459,7 +467,7 @@ turn.task = Some(running_task);</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">3.8</span>小结：turn 循环的完整心智模型</h2>
+    <h2><span class="num">3.8</span>小结：turn 循环一张图记牢</h2>
     <div class="callout warn">
       <b class="tag">一张图记牢</b>
       <code class="inline">run_turn</code>（准备：压缩 / step context / 记录输入）→ <code class="inline">run_turn</code> 的 <code class="inline">loop {}</code>（取 pending 输入 → 捕获 step context → 克隆历史 → 调 <code class="inline">run_sampling_request</code>：在其重试循环里 build_prompt → 流式调 LLM → 产 ResponseItem → 发 Event → 若有 FunctionCall 则执行工具、结果回填历史 → 返回 <code class="inline">needs_follow_up</code>）→ 有工具调用或有待处理输入则回到 loop 顶部再采样，否则 <code class="inline">TurnComplete</code>。
@@ -470,10 +478,16 @@ turn.task = Some(running_task);</pre>
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="02-protocol-model.html">← 02 协议模型</a>
-    <a href="04-session-rollout.html">下一步：会话与 Rollout →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>turn 循环的主干只有一个 <code class="inline">loop {}</code>：每轮取 pending 输入、克隆历史、流式调 LLM；模型要调工具就执行并把结果回填历史，然后 <code class="inline">needs_follow_up</code> 把控制权交回循环顶部；没有工具调用、也没有待处理输入，turn 才算完成。流式重试被隔离在 <code class="inline">run_sampling_request</code> 自己的循环里，与工具循环分工明确。</p>
+    <p>围绕这条主干，steering 让运行中的 turn 吸收新输入，中断靠 CancellationToken 级联逐层下传，任务调度则由 Submission 队列 + TaskKind + AbortOnDropHandle 三件套撑起。循环跑完的历史去哪了？下一章看会话持久化：<a href="04-session-rollout.html">第 4 章：会话与 Rollout</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="02-protocol-model.html"><span class="dir">← 上一章</span><span class="ttl">第 2 章 · 消息与协议模型：会话长什么样，内核与前端怎么对话</span></a>
+    <a class="next" href="04-session-rollout.html"><span class="dir">下一章 →</span><span class="ttl">第 4 章 · 会话与 Rollout：Codex 怎么记住、怎么重生</span></a>
+  </nav>
 </div>
 
 <footer>
