@@ -71,3 +71,10 @@ python3 -m http.server
 - CLI 内核源码未随仓库开放（2026-09 起仅 `mods/` 下 sec-default / diff / telemetry / agents-md 四个内置插件以源码发布，采用 TypeScript hooks 模块写法，见第 8 章 §8.9），涉及循环 / 上下文压缩等内部机制的章节以**官方公开文档 + 仓库实例的行为**为准。
 - 引用的代码片段大多来自上述仓库实例（Hooks、插件、配置、mods），这些是**可运行、可对照**的部分，最适合边读边试。
 - 配色采用 Claude 的橘棕系（`assets/cc-learn.css`），结构上借鉴了 Pi Agent Harness / vLLM 学习站的卡片式模板。
+
+## 维护指南
+
+- 新增/修改章节页：复制任一现有章节的 `topbar nav` 结构，保持 14 个导航链接不变，更新 `<title>`、页头（chap-meta + lede）、章末小结（chapter-summary）与 `pagenav`。
+- 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，外层用 `<div class="figure breakout">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
+- 代码片段：务必从真实源码摘录并标注路径，不要凭记忆杜撰函数签名。
+- 版式为书页式双区：760px 窄栏正文，宽图通过 `.figure.breakout` 溢出到 ~960px；每章配章首导语（lede）、章末小结（chapter-summary）与上下章书式导航（pagenav）。
