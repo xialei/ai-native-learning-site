@@ -113,6 +113,10 @@
       <b class="tag">最关键的一招：退出码 2</b>
       <strong>退出码 2 不是简单拒绝，而是「教模型」</strong>——stderr 的内容会进入模型上下文，模型看到「为什么被拦」后会换策略。比如拦下 <code class="inline">rm -rf</code> 并写「禁止递归删除，请改用 <code class="inline">git clean</code>」，模型下一轮就真的会换。这让 Hook 成了<strong>可教学的护栏</strong>，而非死板的墙。
     </div>
+    <div class="callout info">
+      <b class="tag">hook 挂了算谁赢（2.1.295）</b>
+      上表有个隐含假设：hook 进程能跑起来。若它拉不起、超时或退出码意外，默认是<strong>放行</strong>——护栏失灵时车门大开。命令与 HTTP hook 现支持 <code class="inline">onFailure: "block"</code>：这三种失败一律转成拦截。对安全类 hook 这是该开的开关——「查不了」不该等价于「没问题」。
+    </div>
   </section>
 
   <section class="block">
@@ -232,14 +236,24 @@ _VALIDATION_RULES = [
   on(<span class="st">'settings.read'</span>, ($, e, next) =&gt; next.to(e, <span class="st">'append'</span>))
   on(<span class="st">'tool.register'</span>, <span class="kw">async</span> ($, e, next) =&gt; {
     <span class="cmt">// 能直接读调用方所在的层级，按策略决定放行或拒绝</span>
-    <span class="kw">if</span> (next.origin.tier === <span class="st">'prepend'</span> || next.origin.tier === <span class="st">'append'</span>) {
+    <span class="kw">const</span> isOrgs =
+      next.origin.tier === <span class="st">'prepend'</span> || next.origin.tier === <span class="st">'append'</span>
+
+    <span class="kw">if</span> (isOrgs) {
       <span class="kw">return</span> next.to(e, <span class="st">'append'</span>)
     }
-    <span class="cmt">// …用户层注册则拒绝（fail closed）</span>
-    <span class="kw">return</span> isRefused ? { deny: TOOL_REGISTER_REFUSAL } : next(e)
+    <span class="cmt">// …用户层注册则查企业策略后拒绝（fail closed）</span>
+    <span class="kw">const</span> refusal =
+      next.origin.tier === <span class="st">'user'</span>
+        ? <span class="kw">await</span> readPolicy(() =&gt; $.settings.read(Policy.SOURCE))
+            .then(policy =&gt; registerRefusalOf(policy, next.origin.plugin, e.name))
+            .catch(() =&gt; TOOL_REGISTER_REFUSAL)
+        : <span class="kw">undefined</span>
+
+    <span class="kw">return</span> refusal === <span class="kw">undefined</span> ? next(e) : { deny: refusal }
   })
 }</pre>
-    <div class="annotation"><b>通信契约变了：</b> 三点变化值得注意。<strong>① 通信契约变了</strong>——从「stdin JSON + 退出码」变成函数签名 <code class="inline">($, e, next)</code>：事件对象 <code class="inline">e</code> 直接携带类型化数据，<code class="inline">next</code> 控制链式放行（还能知道调用来源的层级 <code class="inline">origin.tier</code>）。<strong>② 事件粒度更细</strong>——出现了 <code class="inline">settings.read</code>、<code class="inline">tool.register</code>、<code class="inline">tool.check</code>、<code class="inline">prompt.section</code> 这类引擎内部事件，不再是只有 Pre/PostToolUse 级别。<strong>③ 仍是插件</strong>——每个 mod 就是一个带 <code class="inline">hooks/hooks.json</code> 的标准插件目录，只是 <code class="inline">hooks.json</code> 指向一个模块而非 shell 命令。这套 API 标注为早期访问、可能随版本变动；四个 mod 里 <code class="inline">diff</code>（<code class="inline">/diff</code> 面板）与 <code class="inline">telemetry</code>（<code class="inline">$.telemetry</code> 分析事件，只服务内置插件、拒绝用户安装的插件——正是靠 <code class="inline">origin.tier</code> 判别调用方）直接内置在 CLI 里，<code class="inline">agents-md</code> 把 <code class="inline">AGENTS.md</code> 接入为项目指令（见第 4 章 §4.3），<code class="inline">sec-default</code> 则在企业托管环境下挂在最外层，把企业的 hooks、提示内容、设置、工具策略与 <strong>deny 规则</strong>挡在用户插件够不到的地方。</div>
+    <div class="annotation"><b>通信契约变了：</b> 三点变化值得注意。<strong>① 通信契约变了</strong>——从「stdin JSON + 退出码」变成函数签名 <code class="inline">($, e, next)</code>：事件对象 <code class="inline">e</code> 直接携带类型化数据，<code class="inline">next</code> 控制链式放行（还能知道调用来源的层级 <code class="inline">origin.tier</code>）。<strong>② 事件粒度更细</strong>——出现了 <code class="inline">settings.read</code>、<code class="inline">tool.register</code>、<code class="inline">tool.check</code>、<code class="inline">prompt.section</code> 这类引擎内部事件，不再是只有 Pre/PostToolUse 级别。<strong>③ 仍是插件</strong>——每个 mod 就是一个带 <code class="inline">hooks/hooks.json</code> 的标准插件目录，只是 <code class="inline">hooks.json</code> 指向一个模块而非 shell 命令。这套 API 标注为早期访问、可能随版本变动；四个 mod 里 <code class="inline">diff</code>（<code class="inline">/diff</code> 面板）与 <code class="inline">telemetry</code>（<code class="inline">$.telemetry</code> 分析事件，只服务内置插件、拒绝用户安装的插件——正是靠 <code class="inline">origin.tier</code> 判别调用方）直接内置在 CLI 里，<code class="inline">agents-md</code> 把 <code class="inline">AGENTS.md</code> 接入为项目指令（见第 4 章 §4.3），<code class="inline">sec-default</code> 则在企业托管环境下挂在最外层，把企业的 hooks、提示内容、设置、工具策略、<strong>权限规则、deny/ask 裁定与钉死的环境变量</strong>挡在用户插件够不到的地方。</div>
     <div class="callout info">
       <b class="tag">两种形态怎么选</b>
       脚本 Hook（stdin/exit code）——语言无关、可维护边界清晰，适合绝大多数护栏与注入场景，仍是默认写法。hooks 模块——强类型、能拿到引擎内部事件与链式上下文，适合深度定制（如本仓库 mods 的面板与安全策略）。目前函数 hooks 需要显式启用，且 API 未承诺稳定——生产配置仍以脚本 Hook 为准。
@@ -256,6 +270,10 @@ _VALIDATION_RULES = [
     <div class="callout info">
       <b class="tag">新事件：系统提示也能挂钩（2.1.290）</b>
       事件词汇表仍在扩：新事件 <code class="inline">prompt.compose</code> 在引擎<strong>渲染系统提示</strong>时触发——<code class="inline">next(e)</code> 返回分节列表（每节带稳定 <code class="inline">id</code>、文本与 <code class="inline">scope</code>：缓存边界前为 <code class="inline">shared</code>、后为 <code class="inline">session</code>），hook 可以按 id 追加、替换、重排或删节，不调 <code class="inline">next</code> 则整体接管；缓存边界由引擎落章。配套名词 <code class="inline">$.prompt.compose()</code> 供插件读当前分节。<code class="inline">$.session.version()</code> 则返回引擎版本、基线 release 与构建时间。这类事件一出，<code class="inline">sec-default</code> 立刻跟进把 <code class="inline">prompt.compose</code> 也纳入「企业内容对用户插件只读」的范围——护栏与事件的军备竞赛，正是 hooks 模块演化的缩影。
+    </div>
+    <div class="callout info">
+      <b class="tag">军备竞赛又一轮：sec-default 扩围（2026-10）</b>
+      <code class="inline">sec-default</code> 的看守清单从「hooks、提示内容、托管设置、工具策略、deny 规则」扩到<strong>权限规则与钉死的环境变量</strong>，且判罚从「deny 不可放松」收紧为「deny <strong>和 ask</strong> 都不可放松」：用户插件在 <code class="inline">tool.check</code> 上只要把裁定改得更松（allow 化、或换掉规则/hook/企业 ceiling 名义），调度就重跑一遍、以更严的为准。新纳入只读范围的事件还有 <code class="inline">session.append</code>（按 <code class="inline">door</code> 分路：引擎注入的 attachment/hook-context、压缩边界、技能正文整行保持原样入对话）、<code class="inline">session.compact</code>（压缩摘要不许用户插件代写）、<code class="inline">ui.log</code>、<code class="inline">env.get</code>；<code class="inline">env.set</code> 则把企业 <code class="inline">env</code> 设过的变量与 9 个「决定企业策略从哪读」的变量（<code class="inline">CLAUDE_CODE_MANAGED_SETTINGS_PATH</code>、<code class="inline">CLAUDE_CONFIG_DIR</code> 等）钉死——用户层改写直接按名拒绝。演化模式不变：引擎每开一扇新门，护栏就跟进站到门后。
     </div>
   </section>
 
