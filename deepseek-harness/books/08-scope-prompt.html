@@ -63,6 +63,10 @@
   <span class="cmt">/** 动态上下文也按 order 升序拼接 */</span>
   <span class="kw">readonly</span> order: <span class="kw">number</span>
   <span class="kw">readonly</span> text: <span class="kw">string</span> | ((context: <span class="cl">AssembleContext</span>) =&gt; <span class="kw">string</span>)
+  <span class="cmt">/** 是否插值变量（默认 true；false 按字面渲染） */</span>
+  <span class="kw">readonly</span> interpolate?: <span class="kw">boolean</span>
+  <span class="cmt">/** 可选运行时上下文被关闭时，仍然保留这条操作性上下文 */</span>
+  <span class="kw">readonly</span> required?: <span class="kw">boolean</span>
 }
 
 <span class="kw">export interface</span> <span class="cl">PromptAssembly</span> {
@@ -76,7 +80,7 @@
 
   <section class="block">
     <h2><span class="num">8.3</span>SECTION_ORDERS：中央分配的版面</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:125 — SECTION_ORDERS（节选）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:131 — SECTION_ORDERS（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> <span class="cl">SECTION_ORDERS</span> = {
   HARNESS_IDENTITY: -<span class="nu">1000</span>,      <span class="cmt">// "You are an AI agent powered by DeepSeek Harness."</span>
   DEPLOYMENT_PERSONA_PREFIX: <span class="nu">0</span>, <span class="cmt">// 部署方人格·前缀——可被 preset 遮蔽</span>
@@ -97,9 +101,10 @@
   DEPLOYMENT_PERSONA_SUFFIX: <span class="nu">10200</span>, <span class="cmt">// 部署方人格·后缀——垫在所有指导之后</span>
 } <span class="kw">as const</span></pre>
     <p>版面的两个端点也值得注意：<code class="inline">HARNESS_IDENTITY</code>（-1000）永远第一句，而原本排在前面的 <code class="inline">HARNESS_SOURCE</code>/<code class="inline">WEB_SURFACE</code> 被挪到了<strong>最后</strong>（10000/10100）——本地路径与端点属于「具体细节」，注释明确说它们应跟在可复用的指导之后；人格也从单段拆成了<strong>前缀（0）+ 后缀（10200）</strong>两段，夹住中间所有一方指导。</p>
-    <p>三个「政策快照」context 同样中央分配（<code class="inline">CONTEXT_ORDERS</code>），注册者各自归位：</p>
+    <p>「政策快照」context 同样中央分配（<code class="inline">CONTEXT_ORDERS</code>），注册者各自归位：</p>
     <table class="tbl">
       <tr><th>context 名</th><th>order</th><th>注册者</th><th>内容</th></tr>
+      <tr><td><code class="inline">working-directory:current</code></td><td>100</td><td>session/working-directory（v0.2.1）</td><td>会话生效工作目录；<code class="inline">required</code> + <code class="inline">interpolate: false</code>——见下方说明</td></tr>
       <tr><td><code class="inline">sandbox:policy</code></td><td>110</td><td>dsh-sandbox-policy</td><td>当前沙箱模式与 workspace 边界（由 session 事件投影）</td></tr>
       <tr><td><code class="inline">approval:policy</code></td><td>115</td><td>dsh-user-approval</td><td>一句话：approval 是 ask 还是 never</td></tr>
       <tr><td><code class="inline">subagent:delegation</code></td><td>120</td><td>dsh-subagent</td><td>委派边界说明，挂在子 agent 的 scope 上</td></tr>
@@ -121,11 +126,13 @@
       <b class="tag">看懂这个设计</b>
       审批政策的注释写明动机：「完整当前值跟随在保留历史之后，切换政策时不必重写稳定的 system-prompt 缓存前缀」。凡是会<strong>中途变化</strong>的事实（沙箱模式、审批开关、委派状态）都走 user 快照；只有部署期固定的事实（身份、人格、工具说明书）才进 system prompt。注册者用 <code class="inline">getContextOrder()</code> 而非裸数字，就是为了让中央表成为唯一的版面权威。
     </div>
+
+    <div class="annotation"><b>WORKING_DIRECTORY 是第四条，也是 PromptContext 新字段的第一个用户</b>（v0.2.1，<code class="inline">packages/session/working-directory/src/index.ts</code>）：会话有了<strong>运行中可切换</strong>的有效工作目录——原始项目仍保留在不可变的 Session header 里，切换落成一条 <code class="inline">working-directory/change</code> 日志事件（第 2 章），投影折叠出当前值。注册为 context 时它带了两个新字段的组合：<code class="inline">required: true</code>（部署把可操作性上下文关掉时它也保留——没有工作目录，目录类工具全瞎）与 <code class="inline">interpolate: false</code>（目录是外部输入，不进变量语法）。同时它挂了一个 prepend 的 <code class="inline">system-prompt/assemble</code> 监听器，在 waterfall 结果上就地校正自己的文本——「先确保目录可用的 service 状态、再写快照」这两步的顺序由它自己把关。配套的 <code class="inline">refreshContext()</code>（system-prompt/src/index.ts:578）则回答另一个问题：重试时目录可能又变了，循环在 step() 里对<strong>已接受的 assembly</strong> 重跑 context 投影——已注册的 context 用当前值刷新、新出现的 required 注册按 order 补插、被压制的可选项原样保留，而 sections/tools/variables 与 waterfall 一概不重跑，所以这条刷新路径不会击穿 system prompt 的缓存前缀。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">8.4</span>PERSONA_PREFIX/SUFFIX：用「同名遮蔽」实现身份替换</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:179 — 人格段名常量</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:186 — 人格段名常量</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/**
  * The deployment persona prefix's section name. Exported because a
  * composition can replace this slot — an agent preset shadows the
@@ -137,7 +144,7 @@
 <span class="cmt">/** Deployment persona suffix section name shared by global and scoped contributions. */</span>
 <span class="kw">export const</span> <span class="cl">PERSONA_SUFFIX_SECTION</span> = <span class="st">'deployment:persona-suffix'</span></pre>
     <p>注册表构造时无条件注册这两个段——前缀来自 <code class="inline">config.personaPrefix</code>，后缀来自 <code class="inline">config.personaSuffix</code>（缺省为空串，渲染时空段落直接被丢弃）：</p>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:421 — 注册表构造函数（节选，:432）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:441 — 注册表构造函数（节选，:452）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">this</span>.<span class="fn">section</span>({
   name: <span class="cl">PERSONA_PREFIX_SECTION</span>,
   order: <span class="kw">this</span>.<span class="fn">getSectionOrder</span>(<span class="st">'DEPLOYMENT_PERSONA_PREFIX'</span>),
@@ -150,7 +157,7 @@
   text: config.personaSuffix ?? <span class="st">''</span>,
 })</pre>
     <p>遮蔽机制在 <code class="inline">assemble()</code> 里：同层重复注册抛错，<strong>跨层同名则 scope 层遮蔽全局层</strong>：</p>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:558 — assemble() 的合并（节选，:575）</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:610 — assemble() 的合并（节选，:627）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">// Scoped sections shadow globals before the deterministic order sort.</span>
 <span class="kw">const</span> sectionByName = <span class="kw">this</span>.layers.<span class="fn">merge</span>(scope, layer =&gt; layer.sections)
 <span class="cmt">// Scope-chain variables, farthest first, so the nearest scope wins a name.</span>
@@ -197,7 +204,7 @@
 
   <section class="block">
     <h2><span class="num">8.5</span>渲染与严格插值</h2>
-    <div class="code-title">packages/core/system-prompt/src/index.ts:279 / :303 — renderPrompt / joinContextSections</div>
+    <div class="code-title">packages/core/system-prompt/src/index.ts:286 / :310 — renderPrompt / joinContextSections</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">renderPrompt</span>(assembly: <span class="cl">PromptAssembly</span>): <span class="kw">string</span> {
   <span class="kw">return</span> assembly.sections
     .<span class="fn">map</span>(section =&gt; section.interpolate === <span class="kw">false</span> ? section.text : <span class="fn">interpolate</span>(section, assembly.variables, <span class="st">'section'</span>))
@@ -211,7 +218,7 @@
   <span class="kw">if</span> (body.length === <span class="nu">0</span>) <span class="kw">return</span> <span class="st">''</span>
   <span class="kw">return</span> `Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n${body}`
 }</pre>
-    <div class="annotation"><b>插值是严格的</b>：变量名必须匹配 <code class="inline">/^[a-z][a-z0-9_]*$/</code>；未注册的名字抛错（并打印全部已注册变量）；注册了但本次组装无值的也抛错——<code class="inline">{{name}}</code> 拼错不会静默留白，组装时直接抛错。替换后的值不再二次扫描，孤立的 <code class="inline">{{</code> 若后文无 <code class="inline">}}</code> 视为字面散文。工具顺序同理严格：<code class="inline">toolOrder</code> 必须恰好含一个 <code class="inline">&lt;unlisted-tools&gt;</code> 哨兵（未列出的工具按字典序插在那儿），列出未注册的名字在组装时抛错。<code class="inline">PromptSection</code> 还有一个 <code class="inline">interpolate?: boolean</code>（默认 true）：置 false 的段落跳过插值、按字面文本渲染——目前唯一的用户是 dsh-tools 的 <code class="inline">tools:sdk</code> 段（tools/src/index.ts:896），那里渲染的是生成代码（SDK 使用示例），正文的 <code class="inline">{}</code> 不能被变量语法误伤。</div>
+    <div class="annotation"><b>插值是严格的</b>：变量名必须匹配 <code class="inline">/^[a-z][a-z0-9_]*$/</code>；未注册的名字抛错（并打印全部已注册变量）；注册了但本次组装无值的也抛错——<code class="inline">{{name}}</code> 拼错不会静默留白，组装时直接抛错。替换后的值不再二次扫描，孤立的 <code class="inline">{{</code> 若后文无 <code class="inline">}}</code> 视为字面散文。工具顺序同理严格：<code class="inline">toolOrder</code> 必须恰好含一个 <code class="inline">&lt;unlisted-tools&gt;</code> 哨兵（未列出的工具按字典序插在那儿），列出未注册的名字在组装时抛错。<code class="inline">PromptSection</code> 还有一个 <code class="inline">interpolate?: boolean</code>（默认 true）：置 false 的段落跳过插值、按字面文本渲染——目前唯一的用户是 dsh-tools 的 <code class="inline">tools:sdk</code> 段（tools/src/index.ts:899），那里渲染的是生成代码（SDK 使用示例），正文的 <code class="inline">{}</code> 不能被变量语法误伤。</div>
   </section>
 
   <section class="block">
@@ -370,7 +377,7 @@
 
   <section class="block">
     <h2><span class="num">8.9</span>tools.restrict：按 scope 收工具</h2>
-    <div class="code-title">packages/core/tools/src/index.ts:1096 — restrict()（节选）</div>
+    <div class="code-title">packages/core/tools/src/index.ts:1103 — restrict()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="fn">restrict</span>(filter: <span class="cl">ToolRestriction</span>): () =&gt; <span class="kw">void</span> {
   <span class="kw">const</span> scope = <span class="fn">scopeOf</span>(<span class="kw">this</span>.ctx)
   <span class="kw">if</span> (scope === <span class="kw">undefined</span>) {
@@ -404,7 +411,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.2.1-alpha.1 (HEAD 5badb15009) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 08 Prompt/Scope · 版本 dsh-v0.2.1-alpha.2 (HEAD d743267388) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

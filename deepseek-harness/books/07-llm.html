@@ -108,13 +108,13 @@
   sessionId?: <span class="cl">Branded</span>&lt;<span class="st">'SessionId'</span>&gt;
   <span class="cmt">/**
    * Provider-neutral classification for an auxiliary model call. Adapters may
-   * map the purpose to model-hidden transport metadata or purpose-specific
-   * generation policy. Ordinary conversation requests leave it unset.
+   * map the purpose to model-hidden transport metadata. Ordinary conversation
+   * requests leave it unset.
    */</span>
   purpose?: <span class="st">'compaction'</span> | <span class="st">'session-title'</span>
 }</pre>
     <div class="annotation"><b>messages 的类型签名在讲故事</b>：循环构建的请求传的是<strong>派生历史</strong>（dsh-agent-loop，第 2 章），首条系统消息带着 system prompt——所以 <code class="inline">system</code> 字段文档明确写着「one-shot 调用者专用；循环构建的请求不设它」。一次性调用者（会话标题、compaction）没有日志身份可引用，于是有了 <code class="inline">RequestUserInput</code>（types.ts:487）——<code class="inline">id?: never; source?: never</code> 用类型系统声明「这个 user 输入没有持久会话身份，别给它编 id」。工具定义侧还有一个 <code class="inline">deferLoading?: true</code>（ToolSchema，types.ts:479）：请求把工具定义延后装载进模型上下文，用 Anthropic 的 defer_loading 术语——工具清单变长时，不常用的定义不必占每次请求的前缀。deferLoading 与 0.2.0 的 toolUpdate 是一对：<code class="inline">ToolUpdate = 'in-history' | 'addition-only'</code>（types.ts:407）描述<strong>模型路由</strong>怎么消费后续的声明变化，deferLoading 描述<strong>单个工具</strong>要不要立刻进上下文；前者靠后者的配合才能把「先声明、后激活」落成线上协议。</div>
-    <div class="annotation"><b>还没定案的事：哪些字段算 epoch 级</b>：循环构建请求时用的 config 是 <code class="inline">LlmCallConfig</code>（call-config.ts:23）——provider/model/reasoningEffort/temperature/maxTokens/stop 六个字段，每个请求从日志 header 重建而非逐调用传入。哪些字段该进这个集合，作者自己留了 <code class="inline">TODO(call-config-shape)</code>（call-config.ts:15）：「Revisit which fields are epoch-level for cache reuse and where provider-specific request options belong」。为什么这个问题不好答：字段越多，header 变化越频繁（第 3 章 reason 'change' 的触发条件），每次变化都可能打断 KV 缓存前缀；字段越少，供应商特有的采样选项又没有安放位置。目前的分界线是「影响缓存复用的请求头状态」——temperature 和 maxTokens 都在集合里，所以改采样参数会记一条 request/header change，这是有意为之的可见性而非遗漏。</div>
+    <div class="annotation"><b>还没定案的事：哪些字段算 epoch 级</b>：循环构建请求时用的 config 是 <code class="inline">LlmCallConfig</code>（call-config.ts:31）——provider/model 加上继承自 <code class="inline">LlmCallControls</code>（call-config.ts:16）的 reasoningEffort/temperature/maxTokens/stop 四个采样字段，每个请求从日志 header 重建而非逐调用传入。哪些字段该进这个集合，作者自己留了 <code class="inline">TODO(call-config-shape)</code>（call-config.ts:23）：「Revisit which fields are epoch-level for cache reuse and where provider-specific request options belong」。为什么这个问题不好答：字段越多，header 变化越频繁（第 3 章 reason 'change' 的触发条件），每次变化都可能打断 KV 缓存前缀；字段越少，供应商特有的采样选项又没有安放位置。目前的分界线是「影响缓存复用的请求头状态」——temperature 和 maxTokens 都在集合里，所以改采样参数会记一条 request/header change，这是有意为之的可见性而非遗漏。</div>
   </section>
 
   <section class="block">
@@ -140,7 +140,7 @@
 }</pre>
     <table class="tbl">
       <tr><th>码</th><th>来源</th><th>可重试（默认策略）</th></tr>
-      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:980）</td><td>否</td></tr>
+      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:995）</td><td>否</td></tr>
       <tr><td><code class="inline">MISSING_CREDENTIAL</code></td><td>请求时解析不到 API key（api-key 路由抛出，llm-deepseek-api-key/src/index.ts:31；区别于 AUTH：修法不同——前者补凭据，后者换凭据）</td><td>否</td></tr>
       <tr><td><code class="inline">ACCOUNT_SIGN_IN_REQUIRED</code></td><td>账号路由拿不到 token，或请求目的地不允许账号认证（llm-deepseek-account）</td><td>否（终态：先登录）</td></tr>
       <tr><td><code class="inline">ACCOUNT_TOKEN_INVALID</code></td><td>账号 token 收到 401 后的映射码；映射同时 rejectToken 移除凭据</td><td>否（终态：重新登录）</td></tr>
@@ -398,9 +398,9 @@
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="cmt">// developer 消息：文本 → system 文本；工具变更 → tool_addition/tool_removal 引用（:94-95）</span>
   <span class="kw">case</span> <span class="st">'tool-addition'</span>: <span class="kw">return</span> [{ type: <span class="st">'tool_addition'</span>, tool: { type: <span class="st">'tool_reference'</span>, name: block.toolName } }]
   <span class="kw">case</span> <span class="st">'tool-removal'</span>:  <span class="kw">return</span> [{ type: <span class="st">'tool_removal'</span>, tool: { type: <span class="st">'tool_reference'</span>, name: block.toolName } }]
-  <span class="cmt">// effort 解析：session-title 强制 off；否则请求值 → 连接默认值 → high（:146）</span>
-  <span class="kw">const</span> effort = options.purpose === <span class="st">'session-title'</span> ? <span class="st">'off'</span> : …
-  <span class="cmt">// thinking 被部署禁用时任何非 off effort 抛 UNSUPPORTED_REASONING_EFFORT，不悄悄降级（:148）</span>
+  <span class="cmt">// effort 解析：请求值 → 连接默认值 → high（:146）；session-title 的 off 来自 prepareCall 的 configure 回调，不在这里分支</span>
+  <span class="kw">const</span> effort = options.reasoningEffort ?? (connection.defaults.reasoningEffort ?? (connection.defaults.thinking === <span class="st">'disabled'</span> ? <span class="st">'off'</span> : <span class="st">'high'</span>))
+  <span class="cmt">// thinking 被部署禁用时任何非 off effort 抛 UNSUPPORTED_REASONING_EFFORT，不悄悄降级（:147）</span>
   <span class="kw">const</span> system = [options.system, historySystem].<span class="fn">filter</span>(<span class="cl">Boolean</span>).<span class="fn">join</span>(<span class="st">'\n\n'</span>)
   <span class="kw">return</span> {
     model: options.model, stream: <span class="kw">true</span>, messages,
@@ -414,7 +414,7 @@
       tools: options.tools.map(tool =&gt; ({ name: tool.name, description: tool.description, input_schema: tool.parameters })),
     },
   }</pre>
-    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled/disabled + <code class="inline">output_config.effort</code> 两个字段（serialize.ts:154-155）；<code class="inline">off</code> 不作为线上 effort 暴露——wire 上表现为 thinking disabled。purpose 驱动生成策略在这里有了第三个实例：session-title 强制 off（compaction 则只通过请求头 x-deepseek-harness-compact 标记，不改 effort）。可选字段一律省略而非发 null，让供应商默认值生效。developer 消息的落点是 system 角色——「Harness 在 user 输入之前承认系统更新，Messages 把同一条更新放在该 user/tool-result 回合之后、下一个 assistant 之前」（flushSystemUpdates 注释）。</div>
+    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled/disabled + <code class="inline">output_config.effort</code> 两个字段（serialize.ts:154-155）；<code class="inline">off</code> 不作为线上 effort 暴露——wire 上表现为 thinking disabled。适配器不再按 purpose 分叉生成策略——0.2.1 起那类调整统一走 prepareCall 的 <code class="inline">configure</code> 回调（call-config.ts:45）：调用方拿到捕获的模型元数据、返回最终采样控制，适配器只认结果。session-title 就是这样强制 effort 的：它传入 <code class="inline">selectReasoningEffort</code> 选出的 effort，覆盖默认值（compaction 则只通过请求头 x-deepseek-harness-compact 标记，不改 effort）。可选字段一律省略而非发 null，让供应商默认值生效。developer 消息的落点是 system 角色——「Harness 在 user 输入之前承认系统更新，Messages 把同一条更新放在该 user/tool-result 回合之后、下一个 assistant 之前」（flushSystemUpdates 注释）。</div>
     <p>模型目录与默认值（<code class="inline">src/models.ts:6</code> 与 <code class="inline">src/defaults.ts</code>）：</p>
     <div class="code-title">packages/llm/llm-deepseek/src/models.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Advisory official model entries; deployments may replace the catalog. */</span>
@@ -448,9 +448,9 @@
     <h3>动态工具更新：一条声明史怎么走到线上</h3>
     <p>0.2.0 之前，工具清单变了就意味着下一请求整体换掉 tools 数组——对 KV 缓存是一次前缀重写。0.2.0 给了另一条路：声明留在历史里，变化以消息形式追加。整条链路分四段：</p>
     <p><strong>第一段，模型侧声明能力</strong>。目录里 deepseek-flash 声明 <code class="inline">toolUpdate: 'addition-only'</code>——这条路由能把 developer 消息里的 <code class="inline">tool-addition</code> 块读作「激活某个 deferLoading 声明的工具」，但不支持删除语义；<code class="inline">'in-history'</code> 则连 <code class="inline">tool-removal</code> 也走历史（types.ts:401 的文档）。两个都没声明的路由维持旧行为：每次请求发完整清单。</p>
-    <p><strong>第二段，循环侧记账</strong>。循环在 buildRequest 里把新旧 header 的工具名单做差集（agent.ts:640-646），差异写成一条 <code class="inline">developer/message</code> 事件，content 是 <code class="inline">tool-addition</code>/<code class="inline">tool-removal</code> 块，addition 部分携带 <code class="inline">headerSeq</code> 指回定义所在的 request/header 事件。这个事件本身进了会话日志，所以重启后可重放。</p>
-    <p><strong>第三段，会话侧折叠</strong>。新文件 <code class="inline">packages/core/session/src/tool-history.ts</code> 的 ToolHistoryProjection 把 request/header 与 developer/message 两类事件折成不可变的 <code class="inline">ToolHistory</code>（tools + updates）：当前声明系列从哪个 header 开始、每条 update 激活了哪些定义，都从 headerSeq 反查出来。折叠与模型能力无关——日志里怎么记，这里就怎么折。Session.toolHistory()（session/src/index.ts:825）按增量消费事件返回快照。</p>
-    <p><strong>第四段，发送侧投影</strong>。循环把 toolHistory 放进 GenerateOptions；llm 层在真正派发给适配器前调用 <code class="inline">projectToolUpdates</code>（content.ts:424，派发点在 llm/src/index.ts:1069），按路由的 toolUpdate 模式决定发什么：</p>
+    <p><strong>第二段，循环侧记账</strong>。循环在 buildRequest 里把新旧 header 的工具名单做差集（agent.ts:652-664），差异写成一条 <code class="inline">developer/message</code> 事件，content 是 <code class="inline">tool-addition</code>/<code class="inline">tool-removal</code> 块，addition 部分携带 <code class="inline">headerSeq</code> 指回定义所在的 request/header 事件。这个事件本身进了会话日志，所以重启后可重放。</p>
+    <p><strong>第三段，会话侧折叠</strong>。新文件 <code class="inline">packages/core/session/src/tool-history.ts</code> 的 ToolHistoryProjection 把 request/header 与 developer/message 两类事件折成不可变的 <code class="inline">ToolHistory</code>（tools + updates）：当前声明系列从哪个 header 开始、每条 update 激活了哪些定义，都从 headerSeq 反查出来。折叠与模型能力无关——日志里怎么记，这里就怎么折。Session.toolHistory()（session/src/index.ts:953）按增量消费事件返回快照。</p>
+    <p><strong>第四段，发送侧投影</strong>。循环把 toolHistory 放进 GenerateOptions；llm 层在真正派发给适配器前调用 <code class="inline">projectToolUpdates</code>（content.ts:424，派发点在 llm/src/index.ts:1084），按路由的 toolUpdate 模式决定发什么：</p>
     <div class="code-title">packages/llm/llm/src/content.ts:424 — projectToolUpdates()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">projectToolUpdates</span>(
   messages, tools, toolUpdate: <span class="cl">ToolUpdate</span> | <span class="kw">undefined</span>, history?: <span class="cl">ToolHistory</span>,
@@ -502,7 +502,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.2.1-alpha.1 (HEAD 5badb15009) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.2.1-alpha.2 (HEAD d743267388) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

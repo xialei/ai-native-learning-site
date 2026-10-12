@@ -104,7 +104,7 @@
 
   <section class="block">
     <h2><span class="num">3.3</span>用代码看：preStep() —— 决策点</h2>
-    <p>step 的第一步永远是「认领 + 决策」。注意默认决策如何把运行时投影出的上下文（<code class="inline">renderContextSections</code>）追加到认领的消息后面（<code class="inline">packages/core/agent-loop/src/agent.ts</code> 的 claim 之后）：</p>
+    <p>step 的第一步永远是「认领 + 决策」。注意默认决策如何把运行时投影出的上下文（<code class="inline">renderContextSections</code>）追加到认领的消息后面——0.2.1 起这段投影<strong>挪进了 waterfall 的默认回调内部</strong>：监听器若改写了 enter 决策，默认回调根本不执行，投影工作也随之省掉（<code class="inline">packages/core/agent-loop/src/agent.ts</code>）：</p>
     <div class="code-title">packages/core/agent-loop/src/agent.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span>  <span class="kw">private async</span> <span class="fn">preStep</span>(target: <span class="cl">InboxTarget</span>, position: { turn: <span class="kw">number</span>; step: <span class="kw">number</span> }): <span class="cl">Promise</span>&lt;<span class="cl">PreparedStep</span>&gt; {
     <span class="kw">if</span> (<span class="kw">this</span>.phase.kind !== <span class="st">'running'</span>) <span class="kw">throw new</span> <span class="cl">Error</span>(<span class="st">`agent "${this.id}": pre-step outside running phase`</span>)
@@ -112,17 +112,20 @@
     <span class="kw">const</span> claimed = <span class="kw">this</span>.inbox.<span class="fn">claim</span>(target, position.turn)
     <span class="kw">const</span> assembly = <span class="kw">await</span> <span class="kw">this</span>.loopCtx.systemPrompt.<span class="fn">assemble</span>(<span class="fn">assembleContextFor</span>(<span class="kw">this</span>, signal))
     signal.<span class="fn">throwIfAborted</span>()
-    <span class="kw">const</span> sections = <span class="fn">renderContextSections</span>(assembly)
-    <span class="kw">const</span> context = <span class="kw">this</span>.runtimeContext.<span class="fn">project</span>(<span class="fn">joinContextSections</span>(sections), sections)
     <span class="kw">const</span> decision = <span class="kw">await</span> <span class="kw">this</span>.dispatch.<span class="fn">waterfall</span>(
       <span class="st">'agent/pre-step'</span>, { messages: claimed, ...position, signal },
-      (): <span class="cl">Promise</span>&lt;<span class="cl">PreStepDecision</span>&gt; =&gt; <span class="cl">Promise</span>.<span class="fn">resolve</span>&lt;<span class="cl">PreStepDecision</span>&gt;({
-        kind: <span class="st">'enter'</span>,
-        messages: context === <span class="kw">undefined</span> ? claimed : [...claimed, context],
-      }),
+      (): <span class="cl">Promise</span>&lt;<span class="cl">PreStepDecision</span>&gt; =&gt; {
+        <span class="kw">const</span> sections = <span class="fn">renderContextSections</span>(assembly)
+        <span class="kw">const</span> context = <span class="kw">this</span>.runtimeContext.<span class="fn">project</span>(<span class="fn">joinContextSections</span>(sections), sections)
+        <span class="kw">return</span> <span class="cl">Promise</span>.<span class="fn">resolve</span>&lt;<span class="cl">PreStepDecision</span>&gt;({
+          kind: <span class="st">'enter'</span>,
+          messages: context === <span class="kw">undefined</span> ? claimed : [...claimed, context],
+        })
+      },
     )
     signal.<span class="fn">throwIfAborted</span>()
-    <span class="kw">return</span> decision.kind === <span class="st">'reject'</span> ? decision : { ...decision, assembly }
+    <span class="kw">if</span> (decision.kind === <span class="st">'reject'</span>) <span class="kw">return</span> decision
+    <span class="kw">return</span> { ...decision, assembly }
   }</pre>
     <div class="annotation"><b>决策类型</b>（<code class="inline">packages/core/agent/src/runtime-types.ts</code>）：
       <pre class="code" style="margin-top:8px"><span class="kw">export type</span> <span class="cl">PreStepDecision</span> =
@@ -226,6 +229,11 @@
     <span class="kw">let</span> firstAttempt = <span class="kw">true</span>
     <span class="kw">while</span> (<span class="kw">true</span>) {                       <span class="cmt">// ← 每次重试/继续都重新 prepareRequest + buildRequest</span>
       <span class="kw">const</span> { config, preparedCall } = <span class="kw">await</span> <span class="kw">this</span>.<span class="fn">prepareRequest</span>(turn, step, signal)
+      <span class="cmt">// 运行时上下文每次尝试都重新渲染：重试期间上下文段可能已变化。</span>
+      <span class="kw">const</span> currentContext = <span class="kw">this</span>.loopCtx.systemPrompt.<span class="fn">refreshContext</span>(assembly, <span class="fn">assembleContextFor</span>(<span class="kw">this</span>, signal))
+      <span class="kw">const</span> sections = <span class="fn">renderContextSections</span>(currentContext)
+      <span class="kw">const</span> context = <span class="kw">this</span>.runtimeContext.<span class="fn">project</span>(<span class="fn">joinContextSections</span>(sections), sections)
+      signal.<span class="fn">throwIfAborted</span>()
       <span class="kw">const</span> startsRequestSeries = firstAttempt &amp;&amp; decision.startsRequestSeries === <span class="kw">true</span>
       <span class="kw">const</span> commits = <span class="kw">this</span>.systemPrompt.<span class="fn">project</span>(renderedPrompt, {
         inHistory: preparedCall?.systemPromptUpdate === <span class="st">'in-history'</span>,
@@ -237,10 +245,23 @@
         <span class="cmt">// 系统提示词是表面事件（v3）：新提示词 append 为节点 0 或替换旧节点。</span>
         <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'system/message'</span>, { turn, step, message }, intent)
       }
+      <span class="kw">let</span> contextAdmitted = <span class="kw">false</span>
       <span class="kw">if</span> (firstAttempt) {
         <span class="kw">for</span> (<span class="kw">const</span> message <span class="kw">of</span> decision.messages) {
-          <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'user/message'</span>, message, { surfaceOp: <span class="st">'append'</span> })
+          <span class="kw">if</span> (message.source.kind === <span class="st">'runtime-context'</span>) {
+            <span class="cmt">// 运行时上下文消息只承认最新一份：上下文段在尝试间变化时，</span>
+            <span class="cmt">// 用重渲染的结果替换，旧的那份不落日志。</span>
+            <span class="kw">if</span> (context !== <span class="kw">undefined</span> &amp;&amp; !contextAdmitted) {
+              <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'user/message'</span>, context, { surfaceOp: <span class="st">'append'</span> })
+              contextAdmitted = <span class="kw">true</span>
+            }
+          } <span class="kw">else</span> {
+            <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'user/message'</span>, message, { surfaceOp: <span class="st">'append'</span> })
+          }
         }
+      }
+      <span class="kw">if</span> (context !== <span class="kw">undefined</span> &amp;&amp; !contextAdmitted) {
+        <span class="kw">this</span>.session.<span class="fn">append</span>(<span class="st">'user/message'</span>, context, { surfaceOp: <span class="st">'append'</span> })
       }
       firstAttempt = <span class="kw">false</span>
       <span class="kw">const</span> request = <span class="kw">this</span>.<span class="fn">buildRequest</span>(config, preparedCall, assembly.tools, { turn, step }, startsRequestSeries, signal)
@@ -309,7 +330,7 @@
       }
     }
   }</pre>
-    <div class="annotation"><b>结算规则</b>：流成功 → 完整压缩流作为一条 <code class="inline">assistant/message</code> 落日志（含 usage 与完整 stream 记录）；错误/重试/取消且无可见内容 → <code class="inline">assistant/attempt</code>（只留流记录，不产生模型历史）；中断但已输出前缀 → 前缀结算为 <code class="inline">interrupted: true</code> 的消息。v3 的两个细节仍然成立：系统提示词在<strong>每次请求前</strong>由 <code class="inline">SystemPromptProjection.project()</code> 决定是否补写 <code class="inline">system/message</code> 表面事件（内容没变不重复落日志）；<code class="inline">user/message</code> 只在<strong>首个尝试</strong>前落一次，重试不重复认领的消息。0.2.0 在 project 条件上多了一个分支：路由支持 toolUpdate（deepseek-flash 的 addition-only）时，工具集变化不再触发系统提示词重写——变化改由 developer 消息承载（7.5 节的动态工具更新），系统消息的前缀保持稳定。第 7 章会看到与 retry 策略插件的配合。</div>
+    <div class="annotation"><b>结算规则</b>：流成功 → 完整压缩流作为一条 <code class="inline">assistant/message</code> 落日志（含 usage 与完整 stream 记录）；错误/重试/取消且无可见内容 → <code class="inline">assistant/attempt</code>（只留流记录，不产生模型历史）；中断但已输出前缀 → 前缀结算为 <code class="inline">interrupted: true</code> 的消息。v3 的两个细节仍然成立：系统提示词在<strong>每次请求前</strong>由 <code class="inline">SystemPromptProjection.project()</code> 决定是否补写 <code class="inline">system/message</code> 表面事件（内容没变不重复落日志）；<code class="inline">user/message</code> 只在<strong>首个尝试</strong>前落一次，重试不重复认领的消息。0.2.0 在 project 条件上多了一个分支：路由支持 toolUpdate（deepseek-flash 的 addition-only）时，工具集变化不再触发系统提示词重写——变化改由 developer 消息承载（7.5 节的动态工具更新），系统消息的前缀保持稳定。0.2.1 又给运行时上下文加了准入规则：每次尝试都重新 <code class="inline">refreshContext</code> 重渲染，但同一步里只承认<strong>一份</strong>运行时上下文消息（<code class="inline">contextAdmitted</code> 闩住）——认领消息里若带了旧上下文，就被重渲染的新份替换，避免重试把同一截上下文落两遍。第 7 章会看到与 retry 策略插件的配合。</div>
   </section>
 
   <section class="block">
@@ -388,7 +409,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 03 生命周期 · 版本 dsh-v0.2.1-alpha.1 (HEAD 5badb15009) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 03 生命周期 · 版本 dsh-v0.2.1-alpha.2 (HEAD d743267388) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>
