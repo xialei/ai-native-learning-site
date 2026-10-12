@@ -41,11 +41,11 @@
   </div>
   <div class="lede">
     <p>内置的 shell 和 apply_patch 显然不够用——想接一个自己搭的工具服务器，接口长什么样？MCP、Connectors、Plugins、Skills 四个词听着像一回事，边界在哪？几十个外部工具全量塞进 prompt 既费 token 又分散注意力，模型怎么「发现」它这轮真正要用的工具？这些外部工具接进来之后，安全边界（第 8 章的审批/沙箱）还管不管它们？</p>
-    <p>Codex 真正的扩展性来自三条线：<b>MCP（Model Context Protocol）</b>接外部工具服务器，<b>Connectors / Plugins</b>把 skills、MCP 服务器与可选的钩子/界面组合成可分发的能力包，<b>Skills</b>以 SKILL.md 为入口、按需向模型注入工作流指令。它们共享同一套 <code class="inline">ToolSpec</code> 暴露机制——对模型而言，内置工具和扩展工具没有分别。</p>
+    <p>Codex 真正的扩展性来自四条线：<b>MCP（Model Context Protocol）</b>接外部工具服务器，<b>Connectors</b>把整个应用接成带目录缓存的工具集，<b>Plugins</b>把 skills、MCP 服务器与可选的钩子/界面组合成可分发的能力包，<b>Skills</b>以 SKILL.md 为入口、按需向模型注入工作流指令。它们共享同一套 <code class="inline">ToolSpec</code> 暴露机制——对模型而言，内置工具和扩展工具没有分别。</p>
   </div>
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是：① 接口就是 MCP——标准 JSON-RPC 协议接外部工具服务器，挂载点由 McpServerConfig 控制（10.2 / 10.3）；② MCP 是「外部工具服务器协议」，Connectors/Plugins 是「把 skills + MCP 服务器 + 钩子打包分发」的能力包，Skills 是「按需注入的工作流指令」，三层通过 ToolSpec 汇合成一个暴露面（10.4 / 10.5 / 10.6 / 10.8）；③ ToolSearch 让模型先搜再调，动态发现而不是全量列出（10.7）；④ 管——扩展工具与内置工具走同一套 ToolSpec 与执行管线，审批/沙箱一视同仁（10.1 / 10.8）。
+    四问的答案依次是：① 接口就是 MCP——标准 JSON-RPC 协议接外部工具服务器，挂载点由 McpServerConfig 控制（10.2 / 10.3）；② MCP 是「外部工具服务器协议」，Connectors 把整个应用接成工具，Plugins 是「skills + MCP 服务器 + 钩子」的能力包，Skills 是「按需注入的工作流指令」，四条线通过 ToolSpec 汇合成一个暴露面（10.4 / 10.5 / 10.6 / 10.8）；③ ToolSearch 让模型先搜再调，动态发现而不是全量列出（10.7）；④ 管——扩展工具与内置工具走同一套 ToolSpec 与执行管线，审批/沙箱一视同仁（10.1 / 10.8）。
   </div>
 
   <section class="block">
@@ -189,7 +189,7 @@
 <span class="cmt">// 带缓存的目录查询，避免每次都去远端拉</span>
 <span class="kw">pub fn</span> cached_directory_connectors(cache_context) -&gt; <span class="kw">Option</span>&lt;<span class="kw">Vec</span>&lt;<span class="cl">AppInfo</span>&gt;&gt;</pre>
 
-    <p>Connectors 解决的是「应用生态」问题：一个企业可能有几十个内部系统，逐个写 MCP 服务器太重。Connector 框架提供统一的发现、缓存、路由机制——你可以把一组应用装进一个 marketplace，按需启用。这与第 11 章的多 Agent 协作紧密相关：某些 connector 本身就是「应用 Agent」。</p>
+    <p>Connectors 解决的是「应用生态」问题：一个企业可能有几十个内部系统，逐个写 MCP 服务器太重。Connector 框架提供统一的发现、缓存、路由机制——你可以把一组应用装进一个 marketplace，按需启用。它与第 11 章的多 Agent 编排是两条独立的扩展面：connector 打通的是企业应用，不是 Agent 之间的协作。</p>
   </section>
 
   <section class="block">
@@ -271,7 +271,7 @@
 
     <p>四者并非互斥，而是<b>组合</b>：一个 plugin 可以带 MCP overlay，一个 connector 可以暴露多个 MCP 工具，一个 skill 可以调用任意工具。它们共同构成 Codex 的「能力长尾」——核心保持精简，长尾靠扩展。</p>
 
-    <p>扩展能触碰的最深处不是工具，而是<strong>模型请求本身</strong>。2026-09 起 extension API 暴露了一对请求级钩子（#47679）：<code class="inline">ModelRequestContributor</code> 在请求发出前介入——往 <code class="inline">client_metadata</code> 里追加追踪字段（已有键和保留键不可覆盖），并按需为这条请求创建一个 <code class="inline">ModelResponseInterceptor</code>；拦截器则拥有回包流，可以在事件到达 trace/记账之前 inspect、缓冲或改写（ext/extension-api/src/model_request.rs）。两个设计约束值得注意：一是请求分 <code class="inline">Generation</code> 与 <code class="inline">Warmup</code> 两类——预热请求（3.2 的 prewarm）也会过钩子，host 实现可以选择对 warmup 绕过输出门控；二是拦截器按注册顺序组合、丢弃流即释放未完成的工作。这让扩展能做「模型流量观测」而无需魔改内核——但能改写模型看到/产出的流，也意味着这个钩子的信任级别远高于普通工具。</p>
+    <p>扩展能触碰的最深处不是工具，而是<strong>模型请求本身</strong>。2026-09 起 extension API 暴露了一对请求级钩子（#47679）：<code class="inline">ModelRequestContributor</code> 在请求发出前介入——往 <code class="inline">client_metadata</code> 里追加追踪字段（已有键和保留键不可覆盖），并按需为这条请求创建一个 <code class="inline">ModelResponseInterceptor</code>；拦截器则拥有回包流，可以在事件到达 trace/记账之前 inspect、缓冲或改写（ext/extension-api/src/model_request.rs）。这条钩子有两条设计约束：一是请求分 <code class="inline">Generation</code> 与 <code class="inline">Warmup</code> 两类——预热请求（3.2 的 prewarm）也会过钩子，host 实现可以选择对 warmup 绕过输出门控；二是拦截器按注册顺序组合、丢弃流即释放未完成的工作。这让扩展能做「模型流量观测」而无需魔改内核——但能改写模型看到/产出的流，也意味着这个钩子的信任级别远高于普通工具。</p>
   </section>
 
   <section class="block">
