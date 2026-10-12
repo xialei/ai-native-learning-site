@@ -36,8 +36,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 02 3D 并行</div>
+    <div class="chap-meta">Chapter 02 · Hybrid Parallel</div>
     <h1>3D 并行：五种切法怎么组合</h1>
-    <div class="subtitle">并行有哪几种切法，各切什么对象、付什么通信代价？一组卡怎么变成 TP/PP/DP 组（rank 映射）？DeepSpeed 侧怎么接进来？组合时先算哪笔账。</div>
+    <div class="lede">
+      <p>并行有哪几种切法，各切什么对象、付什么通信代价？一组卡怎么变成 TP/PP/DP 组（rank 映射）？DeepSpeed 侧怎么接进来？组合时先算哪笔账。</p>
+      <p>这一章是 3–5 章（Megatron 的 TP/PP/CP）和 6–9 章（DeepSpeed 的 DP 显存账）共同的分派表：五种并行在这里各领一个切分对象，后面各章逐个下钻。本章只到「rank 怎么分组、通信插在哪」，不进任何一层算子的切分数学。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -76,7 +80,7 @@
     最后一点贯穿所有并行组：每个组都是一种「窄通信域」——TP 组内每层通信、PP 组只有 stage 边界通信、DP 组每步规约一次。把通信限制在最小集合里，这是所有并行组设计的共同动机。</div>
 
     <p>签名读完了，先把它落到一张全量图上。64 卡、TP=4×PP=4×DP=4（单机 8 卡 × 8 台机器），这是最容易把「三堵墙各堵一截」的配法：TP 吃机内带宽、PP 跨机、DP 做副本。图 2.1a 是全 64 卡的布局，图 2.1b 是其中一个 TP×PP 组的放大——两张图对着读：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21a d21a">
   <title id="t21a">64 卡、TP=4 PP=4 DP=4 的完整 rank 布局</title>
   <desc id="d21a">8 台机器各 8 卡。rank 顺序 tp-cp-ep-dp-pp（CP=EP=1 时即 tp-dp-pp）：每台机器的一行 4 卡是一个 TP 组；PP stage 占两台机器；DP 组是同一 stage 上同列的 4 张卡（如 rank 0、4、8、12）。TP 通信不出机器，PP/DP 通信跨机。</desc>
@@ -312,7 +316,7 @@
 </svg>
       <div class="fig-cap">图 2.1a：64 卡总览（TP=4×PP=4×DP=4，单机 8 卡 × 8 台）。每个小方块是一个 rank（上排数字 = 全局 rank，下排 = TP 位次）；同色一行是一个 TP 组，虚线框一列是一个 DP 组，PP 沿机器对横向传递。order 改变时这张图的行列含义整体重排。</div>
     </div>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -396,7 +400,7 @@
   <section class="block">
     <h2><span class="num">2.4</span>PP 气泡：组合前必须先算清的账</h2>
     <p>插头接好了，最后还有一笔账：两库组合时，PP 的气泡账决定你敢不敢开 PP。流水线并行用「分段接力」换低通信，代价是时间线上的<strong>气泡（bubble）</strong>。经典 1F1B 调度下，气泡占比有一个干净的下界公式：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t22 d22">
         <title id="t22">1F1B 时间线与气泡</title>
         <desc id="d22">4 个 stage、8 个 micro-batch 的 1F1B 调度甘特图。stage 0 从 t=0 开始连续前向，随后进入 F/B 交替稳态，结尾 cooldown 排空。最后 stage 的前向起点比 stage 0 晚 3 拍，这正是 warmup。气泡总量 = (stages-1) 拍 /(micro-batches) 分摊到每张卡。</desc>
@@ -438,7 +442,6 @@
       <b class="tag">回到 64 卡：若换成 4D（加 CP/EP）</b>
       图 2.1a 是 3D（TP/PP/DP）。真实大模型常开 4D 甚至 5D：例如 64 卡 = TP=2 × CP=2 × PP=2 × DP=8，或 MoE 模型再叠 EP。规则不变——world_size 仍等于各轴之积，<code class="inline">order</code> 里排在越前面的轴，相邻 rank 越近、越吃机内带宽。CP 排在 tp 之后（"tp-cp-…"），所以 CP 组也是机内相邻；EP 组横跨 DP 维的机器（专家分散在不同机器上，all-to-all 走机间）。第 5 章讲 CP 的 zigzag 切分，第 13 章讲 EP 的 all-to-all。
     </div>
-    </div>
     <p>这笔账直接决定组合方案：<strong>先算 PP 需要的 micro-batch 数 → 气泡率可接受时才开 PP；剩下的卡给 TP×DP</strong>。Megatron 默认建议 TP ≤ 单机卡数（NVLink 域），PP 拿跨机带宽，DP 用 ZeRO 砍显存。</p>
   </section>
 
@@ -460,10 +463,22 @@
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="01-architecture.html">← 上一步：总架构</a>
-    <a href="03-megatron-tp.html">下一步：Megatron 张量并行 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章把三堵墙对应的切法加上 CP/EP 两种特种切法排进一张表：TP 切权重、PP 切层、DP 切数据、CP 切序列、EP 切专家，各自的通信代价与带宽要求不同。rank 到并行组的映射由 <code class="inline">initialize_model_parallel</code> 一次定型，order 参数决定哪一维吃机内 NVLink；DeepSpeed 只认 DP 组，靠 mpu 插头接进 Megatron 的世界。组合前先算 PP 气泡账，选型速查表按处境给第一步。</p>
+    <p>下一章进入第一种切法的内部：一层权重矩阵怎么切、通信插在哪。<a href="03-megatron-tp.html">第 3 章：Megatron 张量并行</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="01-architecture.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 1 章 · 总架构：两库如何拼成一台训练机</span>
+    </a>
+    <a class="next" href="03-megatron-tp.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 3 章 · 张量并行：一层权重怎么切给多张卡</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

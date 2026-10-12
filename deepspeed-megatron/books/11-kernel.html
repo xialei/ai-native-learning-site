@@ -36,8 +36,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Kernel 层</div>
+    <div class="chap-meta">Chapter 11 · Kernels</div>
     <h1>Kernel 层：并行框架底下的算子竞赛</h1>
-    <div class="subtitle">融合省的到底是什么——计算还是显存往返？哪些算子值得融合、哪些永远不值得？Megatron 的 fusions 目录和 DS 的 csrc 各自补谁的短板，fp8 为什么直接用 TE 不自己写，fp4（NVFP4）落地又动了哪里？自研到什么程度该收手？</div>
+    <div class="lede">
+      <p>融合省的到底是什么——计算还是显存往返？哪些算子值得融合、哪些永远不值得？Megatron 的 fusions 目录和 DS 的 csrc 各自补谁的短板，fp8 为什么直接用 TE 不自己写，fp4（NVFP4）落地又动了哪里？自研到什么程度该收手？</p>
+      <p>并行切完、显存省完，最后一层是算子本身的速度。这一章站在两库的 kernel 资产上算一笔「launch 开销 vs 显存往返」的账，甜点区在哪、哪些永远不值得写、fp8/fp4 为什么走 TE 透传——11.5 的自研纪律是这条底线的收口。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -106,7 +110,7 @@
 └── lion/、adagrad/、lamb/…    <span class="cmt"># 其余 optimizer kernel（cpu_lion 在 csrc/lion）</span></pre>
     <div class="annotation"><b>家底形态对比：</b>Megatron 的 fusions 服务「训练前向/反向的热路径」，DS 的 csrc 服务「训练周边（optimizer、IO、offload）+ 推理 kernel」——各自补自己主打场景的短板。共同点只有一条：<strong>multi-tensor / multi-param 的 batch 化</strong>（一次 kernel 处理多个参数张量，减少 launch 开销）——DS 的 fused Adam 与 Megatron 的分布式 optimizer 步进都受益于此思路。</div>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t111 d111">
         <title id="t111">bias + GELU：分开算与融合算的显存往返</title>
         <desc id="d111">上行：分开算三个 kernel（GEMM 输出写显存 → bias kernel 读一遍写一遍 → GELU kernel 再读一遍写一遍），四次数往返。下行：融合成一个 kernel，GEMM 输出直接在片上做完 bias+GELU 写回一次。省的是中间张量的全量读写。</desc>
@@ -156,32 +160,44 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">11.4</span>哪些值得抄，哪些直接用</h2>
-    <p>两库家底盘点完，就轮到自研的边界了——哪类抄、哪类直接用：</p>
+    <h2><span class="num">11.4</span>哪些自己写，哪些直接用</h2>
+    <p>两库家底盘点完，就轮到自研的边界了——哪类自己写、哪类直接用：</p>
     <table class="tbl">
       <tr><th>类别</th><th>建议</th><th>理由</th></tr>
       <tr><td>GEMM</td><td>直接用 cuBLAS/cuBLASLt 或 TE</td><td>自研打不过厂商库</td></tr>
       <tr><td>注意力</td><td>直接用 FlashAttention / TE</td><td>同样打不过，且变长支持复杂</td></tr>
-      <tr><td>LN+激活+残差融合</td><td>值得抄思路（简单、收益明确）</td><td>元素级 kernel，C++/Triton 一天能写</td></tr>
-      <tr><td>Fused optimizer</td><td>值得抄实现（multi-tensor batch 化）</td><td>launch 开销是 optimizer 热路径大头</td></tr>
+      <tr><td>LN+激活+残差融合</td><td>可以自己写（简单、收益明确）</td><td>元素级 kernel，C++/Triton 一天能写</td></tr>
+      <tr><td>Fused optimizer</td><td>可以自己写（multi-tensor batch 化）</td><td>launch 开销是 optimizer 热路径大头</td></tr>
       <tr><td>异步 IO / offload</td><td>直接用 DS 的 DeepNVMe</td><td>调优过的 libaio 封装，重写不经济</td></tr>
       <tr><td>fp8 量化调度</td><td>直接用 TE</td><td>scale 管理的状态机深，别自己碰</td></tr>
     </table>
   </section>
 
   <section class="block">
-    <h2><span class="num">11.5</span>小结 + 自研启示</h2>
-    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、量化 kernel）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE；fp4/NVFP4 沿同一条路（11.2 末），连落地时的回滚反复，都是「不自研、透传 TE」这条路线的再现。真正值得动手抄的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8/fp4 都直接用现成。把自研纪律归拢：</p>
+    <h2><span class="num">11.5</span>自研纪律</h2>
+    <p>本章其实就讲了一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径（forward/backward 配对 + autograd 接管），DS 的 csrc 服务训练周边（fused Adam、CPU Adam、aio、量化 kernel）+ 推理 kernel，各自补主打场景的短板。fp8 的 per-tensor scale 状态机太深，Megatron 自己也不写——它把并行边界透传给 TE，自研同理直接用 TE；fp4/NVFP4 沿同一条路（11.2 末），连落地时的回滚反复，都是「不自研、透传 TE」这条路线的再现。真正值得自己动手写的是 LN+激活残差融合与 fused optimizer 的思路，GEMM/注意力/异步 IO/fp8/fp4 都直接用现成。把自研纪律归拢：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
       kernel 层的自研纪律：<strong>先 profile 再动手</strong>——nsight 里看到 launch gap 或带宽打满才值得写融合；GEMM 与注意力的时间占比决定了自研 kernel 的天花板（通常 < 40% 时间在元素级算子上，融合的全部收益在这 40% 里）。最容易错的三点：融合 kernel 的 backward 忘了与 forward 配对（autograd 断链静默错）、用了 fp16 累加（元素级 kernel 应 fp32 累加）、融合边界跨了 TP 通信（第 10 章同款坑）。
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="10-checkpointing.html">← 上一步：激活重算</a>
-    <a href="12-checkpoint-io.html">下一步：Checkpoint IO →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章就一笔账：融合省的是显存往返不是计算，判断标准是「算子有没有把 tensor core 用到极限」，甜点区在 LN/激活/dropout/残差这些带宽密集的小算子。Megatron 的 fusions 服务训练热路径，DS 的 csrc 服务训练周边加推理 kernel，各自补主打场景的短板。fp8 的 scale 状态机太深，连 Megatron 都透传 TE；fp4/NVFP4 沿同一条路。真正值得自己动手写的是 LN+激活残差融合与 fused optimizer 的思路——先 profile 再动手，GEMM 与注意力的时间占比决定了自研 kernel 的天花板。</p>
+    <p>下一章解决续训：分片存下的 checkpoint，怎么在并行度变了以后读回来。<a href="12-checkpoint-io.html">第 12 章：分布式 Checkpoint</a>。</p>
   </div>
+
+    <nav class="pagenav">
+    <a class="prev" href="10-checkpointing.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 10 章 · 激活重算：用 33% 的算力换显存</span>
+    </a>
+    <a class="next" href="12-checkpoint-io.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 12 章 · 分布式 Checkpoint：存的是分片，读回来还能变拓扑</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

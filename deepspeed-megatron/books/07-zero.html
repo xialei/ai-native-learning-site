@@ -36,8 +36,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 ZeRO 1/2</div>
+    <div class="chap-meta">Chapter 07 · ZeRO 1/2</div>
     <h1>ZeRO 1/2 与 Megatron 分布式优化器：同一思想的两个实现</h1>
-    <div class="subtitle">优化器状态为什么能安全地按 DP 切、切完之后梯度归约怎么改、step 只更新本卡分区的语义怎么保证一致？Megatron 不叫 ZeRO 却做了等价物——它的「bucket + range map」和 DS 的「IPG bucket」差在哪？换个更新规则的优化器（Muon）怎么进分片框架？fp16 训练的 loss scale 归谁管？</div>
+    <div class="lede">
+      <p>优化器状态为什么能安全地按 DP 切、切完之后梯度归约怎么改、step 只更新本卡分区的语义怎么保证一致？Megatron 不叫 ZeRO 却做了等价物——它的「bucket + range map」和 DS 的「IPG bucket」差在哪？换个更新规则的优化器（Muon）怎么进分片框架？fp16 训练的 loss scale 归谁管？</p>
+      <p>第 6 章账本上最贵的一项——优化器状态 fp32 两份——在这里被切掉。DeepSpeed 和 Megatron 各有一个实现，思想同为「状态按 DP 分片」，数据结构却分岔了；这一章对照着读，分片框架怎么收编新优化器（Muon）、loss scale 归谁，都是「同一思想、两个实现」的注脚。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -124,7 +128,7 @@ ZeRO-3：    前向整模型 AG(2B 参数) 1 遍 + 反向再 AG 1 遍
     self.<span class="fn">_clear_param_grad_only</span>()</pre>
     <div class="annotation"><b>step 的分片语义：</b>epilogue 是 backward 的收尾（ZeRO-2 在这里丢掉非本卡分区的梯度，只留归约产物），真正的溢出检查和 step 在 <code class="inline">step()</code> 里：先 <code class="inline">check_overflow</code>（任一卡 NaN → <code class="inline">_update_scale</code> 记溢出，全组清梯度直接 return），不溢出才逐子组 <code class="inline">optimizer.step</code>——只有本卡负责的分区有 master/m/v。<strong>master 权重（fp32）按分区持有</strong>——本卡分区更新后，用 all-gather 把新参数广播回各卡的 fp16 副本。这一切对用户透明，engine.step() 内部完成。</div>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t71 d71">
         <title id="t71">ZeRO-1 的时序：reduce-scatter → 分区 step → all-gather</title>
         <desc id="d71">DP=2 对照。上行（ZeRO 之前）：两卡各持全量 fp16 参数、全量梯度、全量 fp32 master/m/v——优化器状态冗余 DP 份。下行（ZeRO-1）：① reduce-scatter 让各卡只收自己窗口的梯度；② optimizer.step 只更新本卡窗口的 fp32 master/m/v；③ all-gather 把新参数广播回两卡 fp16 副本。三步全在 optimizer 内部。</desc>
@@ -278,15 +282,22 @@ buffer = torch.narrow(staged_momentum, <span class="nu">0</span>, buffer_idx, te
     </div>
   </section>
 
-  <section class="block">
-    <h2><span class="num">7.8</span>小结</h2>
-    <p>本章从「为什么要存 N 份」的疑问出发，答案逐层落地：优化器状态能切，是因为 DP 副本间它完全冗余——分片语义收在 optimizer.step 内部，模型和梯度代码零改动；梯度归约跟着改——IPG bucket 满即异步归约与反向计算重叠，ZeRO-2 用 reduce 代替 all-reduce 让梯度只在负责卡存在；Megatron 的等价物是「bucket + range map」——与 DS 的差异是按平坦缓冲窗口而非按参数分组，reduce-scatter 直达窗口；换更新规则的优化器进分片框架，撞上的全是「状态按参数切」这个预设——Muon 的四个坑加动量暂存/提交（7.5）就是预设与新算法的边界清单；loss scale 归 optimizer 管——bf16 指数位够直接跳过，fp16 的 growth_interval + hysteresis 两库语义一致。7.4 末尾那条场景判断是本章最实用的一句：用 DS 主导的代码库就从 ZeRO-2 起步，用 Megatron 栈就常开 DistributedOptimizer，两者不要混用。</p>
-  </section>
-
-  <div class="arrow-nav">
-    <a href="06-deepspeed-engine.html">← 上一步：DS 引擎</a>
-    <a href="08-zero3.html">下一步：ZeRO-3 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章的两个实现、一个思想：优化器状态能切，是因为 DP 副本间它完全冗余——分片语义收在 optimizer.step 内部，模型代码零改动。DS 靠 IPG bucket 满即异步归约，Megatron 靠 bucket + range map 直达窗口（reduce-scatter）；换更新规则的优化器进分片框架，撞上的全是「状态按参数切」这个预设，Muon 的四个坑就是预设与新算法的边界清单；loss scale 归 optimizer 管，bf16 直接跳过。7.4 那条场景判断最实用：DS 主导的代码库从 ZeRO-2 起步，Megatron 栈常开 DistributedOptimizer，两者不要混用。</p>
+    <p>下一章把最激进的一步走完：参数本身也按 DP 切，前向改成借还循环。<a href="08-zero3.html">第 8 章：ZeRO-3</a>。</p>
   </div>
+
+    <nav class="pagenav">
+    <a class="prev" href="06-deepspeed-engine.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 6 章 · DeepSpeedEngine：三行训练循环背后的三百个分支</span>
+    </a>
+    <a class="next" href="08-zero3.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 8 章 · ZeRO-3：参数也切了，前向怎么算</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

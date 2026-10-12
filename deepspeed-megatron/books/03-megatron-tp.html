@@ -36,8 +36,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 Megatron 张量并行</div>
+    <div class="chap-meta">Chapter 03 · Megatron TP</div>
     <h1>张量并行：一层权重怎么切给多张卡</h1>
-    <div class="subtitle">把 Y = XA 切给多卡，怎么切才能让通信最少？通信代码写在哪，才能让模型作者无感？dgrad 与 wgrad 的通信怎么跟计算重叠？激活还能不能省？</div>
+    <div class="lede">
+      <p>把 Y = XA 切给多卡，怎么切才能让通信最少？通信代码写在哪，才能让模型作者无感？dgrad 与 wgrad 的通信怎么跟计算重叠？激活还能不能省？</p>
+      <p>这一章讲透五种并行里通信最密的一种：切分只有列/行两种姿势，难点全在「通信插在哪个位置、autograd 怎么把它接住」。第 5 章的模型透明性、第 7 章的梯度 buffer 都建立在这一章的 f/g 共轭算子上。只讲线性层，注意力/MLP 怎么组合留给第 5 章。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -102,7 +106,7 @@ A = [ 1  0 | 1  1 ]       # 4x4 权重，| 是列切分线：卡0 拿左两列 A
     <span class="cmt"># input_is_parallel: 输入已是各卡分片（接在列并行后）→ 免切分直接算</span></pre>
     <div class="annotation"><b>重点看两者相接处：</b>Column 并行切 A 的列 → 每卡输出是 Y 的一段特征维；Row 并行切 A 的行、同时要求 X 也按特征切 → 每卡输出是完整 Y 的<strong>部分和</strong>，需要 all-reduce。而<strong>两者相接处不需要通信</strong>——列并行的输出本来就是行并行想要的输入分片（上文 3.1 的手算里，Y₁/Y₂ 两块正好就是行并行要的 X 分片形状），这就是「MLP 两次 GEMM 只通信一次」的实现基础。配置里 <code class="inline">gather_output=False</code> + <code class="inline">input_is_parallel=True</code> 就是在声明「保持分片不落地」。</div>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t31 d31">
         <title id="t31">MLP 的列-行切分与 f/g 通信</title>
         <desc id="d31">两卡场景：输入 X 复制到两卡（f 算子，前向恒等反向 all-reduce）；卡0 持有 A 的左半列算出 Y 的左半，卡1 持有右半；直接交给 B 的行切分，各算部分和；输出前 all-reduce（g 算子）。全程只有 1 次 all-reduce。</desc>
@@ -226,7 +230,7 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
   <section class="block">
     <h2><span class="num">3.5</span>Sequence Parallel：把 TP 的激活也切了</h2>
     <p>梯度省完了，激活还剩一笔账：纯 TP 下，LayerNorm/Dropout 的激活每个卡仍是<strong>完整序列</strong>的副本。序列并行（SP）把它们沿序列维切开，代价是 TP 通信的形态变化：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t33 d33">
         <title id="t33">TP 通信 vs TP+SP 通信</title>
         <desc id="d33">上半：纯 TP 的 layer 结构，attention 与 MLP 内部 all-reduce 两次。下半：TP+SP 的结构，LayerNorm 后的 all-reduce 变为 reduce-scatter，进入线性层前的 all-gather 变为 g 算子的 all-gather；激活量减半。</desc>
@@ -269,7 +273,7 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
   </section>
 
   <section class="block">
-    <h2><span class="num">3.6</span>小结 + 自研启示</h2>
+    <h2><span class="num">3.6</span>算子速查与自研启示</h2>
     <p>回望这一章：两种切法通信代价差一倍——列并行前向免通信、行并行前向要 all-reduce，列-行配对后每层只通信 2 次；通信写进 autograd.Function（f/g 共轭算子），模型代码与普通 Linear 无异；反向靠 allreduce_dgrad 异步重叠、gradient_accumulation_fusion 直写 main_grad，激活则交给 SP 换通信原语。算子速查：</p>
     <table class="tbl">
       <tr><th>算子</th><th>切法</th><th>前向通信</th><th>反向通信</th></tr>
@@ -284,10 +288,22 @@ output = <span class="fn">reduce_from_tensor_model_parallel_region</span>(output
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="02-hybrid-parallel.html">← 上一步：3D 并行</a>
-    <a href="04-pp-1f1b.html">下一步：流水线并行 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章把 Y = XA 切成了两种姿势：列并行（Y 按行切）配 f（前向 identity、反向 all-reduce），行并行（A 按列切）配 g（前向 all-reduce、反向 identity）——通信从此长在 autograd 里，模型作者一行不改。列-行配对让 MLP 中间点零通信；Sequence Parallel 把 LayerNorm/Dropout 的激活也沿序列切，TP 通信从 all-reduce 变成 reduce-scatter + all-gather；async-TP 用一行环境变量把这两步插进计算间隙。可复用的三样资产——f/g 共轭、列-行配对、初始化一致性——都进了 3.6 的收拢表。</p>
+    <p>下一章换一种切法：不再切细一层，而是把层分段装进不同卡，靠时间表填气泡。<a href="04-pp-1f1b.html">第 4 章：流水线并行</a>。</p>
   </div>
+
+    <nav class="pagenav">
+    <a class="prev" href="02-hybrid-parallel.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 2 章 · 3D 并行：五种切法怎么组合</span>
+    </a>
+    <a class="next" href="04-pp-1f1b.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 4 章 · 流水线并行：1F1B 调度怎么排</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

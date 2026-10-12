@@ -37,8 +37,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 分布式 Checkpoint</div>
+    <div class="chap-meta">Chapter 12 · Checkpointing</div>
     <h1>分布式 Checkpoint：存的是分片，读回来还能变拓扑</h1>
-    <div class="subtitle">并行度改了之后旧 checkpoint 还能读吗——「存的是分片」和「读回来变拓扑」之间的矛盾怎么解？保存的复杂度其实是几个独立问题？ShardedTensor 的坐标系怎么让任意 rank 找回自己要的那部分？异步保存期间训练崩溃，checkpoint 会坏吗？</div>
+    <div class="lede">
+      <p>并行度改了之后旧 checkpoint 还能读吗——「存的是分片」和「读回来变拓扑」之间的矛盾怎么解？保存的复杂度其实是几个独立问题？ShardedTensor 的坐标系怎么让任意 rank 找回自己要的那部分？异步保存期间训练崩溃，checkpoint 会坏吗？</p>
+      <p>训练跑起来了，下一个问题是断点续训：3D 并行下存的是分片，换拓扑后每个 rank 要的又是另一套分片。Megatron 用原生 reshardable 格式、DS 用事后转换的 universal checkpoint，两条路线解的是同一个矛盾；RNG 和 consumed_samples 这两个隐形条件最难察觉，run_config.yaml 是人的那半边答案。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -111,7 +115,7 @@
     <p>还有一类「当时不知道、半年后想要」的 metadata：训练本身的配置。2026-09 之前，Megatron 的 checkpoint 目录里只有权重和训练状态，当时的并行布局、超参、模型结构都要靠翻保存作业的日志才能拼出来；#7344 把完整的配置容器（<code class="inline">run_config.yaml</code>）直接落进每个 checkpoint 目录——训练、模型、优化器、scheduler、checkpoint、tokenizer 各节齐全，dataclass 的完整结构配合每项的 docstring，checkpoint 从此自带说明书。两个工程细节值得留意：写入时机在 tracker 文件（latest_checkpointed_iteration.txt）更新<strong>之前</strong>，也就是「配置永远先于『可发现的 checkpoint』出现」，不会出现 tracker 指着一个没有配置的目录；读取走 rank 0 读盘 + broadcast，运行期对象（Timers 这类无法离线重建的）在反序列化时置为 None。DeepSpeed 侧对应的字段早已有之——engine 的 checkpoint state 里存 <code class="inline">ds_config</code> 和 <code class="inline">ds_version</code>，但那是存在 checkpoint 文件内部；Megatron 这次补齐的是「目录级、人可直接打开」的形态。自研时这两层都值得做：机器读的配置进 state（保 round-trip），人读的配置落一个 yaml/json（保排查）。</p>
     <p>这套「args 随 checkpoint 走」的机制在 2026-09 末又经受了第一次实战扩展：#6716/#7599 给 Megatron 加了 streamwise wide-residual 连接（每条残差流有独立保留门），五个新架构超参跟着进了 checkpoint 流程——<code class="inline">check_checkpoint_args</code> 里按「使能参数为 None 默认、具体默认值跟随 checkpoint」的规则逐一比对（checkpointing.py 的 <code class="inline">_WIDE_RESIDUAL_ARG_DEFAULTS</code>），<code class="inline">load_args_from_checkpoint</code> 里成对恢复。看它的形状而不是内容：每加一类模型结构，checkpoint 校验表就要长一列——「旧 checkpoint 加载时逐项断言架构一致」这个机制的生命力，恰恰靠这种持续的小扩展维持。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t121 d121">
         <title id="t121">ShardedTensor 坐标：保存 4 卡、加载 2 卡的 reshard</title>
         <desc id="d121">上行：保存时 DP=4，一个完整张量切成 4 段，每卡分片带 global_offset（0、1/4、2/4、3/4）+ local_shape + global_shape。下行：加载时 DP=2，每个新 rank 按坐标反查旧分片——rank0 读旧 rank0+rank1 两段，rank1 读旧 rank2+rank3 两段。metadata 记录坐标系，读盘后拼装。</desc>
@@ -158,7 +162,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">12.5</span>小结 + 自研启示</h2>
+    <h2><span class="num">12.5</span>自研路径</h2>
     <p>本章的三个问题到这里都有了答案：存什么/怎么存/怎么读确实是三个独立问题，工程量大头在后两个；ShardedTensor 用 (global_offset, local_shape, global_shape) 描述每个分片，任意新 rank 靠 metadata 就能反查自己要读哪些旧分片（图 12.1）；DS 的 universal checkpoint 是事后转换、Megatron 是原生保存，功能等价、工作流不同；至于 RNG 和 consumed_samples 这两个隐形条件，它们都是 metadata 级的小数据，漏了却最难察觉——而 run_config.yaml（12.4）补的是另一层：不只机器能读，人也打开得开。落到自研路径：</p>
     <div class="callout warn">
       <b class="tag">自研启示</b>
@@ -166,10 +170,22 @@
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="11-kernel.html">← 上一步：Kernel</a>
-    <a href="13-moe.html">下一步：MoE →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章解开「存的是分片、读回来变拓扑」的矛盾：存什么/怎么存/怎么读是三个独立问题，工程量大头在后两个；ShardedTensor 用 (global_offset, local_shape, global_shape) 描述每个分片，任意新 rank 靠 metadata 反查自己要读哪些旧分片；DS 的 universal checkpoint 是事后转换、Megatron 是原生保存，功能等价、工作流不同。RNG 和 consumed_samples 这两个隐形条件是 metadata 级的小数据，漏了却最难察觉；run_config.yaml 补的是人的那半边——不只机器能读，人也打开得开。</p>
+    <p>下一章是两条主线的汇合处：MoE 的专家切分与 token 的往返通信。<a href="13-moe.html">第 13 章：MoE</a>。</p>
   </div>
+
+    <nav class="pagenav">
+    <a class="prev" href="11-kernel.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 11 章 · Kernel 层：并行框架底下的算子竞赛</span>
+    </a>
+    <a class="next" href="13-moe.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 13 章 · MoE：专家并行与 token 的往返</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

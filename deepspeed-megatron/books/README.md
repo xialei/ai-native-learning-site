@@ -15,11 +15,13 @@
 
 直接用浏览器打开 `index.html`，或从任一章开始（每页顶部有完整章节导航）。纯静态 HTML，无构建步骤。
 
+版式为书页式双区：760px 窄栏正文，宽图通过 `.figure.breakout` 溢出到 ~960px；每章配章首导语（lede）、章末小结（chapter-summary）与上下章书式导航（pagenav）。
+
 ## 章节
 
 | # | 文件 | 内容 |
 |---|---|---|
-| 01 | `01-architecture.html` | 总架构：两库分工（计算侧 vs 显存侧）、四层地图、三种组合模式 |
+| 01 | `01-architecture.html` | 总架构：两库分工（计算侧 vs 显存侧）、训练系统四层、三种组合模式 |
 | 02 | `02-hybrid-parallel.html` | 3D 并行总览：六种并行对比、rank 布局、bubble 公式、选型 |
 | 03 | `03-megatron-tp.html` | Megatron TP：列/行并行、f/g 共轭算子、VocabParallelEmbedding、SP |
 | 04 | `04-pp-1f1b.html` | 流水线：warmup/steady/cooldown、interleaved、DS pipe 命令列表 |
@@ -76,4 +78,4 @@
 ## 维护
 
 - 源码演进后的再核实流程：`git -C <repo> describe` 取新锚点 → 对照各章引用的文件 + 函数名（不认行号）→ 更新版本 badge 与 footer。
-- 站点结构仿照 `vllm-engine/books/`（共享 CSS 在 `assets/dsm-learn.css`，调色板已换为 DS·Megatron 暗红系）。
+- 站点结构仿照 `vllm-engine/books/`（共享 CSS 在 `assets/dsm-learn.css`，调色板已换为 DS·Megatron 暗红系）。叙事层版式参照 `pytorch/books/` 的移植（2026-10-16，同路径已验证于 on-device/robotics）。
