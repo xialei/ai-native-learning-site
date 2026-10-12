@@ -35,15 +35,19 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 09 持久化记忆</div>
+    <div class="chap-meta">Chapter 9 · Checkpointer & Store</div>
     <h1>持久化记忆：Checkpointer 与 Store</h1>
-    <div class="subtitle">「它能记住我上句话吗」和「它能记住我是谁吗」是两件不同的事。本章从这句话出发，拆两层记忆各自的存取机制、checkpoint 的链式结构和落盘时机，以及自建生产级 Agent 时怎么划清两者的边界。</div>
+    <div class="lede">
+      <p>「它能记住我上句话吗」和「它能记住我是谁吗」是两件不同的事。本章从这句话出发，拆两层记忆各自的存取机制、checkpoint 的链式结构和落盘时机，以及自建生产级 Agent 时怎么划清两者的边界。</p>
+      <p>第 6 章的暂停-恢复之所以成立，是因为状态已经在每个 super-step 落了盘——本章把「落盘」这件事本身讲清楚：存什么、存到哪、何时存。多 agent 场景里两层记忆怎么配合（子图继承哪个 checkpointer、Store 怎么跨 agent 共享），等第 7 章展开后再回来对照。</p>
+    </div>
   </div>
 
   <section class="block">
     <h2><span class="num">9.1</span>两层记忆：为什么不是一个笼统的「记忆」</h2>
     <p>一个 Agent 跑起来之后，最常被问到的两个工程问题是：「它能记住我上句话吗？」和「它能记住我是谁吗？」。听起来都像「记忆」，但这两件事的<strong>作用域</strong>完全不同：前者属于<strong>一次会话内部</strong>的上下文累积，后者属于<strong>跨多次会话</strong>的用户档案。LangGraph 没有把它们塞进一个笼统的「记忆」概念里，而是拆成了两个正交的抽象——<code class="inline">Checkpointer</code>（短期 / 会话记忆）和 <code class="inline">Store</code>（长期 / 跨会话记忆）。这种分离本身就是一种设计取舍，我们在选型时也应该照着这个边界去划分自己的数据。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t91 d91">
         <title id="t91">两层记忆模型</title>
         <desc id="d91">Checkpointer 按 thread_id 分桶，Store 全局命名空间</desc>
@@ -319,7 +323,7 @@ past_config = history[-<span class="nu">1</span>].config   <span class="cmt"># �
 graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</span>: <span class="st">"user"</span>, <span class="st">"content"</span>: <span class="st">"从过去重新走"</span>}]}, past_config)</pre>
     <div class="annotation"><b>快照里都有什么：</b> <code class="inline">StateSnapshot</code> 是个 NamedTuple（见 <code class="inline">langgraph/types.py</code>），字段包括 <code class="inline">values</code>（当时的状态值）、<code class="inline">next</code>（下一步要执行的节点）、<code class="inline">config</code>（含 <code class="inline">checkpoint_id</code>）、<code class="inline">parent_config</code>（父快照，用于回溯整条链）等。配合 <code class="inline">update_state(config, values)</code> 还能在某个历史点上手动改状态再续跑，实现「假设分析」。</div>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t95a d95a">
         <title id="t95a">checkpoint 链与时间旅行分叉</title>
         <desc id="d95a">一条 thread 的 checkpoint 用 parent_config 串成链：初始快照、step 1、step 2 依次相接；从最早的快照重新 invoke 会在同一条链上追加新快照而不是覆盖，历史快照全部保留</desc>
@@ -384,7 +388,7 @@ graph.invoke({<span class="st">"messages"</span>: [{<span class="st">"role"</spa
     </ul>
     <p>典型组合是：<code class="inline">thread_id</code> 由你的会话管理逻辑生成（比如 <code class="inline">f"{user_id}-{session_id}"</code>），而 <code class="inline">user_id</code> 同时作为 Store 的 namespace 之一（<code class="inline">("user", user_id)</code>）。这样既保证会话内记忆隔离，又让长期偏好可共享。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 840 320" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t96 d96">
         <title id="t96">thread_id 与 Store 的协作</title>
         <desc id="d96">用户多会话各自 thread_id 隔离，Store 共享偏好</desc>
@@ -615,10 +619,22 @@ store.<span class="fn">put</span>((<span class="st">"user"</span>, <span class="
     </details>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="06-human-in-the-loop.html">← 人机协同</a>
-    <a href="07-multi-agent.html">多智能体 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>两层记忆按作用域分：Checkpointer 按 thread_id 分桶，每个 thread 一条状态链，管「这次会话走到哪」——多轮历史、HITL 暂停恢复、回放重试、时间旅行都靠它；Store 按 (namespace, key) 全局寻址，管「这个用户是谁」。checkpoint 在每个 super-step 自动快照，Durability 语义决定「自动」到什么程度。按作用域选抽象，是本章最该带走的判断准则：别用 Store 存对话历史，也别把用户偏好塞进某个 thread。</p>
+    <p>单 agent 的图到这里讲完了。当一张图装不下、要拆成多个 agent 时，两层记忆怎么在 agent 之间传递——<a href="07-multi-agent.html">第 7 章：多智能体</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="06-human-in-the-loop.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 6 章 · 人机协同</span>
+    </a>
+    <a class="next" href="07-multi-agent.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 7 章 · 多智能体</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

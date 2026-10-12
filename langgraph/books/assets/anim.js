@@ -26,8 +26,8 @@
     let step = 0;
     const total = scene.states.length;
 
-    // 骨架
-    container.className = "anim";
+    // 骨架（保留容器上预置的附加类，如 breakout——只固定 anim 本类）
+    container.classList.add("anim");
     container.innerHTML =
       '<div class="anim-canvas">' + scene.svg + '</div>' +
       '<div class="anim-controls">' +
