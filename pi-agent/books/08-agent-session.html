@@ -35,8 +35,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 08 生产 Harness</div>
+    <div class="chap-meta">Chapter 08 · Agent Session</div>
     <h1>生产 Harness：裸循环到稳定会话之间缺什么</h1>
-    <div class="subtitle">★ 本站在意的另一半，落地版。第 7 章是旧 experimental 的 <code class="inline">AgentHarness</code>（v1.0.0 已删）；这一页走进一直担任生产主力的 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4400 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</div>
+    <div class="lede">
+      <p>第 7 章是旧 experimental 的 <code class="inline">AgentHarness</code>（v1.0.0 已删）；这一页走进一直担任生产主力的 <code class="inline">packages/coding-agent/src/core/agent-session.ts</code>（约 4400 行）——把第 3 章的基础循环变成「可排队、可恢复、可分叉、可持久化」的完整 Agent 会话。用户的输入走一条固定流水线进来，模型每次看到的上下文由 SessionManager 投影接管，扩展在 turn_end / agent_before_settle 这些边界上能真正改写会话，跑完一轮后还有一套重试→压缩→续跑的自动驾驶。这些逐一拆开看。</p>
+      <p>第 3 章留下的两个可编程边界（finishTurn / prepareRequest）在这里被生产层逐个接管；第 9 章的工具层、第 10 章的模型层都挂在本章的装配线上。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -46,8 +50,7 @@
       <b class="tag">答案地图</b>
       输入流水线在 8.2，上下文接管在 8.2b（prepareRequest 接管 + prepareNextTurn 刷新），扩展边界在 8.4（事件桥、context 拆分、可操作边界），收敛在 8.5（收敛三段式 + agent_settled）；8.3 双队列、8.6 会话替换作为支撑件穿插。先把结论放在前面：<strong>AgentSession 不是另一个循环，而是循环外面的一层壳——它用一组接管安装器（prepareRequest 投影 / prepareNextTurnWithContext / finishTurn / transformContext / hiddenDeclarations 投影，见 8.2b）把裸循环的每个开放边界都换成自己的实现。</strong>
     </div>
-    <div class="figure">
-      <svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
+    <div class="figure breakout"><svg class="svg-box" viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8 d8">
         <title id="t8">两层 harness 的关系</title>
         <desc id="d8">基础包提供 Agent 类与循环，生产 harness 组装成 AgentSession</desc>
         <defs>
@@ -113,8 +116,7 @@
   <section class="block">
     <h2><span class="num">8.2</span>一次 prompt 的完整流水线</h2>
     <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间要过十几个环节。全程时序如下：</p>
-    <div class="figure">
-      <svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
+    <div class="figure breakout"><svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
         <title id="t8b">AgentSession.prompt 完整流水线</title>
         <desc id="d8b">从用户输入到 agent 运行，经过命令、钩子、展开、队列/校验、压缩预检、before_agent_start，最后进 _runAgentPrompt</desc>
         <defs>
@@ -368,8 +370,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   <section class="block">
     <h2><span class="num">8.4</span>事件桥：Agent 事件 → 扩展 → 监听器 → 会话落盘</h2>
     <p>基础包的 <code class="inline">Agent</code> 只发 <code class="inline">AgentEvent</code>。生产层要做的两件事：<strong>(a)</strong> 把它转成扩展事件喂给 ExtensionRunner；<strong>(b)</strong> 把 <code class="inline">message_end</code> 落盘到 SessionManager。这就是 <code class="inline">_handleAgentEvent</code>，一块事件枢纽：</p>
-    <div class="figure">
-      <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8c d8c">
+    <div class="figure breakout"><svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8c d8c">
         <title id="t8c">事件桥与持久化</title>
         <desc id="d8c">AgentEvent 分流到扩展、监听器、会话存储</desc>
         <defs>
@@ -666,10 +667,22 @@ resetApiProviders();
         <tr><td>会话替换</td><td><code class="inline">teardownCurrent → createRuntime → rebind</code></td><td>换会话在最坏时机（运行中）也必须不丢数据</td></tr>
       </tbody>
     </table>
-    <div class="arrow-nav">
-      <a class="prev" href="07-harness.html">← 上一章 · Harness 运行时骨架</a>
-      <a class="next" href="09-tools.html">下一章 · 工具层 →</a>
-    </div>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>四问收拢：输入走 prompt() 固定流水线——扩展命令 → input 钩子 → 技能/模板展开 → 流式强制入队 → 校验 → 压缩预检，三个可短路点；上下文由一组接管安装器换掉裸循环的开放边界，SessionManager 投影成为唯一上下文来源；扩展在两扇转换门与 turn_end / agent_before_settle 边界上改写会话——草稿链式累积、沙盘预演、失败整体作废；跑完由「重试 → 压缩 → 续跑」的 while 循环收敛，收敛到头后 agent_before_settle 仍可追加续跑一次，agent_settled 纯通知。这张「生产 harness 必备件」清单就是第 12 章自制 Runtime 的骨架。</p>
+    <p>内核之下是工具 → <a href="09-tools.html">第 9 章 · 工具层</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="07-harness.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 7 章 · Harness 运行时骨架</span>
+    </a>
+    <a class="next" href="09-tools.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 9 章 · 工具层</span>
+    </a>
+  </nav>
   </section>
 </div>
 

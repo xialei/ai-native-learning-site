@@ -35,8 +35,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 12 实战 · 模型权重加载</div>
+    <div class="chap-meta">Chapter 12 · Case Study · Model Weights</div>
     <h1>实战：vLLM 是怎么把开源模型权重加载起来、并让它跑得又快又好的</h1>
-    <div class="subtitle">前面 11 章讲的是「模型已经装好之后」怎么推理。这一章回答另一头的问题：<strong>当你说 <code class="inline">vllm serve deepseek-ai/… --quantization fp8</code> 时，那几 GB～几百 GB 的 safetensors 是怎么从 HF 变成显存里一个能算的模型的？</strong>先看 from_pretrained 搞不定的三个障碍，再沿「认模型 → 选加载器 → 进显存 → 重映射参数」走完加载管线，然后是「跑得好」的调优与真实 checkpoint 目录，以及启动之后仍在动的 LoRA 挂载与量化注册表，末了三模型实战收尾。例子用仓库真实支持的 <strong>DeepSeek-V4</strong>、<strong>GLM-5.2</strong>、<strong>Kimi-K2.5 / K3</strong>。</div>
+    <div class="lede">
+      <p>前面 11 章讲的是「模型已经装好之后」怎么推理。这一章回答另一头的问题：<strong>当你说 <code class="inline">vllm serve deepseek-ai/… --quantization fp8</code> 时，那几 GB～几百 GB 的 safetensors 是怎么从 HF 变成显存里一个能算的模型的？</strong>先看 from_pretrained 搞不定的三个障碍，再沿「认模型 → 选加载器 → 进显存 → 重映射参数」走完加载管线，然后是「跑得好」的调优与真实 checkpoint 目录，以及启动之后仍在动的 LoRA 挂载与量化注册表，末了三模型实战收尾。例子用仓库真实支持的 <strong>DeepSeek-V4</strong>、<strong>GLM-5.2</strong>、<strong>Kimi-K2.5 / K3</strong>。</p>
+      <p>前 11 章假设「模型已经装好」；这一章补上「装好」本身——它是引擎与开源权重世界之间的接口层。第 8 章的显存预算、第 10 章的 TP/EP 分片在这里汇合：权重怎么切、怎么映射、怎么量化，决定了第 14 章每个新模型架构能不能「几天内进 vLLM」。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -68,7 +72,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
 )</pre>
     <p>于是「<strong>HF 架构名 → vLLM 模型类</strong>」的映射就是一张 <code class="inline">ModelRegistry.models</code> 字典。关键在于它<strong>不是靠装饰器凑出来的</strong>：文件顶部有一张手写的静态表 <code class="inline">_VLLM_MODELS</code>（由 <code class="inline">_TEXT_GENERATION_MODELS</code>、<code class="inline">_MULTIMODAL_MODELS</code> 等分表合并），形如 <code class="inline">"GlmMoeDsaForCausalLM": ("deepseek_v32", "DeepseekV32ForCausalLM")</code>；导入 registry 时用一张推导式把整张表灌进 <code class="inline">ModelRegistry</code>（上方代码）。<code class="inline">register_model()</code> 的文档串写的是 "Register an <strong>external</strong> model"，服务的是树外/运行时注册，内置模型并不走它。启动时解析 <code class="inline">config.json</code> 拿到架构名，再从注册表 <code class="inline">load_model_cls()</code> 取出对应的类。锚点：静态表 <code class="inline">registry.py</code>、外部注册入口 <code class="inline">config/model.py</code>、类解析 <code class="inline">registry.py</code>。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
@@ -124,7 +128,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     <span class="kw">return</span> _LOAD_FORMAT_TO_MODEL_LOADER[load_config.load_format](load_config)</pre>
     <p>日常跑这三个模型，默认 <code class="inline">auto</code> 走 <code class="inline">DefaultModelLoader</code>；当 checkpoint 是 tensorizer 等专用格式、或想多机多进程并行加载时，再切换别的 loader。所有 loader 都继承 <code class="inline">BaseModelLoader</code>，因此 <code class="inline">load_model</code> 的主流程是共同的。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 200" xmlns="http://www.w3.org/2000/svg">
         <text class="lbl sm" x="20" y="24">BaseModelLoader.load_model（公共主流程）：</text>
         <rect class="node" x="30" y="34" width="150" height="56" rx="6"></rect>
@@ -202,7 +206,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
         <span class="cmt"># …查 stacked_params_mapping，把 HF 张量塞进融合后的 vLLM 参数…</span></pre>
     <p>这一小段就是「让模型跑得快」的结构性前提：把 attention 的 Q/KV 三份投影<strong>拼成一个</strong>大矩阵，就能一次 GEMM 算完，减少 kernel 启动与显存搬运。再用 <code class="inline">default_weight_loader</code>（<code class="inline">weight_utils.py</code>）按名把每个张量 <code class="inline">copy_</code> 到位。</p>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg">
         <text class="lbl" x="30" y="24" font-weight="bold" fill="#165a7b">HF 权重（磁盘）</text>
         <rect class="node" x="40" y="40" width="150" height="34" rx="5"></rect>
@@ -239,7 +243,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     </div>
     <div class="annotation"><b>逐行拆解：</b><code class="inline">(param_name, shard_name, shard_id)</code> 三件套的意思是：vLLM 的 <code class="inline">param_name</code> 由 HF 的 <code class="inline">shard_name</code> 在 <code class="inline">shard_id</code> 这个位置拼接而成。读权重的循环里看到 <code class="inline">gate_proj</code> 就写进 <code class="inline">gate_up_proj</code> 的 0 号切片，看到 <code class="inline">up_proj</code> 写进 1 号切片。这不只是「换个名」，而是<strong>真的把两个矩阵贴在一起</strong>变成一个更大的算子输入。</div>
     <p>「贴在一起」具体长什么样？拿 MLP 最常见的 gate/up 组合看形状（设 hidden = H，中间层 = I）：</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="#5c6b7a"></path></marker>
@@ -308,7 +312,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
 <span class="kw">def</span> <span class="fn">register_backend</span>(backend, class_path=<span class="kw">None</span>): ...   <span class="cmt"># 运行时覆盖某后端的类路径</span>
 <span class="cmt"># 取实际后端类（尊重覆盖）：AttentionBackendEnum.FLASHMLA_SPARSE_DSV4.get_class()</span></pre>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 210" xmlns="http://www.w3.org/2000/svg">
         <text class="lbl" x="30" y="24" font-weight="bold" fill="#165a7b">「跑得好」= 三层协同</text>
         <rect class="node" x="40" y="40" width="180" height="66" rx="6"></rect>
@@ -371,7 +375,7 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># cudagraph_specialize_lora=True（默认）：</span>
 <span class="cmt">#     2 的幂直到 max_loras，再加 max_loras+1 —— 每档单独捕获一张图</span>
 <span class="cmt"># False：只捕 [0, max_loras+1] 两档</span></pre>
-    <div class="annotation"><b>几个容易踩的坑：</b>① <code class="inline">lora_int_id</code> 要自己保证全局唯一——vLLM 的注释明说「currently not enforced」；要用新权重顶掉旧适配器，得显式 <code class="inline">load_inplace=True</code>。② <code class="inline">max_loras</code> 直接限制单批多样性：来了第 5 个不同适配器而 max_loras=4，调度器就让它在队列里等（scheduler.py:897 附近的 gate），不是报错而是<strong>延迟调度</strong>。③ 非 CUDA 平台走 SGMV kernel 的原因写在 <code class="inline">_set_active_loras</code> 的注释里：「so we always use the SGMV kernels on non-cuda platforms」（is_prefill 恒为 True）。④ CUDA graph 捕获案例随 LoRA 配置变多，启动时间和显存都涨——<code class="inline">cudagraph_specialize_lora</code>（config/compilation.py:663，默认 True）就是这笔开销的开关。自研启示：LoRA 服务化的最小闭环 = 「请求带适配器 id + worker 里 LRU 缓存适配器权重 + 逐 token 映射张量」三件事，SGMV kernel 可以先不做。</div>
+    <div class="annotation"><b>几个容易踩的坑：</b>① <code class="inline">lora_int_id</code> 要自己保证全局唯一——vLLM 的注释明说「currently not enforced」；要用新权重顶掉旧适配器，得显式 <code class="inline">load_inplace=True</code>。② <code class="inline">max_loras</code> 直接限制单批多样性：来了第 5 个不同适配器而 max_loras=4，调度器就让它在队列里等（scheduler.py:897 附近的 gate），不是报错而是<strong>延迟调度</strong>。③ 非 CUDA 平台走 SGMV kernel 的原因写在 <code class="inline">_set_active_loras</code> 的注释里：「so we always use the SGMV kernels on non-cuda platforms」（is_prefill 恒为 True）。④ CUDA graph 捕获案例随 LoRA 配置变多，启动时间和显存都涨——<code class="inline">cudagraph_specialize_lora</code>（config/compilation.py:663，默认 True）就是这笔开销的开关。自研启示：LoRA 服务化的最小可用回路 = 「请求带适配器 id + worker 里 LRU 缓存适配器权重 + 逐 token 映射张量」三件事，SGMV kernel 可以先不做。</div>
   </section>
 
   <section class="block">
@@ -511,10 +515,22 @@ ModelRegistry = _ModelRegistry(   <span class="cmt"># 全局单例，导入时�
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a href="11-build-own-engine.html">← 上一步：自制引擎</a>
-    <a href="13-agentic-gateway.html">下一步：实战·Agentic 网关 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>加载管线四步：Registry 按 HF 架构名认模型 → loader 分 DefaultDeviceModelLoader 等几条路 → safetensors 迭代式入显存 → load_weights 做参数名重映射（多权重融合与 GGUF 反量化都在这层）。「跑得好」靠协同调优（量化 + KV dtype + 后端组合）与三层量化注册表（名字清单 → 配置类 → quant_method 多态分派 kernel）；LoRA 是请求到达时才挂的运行时机制，不走启动管线。三个真实 checkpoint 把三种典型形态各走一遍：标准仓库、带 chat_template、需远程代码。</p>
+    <p>权重装好了，引擎跑起来了。下一章在引擎前面再补一层：一个「有状态」的 Agentic 网关——第 9 章说引擎不持有会话状态，这层由谁来持有？<a href="13-agentic-gateway.html">第 13 章：实战·Agentic 网关</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="11-build-own-engine.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 11 章 · 从「看懂 vLLM」到「写出自己的推理引擎」</span>
+    </a>
+    <a class="next" href="13-agentic-gateway.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 13 章 · 实战：给 vLLM 补一层「有状态」的 Agentic 网关</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

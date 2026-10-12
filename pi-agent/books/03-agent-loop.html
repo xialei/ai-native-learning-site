@@ -35,8 +35,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 基础 Agent 循环</div>
+    <div class="chap-meta">Chapter 03 · Agent Loop</div>
     <h1>基础 Agent 循环：一次 turn 之后，凭什么继续</h1>
-    <div class="subtitle">循环什么时候停、什么时候继续，由谁说了算？每次调模型前还有哪几道准备工序？流式回复是逐 token 到的，上下文怎么保证任何时刻都是合法序列？用户中途插话从哪进来？这几个问题都指向同一处源码——agent-loop.ts，本章就把它拆开。</div>
+    <div class="lede">
+      <p>循环什么时候停、什么时候继续，由谁说了算？每次调模型前还有哪几道准备工序？流式回复是逐 token 到的，上下文怎么保证任何时刻都是合法序列？用户中途插话从哪进来？这几个问题都指向同一处源码——agent-loop.ts，本章就把它拆开。</p>
+      <p>上一章把消息类型定成了「能进 LLM 的内容」与「给机器看的簿记」两类；本章只消费前者——消息怎么被一次次送进模型。会话怎么存（第 4 章）、上下文怎么组装（第 5 章）、压缩什么时候发生（第 6 章），都只在本章标注的钩子处接入，本章不展开。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -57,7 +61,7 @@
   <section class="block">
     <h2><span class="num">3.2</span>主循环骨架：内层 turn，外层续命</h2>
     <p><code class="inline">runLoop</code> 是一个双层 while：内层把「当前的 turn」跑到底（含工具循环）；外层在有跟问消息或 continue 承诺时再开新 turn。</p>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t3 d3">
         <title id="t3">runLoop 双层循环结构</title>
         <desc id="d3">内层 turn 循环 + 外层 follow-up/continue 循环</desc>
@@ -191,7 +195,7 @@ pendingMessages = (<span class="kw">await</span> config.getSteeringMessages?.())
 <span class="kw">if</span> (hasMoreToolCalls || pendingMessages.length &gt; <span class="nu">0</span>) {
   explicitContinuation = <span class="kw">false</span>;    <span class="cmt">// 已有自然请求，续命承诺视为满足</span>
 }</pre>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t33 d33">
         <title id="t33">continue 承诺的兑现时机</title>
         <desc id="d33">finishTurn 在 turn_end 前给出 continue；若下一轮有工具结果或 steering，承诺被自然满足，否则循环末尾补一个只读上下文的 turn</desc>
@@ -263,8 +267,7 @@ pendingMessages = (<span class="kw">await</span> config.getSteeringMessages?.())
   }
 }</pre>
     <div class="annotation">一个很讲究的细节——<strong>先把「半成品」放进 <code class="inline">messages</code></strong>，每次增量用新对象<strong>原位覆盖最后一项</strong>，最后用 final 替换。这样任何时刻上下文里都只有「当前位置」的正确消息，无需在结束时额外拼接。另一个容易漏看的防线：回复带着 toolCall 却 <code class="inline">stopReason === "length"</code>（输出被 token 上限截断）时，<strong>整批工具调用一律判失败</strong>——流式参数会经过一个尽力修复的 JSON 解析器，截断的参数可能校验通过但内容残缺，执行它等于埋雷，所以全部报错让模型重发。还有一处一笔带过但有心：拿结果时循环顺手给最终消息补写一个 <code class="inline">thinkingLevel</code> 字段（agent-loop.ts，一句 <code class="inline">Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" })</code>）——无论哪个流函数答的题，消息自己记住「当时是按哪档思考生成的」。这个字段只在循环内存在（压缩摘要等旁路调用、旧会话回放都没有），第 8 章的虚拟模型路由与第 10 章的消息画像都会读它。</div>
-    <div class="figure">
-      <svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t34 d34">
+    <div class="figure breakout"><svg class="svg-box" viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t34 d34">
         <title id="t34">一次带工具的 prompt 事件序列</title>
         <desc id="d34">从 agent_start 到 agent_end 的事件顺序</desc>
         <!-- 时间轴 -->
@@ -368,10 +371,22 @@ pendingMessages = (<span class="kw">await</span> config.getSteeringMessages?.())
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="02-messages-types.html">← 上一页：消息类型</a>
-    <a href="04-session-storage.html">下一步：会话与存储模型 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>agent-loop.ts 只管一件事：把消息一次次喂给模型、执行工具、发事件，而「什么时候继续」被改写成一个返回 continue/end 的回调——裁决在 turn_end 之前给出，执行被推迟到所有队列清空之后。请求前三道工序（prepareNextTurn → declareToolChanges → prepareRequest）顺序固定、每次请求都走；流式半成品靠「先入列、原位覆盖、final 替换」保证上下文任何时刻合法；中途插话走两条队列、以拉模型取用。这两个可编程边界（finishTurn / prepareRequest）是第 8 章生产层接管的入口。</p>
+    <p>消息送进模型之前还得上上下文：系统提示、分支裁剪、离题剔除都在哪里做 → <a href="05-context.html">第 5 章：上下文构建</a>。但先看消息落在哪里——<a href="04-session-storage.html">第 4 章：会话与存储模型</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="02-messages-types.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 2 章 · 消息与类型体系</span>
+    </a>
+    <a class="next" href="04-session-storage.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 4 章 · 会话与存储模型</span>
+    </a>
+  </nav>
 </div>
 
 <footer>
