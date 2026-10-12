@@ -7,6 +7,7 @@
 ## 亮点
 
 - **全部静态 HTML + 单一共享 CSS**，无需构建、无运行时依赖，浏览器直接打开 `index.html` 即可。
+- **书页式版式**：760px 窄栏正文 + chap-meta 章标 + lede 导语 + 每章「本章小结」收拢块 + 上下章书式导航；宽图经 `.breakout` 溢出到 960px 保持可读，窄屏自动回落栏内。
 - 所有架构图 / 流程图均使用**内联 SVG**。
 - **重点章节**：Turn 循环（第 3 章）、上下文构建（第 5 章）与工具系统（第 7 章），这正是 Codex 里信息密度最高、对「自己做 Runtime」最关键的部分。
 - 每章都带**真实源码片段 + 逐行解释 + 结论式 callout**，深入浅出，绝不只是大纲。所有代码路径与标识符均标注真实位置（如 `codex-rs/core/src/session/turn.rs`）。
@@ -65,4 +66,4 @@ python3 -m http.server
 ## 备注
 
 - 内容基于 `openai/codex @ 8c0f701167`（完整 commit SHA，检索日期 2026-10-11；检索时主干尚未打入任何发布标签，最近的预发布线为 rust-v0.163.0-alpha.5，落后本锚点 21 个提交）整理。章节内标注了具体文件与行号附近的要点，随主干演化可能略有出入，以源码为准。
-- 配色采用 Codex 的墨绿/青色品牌色调（`assets/codex-learn.css`），结构借鉴了自建的 Pi Agent Harness 学习站模板。
+- 配色采用 Codex 的墨绿/青色品牌色调（`assets/codex-learn.css`），结构借鉴了自建的 Pi Agent Harness 学习站模板（书页式版式）。
