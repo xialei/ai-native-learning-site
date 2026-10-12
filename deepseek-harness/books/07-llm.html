@@ -34,8 +34,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 LLM 层</div>
+    <div class="chap-meta">Chapter 07 · LLM Layer</div>
     <h1>LLM 适配层与流式：封闭词汇表、两条认证路由、一条 Messages 直连</h1>
-    <div class="subtitle">模型在进程外、循环在进程内，中间这条 HTTP 流怎么管？dsh 不 import 任何模型 SDK，而是自己定义词汇表、让供应商适配器来翻译。本章沿请求的一生走：词汇表两头怎么定，失败怎么归成稳定码，重试为什么拆成策略与执行两半，官方适配器怎么发请求、收流——以及 0.2.0 把「官方适配器」一拆为二之后，传输与认证的边界划在哪。</div>
+    <div class="lede">
+      <p>模型在进程外、循环在进程内，中间这条 HTTP 流怎么管？dsh 不 import 任何模型 SDK，而是自己定义词汇表、让供应商适配器来翻译。本章沿请求的一生走：词汇表两头怎么定，失败怎么归成稳定码，重试为什么拆成策略与执行两半，官方适配器怎么发请求、收流——以及 0.2.0 把「官方适配器」一拆为二之后，传输与认证的边界划在哪。</p>
+      <p>这是全书唯一一章把眼光伸出进程边界：前六章所有东西都在 <code class="inline">ctx.&lt;key&gt;</code> 里，而模型是一个不受你控制的远端服务。第 3 章的请求头快照与结算终态在这里找到发送方的实现，第 8 章的 prompt 注册表在每次请求前组装成这里发出的消息数组。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -351,7 +355,7 @@
 } <span class="cmt">// 整个 request 体包在 try/catch 里，catch 调 auth.onRequestError 映射错误（见上）</span></pre>
     <div class="annotation"><b>读这个结构：三层各管一件事</b>。<code class="inline">generate()</code>（:51）管<strong>生命周期</strong>——idle watchdog（<code class="inline">@deepseek-ai/dsh-timeout</code>）用 <code class="inline">using</code> 守护，任何一次流读超过 streamIdleTimeoutMs（默认 300_000）就放弃读并把错误归为 TIMEOUT（可重试）；消费方取消归 ABORTED，其余归 TRANSPORT；<code class="inline">finally</code> 里 <code class="inline">iterator.return()</code> 保证取消时底层 fetch reader 被关闭，但注释明确写着 aborting its reader cannot replace that outcome——已结算的请求不许被清理动作改写结局。<code class="inline">request()</code>（:75）管<strong>内容</strong>——图像先试 Files 引用；解析失败且仅当失败类型是 <code class="inline">FileResolutionFailure</code> 时整体退回 base64 内联，从 beginAttempt 重走；<code class="inline">serialize()</code> 组装线上体；beta 头现在按需拼两种（Files、工具变更），一个都没有时不发 anthropic-beta；插件扩展字段在 fetch 前注入、2xx 后 <code class="inline">accept()</code>。<code class="inline">translate()</code>（translate.ts:104）管<strong>翻译</strong>——把供应商 SSE 事件翻成 7 种 StreamChunk，thinking 块原生重放（回放降级时回调 onReplayDegrade 上报，不暴露内容）。三层共享同一个 <code class="inline">activity()</code> 回调喂 watchdog 呼吸——连 Files API 等待期间也在续命，超时计的只是「无任何进展」的时间。</div>
 
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg">
         <defs>
           <marker id="arrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">
@@ -494,11 +498,22 @@
     <p>本章其余部分各归其位：词汇表两头（GenerateOptions/StreamChunk）让供应商差异被吸收在适配器边界（7.2）；LlmFailure 稳定码驱动重试、compaction、UI 三类消费者（7.3）；重试策略归供应商、执行归插件，持久化先记账后开始（7.4）；一次请求走 generate→request→translate 三层（7.5），工具变更以历史消息的形式进请求（7.5 末尾）；适配器边界对外还有一条 dsh_session_log 扩展缝，现在带着 8 MiB 的字节预算（7.6）。下一步进入 <a href="08-scope-prompt.html">第 8 章：System Prompt 组装与 Scope</a>。</p>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="index.html">← 返回索引</a>
-    <a class="dim" href="06-tools.html">← 上一章：工具系统</a>
-    <a href="08-scope-prompt.html">下一步：Prompt/Scope →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>这一章的轴心是 7.1 的「为什么拆」：api-key 路由的认证只有一行 headers 赋值，account 路由带着配额重映射、401 检测、token 回收——两种没有交集的复杂度共享全部传输行为，拆开后传输包不知道有几种登录方式存在。其余各归其位：封闭词汇表两头吸收供应商差异；LlmFailure 稳定码驱动重试、compaction、UI 三类消费者；重试策略归供应商、执行归插件；一次请求走 generate→request→translate 三层。dsh 对模型的态度贯穿全章：不信任 SDK，自己定义契约——这条契约现在带着两条认证路由和一条 Messages 直连。</p>
+    <p>请求发出去了，但消息数组是哪来的？<a href="08-scope-prompt.html">第 8 章：System Prompt 组装与 Scope</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="06-tools.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 6 章 · 工具系统与并行调度：一次调用的完整管线</span>
+    </a>
+    <a class="next" href="08-scope-prompt.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 8 章 · System Prompt 组装与 Scope：谁在哪个作用域里说了什么</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

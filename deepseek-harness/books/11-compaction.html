@@ -34,8 +34,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 11 Compaction</div>
+    <div class="chap-meta">Chapter 11 · Compaction</div>
     <h1>Compaction：在 append-only 日志上「改历史」</h1>
-    <div class="subtitle">日志不可变，上下文却必须能缩——dsh 的答案不是删除而是遮蔽：选一段表面范围，用一条摘要节点替换它的表面位置，原始事件原封不动留在日志里。这一章拆开这道手术的四个部件：三种压缩入口的抽象缝、四个持久事件串成的事务编舞、三条恢复链（pressure / overflow / 图片配额），以及一次命中前缀缓存的摘要调用。</div>
+    <div class="lede">
+      <p>日志不可变，上下文却必须能缩——dsh 的答案不是删除而是遮蔽：选一段表面范围，用一条摘要节点替换它的表面位置，原始事件原封不动留在日志里。这一章拆开这道手术的四个部件：三种压缩入口的抽象缝、四个持久事件串成的事务编舞、三条恢复链（pressure / overflow / 图片配额），以及一次命中前缀缓存的摘要调用。</p>
+      <p>第 2 章的「Model-visible means logged」和第 5 章的「后继文件只在写路径发布」在这里承受最大的压力测试：如果 compaction 选择改日志，前面全部不变量作废——它选择遮蔽，于是一切照旧。前缀缓存命中那一节是全书少有的「钱」的话题：同样的手术，切错边界就是真金白银的重复计费。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -115,7 +119,7 @@
 <span class="cmt">/** log-only, releases the lock; error 记录一次未成功的尝试 */</span>
 'compaction/end': { compactionId: <span class="cl">CompactionId</span>; sourceCommandId?: <span class="cl">CommandId</span>; turn: <span class="kw">number</span> | <span class="kw">null</span>; error?: <span class="kw">string</span> }</pre>
     <div class="annotation"><code class="inline">sourceCommandId</code> 只出现在 start/end 上，summary 没有——它回答的是「这次压缩是哪条命令触发的」；<code class="inline">manual-compaction.ts</code> 把它写成 <code class="inline">ManualCompactAgentContext</code> 的可选位，手动事务在回合之间发生时 <code class="inline">turn</code> 为 null。</div>
-    <div class="figure">
+    <div class="figure breakout">
       <div class="svg-box">
         <svg viewBox="0 0 960 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="compaction 事务编舞">
           <defs>
@@ -245,7 +249,7 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
       <span class="fn">validateSurfaceRegion</span>(agent.session, prepared.start, prepared.end))
   }
 }</pre>
-    <div class="annotation"><b>recover 是什么</b>：compaction-basic 在 <code class="inline">regionDependencies()</code>（index.ts:438）里把它绑成 <code class="inline">ctx.waterfall('compaction/summary-error', {session, sourceEventSeqs, error, signal?}, () =&gt; false)</code>——默认没人能恢复。返回 <code class="inline">true</code> 的含义是「有进展」：循环不抛错，而是重投影 + 重新计价后再试。image-offload 在这里返回 true 的效果和 §11.4 的 <code class="inline">{kind:'retry'}</code> 完全同构：都是「插件用一条持久事件修好了表面，请从头再来」。注意 payload 里带着 <code class="inline">sourceEventSeqs</code>（被选中的源事件，不是当前表面节点）——恢复插件看得见被遮蔽前的原始材料。至此压缩缝的恢复矩阵补齐：阈值内（pressure）/ 请求超限（overflow）/ 图片配额（offload，模型路径 + 摘要路径两条腿）。</div>
+    <div class="annotation"><b>recover 是什么</b>：compaction-basic 在 <code class="inline">regionDependencies()</code>（index.ts:438）里把它绑成 <code class="inline">ctx.waterfall('compaction/summary-error', {session, sourceEventSeqs, error, signal?}, () =&gt; false)</code>——默认没人能恢复。返回 <code class="inline">true</code> 的含义是「有进展」：循环不抛错，而是重投影 + 重新计价后再试。image-offload 在这里返回 true 的效果和 §11.4 的 <code class="inline">{kind:'retry'}</code> 完全同构：都是「插件用一条持久事件修好了表面，请从头再来」。注意 payload 里带着 <code class="inline">sourceEventSeqs</code>（被选中的源事件，不是当前表面节点）——恢复插件看得见被遮蔽前的原始材料。压缩缝的恢复矩阵到这里补齐：阈值内（pressure）/ 请求超限（overflow）/ 图片配额（offload，模型路径 + 摘要路径两条腿）。</div>
   </section>
 
   <section class="block">
@@ -312,11 +316,22 @@ ctx.<span class="fn">on</span>(<span class="st">'agent/request-error'</span>, <s
     <p>遮蔽方案的完整形状：入口上，三个方法对应三种触发——compactIfNeeded（自动，pressure 双封顶阈值 + overflow 绕过阈值）、compactNow（手动，idle 经 runMaintenance，0 阈值语义）、compactRegion（强制区域，边界 tool-pairing balanced）；事务上，start 持锁 → summary 定价 → 相邻 user/message 替换 → end 放锁，失败尝试也留在日志，影子定价协议让纯消费者 O(1) 对账，启发式与路由定价各管折叠与决策；恢复上，三条链共用「持久事件修表面 + 重试」模式——pressure（warn 不阻断）、overflow（replaceGeneration 守卫 + retry）、image-offload（offload 事件 + retry，摘要路径走 compaction/summary-error 瀑布）；缓存上，重放会话前缀命中 KV 缓存，指令是最后一条 user 消息，purpose 隔离游标，检查点来源是后端无关的 compact-checkpoint 标记。下一步看多 agent 编排：<a href="12-orchestration.html">第 12 章：编排与多 Agent</a>。</p>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="index.html">← 返回索引</a>
-    <a class="dim" href="10-seams.html">← 上一章：能力缝</a>
-    <a href="12-orchestration.html">下一步：编排 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>遮蔽方案的完整形状：三个入口对应三种触发（自动 pressure 双封顶、手动 idle、强制区域 tool-pairing balanced）；四个持久事件串成事务——start 持锁、summary 定价、相邻替换、end 放锁，失败尝试也留在日志；三条恢复链共用「持久事件修表面 + 重试」；缓存靠重放会话前缀命中 KV 缓存，purpose 隔离游标。这一章最有分量的结论在第 2 章就埋好了：因为日志不可变，压缩才敢做成「每请求重算投影」——遮蔽不改事实，只是换投影参数。</p>
+    <p>单 agent 的故事讲完了，最后一章把镜头拉远。<a href="12-orchestration.html">第 12 章：编排与多 Agent</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="10-seams.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 10 章 · 能力缝实战：shell / fs / web / skill / jobs</span>
+    </a>
+    <a class="next" href="12-orchestration.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 12 章 · 编排与多 Agent：委派缝、工作流、Ralph</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

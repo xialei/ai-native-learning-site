@@ -67,7 +67,7 @@ open ai-native-learning-site/deepseek-harness/books/index.html
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`；页脚保留版本戳。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头（`chap-meta`/`lede`）与章末 `chapter-summary` + `pagenav`（`ttl` 必须与目标章 h1 逐字一致）；页脚保留版本戳。
 - 新增概念图：直接在页面内写内联 `<svg>`，复用 `<marker id="arrow">`（描边色 `#4156c8`）。
 - 代码片段：务必从真实源码摘录并标注路径（可行时带行号），不要凭记忆杜撰函数签名。
 - 重新核实版本锚点：在 deepseek-harness 仓库跑 `git describe --tags` + `git rev-parse --short=10 HEAD`，逐章更新页脚戳与 `index.html` 徽标。
