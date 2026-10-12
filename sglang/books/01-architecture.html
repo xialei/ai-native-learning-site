@@ -34,8 +34,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 01 整体架构与进程模型</div>
+    <div class="chap-meta">Chapter 01 · Architecture</div>
     <h1>整体架构：SRT 由哪几个进程组成</h1>
-    <div class="subtitle">SGLang 的运行时叫 SRT（SGLang Runtime）。它最鲜明的选择是把「分词、调度、反分词」拆成独立进程，用 ZMQ 连起来。这一章先看清整台机器：谁在哪个进程、消息怎么走、为什么这么拆。</div>
+    <div class="lede">
+      <p>SGLang 的运行时叫 SRT（SGLang Runtime）。它最鲜明的选择是把「分词、调度、反分词」拆成独立进程，用 ZMQ 连起来。这一章先看清整台机器：谁在哪个进程、消息怎么走、为什么这么拆。</p>
+      <p>本章只画进程边界，不进任何进程内部——调度怎么挑请求是第 4 章，KV 池怎么分是第 5 章，前向怎么跑是第 6 章；读法上先记一句：Scheduler 一个进程管调度、KV、前向发起三件事，其余进程都只是它的输入/输出通道。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -52,8 +56,7 @@
 
   <section class="block">
     <h2><span class="num">1.2</span>进程图</h2>
-    <div class="figure">
-      <svg class="svg-box" viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t1 d1">
+    <div class="figure breakout"><svg class="svg-box" viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t1 d1">
         <title id="t1">SGLang SRT 进程模型</title>
         <desc id="d1">主进程、Scheduler 子进程、Detokenizer 子进程与 ZMQ 通道</desc>
         <defs>
@@ -184,7 +187,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.3</span>Scheduler 里持有哪些状态</h2>
+    <h2><span class="num">1.4</span>Scheduler 里持有哪些状态</h2>
     <p>Scheduler 的构造函数把所有引擎状态聚到一处。内存池和缓存不是 Scheduler 私有的，而是从 <code class="inline">TpModelWorker</code> 初始化结果里拿来的引用——也就是说，<strong>KV 池的 GPU 内存在 worker 里分配，但分配决策由 Scheduler 做</strong>：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — Scheduler.__init__ 的组件接线（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Scheduler</span>:
@@ -209,10 +212,10 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.4</span>为什么拆进程：演进与代价</h2>
+    <h2><span class="num">1.5</span>为什么拆进程：演进与代价</h2>
     <p>一个自然的问题是：<strong>为什么不像 vLLM 那样把调度器放进引擎主进程，而要单独开进程？</strong>从代码里能找到答案的一半——Scheduler 持有 GPU 上下文并做 Python 层的调度计算（排序、预算扣减、树操作），这些工作和 HTTP/分词的 asyncio 事件循环互相拖累。拆开后：</p>
     <ul>
-      <li><strong>GIL 隔离</strong>：Scheduler 的事件循环是纯 while True（见 1.5 节），RadixCache 的树操作和 PrefillAdder 的预算计算是 CPU 密集的 Python 代码，与 uvloop 的网络 IO 各跑各的。</li>
+      <li><strong>GIL 隔离</strong>：Scheduler 的事件循环是纯 while True（见 1.6 节），RadixCache 的树操作和 PrefillAdder 的预算计算是 CPU 密集的 Python 代码，与 uvloop 的网络 IO 各跑各的。</li>
       <li><strong>每 TP rank 一个进程</strong>：模型权重按 TP 分片到多卡，每张卡要独立做内存 profiling 和 CUDA Graph 捕获，天然是一个进程一张卡的边界。</li>
       <li><strong>崩溃隔离</strong>：一个 rank 的 CUDA OOM 不会带走 HTTP 服务；主进程有 watchdog 监控子进程存活。</li>
     </ul>
@@ -224,7 +227,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.5</span>事件循环在哪：dispatch_event_loop</h2>
+    <h2><span class="num">1.6</span>事件循环在哪：dispatch_event_loop</h2>
     <p>Scheduler 的事件循环不止一种。启动时按配置分发到不同实现——普通/重叠（overlap）、流水线（PP）、prefill-decode 复用（pdmux）、PD 分离各自的前后端循环：</p>
     <div class="code-title">python/sglang/srt/managers/scheduler.py — _dispatch_event_loop_once（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_dispatch_event_loop_once</span>(scheduler: <span class="cl">Scheduler</span>):
@@ -250,7 +253,7 @@
   </section>
 
   <section class="block" id="sec-16">
-    <h2><span class="num">1.6</span>一张表记牢每个部件</h2>
+    <h2><span class="num">1.7</span>一张表记牢每个部件</h2>
     <table class="tbl">
       <tr><th>部件</th><th>文件</th><th>职责</th><th>进程</th></tr>
       <tr><td>launch_server</td><td>srt/entrypoints/http_server.py</td><td>启动整套进程，注册 ~80 条 HTTP 路由</td><td>主进程</td></tr>
@@ -274,17 +277,26 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">1.7</span>对「自研引擎」的第一个启示</h2>
+    <h2><span class="num">1.8</span>对「自研引擎」的第一个启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      多进程不是必需品。自研引擎的 MVP 用一个进程、一个 asyncio 事件循环 + 一个 GPU 前向线程就够。SGLang 拆进程换来的收益（GIL 隔离、rank 独立、崩溃隔离）只有在并发上去之后才值得。但有一个设计从第一天就该学：<strong>token id 通道和文本通道分开</strong>——调度层只传 id，反分词独立成段，这决定了你的流式协议好不好做。下一步进入 <a href="02-request-lifecycle.html">第 2 章：请求全生命周期</a>。
+      多进程不是必需品。自研引擎的 MVP 用一个进程、一个 asyncio 事件循环 + 一个 GPU 前向线程就够。SGLang 拆进程换来的收益（GIL 隔离、rank 独立、崩溃隔离）只有在并发上去之后才值得。但有一个设计从第一天就该学：<strong>token id 通道和文本通道分开</strong>——调度层只传 id，反分词独立成段，这决定了你的流式协议好不好做。
     </div>
   </section>
 
-  <div class="arrow-nav">
-    <a class="dim" href="index.html">← 返回索引</a>
-    <a href="02-request-lifecycle.html">下一步：请求全生命周期 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>SRT 把一台推理引擎拆成四个部分：主进程持有 HTTP 服务和 TokenizerManager，每个 TP rank 一个 Scheduler 子进程，外加一个 DetokenizerManager 子进程，进程间全部走 ZMQ ipc——这个结构直接写在 launch_server 的 docstring 里。Scheduler 是引擎的大头：请求队列、前缀缓存、KV 池分配、组装 batch、发起 GPU 前向都集中在它身上，而 KV 池的 GPU 内存在 worker 里分配、分配决策由 Scheduler 做出，这是「拿引用、不持有实现」的具体形态。拆进程换 GIL 隔离、rank 独立、崩溃隔离，代价是每个 token 多走一跳 ZMQ；从第一天就该学的是 token id 通道和文本通道分开。</p>
+    <p>下一章跟着一条请求走完全程，看这些进程怎么接力 → <a href="02-request-lifecycle.html">第 2 章 · 请求全生命周期：一次 /generate 走到哪几步</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="placeholder">&nbsp;</a>
+    <a class="next" href="02-request-lifecycle.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 2 章 · 请求全生命周期：一次 /generate 走到哪几步</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

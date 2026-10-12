@@ -34,8 +34,12 @@
 <div class="wrap">
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 调度器与调度策略</div>
+    <div class="chap-meta">Chapter 04 · Scheduler</div>
     <h1>调度器：每一步该跑谁，内存不够先踢谁</h1>
-    <div class="subtitle">第 2 章看了事件循环的主干，这一章拆其中最重的三步：get_next_batch_to_run 怎么从等待队列里挑请求组成 prefill 批（PrefillAdder 的预算制准入）、默认启用的 overlap 事件循环怎么把 CPU 调度藏进 GPU 前向的影子里，以及 running batch 内存不够时怎么收缩（retract_decode 抢占）。</div>
+    <div class="lede">
+      <p>第 2 章看了事件循环的主干，这一章拆其中最重的三步：get_next_batch_to_run 怎么从等待队列里挑请求组成 prefill 批（PrefillAdder 的预算制准入）、默认启用的 overlap 事件循环怎么把 CPU 调度藏进 GPU 前向的影子里，以及 running batch 内存不够时怎么收缩（retract_decode 抢占）。</p>
+      <p>调度是 vLLM/SGLang 这类引擎区别于朴素实现的第一道分水岭：连续批处理、chunked prefill、前缀缓存、抢占，在调度器眼里全是同一套「预算记账」的不同科目；本章只讲 prefill 侧准入和 decode 侧收缩两本账，chunked prefill 的切段细节和 overlap 三件套各自有节，读完 4.3 那三行预算判断就掌握了主干。</p>
+    </div>
   </div>
 
   <section class="block">
@@ -50,7 +54,7 @@
 
   <section class="block">
     <h2><span class="num">4.2</span>一轮调度的完整流程</h2>
-    <div class="figure">
+    <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t4 d4">
         <title id="t4">get_new_batch_prefill 调度流程</title>
         <desc id="d4">从 waiting_queue 到新 prefill 批的决策流，以及 decode 侧的抢占回路</desc>
@@ -516,15 +520,27 @@ self.<span class="fn">_update_prefill_budget</span>(
     <h2><span class="num">4.8</span>对「自研引擎」的启示</h2>
     <div class="callout warn">
       <b class="tag">要点</b>
-      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：先搭三本账的最简版（只算 rem_total），再加 CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入，cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。CPU 调度与 GPU 前向的并行不必一开始就上：先把 normal 循环做对（它最容易读、最好调试），等调度开销真的进入瓶颈曲线，再按 §4.5 的三件套（result_queue、FutureMap、WAR 屏障）搬 overlap——顺序反过来，调试成本会翻倍。下一步进入 <a href="05-memory.html">第 5 章：内存池与显存预算</a>。
+      预算制准入优先于 OOM 反应式抢占。SGLang 两套都有，但 prefill 侧的账（输入 + 输出估计 + page_size 余量）让绝大多数情况根本走不到 retraction。自己实现时按这个顺序补齐：先搭三本账的最简版（只算 rem_total），再加 CLIP 上限，防止单个 max_new_tokens 巨大的请求锁死准入，cache-aware 排序可以最后加，加的时候记得给排序本身留预算（128 阈值的做法）。retract_decode 只做最后一道防线，并且要有「至少保留一个请求」的底线——全部踢光的调度器等于把服务变成抽奖。CPU 调度与 GPU 前向的并行不必一开始就上：先把 normal 循环做对（它最容易读、最好调试），等调度开销真的进入瓶颈曲线，再按 §4.5 的三件套（result_queue、FutureMap、WAR 屏障）搬 overlap——顺序反过来，调试成本会翻倍。
     </div>
     <p style="font-size:13.5px;color:#6b5d54">关联阅读：预算里的 <code class="inline">evictable_size()</code> 来自第 3 章的基数树；<code class="inline">check_decode_capacity</code> 的实现和 mem_fraction_static 的显存划分在第 5 章。</p>
   </section>
 
-  <div class="arrow-nav">
-    <a href="03-radix-cache.html">← 上一章：RadixCache 前缀缓存</a>
-    <a href="05-memory.html">下一步：内存池与显存预算 →</a>
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>事件循环每转一圈回答两个问题：admission——get_new_batch_prefill 先由 SchedulePolicy 排序、再由 PrefillAdder 按三本账（rem_total_tokens、rem_chunk_tokens、rem_input_tokens）逐个收编候选请求；survival——decode 的 KV 放不下时 retract_decode 把部分请求踢回等待队列，是最后一道防线。cache-aware 排序按前缀重排队列（128 阈值防抖），chunked prefill 把长 prompt 按 rem_chunk_tokens 切片，overlap 调度用 result_queue、FutureMap、WAR 屏障三件套把 CPU 调度和 GPU 前向错开一拍——先做对 normal 循环，再按 §4.5 搬 overlap。</p>
+    <p>下一章 → <a href="05-memory.html">第 5 章 · 内存池与显存预算：token 槽位怎么发、KV 池怎么定大小</a>。</p>
   </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="03-radix-cache.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 3 章 · RadixCache：用一棵基数树管住所有可复用的 KV</span>
+    </a>
+    <a class="next" href="05-memory.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 5 章 · 内存池与显存预算：token 槽位怎么发、KV 池怎么定大小</span>
+    </a>
+  </nav>
 </div>
 
 <footer>

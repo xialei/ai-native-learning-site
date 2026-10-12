@@ -32,6 +32,8 @@ open sglang/books/index.html
 
 共享样式：`assets/sglang-learn.css`。所有架构图/流程图均为**内联 SVG**。
 
+- **书页式版式**：760px 窄栏正文 + chap-meta 章标 + lede 导语 + 每章「本章小结」收拢块 + 上下章书式导航；宽图（≥800px）经 `.breakout` 溢出到 960px 保持可读，窄屏自动回落栏内。
+
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
@@ -40,7 +42,7 @@ open sglang/books/index.html
 
 ## 维护指南
 
-- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头与 `arrow-nav`。
+- 新增/修改页面：复制任一现有页面的 `topbar nav` 结构，保持 13 个导航链接不变，更新 `<title>`、页头（chap-meta/lede）与尾部 `chapter-summary` + `pagenav`（ttl 需与目标章 h1 逐字一致）。
 - 新增概念图：直接在页面内写内联 `<svg class="svg-box">`，复用 CSS 中的 `.node` / `.edge` / `.lbl` 等类与 `<marker id="arrow">`。
 - 代码片段：务必从真实源码摘录并标注路径，不要凭记忆杜撰函数签名。
 - 如需在 `index.html` 的 `pathgrid` 增删卡片，同步调整对应页面即可。
