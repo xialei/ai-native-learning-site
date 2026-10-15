@@ -478,10 +478,7 @@ toProviderMessages ?? convertToLlm;</pre>
     <p>子任务与中止为什么能成体系？因为 pi-durable 把<strong>任务和会话编成了一棵归属树</strong>：任务属于创建它的任务或会话，会话属于拥有它的任务——任何一层标记中止，沿着树向下波及；<code class="inline">waitForIdle</code> 等的正是「自己名下的整棵子树」。后台任务（<code class="inline">background: true</code>）不随前台中止，除非显式指定。这就是结构化并发的思路：不靠调用栈管生命周期，靠归属关系。调度器源码（<code class="inline">harness/scheduler.ts</code>）开头的注释把这条写成第一原则。</p>
     <p>归属树还在向两个方向生长。<strong>其一，嵌套工具调用也入了树</strong>：durable 侧的 <code class="inline">ToolExecutionApi.executeTool()</code>（与第 9 章 coding-agent 的 <code class="inline">ctx.executeTool()</code> 同名不同层）把「跑另一个工具」变成一个<strong>真正的 pi.tool 任务</strong>——归属挂在调用方名下、按 key 记账可重放回接，结果落在调用方的嵌套结果文档里直到它结算；调用方一结算，名下还活着的嵌套调用先被中止。<code class="inline">ToolRegistration</code> 也随行长出两条调用方管控：<code class="inline">structuredOutputSchema</code>（声明了它，程序化调用方拿到的就是校验过的 <code class="inline">structuredOutput</code>）和 <code class="inline">callers: ["model" | "tools"]</code>——「谁能调我」从隐含约定变成注册时的显式声明（codemode 工具是 <code class="inline">["model"]</code>，脚本不能再起脚本；MCP 工具可以是 <code class="inline">["tools"]</code>，模型永远看不到它们）。<strong>其二，调度器的索引学会了「随活物伸缩」</strong>：早期实现每轮 reconcile 都从每个活任务向上走到根找会取消的归属方，一条 n 个任务的持有链要付出约 n³ 步——500 个任务 12 秒，2 万个永远跑不完（commit cb4375493/ea448f454）。修法不动归属语义，只换记账方式：内存索引只保留「活工作上方」的链，死任务的归属边在没人引用时入队清扫，每轮发布末尾或由清扫任务收走。<code class="inline">TaskRuntime.ownedTasks()</code> 配套出现——从索引里读「我直接拥有的活任务」，不必再扫 <code class="inline">pi.live</code>。</p>
     <p>观察面也有对应物：旧线的 <code class="inline">watch()</code> 升级成两件套——<code class="inline">harness.taskGraph(context)</code> 给出整个 Session 的任务图（每个节点带归属边、状态、是否后台、是否被标记中止），<code class="inline">watchTaskGraph</code> 把同一张图变成持续推送；单条会话则用 <code class="inline">viewState()</code>，返回只读的 Chord 状态，<code class="inline">value.entries</code> 是历史、<code class="inline">value.docs["pi.live"]</code> 是进行中的生成与工具调用、<code class="inline">pi.inbox</code>/<code class="inline">pi.usage</code>/<code class="inline">pi.agent</code>/<code class="inline">pi.provider</code> 各管一摊——UI 需要的一切都在已提交状态里，不用从事件流里拼。内容条目走 <code class="inline">defineEntry(kind)</code> 定义的六种： <code class="inline">pi.user</code> / <code class="inline">pi.assistant</code> / <code class="inline">pi.system</code> / <code class="inline">pi.tool-result</code> / <code class="inline">pi.reset</code> / <code class="inline">pi.compaction</code>。</p>
-    <p>谁在用它？<code class="inline">packages/coding-agent/src/experimental/session-worker.ts</code> 开头两行 import 说明了一切——</p>
-    <div class="code-title">packages/coding-agent/src/experimental/session-worker.ts — 第 15–16 行</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">import</span> { Harness, ROOT_CONVERSATION_ID, <span class="kw">type</span> TaskGraph } <span class="kw">from</span> <span class="st">"@earendil-works/pi-durable"</span>;
-<span class="kw">import</span> { openNodeSqliteStorage } <span class="kw">from</span> <span class="st">"@earendil-works/pi-durable/storage/sqlite/node"</span>;</pre>
+    <p>谁在用它？这行答案在这本书的锚点期间换过一次：最初的消费者是 coding-agent 里的 <code class="inline">experimental/session-worker.ts</code>（两行 import——<code class="inline">Harness</code> 与 <code class="inline">openNodeSqliteStorage</code>——说明了一切）；v1.2.0 把 coding-agent 的实验服务栈整体删除（连同 <code class="inline">experimental/server.ts</code>、<code class="inline">session-worker.ts</code> 与独立协议/客户端/服务端包），pi-durable 的直接消费者变成了同样 experimental 的 pi-env（远程执行环境用同一套文档状态），仓库里另有评测脚本在用。<strong>「谁在用」因此不能只看当下</strong>：experimental 线的消费者本身也在洗牌，读源码时要连消费者一起核对。</p>
     <div class="annotation"><b>和旧线对照着读，能看出「删」的取舍。</b>旧 harness 的 13 叶状态机解决的是「单会话内的操作恢复」，accept/drive 两段式是它的招牌；pi-durable 把恢复问题整个下沉到存储层（事务 + 任务记录 + 归属树），调度器重启后照单全收在途任务，不再需要调用方逐个决定续跑谁。代价是一套新的概念栈（Chord、Tx、任务定义、归属），README 才会声明「API 说变就变」。给自研者的参照点：如果你的 Runtime 要跨进程、跨重启地跑多轮任务，<strong>归属树 + 结构化中止</strong>比「每个操作一个开关」好维护——中止语义只需要定义一次，沿树向下兑现；pi-durable 把第 7 章的教训执行得更彻底。</div>
   </section>
 
@@ -511,7 +508,7 @@ toProviderMessages ?? convertToLlm;</pre>
 </div>
 
 <footer>
-  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v1.1.0-22-gea448f454 · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 07 Harness 运行时骨架 · 版本 v1.2.0-57-g5ab7fe74c · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

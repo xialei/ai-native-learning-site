@@ -103,7 +103,7 @@
       </tr>
       <tr>
         <td><strong>靠什么实现</strong></td>
-        <td>靠<strong>一段写死的顺序流程</strong>，不是声明式配置、也不是 prompt。整个 <code class="inline">prompt()</code> 就是一条按固定步骤走的方法体（命令 → 钩子 → 展开 → 校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>），每一步硬编码在前一步之后。韧性（重试 / 压缩 / 续跑）同样硬编码在 <code class="inline">_handlePostAgentRun</code> 的 while 循环里。系统提示词只决定"模型怎么想"，<strong>这段流程才决定"运行时怎么跑"</strong>。</td>
+        <td>靠<strong>一段写死的顺序流程</strong>，不是声明式配置、也不是 prompt。整个 <code class="inline">prompt()</code> 就是一条按固定步骤走的方法体（命令 → 钩子 → 展开 → 校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_startRun</code>），每一步硬编码在前一步之后。韧性（重试 / 压缩 / 续跑）同样硬编码在 <code class="inline">_handlePostAgentRun</code> 的 while 循环里。系统提示词只决定"模型怎么想"，<strong>这段流程才决定"运行时怎么跑"</strong>。</td>
       </tr>
       <tr>
         <td><strong>没有它会怎样</strong></td>
@@ -118,7 +118,7 @@
     <p>入口是 <code class="inline">AgentSession.prompt(text, options)</code>。别看这一条方法，它就是上面说的那段<strong>写死的顺序流程</strong>——把「用户敲的一句话」变成「LLM 循环上的一次运行」，中间要过十几个环节。全程时序如下：</p>
     <div class="figure breakout"><svg class="svg-box" viewBox="0 0 900 540" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t8b d8b">
         <title id="t8b">AgentSession.prompt 完整流水线</title>
-        <desc id="d8b">从用户输入到 agent 运行，经过命令、钩子、展开、队列/校验、压缩预检、before_agent_start，最后进 _runAgentPrompt</desc>
+        <desc id="d8b">从用户输入到 agent 运行，经过命令、钩子、展开、队列/校验、压缩预检、before_agent_start，最后进 _startRun</desc>
         <defs>
           <marker id="arrow8b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#556674"></path>
@@ -203,10 +203,10 @@
         <line x1="340" y1="501" x2="378" y2="501" stroke="#2563eb" stroke-width="2" marker-end="url(#arrow8s)"/>
 
         <rect class="node core" x="380" y="472" width="220" height="58" rx="8" fill="#eef4fb" stroke="#2563eb"/>
-        <text class="lbl" x="490" y="496" font-size="12" fill="#1f2937" text-anchor="middle">8 _runAgentPrompt</text>
+        <text class="lbl" x="490" y="496" font-size="12" fill="#1f2937" text-anchor="middle">8 _startRun</text>
         <text class="lbl sm" x="490" y="515" text-anchor="middle">agent.prompt → continue 循环</text>
       </svg>
-      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#eaf2f9;border-color:#2563eb"></span>内部步骤</span><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#0f7d7a"></span>压缩/Agent 调用</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#b45309"></span>入队与拦截</span></div><div class="fig-cap">图 8.2：<code class="inline">prompt()</code> 是一条<strong>固定顺序</strong>的流水线（命令 → 钩子 → 展开 → 流式则入队，否则 flush/校验/压缩预检 → before_agent_start → _runAgentPrompt）。三处可短路返回：扩展命令 handled、input 钩子 handled、流式入队。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#eaf2f9;border-color:#2563eb"></span>内部步骤</span><span class="lg-item"><span class="sw" style="background:#dbe9f7;border-color:#0f7d7a"></span>压缩/Agent 调用</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#b45309"></span>入队与拦截</span></div><div class="fig-cap">图 8.2：<code class="inline">prompt()</code> 是一条<strong>固定顺序</strong>的流水线（命令 → 钩子 → 展开 → 流式则入队，否则 flush/校验/压缩预检 → before_agent_start → _startRun）。三处可短路返回：扩展命令 handled、input 钩子 handled、流式入队。</div>
     </div>
     <p>看真实代码。第 1 步扩展命令是最快的短路——以 <code class="inline">/</code> 开头的指令若命中注册命令，直接执行并返回，根本不进 LLM：</p>
     <div class="code-title">agent-session.ts · prompt() 前半段（扩展命令 + input 钩子 + 技能展开）</div>
@@ -233,24 +233,28 @@ expandedText = <span class="fn">expandPromptTemplate</span>(expandedText, [...<s
     <div class="callout">
       <strong>读懂三个「短路」与一个回执：</strong>扩展命令（1）、input 钩子（2）都能<strong>完全吞掉</strong>这一次输入（handled），不让它进 LLM；技能/模板（3）则把一句话<strong>展开成一大段</strong>塞进上下文。三者顺序固定——先给最高优先级、最便宜的拦截机会。而 <code class="inline">preflightResult</code> 回调（RPC 模式挂进来观察 prompt 去向的内部钩子，不拒绝就一定会被调用）如今收到的不再是布尔的「有没有被处理」，而是一个三值处置：<code class="inline">PromptDisposition = "handled" | "queued" | "started"</code>——扩展命令吞掉或 input 钩子接管是 <code class="inline">"handled"</code>；流式入队是 <code class="inline">"queued"</code>；真正开跑前一刻是 <code class="inline">"started"</code>。RPC 的 prompt 响应把该值放进 <code class="inline">data.disposition</code>，客户端由此能区分「这条输入被本地消化了」和「它已经在模型面前跑起来了」。
     </div>
-    <p>流水线的后半段（before_agent_start 事件之后）有个容易误读的顺序决定——<strong>消息数组的构建被刻意推迟到钩子跑完之后</strong>：</p>
-    <div class="code-title">agent-session.ts · prompt() 中段：钩子之后才归一化图片、才 build messages（节选，注释为译注）</div>
+    <p>流水线的后半段（压缩预检之后）有个容易误读的顺序决定——<strong>「emit 钩子 → 归一化图片 → 构建消息」被收进了一个独立的方法 <code class="inline">_prepareRun(trigger)</code></strong>，<code class="inline">prompt()</code> 末尾只留一句 <code class="inline">await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages })</code>。看 <code class="inline">_prepareRun</code> 里最值得停的顺序决定：</p>
+    <div class="code-title">agent-session.ts · _prepareRun 中段：钩子之后才归一化图片、才 build messages（节选，注释为译注）</div>
     <pre class="code"><code><span class="cmt">// 6. before_agent_start 先行 —— 此时 selectedTools 已定，模型也可能被扩展换掉</span>
-<span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.emitBeforeAgentStart(expandedText, currentImages, ...);
+<span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">this</span>._extensionRunner.emitBeforeAgentStart(trigger, ...);
 <span class="cmt">// 扩展显式改了 selectedTools 就尊重它，没改则以运行时真实 loadout 为准</span>
 <span class="kw">if</span> (!handlerEditedTools) result.systemPromptOptions.selectedTools = <span class="kw">this</span>.getActiveToolNames();
 
 <span class="cmt">// 7. 这之后才做图片归一化 —— 用的正是 before_agent_start 里选定的模型的画像</span>
-<span class="kw">const</span> normalized = <span class="kw">await this</span>._normalizePromptImages(currentImages);
-<span class="kw">const</span> userText = normalized.hints.length &gt; <span class="nu">0</span> ? <span class="st">`${expandedText}\n\n${normalized.hints.join("\n")}`</span> : expandedText;
+<span class="kw">const</span> normalized = <span class="kw">await this</span>._normalizePromptImages(trigger.images);
+<span class="kw">const</span> text =
+  normalized.hints.length &gt; <span class="nu">0</span> ? <span class="st">`${trigger.prompt}\n\n${normalized.hints.join("\n")}`</span> : trigger.prompt;
 
 <span class="cmt">// 8. Build messages only after hooks and image normalization have completed.</span>
-messages = [];
-<span class="kw">const</span> userContent = [{ type: <span class="st">"text"</span>, text: userText }, ...normalized.images];
+<span class="kw">const</span> messages: AgentMessage[] = [];
+<span class="kw">const</span> userContent = [{ type: <span class="st">"text"</span>, text }, ...normalized.images];
 messages.push({ role: <span class="st">"user"</span>, content: userContent, timestamp: <span class="fn">Date</span>.now() });
 <span class="cmt">// nextTurn 结转消息、before_agent_start 返回的 custom 消息随后依次入列</span></code></pre>
     <div class="callout">
       <strong>为什么图片归一化非得等钩子跑完？</strong>缩放档案（<code class="inline">maxWidth/maxBytes</code> 等）来自<strong>当前模型的画像</strong>（第 10 章的 <code class="inline">inputLimits.images.resize</code>）。而 <code class="inline">before_agent_start</code> 里扩展可以切模型——若先缩放后切模型，图片就按旧模型的档案编码了。处理顺序的依据是<strong>「这条数据会被谁消费」</strong>：图片要跟着模型走，用户文本则不需要。顺带一提，处理失败的图片不会静默丢弃——失败原因作为 hint 文本追加在用户消息后面，让模型知道「你少看到一张图、为什么」。同一条归一化也盖住工具返回的图片（<code class="inline">normalizeToolResultImages</code>，在扩展钩子<strong>之后</strong>跑，扩展注入的图同样被处理），以及 read 工具读到的图片文件——三处共用模型档案，保证「进历史之前先对齐」。
+    </div>
+    <div class="callout">
+      <strong>v1.2.0 的一处破坏性改动（#10739）值得记：</strong><code class="inline">before_agent_start</code> 事件不再只属于用户输入。<code class="inline">BeforeAgentStartEvent</code> 变成了按 <code class="inline">messageType</code> 区分的联合——<code class="inline">"user"</code> 带 <code class="inline">prompt/images</code>，<code class="inline">"custom"</code> 带 <code class="inline">message</code>（ sendMessage 等程序化消息也能开 run 了，同样过钩子）；<code class="inline">emitBeforeAgentStart</code> 的签名随之从 <code class="inline">(prompt, images, options)</code> 收成一个 <code class="inline">trigger</code> 对象。写扩展时不能假设 <code class="inline">event.prompt</code> 一定存在，要先看 <code class="inline">messageType</code>。
     </div>
   </section>
 
@@ -307,7 +311,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
     <ul>
       <li><strong>理由（reason）</strong>：<code class="inline">"retry" | "user" | "continuation"</code>——上次失败要重发（<code class="inline">failed</code> 有值）算 retry；最后一条 assistant 之后存在用户写的消息算 user（steering/follow-up 也算，因为它们都是用户亲笔）；其余一律 continuation。路由器据此决定「换档」还是「延续原路由」——比如某路由器只在用户开启新话题时才换物理模型，循环内的续跑和重试就不该触发它。</li>
       <li><strong>路由状态（state）</strong>：路由器可以是无状态的纯函数，也可以跨请求记账。状态不放在内存里，而是<strong>作为自定义条目（<code class="inline">pi.virtual-model-state</code>）写进会话树</strong>——于是它天然随分支分叉、随压缩存活、回放即恢复，与第 5 章「状态即条目」的哲学一脉相承。直接请求（循环外的 streamSimple，如压缩摘要）不携带状态。</li>
-      <li><strong>失败现场（failed）</strong>：自动重试与溢出恢复在重试前把失败的 assistant 消息存进 <code class="inline">_failedResponse</code>——因为省略编辑已经把它从上下文里隐去了，路由器看不见它，只能显式递过去。重试因此可以被路由器区别对待（比如「同一物理模型连续失败就换一家」）。这个字段在 <code class="inline">_runAgentPrompt</code> 开头清一次、finally 再清一次：新 prompt 会取代压缩前安排好的重试，谁都不该消费到陈旧的失败现场。</li>
+      <li><strong>失败现场（failed）</strong>：自动重试与溢出恢复在重试前把失败的 assistant 消息存进 <code class="inline">_failedResponse</code>——因为省略编辑已经把它从上下文里隐去了，路由器看不见它，只能显式递过去。重试因此可以被路由器区别对待（比如「同一物理模型连续失败就换一家」）。这个字段在 <code class="inline">_startRun</code> 开头清一次、finally 再清一次：新 prompt 会取代压缩前安排好的重试，谁都不该消费到陈旧的失败现场。</li>
     </ul>
     <p>选中的物理模型不入会话的 <code class="inline">model_change</code>——选择（虚拟条目）不动，只有分发（每条响应自报家门用的是哪个物理模型）随之流动。于是「会话当前在用什么」出现了一个投影态：<code class="inline">routedModel</code> getter 从最近一条<strong>成功</strong>响应里读出物理模型与当轮档位（错误/中断的响应不算），TUI 底栏也据此显示成 <code class="inline">auto • high → gpt-5.6-luna • medium</code> 这样的两段式；上下文用量与压缩阈值同样按<strong>被路由到的物理模型</strong>的窗口算（<code class="inline">_limitsModel()</code> 优先返回 <code class="inline">routedModel</code>）——路由器把你切到了小窗口模型，压缩就得立刻按新窗口预算，哪怕会话还没写回一条 model_change。若路由结果也超阈值，就先压缩再重建请求，路由结论原样保留。</p>
   </section>
@@ -363,7 +367,7 @@ messages.push({ role: <span class="st">"user"</span>, content: userContent, time
   <span class="kw">return</span> steering.length &gt; <span class="nu">0</span> ? steering : <span class="kw">this</span>.followUpQueue.<span class="fn">peek</span>();
 }</code></pre>
     <div class="callout">
-      <strong>为什么需要双队列？</strong>打断语义天然比「排队等」急迫。你在终端里按 <kbd>Esc</kbd> 想叫停 Agent 去读另一个文件，这是 <code class="inline">steer</code>；你顺手补一句「对了记得用 Vite」是 <code class="inline">followUp</code>。UI（TUI）正是靠 <code class="inline">queue_update</code> 事件把两侧队列实时画出来。你的 Runtime 若支持中断/追加，照抄这对队列即可。
+      <strong>为什么需要双队列？</strong>打断语义天然比「排队等」急迫。你在终端里按 <kbd>Esc</kbd> 想叫停 Agent 去读另一个文件，这是 <code class="inline">steer</code>；你顺手补一句「对了记得用 Vite」是 <code class="inline">followUp</code>。UI（TUI）正是靠 <code class="inline">queue_update</code> 事件把两侧队列实时画出来。你的 Runtime 若支持中断/追加，这对队列可以直接搬走用。
     </div>
   </section>
 
@@ -500,7 +504,7 @@ currentMessages = handlerResult?.messages ?? currentMessages;
 ${body}
 <span class="st">&lt;/skill&gt;`</span>;
 <span class="kw">return</span> args ? <span class="st">`${skillBlock}\n\n${args}`</span> : skillBlock;</code></pre>
-    <p>两条路径的分工值得注意：模型自发的「按需读文件」零展开成本，但每次都要花一轮工具调用；用户敲命令则把全文（frontmatter 已剥掉）包进 <code class="inline">&lt;skill&gt;</code> 块直接进上下文，一步到位但占 token。另一个开关是 frontmatter 里的 <code class="inline">disable-model-invocation</code>——设了它的技能<strong>整个从 <code class="inline">&lt;available_skills&gt;</code> 清单里排除</strong>（源码注释：「Skills with disableModelInvocation=true are excluded from the prompt (they can only be invoked explicitly via /skill:name commands)」），模型看不到它，只有用户敲命令这一条路径。提示词模板与之同构：<code class="inline">/name args</code> 展开时 <code class="inline">substituteArgs</code> 支持 <code class="inline">$1..$N</code>、<code class="inline">$@</code>（全部参数）、<code class="inline">${N:-default}</code>（缺省值）、<code class="inline">${@:N}</code> 和 <code class="inline">${@:N:L}</code>（bash 风格切片，把第 N 个参数开始的 L 个拼回去），替换不递归——展开结果里再有 <code class="inline">$1</code> 不会再被展开。</p>
+    <p>两条路径的分工有讲究：模型自发的「按需读文件」零展开成本，但每次都要花一轮工具调用；用户敲命令则把全文（frontmatter 已剥掉）包进 <code class="inline">&lt;skill&gt;</code> 块直接进上下文，一步到位但占 token。另一个开关是 frontmatter 里的 <code class="inline">disable-model-invocation</code>——设了它的技能<strong>整个从 <code class="inline">&lt;available_skills&gt;</code> 清单里排除</strong>（源码注释：「Skills with disableModelInvocation=true are excluded from the prompt (they can only be invoked explicitly via /skill:name commands)」），模型看不到它，只有用户敲命令这一条路径。提示词模板与之同构：<code class="inline">/name args</code> 展开时 <code class="inline">substituteArgs</code> 支持 <code class="inline">$1..$N</code>、<code class="inline">$@</code>（全部参数）、<code class="inline">${N:-default}</code>（缺省值）、<code class="inline">${@:N}</code> 和 <code class="inline">${@:N:L}</code>（bash 风格切片，把第 N 个参数开始的 L 个拼回去），替换不递归——展开结果里再有 <code class="inline">$1</code> 不会再被展开。</p>
     <p><strong>reload：先退场、再换资源、再进场。</strong>改完扩展代码想让它生效，不用重启，敲 <code class="inline">/reload</code>。整个流程严格排队：</p>
     <div class="code-title">core/agent-session.ts · reload()（摘录，注释为译注）</div>
     <pre class="code"><code><span class="kw">await</span> emitSessionShutdownEvent(oldRunner, { type: <span class="st">"session_shutdown"</span>, reason: <span class="st">"reload"</span> });
@@ -520,8 +524,8 @@ resetApiProviders();
 
   <section class="block">
     <h2><span class="num">8.5</span>运行后收敛：重试 → 压缩 → 续跑 → 结算</h2>
-    <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有消息吗？能结算了吗？</strong>看 <code class="inline">_runAgentPrompt</code> 的主循环：</p>
-    <div class="code-title">agent-session.ts · _runAgentPrompt 主循环（注释为译注）</div>
+    <p>一次 <code class="inline">agent.prompt</code> 结束（发出 <code class="inline">agent_end</code>）不等于整件事结束。生产模型在这一帧做「自动驾驶」：<strong>要不要重试？要不要压缩？队列里还有消息吗？能结算了吗？</strong>看 <code class="inline">_startRun</code> 的主循环：</p>
+    <div class="code-title">agent-session.ts · _startRun 主循环（注释为译注）</div>
     <pre class="code"><code><span class="kw">await</span> <span class="fn">this</span>.agent.prompt(messages);
 <span class="kw">while</span> (!<span class="fn">this</span>._agentRunAbortRequested) {
   <span class="kw">if</span> (<span class="kw">await</span> <span class="fn">this</span>._handlePostAgentRun()) {          <span class="cmt">// 重试/压缩/队列有活 → 续跑</span>
@@ -648,7 +652,7 @@ resetApiProviders();
   <section class="block">
     <h2><span class="num">8.7</span>收尾：四问的答案</h2>
     <ul>
-      <li><strong>输入怎么进？</strong><code class="inline">prompt()</code> 一条固定流水线：扩展命令 → input 钩子 → 技能/模板展开 → 流式则强制入 steer/followUp 队列 → flush bash → 模型/鉴权校验 → 压缩预检 → <code class="inline">before_agent_start</code> → <code class="inline">_runAgentPrompt</code>。三个可短路点（命令、钩子、入队），一个「钩子之后才归一化」的顺序决定。</li>
+      <li><strong>输入怎么进？</strong><code class="inline">prompt()</code> 一条固定流水线：扩展命令 → input 钩子 → 技能/模板展开 → 流式则强制入 steer/followUp 队列 → flush bash → 模型/鉴权校验 → <code class="inline">_startRun</code>（压缩预检 → <code class="inline">before_agent_start</code> 都在其内的 <code class="inline">_prepareRun</code> 里）。三个可短路点（命令、钩子、入队），一个「钩子之后才归一化」的顺序决定。</li>
       <li><strong>上下文从哪来？</strong>一组接管安装器把裸循环的开放边界全部换掉：prepareRequest 装投影（SessionManager 是唯一上下文来源；选中虚拟模型时同一根钩子还执行路由——按 user/continuation/retry 理由分发到物理模型）、prepareNextTurnWithContext 做 turn 间手术、finishTurn 桥接扩展边界、transformContext 投影强制 prompt、hiddenDeclarations 投影隐藏不该暴露的声明。</li>
       <li><strong>扩展在哪能改写会话？</strong>转换流两扇门（context 只看对话 / context_with_system 拥有完整转写）；可操作边界（turn_end / agent_before_settle）四种草稿链式累积、沙盘预演、失败整体作废，continue 需过 canContinue 校验。</li>
       <li><strong>跑完谁收敛？</strong>重试→压缩→续跑的 while 循环，配三类压缩守卫与一次性的溢出恢复；收敛到头后 agent_before_settle 仍可追加条目续跑一次，最终 agent_settled 纯通知——集成方由此知道 Pi 不会再动。</li>
@@ -688,7 +692,7 @@ resetApiProviders();
 </div>
 
 <footer>
-  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v1.1.0-22-gea448f454 · 所有引用代码路径以仓库最新为准</p>
+  <p>Pi Agent Harness · 08 生产 Harness（agent-session） · 版本 v1.2.0-57-g5ab7fe74c · 所有引用代码路径以仓库最新为准</p>
   <p>章节：<a href="01-architecture.html">架构</a> · <a href="05-context.html">上下文</a> · <a href="07-harness.html">Harness</a> · <a href="08-agent-session.html">生产 Harness</a> · <a href="12-build-own-runtime.html">自制 Runtime</a> · <a href="14-security-local-integration.html">安全·本地·集成</a>
       <a href="15-comparison-langgraph.html">vs LangGraph</a></p>
 </footer>
