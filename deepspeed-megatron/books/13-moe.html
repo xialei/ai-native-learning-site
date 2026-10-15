@@ -67,16 +67,15 @@
     <div class="code-title">megatron/core/transformer/moe/moe_layer.py — MoELayer.forward（结构摘录，译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states):
     <span class="cmt"># ① route：router 打分 + top-k 选择 → probs + routing_map</span>
-    scores, routing_map = self.router(hidden_states)
-    <span class="cmt"># ② dispatch：按专家重排 token，跨卡 all-to-all（dispatcher 多态）</span>
-    dispatched, tokens_per_expert = self.token_dispatcher.<span class="fn">token_permutation</span>(
-        hidden_states, scores, routing_map)
+    probs, routing_map = self.route(hidden_states)
+    <span class="cmt"># ② dispatch：preprocess 后按专家重排 token，跨卡 all-to-all（dispatcher 多态）</span>
+    dispatched, probs = self.dispatch(hidden_states, probs)
     <span class="cmt"># ③ compute：各专家自己的 MLP（专家内部可再 TP）</span>
-    expert_output, mlp_bias = self.experts(dispatched, tokens_per_expert)
-    <span class="cmt"># ④ combine：unpermute + 加权合并 + all-to-all 回程</span>
-    output, mlp_bias = self.token_dispatcher.<span class="fn">token_unpermutation</span>(expert_output, mlp_bias)
+    expert_output, mlp_bias = self.routed_experts_compute(dispatched, probs)
+    <span class="cmt"># ④ combine：加权合并 + all-to-all 回程</span>
+    output, mlp_bias = self.combine(expert_output)
     <span class="kw">return</span> output, mlp_bias</pre>
-    <div class="annotation"><b>命名约定值得记：</b>router 的输出链是 <code class="inline">logits → scores（softmax 后）→ probs（top-k 后归一）→ routing_map（bool：谁去哪）</code>——读 MoE 源码时抓住这四个名字就不迷路。dispatch 与 combine 是一对（permute/unpermute），dispatcher 决定它们的实现。aux loss（负载均衡）在 router 里算、加进总 loss，不在这四段里。</div>
+    <div class="annotation"><b>命名约定值得记：</b>router 的输出链是 <code class="inline">logits → scores（softmax 后）→ probs（top-k 后归一）→ routing_map（bool：谁去哪）</code>——读 MoE 源码时抓住这四个名字就不迷路。层的四个方法（<code class="inline">route/dispatch/routed_experts_compute/combine</code>）各自转发到 <code class="inline">token_dispatcher</code> 的五段钩子（<code class="inline">dispatch_preprocess → token_dispatch → dispatch_postprocess → combine_preprocess → token_combine</code>，再加 <code class="inline">combine_postprocess</code>），permute/unpermute 的具体实现在 dispatcher 里。aux loss（负载均衡）在 router 里算、加进总 loss，不在这四段里。</div>
 
     <div class="code-title">megatron/core/transformer/moe/router.py — TopKRouter（结构摘录，译注）</div>
     <pre class="code"><span class="kw">class</span> <span class="cl">TopKRouter</span>(...):
@@ -168,7 +167,7 @@
   t₃ → {E0, E3}
   t₄ → {E2, E3}      # 两个专家都在卡1，本 token 整个发走
 
-token_permutation 做两件事：
+dispatch（token_dispatch）做两件事：
   1) 按目的地重排：发往卡1 的 5 份（t₁→E2, t₂→E2, t₂→E3, t₄→E2, t₄→E3）
      （注意 top-k=2 意味着一份 token 可能复制两份——每个目的地各一份）
   2) all-to-all：本卡发 5 份出去、收 3 份回来（t₁→E0、t₂→E1、t₃→E0 都落本卡）
@@ -176,7 +175,7 @@ token_permutation 做两件事：
 
 compute：E0 算 t₁、t₃；E1 算 t₂ —— 就是普通 MLP
 
-combine（token_unpermutation）：结果 all-to-all 送回原卡，
+combine（token_combine）：结果 all-to-all 送回原卡，
   t₁ 拿到 E0 和 E2 的输出，按 probs 加权求和——一次 unpermute 还原到原位置</pre>
     <p>通信量账：AlltoAll 每跳的本卡收发量 = 发出的份数 × hidden×2B。上例每跳发 5 份 × 每 token 8192×2B（接第 3 章的 h=8192）≈ 80 KiB——单层看似不大，但按 token 总量算：EP 度为 e、top-k=k 时，平均每 token 发出约 <code class="inline">k×(e−1)/e</code> 份跨卡。代入一个 671B 风格的配置（e=64、k=8、s=4096、b=4、h=7168、bf16）：本卡每层要发 4×4096×8×(63/64) ≈ 12.9 万份 token×h，即 <strong>dispatch 约 1.7 GiB、combine 回程同量，每层 two-hop 合计约 3.4 GiB</strong>——是第 3 章纯 TP 每层 896 MiB 的近 4 倍，且没有 RS/AG 的原语可拆、无法与计算重叠到无感，这就是「MoE 的代价全在 token 往返」的量级来源。</p>
   </section>
@@ -234,7 +233,7 @@ combine（token_unpermutation）：结果 all-to-all 送回原卡，
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-86-gf0a3be9bb / core_v0.15.0rc7-2735-ge4294782f
+  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-120-g5f266e26d / core_v0.15.0rc7-2853-g9eadd78ec
 </footer>
 
 </body>
