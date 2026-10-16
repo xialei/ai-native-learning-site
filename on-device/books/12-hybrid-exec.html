@@ -45,7 +45,7 @@
   <section class="block">
     <h2><span class="num">12.1</span>两块带宽，一道分法</h2>
     <p>第 11 章的 offload 模式下，decode 每步每层的缺失专家都要过 PCIe（典型 16-32 GB/s）。而 CPU 这边——内存带宽 50-100 GB/s 的桌面机——整个 decode 期间基本闲着。hybrid 把两边同时用上：每步的缺失专家分成两份，<strong>一份经 PCIe 拉到 GPU 槽池由 GPU 算，剩下的直接在 CPU 上用 host bank 算 GEMV</strong>，两边的部分结果相加。</p>
-    <p>切分比例的推导写在 engine.py 的注释里（python/freetoken/engine/engine.py:767-771）：</p>
+    <p>切分比例的推导写在 engine.py 的注释里（python/freetoken/engine/engine.py:856-864）：</p>
     <div class="code-title">python/freetoken/engine/engine.py — fetch fraction 推导（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># _resolve_hybrid_fetch：--moe-hybrid-max-fetch -1 (auto) 的解析</span>
 <span class="cmt"># Perfect fetch/compute overlap wants fetched : cpu-computed misses = pcie_bw :</span>
@@ -69,7 +69,7 @@
 
   <section class="block">
     <h2><span class="num">12.2</span>benchbw：给这台机器测一遍带宽</h2>
-    <p>比例来自 <code class="inline">ft bench bw</code>（moe/benchbw.py），一台 GPU 跑一次，结果存 <code class="inline">~/.cache/freetoken/benchbw/&lt;gpu-uuid&gt;.json</code>（docs/cli.md:206，按 UUID 键控——同型号卡插不同槽位带宽可能不同）。它测三组数：</p>
+    <p>比例来自 <code class="inline">ft bench bw</code>（moe/benchbw.py），一台 GPU 跑一次，结果存 <code class="inline">~/.cache/freetoken/benchbw/&lt;gpu-uuid&gt;.json</code>（docs/cli.md:208，按 UUID 键控——同型号卡插不同槽位带宽可能不同）。它测三组数：</p>
     <div class="tbl">
       <table>
         <thead><tr><th>测量</th><th>方法</th><th>用途</th></tr></thead>
@@ -80,8 +80,8 @@
         </tbody>
       </table>
     </div>
-    <p>重叠测量的结构（benchbw.py:540-599）：双线程共享 barrier 起跑，CPU 侧线程循环跑 bs=1 的 CPU decode 步（run_task 释放 GIL），主线程循环 gather + synchronize 保证 DMA 真的在飞，各自报自己的 bytes/elapsed。为什么必须实测争用而不用独立带宽推导？docstring 给了反例：</p>
-    <div class="code-title">python/freetoken/moe/benchbw.py:540-549 — measure_overlap_bw docstring（摘录，注释为译注）</div>
+    <p>重叠测量的结构（benchbw.py:553 起）：双线程共享 barrier 起跑，CPU 侧线程循环跑 bs=1 的 CPU decode 步（run_task 释放 GIL），主线程循环 gather + synchronize 保证 DMA 真的在飞，各自报自己的 bytes/elapsed。为什么必须实测争用而不用独立带宽推导？docstring 给了反例：</p>
+    <div class="code-title">python/freetoken/moe/benchbw.py:553-562 — measure_overlap_bw docstring（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt">"""Concurrent achieved bandwidths (GB/s): the CPU MoE GEMV and the PCIe gather running
 at the same time -- the contention regime hybrid decode's overlap actually lives in.
 
@@ -91,7 +91,7 @@ DRAM to begin with -- the DMA then mostly rides the leftover bandwidth; assuming
 contention ignores it entirely. Measuring the contended pair directly gives the hybrid
 backend its bandwidth-matched fetch split: fetched : cpu-computed = pcie_ov : cpu_ov.
 """</span></pre>
-    <p>判定与分流用这套 profile 的决策链（docs/cli.md:84、engine/engine.py:1668-1748）：moe_strategy=auto 时默认 offload；若 profile 判定 hybrid（CPU 带宽 &gt; 2× PCIe），再核对 CPU 执行器支持该激活函数、编译扩展没过期，都过了才升级 hybrid——<strong>每一步降级都有日志，绝不静默</strong>。分流比例 --moe-hybrid-max-fetch=-1（auto）读同一个 profile：没有 profile 就退回固定 cap=1（engine.py:798-804）。</p>
+    <p>判定与分流用这套 profile 的决策链（docs/cli.md:84、engine/engine.py:1751-1831）：moe_strategy=auto 时默认 offload；若 profile 判定 hybrid（CPU 带宽 &gt; 2× PCIe），再核对 CPU 执行器支持该激活函数、编译扩展没过期，都过了才升级 hybrid——<strong>每一步降级都有日志，绝不静默</strong>。分流比例 --moe-hybrid-max-fetch=-1（auto）读同一个 profile：没有 profile 就退回固定 cap=1（engine.py:873-879）。</p>
     <div class="annotation">这个设计把「调参」变成了「测量」。q* 没有公式可推导——不同主板、内存条数、PCIe 通道数的组合，谁也推不准，测一次就一劳永逸（profile 按 format+GPU 键控，换格式或换卡才重测）。<strong>自适应的本质是承认自己算不准</strong>，把不确定的部分交给测量。</div>
     <div class="callout info">
       <b class="tag">一段代码的进化痕迹</b>
@@ -101,67 +101,75 @@ backend its bandwidth-matched fetch split: fetched : cpu-computed = pcie_ov : cp
 
   <section class="block">
     <h2><span class="num">12.3</span>hybrid decode：一份路由的两半</h2>
-    <p>hybrid 的每步每层（layers/moe.py:298-350）是把第 11 章的 ensure_experts 换成带 cap 的变体，然后路由一分为二：</p>
+    <p>hybrid 的每步每层（layers/moe.py:297-343）是把第 11 章的 ensure_experts 换成带 cap 的变体，然后路由一分为二：</p>
     <div class="code-title">python/freetoken/layers/moe.py — _decode_hybrid（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span>raw_ids = topk_ids.clone()                       <span class="cmt"># 原始专家 id 留给 CPU 侧</span>
-cache.ensure_experts_hybrid(self.layer_id, topk_ids) <span class="cmt"># 原地改写：槽 id 或 -1（超 cap 的缺失）</span>
-...
-on_gpu = topk_ids &gt;= <span class="nu">0</span>
-cpu_ids = torch.where(on_gpu, -<span class="nu">1</span>, raw_ids).contiguous()
-gpu_w = torch.where(on_gpu, topk_weights, <span class="nu">0.0</span>).contiguous()
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 内核读每条路由的槽：不支持跳过槽 -1 的内核给它槽 0——</span>
+<span class="cmt"># 槽 0 必有完整数据（payload 或 bank 的零填充），乘权重 0</span>
+clamp = <span class="kw">not</span> self.skips_inactive_slots
+gpu_slots, gpu_w, cpu_ids = cache.ensure_experts_hybrid(
+    self.layer_id, topk_ids, topk_weights, clamp=clamp)
+<span class="cmt"># 原地改写在 ensure 内核里完成：gpu_slots 是槽 id 或 -1（超 cap 的缺失），</span>
+<span class="cmt"># gpu_w 同形状权重，cpu_ids 是 GPU 负责路由的 -1 化原始专家 id</span>
 pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 <span class="cmt"># ↑ CPU 池先开跑，再去做 GPU 的 PCIe fetch + GEMM —— 重叠点</span>
 
+<span class="cmt"># A/B 测量开关：把 sync 提前到 gather 之前，串行跑两边</span>
+cpu_routed_early = executor.<span class="fn">decode_sync</span>(pending) <span class="kw">if not</span> _HYBRID_OVERLAP <span class="kw">else</span> <span class="kw">None</span>
+
 cache.copy_missing()                              <span class="cmt"># GPU 只拉 cap 内的缺失（≤K 个）</span>
-gpu_slots = topk_ids                              <span class="cmt"># -1 → 槽 0（权重置 0）</span>
-<span class="kw">if not</span> (self.quant_method <span class="kw">is not None</span> <span class="kw">and</span> self.quant_method.kernel.supports_inactive_slots):
-    <span class="cmt"># 2026-10 起（#603）：支持「槽 -1 不读」的内核跳过这一步，</span>
-    <span class="cmt"># 其余内核仍把 -1 clamp 到槽 0（槽 0 必有完整数据，乘权重 0）</span>
-    gpu_slots = gpu_slots.clamp_min(<span class="nu">0</span>)
-gpu_routed = self._expert_gemm(cache, hidden_states, gpu_w, gpu_slots, ...)
-cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU 部分算完</span>
-<span class="kw">return</span> gpu_routed + cpu_routed</pre>
-    <p>「每条路由恰好算一次」靠的是<strong>双向置零</strong>：GPU 侧把 CPU 负责的路由权重置 0（不支持跳过 -1 的内核把 id clamp 到槽 0，乘出来是 0）；CPU 侧把 GPU 负责的路由 id 置 -1（C++ 内核跳过 id&lt;0）。两边都跑、各自只算自己那份、结果相加——没有 if 分支，全部是形状固定的张量操作，CUDA Graph 可捕获。2026-10 的 #603 又收了一次尾：新内核直接声明 supports_inactive_slots，槽 -1 一行读都不读，连「clamp 到槽 0 借道」都省了——置零的数学不变，搭车的开销减到零。</p>
-    <p>cap 的语义（offload_cache.py:858-877 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:197-202）。</p>
-    <div class="annotation">为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:328-329 注释明说 "Measurement knob"）。</div>
+gpu_routed = self._expert_gemm(cache, hidden_states, gpu_w, gpu_slots,
+    views=cache.pool_bank_views(self.layer_id), ...)
+<span class="kw">if not</span> _HYBRID_OVERLAP:
+    <span class="kw">return</span> gpu_routed + cpu_routed_early
+<span class="kw">return</span> executor.<span class="fn">decode_sync</span>(pending, add_to=gpu_routed)  <span class="cmt"># CPU 部分直接累加进 GPU 结果</span></pre>
+    <p>「每条路由恰好算一次」靠的是<strong>双向置零</strong>：GPU 侧把 CPU 负责的路由权重置 0（不支持跳过 -1 的内核把 id clamp 到槽 0，乘出来是 0）；CPU 侧把 GPU 负责的路由 id 置 -1（C++ 内核跳过 id&lt;0）。#685（2026-10）把「拆分」本身挪进了 ensure 内核——旧版在 Python 里用两条 torch.where 从改写后的 topk_ids 反推两半路由，现在内核一次读完路由直接输出 gpu_slots/gpu_w/cpu_ids 三元组，Python 侧少两遍全量张量扫描。两边都跑、各自只算自己那份、结果相加——没有 if 分支，全部是形状固定的张量操作，CUDA Graph 可捕获。更早的 #603 收过一次尾：新内核直接声明 supports_inactive_slots，槽 -1 一行读都不读，连「clamp 到槽 0 借道」都省了——置零的数学不变，搭车的开销减到零。</p>
+    <p>cap 的语义（offload_cache.py:1048-1070 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计；返回值就是拆好的 HybridRoutes。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:224-229）。</p>
+    <div class="annotation">为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:324-328 注释明说 "Measurement knob"）。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.4</span>memop 握手：不用回调的 GPU-CPU 门铃</h2>
     <p>CPU 执行器（moe/cpu_executor.py）把「GPU 停下来等 CPU 算完」做成了一套门铃协议。第一版用 cudaLaunchHostFunc（回调派发），问题是延迟——文件头的账算得很清楚：</p>
-    <div class="code-title">python/freetoken/moe/cpu_executor.py:32-43 — memop 方案的动机（摘录，注释为译注）</div>
+    <div class="code-title">python/freetoken/moe/cpu_executor.py:29-48 — memop 方案的动机（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Flag-based GPU&lt;-&gt;CPU handshake for hybrid/cpu decode. The default host-func path</span>
 <span class="cmt"># (cudaLaunchHostFunc submit+sync per layer) pays ~30-50us of callback dispatch latency</span>
 <span class="cmt"># per call with the GPU stream idle -- 2 calls per MoE layer per decode step (~6 ms/step</span>
 <span class="cmt"># on a 75-layer model). Instead the GPU raises a mapped-pinned "ready" flag at submit; a</span>
 <span class="cmt"># persistent CPU coordinator (in _cpu_moe) polls it, runs the layer, and sets a "done"</span>
 <span class="cmt"># flag the GPU waits on at sync -- no host-func round-trip. Both GPU-side operations are</span>
-<span class="cmt"># STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64, resolved from the</span>
-<span class="cmt"># driver at runtime): they execute on the GPU front end with no SM-resident kernel, so</span>
+<span class="cmt"># STREAM MEMORY OPERATIONS (cuStreamWriteValue64 / cuStreamWaitValue64 on CUDA, see</span>
+<span class="cmt"># gpu_sync.h): they execute on the GPU front end with no SM-resident kernel, so</span>
 <span class="cmt"># GPU utilization stays truthful during the CPU compute window. (The first cut used a</span>
 <span class="cmt"># spin-wait kernel; that pinned reported utilization at 99% and laptop CPU/GPU dynamic</span>
 <span class="cmt"># power schedulers responded by clamping the CPU frequency -- a net decode regression on</span>
-<span class="cmt"># power-coupled edge devices.) ...</span></pre>
-    <p>C++ 侧的两次 write 与一次 wait（kernel/csrc/cpu_moe/cpu_moe_ext.cpp:654-672）：</p>
-    <div class="code-title">python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp — memop submit/sync（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">c++</span><span class="kw">static void</span> <span class="fn">cumemop_submit</span>(<span class="kw">uintptr_t</span> stream, <span class="kw">uintptr_t</span> done_addr,
-                           <span class="kw">uintptr_t</span> ready_addr, <span class="kw">int64_t</span> slot) {
+<span class="cmt"># power-coupled edge devices.) The doorbell word names the (layer, decode batch size)</span>
+<span class="cmt"># task, so one ready/done pair serves every layer and every captured graph (gpu_sync.h).</span>
+<span class="cmt"># Where memops are unavailable (some driver models, vGPU, old drivers -- functionally probed at</span>
+<span class="cmt"># startup), decode keeps the host-func path (functional, slower). ROCm 7.14 cannot replay</span>
+<span class="cmt"># that path from a graph, so capture fails loudly there instead. A Python watchdog thread</span>
+<span class="cmt"># turns a wedged coordinator into a loud RuntimeError (via raise_if_unhealthy) instead of</span>
+<span class="cmt"># an indefinite stream stall. ...</span></pre>
+    <p>C++ 侧的两次 write 与一次 wait（kernel/csrc/cpu_moe/gpu_sync_cuda.cpp:134-148——#670 起 GpuSync 类统一 CUDA/HIP 两个后端，此为 CUDA 实现）：</p>
+    <div class="code-title">python/freetoken/kernel/csrc/cpu_moe/gpu_sync_cuda.cpp — GpuSync memop submit/wait（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">c++</span><span class="kw">void</span> <span class="cl">GpuSync</span>::<span class="fn">gpu_submit</span>(<span class="kw">uintptr_t</span> stream, <span class="kw">uint64_t</span> task) {
+  <span class="kw">auto</span>* s = <span class="kw">reinterpret_cast</span>&lt;<span class="kw">void</span>*&gt;(stream);
   <span class="cmt">// Order matters and is preserved by the front end: reset done BEFORE raising ready,</span>
   <span class="cmt">// so the coordinator's completion write for THIS step can never be wiped.</span>
-  cumemop_check(g_cu_write64(s, done_addr + slot * <span class="nu">8</span>, <span class="nu">0</span>ULL, kCuWriteDefault),
+  cumemop_check(g_cu_write64(s, impl_-&gt;done, <span class="nu">0</span>ULL, kCuWriteDefault),
                 <span class="st">"cuStreamWriteValue64(done)"</span>);
-  cumemop_check(g_cu_write64(s, ready_addr + slot * <span class="nu">8</span>, <span class="nu">1</span>ULL, kCuWriteDefault),
+  cumemop_check(g_cu_write64(s, impl_-&gt;ready, task, kCuWriteDefault),
                 <span class="st">"cuStreamWriteValue64(ready)"</span>);
 }
 
-<span class="kw">static void</span> <span class="fn">cumemop_sync</span>(<span class="kw">uintptr_t</span> stream, <span class="kw">uintptr_t</span> done_addr, <span class="kw">int64_t</span> slot) {
-  cumemop_check(g_cu_wait64(s, done_addr + slot * <span class="nu">8</span>, <span class="nu">1</span>ULL, kCuWaitValueGeq),
+<span class="kw">void</span> <span class="cl">GpuSync</span>::<span class="fn">gpu_wait</span>(<span class="kw">uintptr_t</span> stream) {
+  cumemop_check(g_cu_wait64(<span class="kw">reinterpret_cast</span>&lt;<span class="kw">void</span>*&gt;(stream), impl_-&gt;done, <span class="nu">1</span>ULL,
+                            kCuWaitValueGeq),
                 <span class="st">"cuStreamWaitValue64(done)"</span>);
 }</pre>
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t12 d12">
         <title id="t12">memop 握手时间线</title>
-        <desc id="d12">GPU 流上 write(done=0)→write(ready=1)→…GPU 工作…→wait(done)；CPU 协调者轮询 ready、跑 GEMV、写 done</desc>
+        <desc id="d12">GPU 流上 write(done=0)→write(ready=task，编码 layer+bs)→…GPU 工作…→wait(done)；CPU 协调者轮询 ready、跑 GEMV、写 done</desc>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
@@ -170,27 +178,27 @@ cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU �
 
         <rect class="node core" x="30" y="40" width="880" height="120" rx="10"></rect>
         <text class="lbl" x="50" y="68" font-weight="bold" fill="#1d6b4f">GPU 流（前端 memop，不占 SM）</text>
-        <text class="lbl sm" x="50" y="90">write done[slot]=0　→　write ready[slot]=1　→　D2H 激活/路由　→　（PCIe fetch + GEMM…）　→　wait done[slot]≥1　→　H2D 结果</text>
+        <text class="lbl sm" x="50" y="90">write done=0　→　write ready=task（编码 layer+bs）　→　D2H 激活/路由　→　（PCIe fetch + GEMM…）　→　wait done≥1　→　H2D 结果</text>
         <text class="lbl sm" x="50" y="120" fill="#55685e">doorbell 两连写顺序由前端保证：先清 done 再拉 ready，协调者本次完成写不会被下一轮清掉</text>
         <text class="lbl sm" x="50" y="142" fill="#55685e">WAIT 立即数恒定 → 图重放安全</text>
 
         <rect class="node" x="30" y="200" width="880" height="110" rx="10"></rect>
         <text class="lbl" x="50" y="228" font-weight="bold">CPU 协调者（独占一个物理核，busy-poll）</text>
-        <text class="lbl sm" x="50" y="250">轮询 ready[slot]==1 → 从 pinned IO 读激活/路由 → worker 池 GEMV（host bank 零拷贝）→ 写 out 到 pinned → done[slot]=1</text>
-        <text class="lbl sm" x="50" y="272" fill="#55685e">watchdog（每 2s）：ready==1 &amp;&amp; done==0 持续 &gt;10s 且 served 计数不动 → 判死，置 err[] 毒化 done[]，下一步报错而非死等</text>
-        <text class="lbl sm" x="50" y="294" fill="#55685e">每 (layer, bs) 对一个 slot：_FLAG_SLOTS_PER_LAYER=16，超容量退回 host-func 路径</text>
+        <text class="lbl sm" x="50" y="250">轮询 ready≠0 → 读出 task（layer+bs）→ 从共享 pinned IO 读激活/路由 → worker 池 GEMV（host bank 零拷贝）→ 写 out 到 pinned → done=1</text>
+        <text class="lbl sm" x="50" y="272" fill="#55685e">watchdog（每 2s）：pending 持续 &gt;10s 且 served 计数不动 → 判死，毒化 done，下一步报错而非死等</text>
+        <text class="lbl sm" x="50" y="294" fill="#55685e">一个门铃字（task 编码 layer+bs）服务所有层与所有图：一次只有一条任务在飞</text>
 
         <text class="lbl sm" x="470" y="338" text-anchor="middle" fill="#55685e">不可用环境（Windows WDDM / vGPU / 老驱动）启动时功能探测失败 → 整体退回 cudaLaunchHostFunc（慢但正确）</text>
       </svg>
-      <div class="fig-cap">图 12.1：门铃协议。三级退化路径：memop（默认）→ host-func（探测失败/超容量）→ watchdog 报错（卡死）。每级都是「功能正常但慢一档」，没有静默的错。</div>
+      <div class="fig-cap">图 12.1：门铃协议。三级退化路径：memop（默认）→ host-func（探测失败）→ watchdog 报错（卡死）。每级都是「功能正常但慢一档」，没有静默的错。</div>
     </div>
-    <div class="annotation">注释里留下的三个历史教训比机制本身更值钱。<strong>回调延迟</strong>：每层 2 次回调 × 30-50µs，层数一多每步白丢几毫秒（源码按 75 层模型算出 ~6ms/步），门铃把「每层两次往返」变成「每步一次轮询」。<strong>自旋内核骗了电源管理</strong>：GPU 利用率假 99%，笔记本的功耗调度看到「GPU 忙」就压 CPU 频率，解码反而更慢——memop 在 GPU 前端执行、不占 SM，利用率数字恢复诚实。<strong>watchdog 的三重确认</strong>（cpu_executor.py:629-639）：门铃 pending 跨 ≥10 秒、第一次见到时就 pending、期间 served 计数一动不动，三条同时成立才判死——两点采样会撞上正常的微秒级 pending 窗口，served 计数不变才是「协调者死了」的铁证。</div>
+    <div class="annotation">注释里留下的三个历史教训比机制本身更值钱。<strong>回调延迟</strong>：每层 2 次回调 × 30-50µs，层数一多每步白丢几毫秒（源码按 75 层模型算出 ~6ms/步），门铃把「每层两次往返」变成「每步一次轮询」。<strong>自旋内核骗了电源管理</strong>：GPU 利用率假 99%，笔记本的功耗调度看到「GPU 忙」就压 CPU 频率，解码反而更慢——memop 在 GPU 前端执行、不占 SM，利用率数字恢复诚实。<strong>watchdog 的三重确认</strong>（cpu_executor.py:585-611）：门铃仍 pending、第一次见到时就 pending、期间 served 计数一动不动，三条同时成立且跨 ≥10 秒才判死——两点采样会撞上正常的微秒级 pending 窗口，served 计数不变才是「协调者死了」的铁证。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">12.5</span>host bank：为带宽把每一步都做对</h2>
-    <p>CPU 算 GEMV 的速度上限是内存带宽，host bank 的每个细节都在为这条带宽服务。物理核 pin（cpu_executor.py:94-118）：</p>
-    <div class="code-title">python/freetoken/moe/cpu_executor.py:94-101 — 只用物理核（摘录，注释为译注）</div>
+    <p>CPU 算 GEMV 的速度上限是内存带宽，host bank 的每个细节都在为这条带宽服务。物理核 pin（cpu_executor.py:87-114）：</p>
+    <div class="code-title">python/freetoken/moe/cpu_executor.py:87-94 — 只用物理核（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">physical_core_cpus</span>() -&gt; list[<span class="cl">int</span>]:
     <span class="cmt">"""One logical CPU per physical core, restricted to this process's affinity.
 
@@ -198,7 +206,7 @@ cpu_routed = executor.decode_sync(pending)        <span class="cmt"># 等 CPU �
     same core's load ports without adding bandwidth. Picking one logical CPU per
     physical core (and pinning to it) gives the best, most stable bandwidth.
     ..."""</span></pre>
-    <p>协调者也要占核：auto 尺寸时从 worker 池里扣出最后一个物理核给协调者（:237-242），宁可少一个 worker 也不让 busy-poll 与 GEMV 抢核。pinned 内存的分配不走 torch 的 allocator——kernel/pinned.py 的理由是个具体的数字：</p>
+    <p>协调者也要占核：auto 尺寸时从 worker 池里扣出最后一个物理核给协调者（:244-252），宁可少一个 worker 也不让 busy-poll 与 GEMV 抢核。pinned 内存的分配不走 torch 的 allocator——kernel/pinned.py 的理由是个具体的数字：</p>
     <div class="code-title">python/freetoken/kernel/pinned.py:1-6 — 精确尺寸 pinned（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt">"""Exact-size pinned host tensors (e.g. offload expert banks).
 
@@ -206,9 +214,9 @@ The offload gather kernel (``fast_index_copy``) reads host memory zero-copy from
 GPU, so allocations must be pinned + device-mapped. We avoid
 ``torch.empty(pin_memory=True)`` because its caching allocator rounds sizes up to the
 next power of two (a 70GB bank would reserve 128GB)."""</span></pre>
-    <p>普通层用 mmap + 填满后注册（pin-after-fill，moe/host_banks.py:5-12——顺序反了会先付一轮全页 zero-fill，DSV4 的 137 GiB 约 47 秒白搬）。不 pin 的层（LOCKED：只有 OS 锁无设备地址；PAGEABLE：什么都不锁）没有 GPU 可见的别名，第 11 章见过它们在 copy_missing 里走整层同步路径——对应运行时字段 layer_residency 与 _unpinned_layers（offload_cache.py:213-217）。</p>
+    <p>普通层用 mmap + 填满后注册（pin-after-fill，moe/host_banks.py:5-12——顺序反了会先付一轮全页 zero-fill，DSV4 的 137 GiB 约 47 秒白搬）。不 pin 的层（LOCKED：只有 OS 锁无设备地址；PAGEABLE：什么都不锁）没有 GPU 可见的别名，第 11 章见过它们在 copy_missing 里走整层同步路径——对应运行时字段 layer_residency 与 _unpinned_layers（offload_cache.py:240-243）。</p>
     <p>ds_fp4 模型（DeepSeek-V4）还有一个「把标量循环挪出临界路径」的实例：W4A8 参考实现要求激活先过一遍 FP8 round-trip，C++ 侧的实现是单线程标量链（~0.3ms/层，H=4096），整条 decode 都在等它。有 GPU 时把这个数值上完全相同的 round-trip 挪到 GPU 上做（D2H 之前），CPU 侧跳过：</p>
-    <div class="code-title">python/freetoken/moe/cpu_executor.py:319-326 — GPU prequant（摘录，注释为译注）</div>
+    <div class="code-title">python/freetoken/moe/cpu_executor.py:211-218 — GPU prequant（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ds_fp4: the reference FP8 activation round-trip is a scalar per-element chain</span>
 <span class="cmt"># that the C++ side runs single-threaded on the CUDA host-callback thread --</span>
 <span class="cmt"># straight on the decode critical path (~0.3ms/layer at H=4096, every worker and</span>
@@ -216,7 +224,7 @@ next power of two (a 70GB bank would reserve 128GB)."""</span></pre>
 <span class="cmt"># round-trip as a captured GPU kernel BEFORE the D2H ... Measured on</span>
 <span class="cmt"># DeepSeek-V4-Flash bs=1 decode: 12.85 -&gt; 15.65 tok/s, output bit-identical</span>
 <span class="cmt"># (tests/moe/test_dsfp4_prequant.py).</span>
-self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">and</span> device.type == <span class="st">"cuda"</span></pre>
+self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">and</span> device.type == <span class="st">"cuda"</span> <span class="kw">and</span> _DSFP4_GPU_PREQUANT</pre>
     <div class="annotation">15.65 对 12.85 是 22% 的提升，来源只是「别让每层的 decode 都在单线程标量循环上排队」（DSV4 有 43 层 MoE，每层省一次往返）。两个配套值得记：一是<strong>位等价测试</strong>（tests/moe/test_dsfp4_prequant.py）——GPU 侧用与 GPU W4A8 路径 bit-identical 的 kernel，测试跑两种 round-trip 各一遍逐位断言相等，「数值相同」不是声称而是被测过的性质；二是改动标在代码里而非只在 changelog（注释里的 tok/s 数字），下一个读代码的人能直接看到这个分支为什么存在。</div>
   </section>
 
@@ -240,7 +248,7 @@ self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">an
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>hybrid 的所有设计都从一个比例出发：q* = pcie_bw/cpu_bw，两边同时收工的分流比例——它来自 benchbw 的实测争用带宽，不是公式推导。decode 侧用双向置零保证每条路由恰好算一次（GPU 权重置 0、CPU id 置 -1），全设备端形状固定。CPU 工作怎么嵌进 GPU 流？memop 门铃：write done=0 → write ready=1 → … → wait done，前端执行不占 SM，利用率数字保持诚实。注释里的教训也值得带走：回调 30-50µs×2/层太贵；自旋内核骗功耗调度反降频；watchdog 判死要三重确认。host bank 的一切为带宽服务：物理核 pin、协调者独占核、精确尺寸 pinned、pin-after-fill；GPU prequant 把标量循环挪出临界路径，12.85 → 15.65 tok/s，位等价测试钉住正确性。llama.cpp 的对照是切图接力不需要协议——复杂度差源于「CPU 是否要进 CUDA 流」。</p>
+    <p>hybrid 的所有设计都从一个比例出发：q* = pcie_bw/cpu_bw，两边同时收工的分流比例——它来自 benchbw 的实测争用带宽，不是公式推导。decode 侧用双向置零保证每条路由恰好算一次（GPU 权重置 0、CPU id 置 -1），全设备端形状固定。CPU 工作怎么嵌进 GPU 流？memop 门铃：write done=0 → write ready=task（一个门铃字编码 layer+bs，服务所有层）→ … → wait done，前端执行不占 SM，利用率数字保持诚实。注释里的教训也值得带走：回调 30-50µs×2/层太贵；自旋内核骗功耗调度反降频；watchdog 判死要三重确认。host bank 的一切为带宽服务：物理核 pin、协调者独占核、精确尺寸 pinned、pin-after-fill；GPU prequant 把标量循环挪出临界路径，12.85 → 15.65 tok/s，位等价测试钉住正确性。llama.cpp 的对照是切图接力不需要协议——复杂度差源于「CPU 是否要进 CUDA 流」。</p>
     <p>两台机器、两条路线都拆完了。下一章把全部对照收拢成一张表，再给自研引擎画路线。<a href="13-build-own-engine.html">第 13 章：双引擎对照·自研</a>。</p>
   </div>
 
@@ -257,7 +265,7 @@ self._gpu_prequant = fmt == <span class="st">"ds_fp4"</span> <span class="kw">an
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b11552 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 12 CPU/GPU 带宽协同 · llama.cpp b11672 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

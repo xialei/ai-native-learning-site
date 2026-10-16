@@ -55,7 +55,7 @@
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
 };</pre>
-    <p>请求进来时先选 slot。选择逻辑有明确的优先级（server-context.cpp:1694-1777）：客户端显式指定 <code class="inline">id_slot</code> 时先按 id 直选，然后才是 LCP 相似度，最后 LRU 兜底——自动调度场景下起作用的是后两级：</p>
+    <p>请求进来时先选 slot。选择逻辑有明确的优先级（server-context.cpp:1696-1777）：客户端显式指定 <code class="inline">id_slot</code> 时先按 id 直选，然后才是 LCP 相似度，最后在空闲 slot 里挑——#30567 之前只按 LRU，之后改为<strong>空 slot 优先、其余才按 LRU</strong>（server-context.cpp:2473-2491）：</p>
     <div class="code-title">tools/server/server-context.cpp — slot 选择（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// ① 按最长公共前缀（LCP）相似度选 slot</span>
 <span class="kw">const</span> size_t lcp_len = tokens.<span class="fn">get_common_prefix</span>(task.tokens);
@@ -69,17 +69,17 @@
 <span class="cmt">// 即将丢掉现有 context 的大半 → 先存进 prompt cache</span>
 <span class="kw">if</span> (f_keep &lt; <span class="nu">0.5f</span>) { update_cache = <span class="kw">true</span>; }
 
-<span class="cmt">// ② 没有相似 slot → LRU</span>
+<span class="cmt">// ② 没有相似 slot → 空闲 slot 里挑：空 slot 优先，其余 LRU</span>
 <span class="kw">if</span> (ret == <span class="kw">nullptr</span>) {
-    <span class="cmt">// used to determine the slot that has been used the longest</span>
+    <span class="kw">const</span> <span class="kw">auto</span> free_slots = <span class="fn">get_free_slots</span>(<span class="nu">1</span>, -<span class="nu">1</span>);
     ...
 }</pre>
-    <div class="annotation">LCP 选择是整个调度里最值钱的一步：多轮对话的每一轮都重复上一轮的 prompt（system + 历史 + 新消息），命中一个带前缀的 slot 意味着<strong>整段历史不用重算</strong>。f_keep &lt; 0.5 的判断（丢掉的旧 context 超过一半）触发 prompt cache 保存——先存档再释放，和 OS 页缓存「换出前写回」是同一个顺序约束。</div>
+    <div class="annotation">LCP 选择是整个调度里最值钱的一步：多轮对话的每一轮都重复上一轮的 prompt（system + 历史 + 新消息），命中一个带前缀的 slot 意味着<strong>整段历史不用重算</strong>。f_keep &lt; 0.5 的判断（丢掉的旧 context 超过一半）触发 prompt cache 保存——先存档再释放，和 OS 页缓存「换出前写回」是同一个顺序约束。#30567 补的是另一个洞：此前 free slot 只按最近使用时间排，子任务常落在保存着父任务状态的 slot 上、把状态冲掉而没存 prompt cache——排序改成空 slot 优先后（get_free_slots 里 stable_sort：n_tokens==0 的排前面），连带把子任务覆盖前的存档也补上了，官方数字是 12 个状态轮转下 prompt cache 读取从 5 次涨到 36 次。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">9.2</span>前缀复用与 cache_reuse</h2>
-    <p>选中 slot 后，新 prompt 与 slot 现有 tokens 求公共前缀，KV 从前缀末端开始算（server-context.cpp:3594-3613）。注意外层条件在 2026-09 加上了 <code class="inline">&amp;&amp; !is_stateless_task</code>（#29556）——embedding/rerank 这类无状态任务根本不该进前缀复用分支，此前靠 cache_prompt 默认值兜着：</p>
+    <p>选中 slot 后，新 prompt 与 slot 现有 tokens 求公共前缀，KV 从前缀末端开始算（server-context.cpp:3698-3716）。注意外层条件在 2026-09 加上了 <code class="inline">&amp;&amp; !is_stateless_task</code>（#29556）——embedding/rerank 这类无状态任务根本不该进前缀复用分支，此前靠 cache_prompt 默认值兜着：</p>
     <div class="code-title">tools/server/server-context.cpp — 前缀复用（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// n_past = 公共前缀长度；之后的 token 才需要 prefill</span>
 n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_tokens);
@@ -87,6 +87,11 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 <span class="cmt">// 子请求最多从共享前缀起算，不许越过它（#29818 /v1/systemone，decision models）</span>
 <span class="kw">if</span> (slot.task-&gt;<span class="nu">n_tokens_shared</span> &gt; <span class="nu">0</span>) {
     n_past = std::min(n_past, slot.task-&gt;<span class="nu">n_tokens_shared</span>);
+}
+
+<span class="cmt">// decision 输出从 batch 里读，第一个位置必须进批（#30498）</span>
+<span class="kw">if</span> (n_decision_first &gt;= <span class="nu">0</span>) {
+    n_past = std::min(n_past, n_decision_first);
 }
 
 <span class="cmt">// alora 调用点之后不缓存</span>
@@ -97,7 +102,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 <span class="kw">const bool</span> can_cache_reuse =
     <span class="fn">llama_memory_can_shift</span>(llama_get_memory(ctx_tgt)) &amp;&amp;
     !slot.prompt.tokens.has_mtmd;</pre>
-    <p><code class="inline">n_cache_reuse</code> 参数更进一步：不求公共前缀，允许<strong>从旧 prompt 中段搬 KV 块</strong>——哪怕新 prompt 与旧 prompt 只在中段局部相似也能复用（server-context.cpp:3620-3664）：</p>
+    <p><code class="inline">n_cache_reuse</code> 参数更进一步：不求公共前缀，允许<strong>从旧 prompt 中段搬 KV 块</strong>——哪怕新 prompt 与旧 prompt 只在中段局部相似也能复用（server-context.cpp:3728-3776）：</p>
     <div class="code-title">tools/server/server-context.cpp — 块级 KV 搬移（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// 双指针扫旧 cache 与新 prompt</span>
 <span class="kw">size_t</span> head_c = n_past;  <span class="cmt">// cache 指针</span>
@@ -116,7 +121,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
         ...
     }
 }</pre>
-    <div class="annotation">cache_reuse 本质上是把第 4 章的 context-shift 原语（seq_rm + seq_add）用到了极致：不再只复用前缀，任何「长度 ≥ n_cache_reuse 的重复片段」的 KV 都可以原地平移复用。限制条件已经写在 can_cache_reuse 里：memory 必须支持 shift，且多模态（mtmd）禁用。有个容易想当然的点：shift 的拒绝条件不是「recurrent 不行」——恰恰相反，recurrent 内存的 <code class="inline">get_can_shift()</code> 直接返回 true（源码注释：shifting the pos is trivial for recurrent models）；真正被拒的是 M-RoPE 这类 <code class="inline">n_pos_per_embd() &gt; 1</code> 的架构，以及 Step35（它用逐层 RoPE 维度，而 K-shift 假设单一的全局 n_rot）。这是 KV 时代对「指令级缓存」的一种类比——搬的粒度从 token 变成 KV 块。</div>
+    <div class="annotation">cache_reuse 实际上是把第 4 章的 context-shift 原语（seq_rm + seq_add）用到了极致：不再只复用前缀，任何「长度 ≥ n_cache_reuse 的重复片段」的 KV 都可以原地平移复用。限制条件已经写在 can_cache_reuse 里：memory 必须支持 shift，且多模态（mtmd）禁用。有个容易想当然的点：shift 的拒绝条件不是「recurrent 不行」——恰恰相反，recurrent 内存的 <code class="inline">get_can_shift()</code> 直接返回 true（源码注释：shifting the pos is trivial for recurrent models）；真正被拒的是 M-RoPE 这类 <code class="inline">n_pos_per_embd() &gt; 1</code> 的架构，以及 Step35（它用逐层 RoPE 维度，而 K-shift 假设单一的全局 n_rot）。这是 KV 时代对「指令级缓存」的一种类比——搬的粒度从 token 变成 KV 块。</div>
   </section>
 
   <section class="block">
@@ -144,12 +149,17 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 
   <section class="block">
     <h2><span class="num">9.4</span>prompt cache：把整个 slot 存档</h2>
-    <p>前缀复用只在「slot 还留着那个 prompt」时有效。slot 被复用后旧 prompt 的 KV 就没了——prompt cache 把它留在内存里（tools/server/server-task.h:612-681）。注意是纯 RAM、没有磁盘持久化，容量由 <code class="inline">cache_ram_mib</code>（默认 8192，即 8 GiB）控制：</p>
+    <p>前缀复用只在「slot 还留着那个 prompt」时有效。slot 被复用后旧 prompt 的 KV 就没了——prompt cache 把它留在内存里（tools/server/server-task.h:622-690）。注意是纯 RAM、没有磁盘持久化，容量由 <code class="inline">cache_ram_mib</code>（默认 8192，即 8 GiB）控制：</p>
     <div class="code-title">tools/server/server-task.h — prompt cache（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">struct</span> <span class="cl">server_prompt</span> {
     server_tokens tokens;
     std::list&lt;common_prompt_checkpoint&gt; checkpoints;  <span class="cmt">// KV 状态快照</span>
     ...
+};
+
+<span class="kw">struct</span> <span class="cl">server_prompt_data</span> {
+    std::vector&lt;uint8_t&gt; main;    <span class="cmt">// 主模型 KV 快照的序列化字节</span>
+    std::vector&lt;uint8_t&gt; drft;    <span class="cmt">// draft 模型的快照（#30574，投机解码配套）</span>
 };
 
 <span class="kw">struct</span> <span class="cl">server_prompt_cache</span> {
@@ -162,8 +172,8 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
     ...
     <span class="kw">bool</span> <span class="fn">load</span>(server_prompt &amp; prompt, <span class="kw">const</span> server_tokens &amp; tokens_new, ...);
 };</pre>
-    <div class="annotation">缓存条目 = token 序列 + KV checkpoint（common_prompt_checkpoint，投机解码那章见过同一类型）。命中时 load() 把 KV 状态直接恢复进 slot——新请求的前缀部分零计算。容量按字节数和 token 数双限。它补的正是 slot 调度的短板：LCP 选择只在「slot 内存里有」的范围内有效，prompt cache 把有效范围扩展到「曾经出现过」的 prompt。</div>
-    <div class="callout info"><b class="tag">一段代码的进化痕迹</b>上面只讲了「存档」，没讲「在哪打点」——这半边也是一行一行磨出来的。checkpoint 的打点位置不是均匀分批，而是在<strong>用户消息的开头</strong>：server 填批循环里每加一个 token 都要问一次 <code class="inline">spans.is_user_start(...)</code>（server-context.cpp:3982），是就在这里 break 掉、让这一小批单独成一个 ubatch——这样 KV 快照正好落在多轮对话的消息边界上，多轮续聊能从最近一条用户消息整段复用。但 server 怎么知道「第 N 个 token 是用户消息的开头」？靠 chat 模板解析器登记的 <code class="inline">message_delimiters</code>（common/chat.h:289）在 prompt 里搜出消息跨度。坑在这：qwen3-coder、gpt-oss、kimi-k3 等解析器早就登记了各自的分隔符，DeepSeek V3.2/V4 的解析器却一直没登记——<code class="inline">&lt;｜User｜&gt;</code>/<code class="inline">&lt;｜Assistant｜&gt;</code> 就是普通文本，checkpoint 在整个 DSv3.2/DSv4 家族上静默失效。#29008（2026-09）只加了 6 行补上这个登记。启示：一条格式约定要<strong>解析器和 server 两侧同时接上</strong>才生效——Book 里反复出现的「特性接线不全」在这个小案例上重演了一遍。</div>
+    <div class="annotation">缓存条目 = token 序列 + KV checkpoint（common_prompt_checkpoint，投机解码那章见过同一类型）。命中时 load() 把 KV 状态直接恢复进 slot——新请求的前缀部分零计算。容量按字节数和 token 数双限。它补的正是 slot 调度的短板：LCP 选择只在「slot 内存里有」的范围内有效，prompt cache 把有效范围扩展到「曾经出现过」的 prompt。#30574 之后快照字节拆成 main 和 drft 两份——slot 文件（9.2 的持久化）和 prompt cache 共用同一对序列化结构，draft 模型的 KV 也能跟着存档了。</div>
+    <div class="callout info"><b class="tag">一段代码的进化痕迹</b>上面只讲了「存档」，没讲「在哪打点」——这半边也是一行一行磨出来的。checkpoint 的打点位置不是均匀分批，而是在<strong>用户消息的开头</strong>：server 填批循环里每加一个 token 都要问一次 <code class="inline">spans.is_user_start(...)</code>（server-context.cpp:4095），是就在这里 break 掉、让这一小批单独成一个 ubatch——这样 KV 快照正好落在多轮对话的消息边界上，多轮续聊能从最近一条用户消息整段复用。但 server 怎么知道「第 N 个 token 是用户消息的开头」？靠 chat 模板解析器登记的 <code class="inline">message_delimiters</code>（common/chat.h:311）在 prompt 里搜出消息跨度。坑在这：qwen3-coder、gpt-oss、kimi-k3 等解析器早就登记了各自的分隔符，DeepSeek V3.2/V4 的解析器却一直没登记——<code class="inline">&lt;｜User｜&gt;</code>/<code class="inline">&lt;｜Assistant｜&gt;</code> 就是普通文本，checkpoint 在整个 DSv3.2/DSv4 家族上静默失效。#29008（2026-09）只加了 6 行补上这个登记。启示：一条格式约定要<strong>解析器和 server 两侧同时接上</strong>才生效——Book 里反复出现的「特性接线不全」在这个小案例上重演了一遍。</div>
   </section>
 
   <section class="block">
@@ -176,12 +186,12 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 <span class="fn">register_responses_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_control_routes</span>(app, get_global_state, lambda: _MODEL_SAMPLING)
 <span class="fn">register_accounting_routes</span>(app, get_global_state)</pre>
-    <div class="annotation">与 llama-server 不同，FreeToken 同时暴露 OpenAI、Anthropic、Responses 三套协议——端侧应用（桌面客户端等）可能来自任何一家生态。HTTP 进程不直接碰模型：请求经 ZMQ 队列传给 tokenizer/scheduler 进程（utils/mp.py 的 ZmqAsyncPushQueue/ZmqAsyncPullQueue），引擎进程独占 GPU。supervisor（server/supervisor.py）负责启动握手：drain_ready 等所有 worker ack ready、收集进度条、故障时抛 WorkerDied。这个进程拓扑的动机在第 10 章展开：GIL 之下 Python 引擎要把「HTTP 解析、token 流式处理、模型前向」分给不同进程才能吃满 CPU/GPU 流水线。并发上限默认 4：<code class="inline">engine/config.py:26 max_running_req: int = 4</code>（可被 <code class="inline">--max-running-requests</code> 覆盖，shell 模式强制为 1）。</div>
+    <div class="annotation">与 llama-server 不同，FreeToken 同时暴露 OpenAI、Anthropic、Responses 三套协议——端侧应用（桌面客户端等）的协议来源本来就五花八门。HTTP 进程不直接碰模型：请求经 ZMQ 队列传给 tokenizer/scheduler 进程（utils/mp.py 的 ZmqAsyncPushQueue/ZmqAsyncPullQueue），引擎进程独占 GPU。supervisor（server/supervisor.py）负责启动握手：drain_ready 等所有 worker ack ready、收集进度条、故障时抛 WorkerDied。这个进程拓扑的动机在第 10 章展开：GIL 之下 Python 引擎要把「HTTP 解析、token 流式处理、模型前向」分给不同进程才能吃满 CPU/GPU 流水线。并发上限默认 4：<code class="inline">engine/config.py:26 max_running_req: int = 4</code>（可被 <code class="inline">--max-running-requests</code> 覆盖，shell 模式强制为 1）。</div>
   </section>
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>server 层的故事围绕一个目标展开：别重算已经算过的东西。slot 状态机六态，调度按「id 直选（若指定）→ LCP 相似度 → LRU」选槽；前缀复用免算历史，n_cache_reuse 更进一步把「搬 KV 块」推广到中段重复片段。多模态占位符（server_tokens 用 NULL 占位 + 旁挂 map）既支撑图文交错，也划出了 shift/reuse 的多模态禁区。prompt cache 把 KV 状态整体存档，复用范围从「slot 内存里」扩展到「历史上出现过」。FreeToken 侧则是 FastAPI 三协议 + ZMQ 多进程 + supervisor 握手，max_running_req=4。</p>
+    <p>server 层的故事围绕一个目标展开：别重算已经算过的东西。slot 状态机六态，调度按「id 直选（若指定）→ LCP 相似度 → 空闲槽里挑（空 slot 优先，其余 LRU）」选槽；前缀复用免算历史，n_cache_reuse 更进一步把「搬 KV 块」推广到中段重复片段。多模态占位符（server_tokens 用 NULL 占位 + 旁挂 map）既支撑图文交错，也划出了 shift/reuse 的多模态禁区。prompt cache 把 KV 状态整体存档，复用范围从「slot 内存里」扩展到「历史上出现过」。FreeToken 侧则是 FastAPI 三协议 + ZMQ 多进程 + supervisor 握手，max_running_req=4。</p>
     <p>llama.cpp 部分完结。下一章进入 FreeToken 的世界。<a href="10-freetoken.html">第 10 章：FreeToken 引擎总览</a>。</p>
   </div>
 
@@ -198,7 +208,7 @@ n_past = slot.prompt.tokens.<span class="fn">get_common_prefix</span>(input_toke
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b11552 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 09 服务入口 · llama.cpp b11672 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

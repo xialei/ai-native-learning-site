@@ -176,8 +176,8 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
 
   <section class="block">
     <h2><span class="num">7.4</span>对照：FreeToken 的批量采样</h2>
-    <p>llama.cpp 的采样是 CPU 上对整个词表的标量循环；FreeToken 把它做成一个 GPU kernel（python/freetoken/engine/sample.py:25-51）：</p>
-    <div class="code-title">python/freetoken/engine/sample.py:25-51 — sample_impl（摘录，注释为译注）</div>
+    <p>llama.cpp 的采样是 CPU 上对整个词表的标量循环；FreeToken 把它做成一个 GPU kernel（python/freetoken/engine/sample.py:26-52）：</p>
+    <div class="code-title">python/freetoken/engine/sample.py:26-52 — sample_impl（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">sample_impl</span>(logits, temperatures, top_k, top_p) -&gt; torch.Tensor:
     <span class="cmt"># flashinfer 装了用 flashinfer，否则自研 triton kernel</span>
     <span class="kw">if</span> is_flashinfer_installed():
@@ -193,13 +193,23 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
     <span class="kw">if</span> top_k <span class="kw">is</span> <span class="kw">None</span>:
         <span class="kw">return</span> sampling.<span class="fn">top_p_sampling_from_probs</span>(probs, top_p)
     <span class="kw">return</span> sampling.<span class="fn">top_k_top_p_sampling_from_probs</span>(probs, top_k, top_p)</pre>
-    <p>上层接口把「每个请求一份采样配置」压成批量张量：</p>
-    <div class="code-title">python/freetoken/engine/sample.py:59-86 — Sampler.prepare（摘录，注释为译注）</div>
+    <p>上层接口把「每个请求一份采样配置」压成批量张量——#527 起还把 presence/frequency penalty 也压进去（此前 API 收下这两个参数但不生效）：</p>
+    <div class="code-title">python/freetoken/engine/sample.py:60-101 — Sampler.prepare（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">prepare</span>(self, batch: <span class="cl">Batch</span>) -&gt; BatchSamplingArgs:
     params = [r.sampling_params <span class="kw">for</span> r <span class="kw">in</span> batch.reqs]
     is_greedy = [p.<span class="fn">is_greedy</span> <span class="kw">for</span> p <span class="kw">in</span> params]
+    <span class="cmt"># 有惩罚且本轮要出 token 的行才进表：行号 + 计数向量 + 两个系数</span>
+    <span class="cmt"># output_token_counts 是挂在 Req 上的 int32[vocab]，逐 token scatter_add 累计</span>
+    penalties = []
+    <span class="kw">for</span> row, req <span class="kw">in</span> <span class="fn">enumerate</span>(batch.reqs):
+        p = req.sampling_params
+        <span class="kw">if</span> <span class="kw">not</span> (p.presence_penalty <span class="kw">or</span> p.frequency_penalty) <span class="kw">or</span> <span class="kw">not</span> req.can_decode:
+            <span class="kw">continue</span>
+        <span class="kw">if</span> req.output_token_counts <span class="kw">is</span> <span class="kw">None</span>:
+            req.output_token_counts = torch.<span class="fn">zeros</span>(self.vocab_size, dtype=torch.int32, device=self.device)
+        penalties.<span class="fn">append</span>((row, req.output_token_counts, p.presence_penalty, p.frequency_penalty))
     <span class="kw">if</span> all(is_greedy):
-        <span class="kw">return</span> <span class="cl">BatchSamplingArgs</span>(temperatures=<span class="kw">None</span>)  <span class="cmt"># 全 greedy → argmax 特例</span>
+        <span class="kw">return</span> <span class="cl">BatchSamplingArgs</span>(temperatures=<span class="kw">None</span>, penalties=penalties)  <span class="cmt"># 全 greedy → argmax 特例</span>
 
     MIN_P = MIN_T = <span class="nu">1e-6</span>
     <span class="cmt"># greedy 行不靠低温逼近 argmax，由 sample() 里显式选定；</span>
@@ -211,24 +221,32 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
               <span class="kw">for</span> p, g <span class="kw">in</span> zip(params, is_greedy)]
     ...
     greedy_mask = make_device_tensor(is_greedy, torch.bool, self.device) <span class="kw">if</span> any(is_greedy) <span class="kw">else</span> <span class="kw">None</span>
-    <span class="kw">return</span> <span class="cl">BatchSamplingArgs</span>(temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask)</pre>
-    <p>sample 侧对混合批的处理——概率采样照跑，greedy 行最后用 argmax 覆写：</p>
-    <div class="code-title">python/freetoken/engine/sample.py:88-99 — Sampler.sample（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">sample</span>(self, logits, args) -&gt; torch.Tensor:
-    <span class="kw">if</span> args.temperatures <span class="kw">is</span> <span class="kw">None</span>:  <span class="cmt"># 全 greedy：argmax 短路</span>
-        <span class="kw">return</span> torch.<span class="fn">argmax</span>(logits, dim=-1)
-    tokens = <span class="fn">sample_impl</span>(logits.float(), args.temperatures, args.top_k, args.top_p)
-    <span class="kw">if</span> args.greedy_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
-        <span class="cmt"># 混合批对全部行跑概率采样，但 greedy 行必须走 argmax 的确定性并列裁决</span>
-        greedy_tokens = torch.<span class="fn">argmax</span>(logits, dim=-1).to(tokens.dtype)
-        tokens = torch.<span class="fn">where</span>(args.greedy_mask, greedy_tokens, tokens)
-    <span class="kw">return</span> tokens</pre>
-    <div class="annotation"><b>对照读：</b> 先看两个特例的细节。<strong>全 greedy</strong> 时 temperatures is None，直接 argmax，连 softmax 都省。<strong>混合批的 greedy 行</strong>改动更有意思：旧版把 greedy 行塞成「低温 + 数值地板」去近似 argmax，但低温采样对并列最高分 token 的选择是随机的，argmax 是确定性的——同一个 prompt 前缀两次跑出不同续写。#471（2026-09）改成概率采样照跑、greedy 行最后用 argmax 覆写（torch.where 一次向量化完成），另把 <code class="inline">is_greedy</code> 的定义收窄（去掉 <code class="inline">top_p == 1.0</code> 条件——top_k=1 时分布只含一个 token，top_p 无所谓）。再一个省钱细节是条件上传：没有任何请求用 top_k 时这个张量根本不上传——batch 里 4 个请求全默认参数时 GPU 采样只剩 softmax + multinomial。llama.cpp 的可组合责任链 vs FreeToken 的固定 kernel 菜单：前者灵活（grammar/mirostat/DRY 随意组合），后者快（一个 kernel 一件事）且没有 CPU↔GPU 往返——但 grammar 约束在 GPU 采样下无从谈起，FreeToken 的 grammar 支持在 API 层做（第 9 章对照）。</div>
+    <span class="kw">return</span> <span class="cl">BatchSamplingArgs</span>(temperatures, top_k=top_k, top_p=top_p, greedy_mask=greedy_mask, penalties=penalties)</pre>
+    <p>sample 侧在采样<strong>之前</strong>先把惩罚扣到 logits 上，采样<strong>之后</strong>再把新 token 计入——一处张量、两端使用：</p>
+    <div class="code-title">python/freetoken/engine/sample.py:104-124 — Sampler.sample（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>        <span class="kw">if</span> args.penalties:
+            logits = logits.<span class="fn">float</span>().<span class="fn">clone</span>()  <span class="cmt"># 惩罚改写 logits，不能污染原张量</span>
+            <span class="kw">for</span> row, counts, presence, frequency <span class="kw">in</span> args.penalties:
+                <span class="cmt"># frequency 按出现次数线性扣，presence 只看「出现过没有」扣一次</span>
+                logits[row] -= frequency * counts + presence * (counts &gt; <span class="nu">0</span>)
+        <span class="kw">if</span> args.temperatures <span class="kw">is</span> <span class="kw">None</span>:  <span class="cmt"># 全 greedy：argmax 短路</span>
+            tokens = torch.<span class="fn">argmax</span>(logits, dim=-<span class="nu">1</span>)
+        <span class="kw">else</span>:
+            tokens = <span class="fn">sample_impl</span>(logits.float(), args.temperatures, args.top_k, args.top_p)
+            <span class="kw">if</span> args.greedy_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+                <span class="cmt"># 混合批对全部行跑概率采样，但 greedy 行必须走 argmax 的确定性并列裁决</span>
+                greedy_tokens = torch.<span class="fn">argmax</span>(logits, dim=-1).to(tokens.dtype)
+                tokens = torch.<span class="fn">where</span>(args.greedy_mask, greedy_tokens, tokens)
+        <span class="cmt"># 采样流上就地更新计数：重叠调度下下一批的 prepare 可能先于本批 token 回到 CPU</span>
+        <span class="kw">for</span> row, counts, _, _ <span class="kw">in</span> args.penalties:
+            counts.<span class="fn">scatter_add_</span>(<span class="nu">0</span>, tokens[row : row + <span class="nu">1</span>].long(), counts.new_ones(<span class="nu">1</span>))
+        <span class="kw">return</span> tokens</pre>
+    <div class="annotation"><b>对照读：</b> 先看两个特例的细节。<strong>全 greedy</strong> 时 temperatures is None，直接 argmax，连 softmax 都省——但 penalties 在 argmax <em>之前</em>扣，惩罚对 greedy 同样生效。<strong>混合批的 greedy 行</strong>改动更有意思：旧版把 greedy 行塞成「低温 + 数值地板」去近似 argmax，但低温采样对并列最高分 token 的选择是随机的，argmax 是确定性的——同一个 prompt 前缀两次跑出不同续写。#471（2026-09）改成概率采样照跑、greedy 行最后用 argmax 覆写（torch.where 一次向量化完成），另把 <code class="inline">is_greedy</code> 的定义收窄（去掉 <code class="inline">top_p == 1.0</code> 条件——top_k=1 时分布只含一个 token，top_p 无所谓）。再一个省钱细节是条件上传：没有任何请求用 top_k 时这个张量根本不上传——batch 里 4 个请求全默认参数时 GPU 采样只剩 softmax + multinomial。penalty 的实现同样挑了最省事的路径：不在采样 kernel 里加惩罚分支，而是在进 kernel 前把 <code class="inline">freq*计数 + pres*(是否出现过)</code> 一次性减到 logits 上（clone 一份避免污染上游），采样逻辑保持不动；计数的更新也放在采样流上就地 scatter_add，注释点明原因——重叠调度下下一批可能先于本批 token 回到 CPU，等在 CPU 侧更新就晚了。对照 llama.cpp： penalties 是链上一个 sampler，改的是候选数组而不是 logits，还带窗口参数（只惩罚最近 n_last 个 token）。llama.cpp 的可组合责任链 vs FreeToken 的固定 kernel 菜单：前者灵活（grammar/mirostat/DRY 随意组合），后者快（一个 kernel 一件事）且没有 CPU↔GPU 往返——但 grammar 约束在 GPU 采样下无从谈起，FreeToken 的 grammar 支持在 API 层做（第 9 章对照）。</div>
   </section>
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>这一章的核心画面只有一个：候选数组在链上走，每个 sampler 看一眼、动一刀——过滤链只改数组，dist/adaptive-p/mirostat 才是掷骰子的人，链序就是加工顺序。链上还有两个特殊角色：后端 sampler 让 GPU 图直接出 token（grammar 与它互斥，走 CPU 链时靠「采样后校验 + 重采样」兜住）；reasoning budget 永远第一个施加。几个新 sampler 各管一摊：mirostat v2 是意外度反馈控制器，DRY 惩罚「正在形成的重复」，top_n_sigma 按统计截断。FreeToken 那边则是另一套打法：greedy argmax 特例（混合批用 greedy_mask 覆写）、flashinfer/triton kernel、per-request 参数压成批量张量。</p>
+    <p>这一章的核心画面只有一个：候选数组在链上走，每个 sampler 看一眼、动一刀——过滤链只改数组，dist/adaptive-p/mirostat 才是掷骰子的人，链序就是加工顺序。链上还有两个特殊角色：后端 sampler 让 GPU 图直接出 token（grammar 与它互斥，走 CPU 链时靠「采样后校验 + 重采样」兜住）；reasoning budget 永远第一个施加。几个新 sampler 各管一摊：mirostat v2 是意外度反馈控制器，DRY 惩罚「正在形成的重复」，top_n_sigma 按统计截断。FreeToken 那边走的路不一样：greedy argmax 特例（混合批用 greedy_mask 覆写）、presence/frequency 惩罚在进 kernel 前扣到 logits、flashinfer/triton kernel、per-request 参数压成批量张量。</p>
     <p>采样快了还不够，能不能一次算多个 token？下一章投机解码。<a href="08-speculative.html">第 8 章：投机解码</a>。</p>
   </div>
 
@@ -245,7 +263,7 @@ ctx-&gt;mu = ctx-&gt;mu - ctx-&gt;eta * e;</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 07 采样 · llama.cpp b11552 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 07 采样 · llama.cpp b11672 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
