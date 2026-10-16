@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 2 章 · Token 工厂的经济学与指标体系 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 2 章 · Token 工厂的经济学与指标体系</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 2 章 · Economics and Metrics</div>
+      <h1 class="title">Token 工厂的经济学与指标体系</h1>
+      <p class="lede">
+        这一章定义全书唯一的指标体系。之后每一章谈性能、谈优化、谈容量，用的都是这里的词。核心只有一个定义：有效产能。它把吞吐量、延迟 SLA 和合格产出缝在同一个数里——看懂它，你就看懂了为什么"GPU 利用率 90%"可能是个坏消息。
+      </p>
+
+      <h2 id="units">基础计量单位</h2>
+
+      <p>工厂的账本从三个单位开始：GPU 小时、token 吞吐、单位成本。三者的关系是一台"换算机"——花掉 GPU 小时，产出 token 吞吐，两者相除得到单位成本。</p>
+
+      <p><strong>GPU 小时（GPU-hour）。</strong>一座工厂的全部投入最终都能折成 GPU 小时：8 卡机跑一小时是 8 GPU 小时，运维人力按分摊折进去。它是成本侧的总纲——第 15 章的成本核算就是把一张账单摊到 GPU 小时上。</p>
+
+      <p><strong>token 吞吐（throughput）。</strong>产出侧的总数，但要立刻拆成两个轴：输入 token 和输出 token。两者在成本上完全不同——输入 token 在 prefill 阶段批量算（一次前向处理一整段），输出 token 在 decode 阶段逐个算（每生成一个都要跑一次前向，且每步都受显存带宽约束）。同一个模型的每百万输入 token 成本可以做到每百万输出 token 的几分之一，这不是厂商定价策略，是计算结构决定的。所以任何吞吐数字都要问一句：输入输出比例是多少？没有这个比例的吞吐数字没有可比性。</p>
+
+      <p><strong>单位成本（unit cost）。</strong>每百万 token 的完全成本，即"当月全部投入 ÷ 当月合格 token 产出"。注意分母——是合格产出，不是 raw 吞吐；分子——是完全成本，不只是 GPU 折旧。这两个"注意"正是下一节的主角。</p>
+
+      <h2 id="latency">延迟指标：TTFT、ITL 与 SLA</h2>
+
+      <p>有效产能的定义里写着"SLA 约束"，所以先把 SLA 的三个组成部分说清楚。</p>
+
+      <p><strong>TTFT（Time To First Token）</strong>，从请求发出到第一个 token 返回。它由排队时间加 prefill 时间构成，决定用户"系统有没有反应"的体验。流式界面上，TTFT 之外的时间用户都在等待，这个指标一般按 P50/P95/P99 分档承诺，比如 P95 ≤ 2s。</p>
+
+      <p><strong>ITL（Inter-Token Latency），</strong>流式输出中相邻两个 token 的时间间隔，工程上也叫 TPOT（Time Per Output Token）。它决定"字蹦得快不快"的体验。ITL 有个隐蔽的坑：平均 ITL 很好看，但被批调度打断时会出现周期性长尾——某个 decode 步恰好和一条大 prefill 拼在一起，那一步的 ITL 可能是平均值的五倍。所以 ITL 的 SLA 通常对 P99 或"最大值"做约束，这也是 chunked prefill（第 5 章）要解决的问题。</p>
+
+      <p><strong>E2E（端到端时延）</strong>≈ TTFT + 输出 token 数 × ITL。它是前两者的派生指标，SLA 里经常用它兜底（"P95 请求 30s 内完成"）。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>指标</th><th>含义</th><th>体验对应</th><th>受什么主导</th></tr></thead>
+          <tbody>
+            <tr><td>TTFT</td><td>首 token 时延</td><td>反应快不快</td><td>排队 + prefill</td></tr>
+            <tr><td>ITL/TPOT</td><td>逐 token 间隔</td><td>输出顺不顺</td><td>decode 步时延（受批影响）</td></tr>
+            <tr><td>E2E</td><td>完整响应时长</td><td>等多久出全结果</td><td>两者之和 + 输出长度</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>这三个指标构成 SLA 的技术部分。完整的 SLA 还要加上可用性和质量（输出合格率），后两者在第 11 章和第 13 章分别展开。SLA 在本书里不只是运维承诺，它是有效产能定义里的约束条件——没有 SLA，"产能"这个词就退回了吞吐量。</p>
+
+      <h2 id="effective-capacity">有效产能：全书的核心定义</h2>
+
+      <p>现在可以完整给出定义了。</p>
+
+      <blockquote>
+        <p><strong>有效产能</strong> = 在 TTFT / ITL 等 SLA 约束下，单位 GPU（或单位集群）在单位时间内承载的合格请求所产出的 token 数。</p>
+      </blockquote>
+
+      <p>拆开看三个限定词，每个都对应一种"白干的 token"：</p>
+
+      <ul>
+        <li><strong>"SLA 约束下"</strong>——超时被客户端放弃的请求、重试浪费的算力、违背延迟承诺的输出，都不计。这是被排队和过载吃掉的产能。</li>
+        <li><strong>"合格请求"</strong>——4xx/5xx、被截断、内容不合格的产出不计。这是被错误和质量吃掉的产能。</li>
+        <li><strong>"单位 GPU"</strong>——按投入的 GPU 小时归一，扩容不等于增产能，效率掉了扩容也可能是负收益。这是被浪费配置吃掉的产能。</li>
+      </ul>
+
+      <p>这套定义和学术界 goodput 的思想一致：DistServe 论文把"在各自延迟约束下完成"的请求产出定义为 goodput，并指出预填充与解码共享资源时，goodput 优化目标会导出与吞吐优化完全不同的系统设计。<span class="src">来源：DistServe, OSDI 2024</span>它的实战量级有现成的参照：AMD 在单机 8 卡 MI300X 上跑 Qwen3-235B（TTFT 1s + ITL 50ms 的双门槛），同样 8 张卡，单实例混部达标 26/100、拆成两个混部实例 30/100，拆成 prefill/decode 两池后 73/100——有效产能 2.5 倍，卡一张没加；差距不来自"卡多了"，来自违约形态从"输出抖动"换成了"首 token 稍慢"。<span class="src">来源：vLLM Blog《Next-Level Inference: Why Your Single-Node vLLM Setup Needs Prefill-Decode Disaggregation》（AMD / Embedded LLM，MoRI-IO）, 2026-04-07</span>本书的贡献是把它工程化：给出一个运维每天能算、每周能复盘的口径。</p>
+
+      <p><strong>计算方法。</strong>对一个观测周期（比如一天）：</p>
+
+      <pre><code>有效产能 = Σ(合格请求的产出 token)
+           ÷ 投入的 GPU 小时数
+           ÷ SLA 达标窗口占比修正</code></pre>
+
+      <p>工程实现上更常用的形式是先算达标率：把请求按是否满足各自 SLA 分档，有效产能 = raw 吞吐 × 达标请求占比 × 合格产出占比。分母里的两个占比从网关日志和模型日志聚合，第 13 章的监控面板会专门给这两个数留位置。</p>
+
+      <p>三个限定词各自的量级感（示意）：管理不善的集群，排队超时能吃掉两三成产能；重试风暴叠加时更多；质量不合格在 Agent 场景（一个失败请求意味着整条链路重来）造成的浪费最重。三项相乘，"有效产能是吞吐量的六成"在真实集群里不是极端值。</p>
+
+      <h2 id="utilization">为什么 GPU 利用率高不等于经济效益好</h2>
+
+      <p>现在回答概述里埋的问题。GPU 利用率（SM 利用率或"有任务在跑"的时间占比）衡量的是资源忙不忙，不衡量忙得值不值。三种典型的高利用率低效益：</p>
+
+      <p><strong>拿离线任务填坑。</strong>在线低峰时跑离线批处理把卡填满，利用率上去了，但如果这些离线 token 本来可以等到更闲的窗口、或者本来可以跑在更便宜的卡上，那这是用最贵的产能干了最便宜的活。混部本身是对的（第 10 章整章讲），但账要分开算：在线 SLA 达标率和离线任务完成量是两个指标，合并成"利用率"会掩盖两边。</p>
+
+      <p><strong>无效重试填满机器。</strong>过载导致超时，客户端重试，重试进一步加剧过载——重试流量是吞吐量表上的"产出"，账本上的废品。监控上要单独分列"重试消耗的 GPU 小时"。</p>
+
+      <p><strong>在错误的配置上满负荷。</strong>TP=8 跑一个本可以 TP=2 的模型，四倍的卡跑出了 1.3 倍的吞吐，每张卡都很忙，单位成本是别人的三倍。利用率考核不出这种问题，只有单位成本能。</p>
+
+      <blockquote>
+        <p><strong>一条管理原则：利用率用于发现浪费，单位成本用于评估经营。</strong>拿利用率考核团队，团队会学会把卡"看起来很忙"；拿单位成本和有效产能考核，团队才会去优化真正重要的东西。</p>
+      </blockquote>
+
+      <h2 id="curves">吞吐、延迟与并发的三角关系</h2>
+
+      <p>有效产能随并发不是线性增长的。同一批请求、固定输入输出分布，把并发从 1 拉到饱和，会看到这样一条曲线（示意，形态来自 DistServe 的分析框架）：</p>
+
+      <figure>
+        <div class="mermaid">
+xychart-beta
+  title "并发 vs 吞吐与 P99 ITL（示意形态）"
+  x-axis [1, 8, 32, 64, 128, 256, 512]
+  y-axis "相对值" 0 --> 110
+  line "吞吐" [3, 18, 55, 78, 90, 96, 98]
+  line "P99 ITL（越低越好）" [1, 2, 4, 8, 18, 45, 80]
+        </div>
+        <figcaption>并发爬坡的典型形态：吞吐先陡后平，P99 ITL 先平后陡。两条曲线的拐点不重合——有效产能的最优点在两条曲线之间，而不是吞吐的最高点。数字为示意，形态为重点。</figcaption>
+      </figure>
+
+      <p>读这张图的要点：<strong>有效产能的最大值不在吞吐最大处。</strong>并发 256 时吞吐比并发 64 高两成，但 P99 ITL 涨了五倍以上，若 SLA 是"P99 ITL ≤ 50ms"，并发 256 的产出几乎全部不合格。有效产能在拐点附近达到峰值，然后掉头向下——并发更高、吞吐更高，产出却更不值钱，这就是第 1 章那座"利用率三成可能比 API 还贵"的工厂在指标层面的形态。拐点在哪里，取决于负载分布和调度策略，这正是后续章节反复出现的权衡。</p>
+
+      <h2 id="experiment">▶ 实验：吞吐与有效产能随并发的变化曲线</h2>
+
+      <p>把上一节示意图变成你自己的数据，方法固定如下：</p>
+
+      <ol>
+        <li>固化负载：一组真实流量分布（输入/输出长度分布、请求间隔分布），第 14 章讲怎么采；此处用录制的 trace 回放，保证可重复。</li>
+        <li>并发爬坡：并发数从 1 起按 1-2-5 序列（1、2、5、10、20、50、100、200）逐步上调，每档稳定运行 10 分钟。</li>
+        <li>记录四列：吞吐（token/s，分输入输出）、TTFT P50/P95/P99、ITL P50/P95/P99、完成率与重试率。</li>
+        <li>代入你的 SLA：设 TTFT ≤ 2s（P95）、ITL ≤ 50ms（P99），把每档标注"达标/不达标"。</li>
+        <li>画出两条线：吞吐曲线、有效产能曲线（只计达标请求的产出）。两者的差值就是"你的 SLA 值多少钱"。</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>并发</th><th>吞吐（示意）</th><th>TTFT P95（示意）</th><th>ITL P99（示意）</th><th>SLA 达标率（示意）</th><th>有效产能（示意）</th></tr></thead>
+          <tbody>
+            <tr><td>32</td><td>55%</td><td>0.8s</td><td>12ms</td><td>100%</td><td>55</td></tr>
+            <tr><td>64</td><td>78%</td><td>1.4s</td><td>22ms</td><td>98%</td><td>76</td></tr>
+            <tr><td>128</td><td>90%</td><td>2.6s</td><td>58ms</td><td>61%</td><td>55</td></tr>
+            <tr><td>256</td><td>96%</td><td>5.1s</td><td>140ms</td><td>23%</td><td>22</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>注意示意数据里的形态：吞吐一路涨到 96，有效产能却在 76 附近见顶回落。找出你自己环境里的峰值位置和回落斜率，是这本实验的第一个交付物。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>指标体系五个词：GPU 小时（投入）、吞吐（产出，必须按输入输出拆开）、TTFT 与 ITL（两个独立的延迟轴）、有效产能（SLA 约束下的合格产出）、单位成本（完全投入除以合格产出）。有效产能的定义拆出三种白干：排队超时、质量不合格、配置浪费。利用率是发现浪费的仪表，单位成本才是经营的标尺。</p>
+        <p>下一章把视角从数字拉回结构：一座工厂从下到上分五层，控制面和数据面怎么分，单机长成集群时架构怎么演进。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-01-gpu-to-factory.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 1 章 · 从 GPU 集群到 Token 工厂</span>
+        </a>
+        <a class="next" href="chapter-03-architecture.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 3 章 · 一座工厂的完整架构</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

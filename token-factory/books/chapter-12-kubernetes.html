@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 12 章 · Kubernetes 与分布式推理编排 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 12 章 · Kubernetes 与分布式推理编排</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第三篇 · 第 12 章 · Kubernetes and Inference Orchestration</div>
+      <h1 class="title">Kubernetes 与分布式推理编排</h1>
+      <p class="lede">
+        前两章的调度器与租户体系，在现实里多半长在 Kubernetes 上。这一章讲三件事：K8s 管推理时哪些地方顺手、哪些地方别扭；发布（部署/升级/回滚）这个日常动作在推理负载上的特殊处理；以及 llm-d 与 Dynamo 两种编排思路的对照。本章的结论先行：推理引擎 ≠ 推理工厂，K8s 是重要的地基，但不是工厂本身。
+      </p>
+
+      <h2 id="k8s-gpu">Kubernetes 管 GPU：顺手的部分</h2>
+
+      <p>K8s 把"一堆异构机器"抽象成资源池，这件事对推理工厂是真实价值：节点标签（卡型、机房、网络分区）+ 设备插件让调度器能按"资源画像"分配实例（第 7 章的资源画像在这里落库）；PVC/挂载让权重分发、日志、checkpoint 有了标准位置；Pod 生命周期钩子把"实例清空、摘流量、退出"变成声明式配置。这些都是拿来就用的。</p>
+
+      <p>发布与回滚也是 K8s 的强项，但推理负载有两个特殊点要处理。<strong>滚动发布的节奏</strong>：一个 TP=8 的大模型实例，启动到就绪要几分钟（权重加载 + 图捕获，第 7 章），maxSurge/maxUnavailable 要按"就绪时间 × 流量"算，而不是照搬 Web 服务的默认值；就绪探针必须挂模型真正可服务（第 7 章的四层检查），否则滚动过程会持续向半死实例导流。<strong>版本切换的平滑性</strong>：新旧实例的输出分布可能有差异（量化档位、采样默认值变了），蓝绿切换比滚动更适合"一个模型一次大版本"的场景——先把新版本作为独立实例池接入网关，灰度切流量，观察 SLA 与质量后再下线旧池。</p>
+
+      <blockquote>
+        <p><strong>权重分发是被低估的发布瓶颈。</strong>几十 GB 到上百 GB 的权重，从镜像仓库到每台节点的拉取时间在高峰期可以压垮发布窗口。解法：节点本地缓存 + P2P 分发或镜像预拉（DaemonSet 预热），把权重当作一级公民管理，而不是当作镜像的附属品。</p>
+      </blockquote>
+
+      <h2 id="k8s-gaps">K8s 管不了的部分：缺口清单</h2>
+
+      <p>照实说清 Kubernetes 在推理场景的缺口，这些位置正是自研或选型的重心：</p>
+
+      <ul>
+        <li><strong>不做请求级感知</strong>：K8s 调度到 Pod 为止；Pod 内的请求队列深度、缓存命中率、TTFT，调度器一概不知。第 9 章的 Prefix 感知路由、第 10 章的任务调度，K8s 都不提供。</li>
+        <li><strong>扩缩容信号不对</strong>：HPA 默认盯 CPU/内存，推理负载要按"队列深度 × token 吞吐"扩缩，需要自定义指标（第 13 章的监控指标在这里复用）。冷启动几分钟的实例让"反应式扩容"几乎没用——缩容要保守（防止流量波动反复启停），扩容靠预测或常驻余量。</li>
+        <li><strong>KV 状态不感知</strong>：Pod 重启丢 KV 缓存（第 7 章的冷启动尖峰），驱逐策略不知道"这个实例的缓存预热值多少钱"，会做出对缓存命中率灾难性的搬迁决策。</li>
+        <li><strong> Gang 调度（多卡成组）</strong>：TP=8 的实例要么八张卡都拿到、一张都不要，原生的 Pod 调度顺序分配会造成死锁式等待，需要 coscheduling 类插件或按"整机"为调度单位。</li>
+      </ul>
+
+      <h2 id="llmd-dynamo">llm-d 与 Dynamo：两种编排思路的对照</h2>
+
+      <p>把"K8s 之上补齐推理编排"这件事做得最成体系的是两个项目，思路不同，对照着看能看清设计空间：</p>
+
+      <p><strong>llm-d 走 Kubernetes 原生路线</strong>：在 K8s 之上以标准组件组合出推理编排——推理感知的网关路由（含 prefix 感知）、基于 K8s 的模型实例管理、分布式 KV 缓存层。它的路由与调度器（EPP）会替你选好 prefill/decode 端点并编排两者之间的 KV 交接；缓存感知不是靠预测，靠的是把各实例的缓存块事件流（KVEvents）聚合成全局索引，按真实缓存状态给副本打亲和分（第 9 章的"精确版"，同硬件基准下 TTFT P90 比近似版快 57 倍）。它的编排范围不限于推理服务本身：后训练负载也在射程内——时间切片把 RL 作业的相位（采样/训练）作为可调度单元，在 K8s 的资源分配机制上做轮转独占与显存快照，多个训练作业共享同一批卡（第 10 章末尾的实测：3 作业挤 2 卡，GPU 小时比串行省约 28%）。它的立场是"推理编排的每一步都能映射回 K8s 的原语"，好处是站在生态上（安全、多租户、运维工具链全部继承），代价是要把推理的特殊语义"翻译"进通用框架。适合已经深度使用 K8s、希望推理编排长在既有平台上的团队。<span class="src">来源：llm-d 项目说明（Kubernetes 原生分布式推理）；llm-d P/D 指南；llm-d KV-Cache Blog, 2025-09-24；llm-d 时间切片 Blog, 2026-09-14</span></p>
+
+      <p><strong>NVIDIA Dynamo 走专用控制平面路线</strong>：数据中心的分布式推理系统，把路由、KV 管理、worker 编排做成自己的组件，紧贴 NVIDIA 硬件栈的性能特性。它的立场是"推理集群值得拥有自己的专用控制面"，性能上限与集成深度换通用性。适合 NVIDIA 硬件为主、追求极限吞吐、愿意绑定技术栈的团队。<span class="src">来源：NVIDIA Dynamo 项目说明（Datacenter Scale Distributed Inference Serving Framework）</span></p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>llm-d（K8s 原生）</th><th>Dynamo（专用平面）</th></tr></thead>
+          <tbody>
+            <tr><td>编排基座</td><td>K8s 组件组合（Gateway API 等）</td><td>自有控制面 + worker 编排</td></tr>
+            <tr><td>与硬件的关系</td><td>中立</td><td>NVIDIA 栈深度集成</td></tr>
+            <tr><td>路由与 KV 感知</td><td>推理感知路由、KV 缓存层</td><td>内置路由、KV 管理、PD 分离支持</td></tr>
+            <tr><td>适合的团队</td><td>已有 K8s 平台、要长在自家平台上</td><td>追求单集群性能极致、NVIDIA 全栈</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>本书第 10 章的自研调度器与这两个项目不冲突：它们提供的是"编排的公共部分"（部署、路由框架、KV 传输底座），你的负载画像、配额语义、混部规则仍然是自己的。选型的判断标准是"哪边的公共部分与你的环境重叠更多"——已重仓 K8s 选 llm-d 形态，纯 NVIDIA 机群要极限性能看 Dynamo。这里补一条第 8 章的呼应：PD 分离生产化的主要坑——KV 交接编排、租期超时、失败降级——这两个项目都已经趟过，自研代理只适合开发环境；vLLM 官方对测试用示例代理的定位原话是"不能上生产"。另外 vLLM 生产栈的 Helm chart 已内置分离式 prefill 部署形态，AIBrix 补控制面，KServe 的 LLMInferenceService 则构建在 llm-d 之上——K8s 路线的三个深度，选型时值得一并看。</p>
+
+      <h2 id="boundary">核心结论：推理引擎 ≠ 推理工厂</h2>
+
+      <p>本章与第 10 章共用的结论，单独再立一次碑。推理引擎解决"一个实例内的高效"，推理工厂解决"一组实例的组织"；两个问题之间的空档——路由、配额、混部、计量、故障编排——不会因为引擎版本升级而自动补上，也不会被任何一个"all-in-one 开源方案"完全覆盖。工厂的蓝图要自己画，公共组件按图取用。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>K8s 提供资源池抽象、声明式生命周期与标准化发布，推理场景要补四件事：请求级感知路由、以队列深度为信号的扩缩容、缓存感知的调度、多卡整机的 gang 调度。发布的特殊处理围绕冷启动：就绪探针四层、蓝绿优先、权重分发预缓存。llm-d 与 Dynamo 代表"K8s 原生组装"与"专用控制面"两条路线，选择依据是既有平台重仓与硬件栈。引擎、编排、工厂三层职责不能互相替代。</p>
+        <p>第三篇（组织成厂）收束。第四篇进入运营：先看一座工厂怎么"看得见"——监控与故障排查。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-11-multitenancy.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 11 章 · 多租户、服务等级与过载保护</span>
+        </a>
+        <a class="next" href="chapter-13-observability.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 13 章 · 监控、可观测性与故障排查</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

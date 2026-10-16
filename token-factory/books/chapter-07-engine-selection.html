@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 7 章 · 推理引擎选型与集群部署 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 7 章 · 推理引擎选型与集群部署</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第二篇 · 第 7 章 · Engine Selection and Deployment</div>
+      <h1 class="title">推理引擎选型与集群部署</h1>
+      <p class="lede">
+        【重点章】引擎是工厂里最重要的设备，选错 Engines 后面全拧着。这一章给三个东西：三大引擎的定位对照（不排名，只说谁适合什么）、从"装好一个引擎"到"集群里管好 N 个实例"之间的全部工程——资源发现、启动编排、健康检查、失败恢复、异构硬件。所有结论标注版本与硬件前提，因为这一章的内容比其他章更容易过期。
+      </p>
+
+      <h2 id="landscape">三大引擎的定位</h2>
+
+      <p>先把最容易犯的分类错误清掉：vLLM、SGLang、TensorRT-LLM 都是"推理执行"层的东西——给定模型和请求，把 token 高效跑出来。它们不是网关，不是调度器，也不是 KV 存储系统；第 9 章往上的那些职责，选任何一个引擎都解决不了。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>vLLM</th><th>SGLang</th><th>TensorRT-LLM</th></tr></thead>
+          <tbody>
+            <tr><td>出身与生态</td><td>UC Berkeley 系，社区最广，模型覆盖最快</td><td>从 RadixAttention 论文起家，前缀缓存与结构化输出见长</td><td>NVIDIA 官方，与硬件深度绑定</td></tr>
+            <tr><td>上手成本</td><td>低（pip 装、OpenAI 兼容起服）</td><td>低（同）</td><td>高（需编译 engine、版本对齐）</td></tr>
+            <tr><td>性能特征</td><td>均衡，默认配置合理，新特性跟进快</td><td>高并发与缓存命中场景强，调优空间大</td><td>N 卡上极限性能的参照系</td></tr>
+            <tr><td>运维成本</td><td>低-中：发版快，跟随需要纪律</td><td>低-中：同</td><td>中-高：版本耦合与构建链维护</td></tr>
+            <tr><td>典型选择</td><td>业务多变、模型多、快速跟随上游</td><td>Agent/结构化输出重、前缀命中率高的负载</td><td>硬件定型、追求极致单卡吞吐、可接受构建流程</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>选型建议按三条问，不按排行榜：<strong>你的模型新不新？</strong>发布三天就要求上线的新架构，vLLM/SGLang 的跟进速度占优，TensorRT-LLM 要等支持。<strong>你的负载长什么样？</strong>前缀命中率高的流量（Agent、多轮、RAG）SGLang 的 RadixCache 值得单独评估；纯离线吞吐，三者差距用你的压测说话。<strong>你有多少运维人力？</strong>TensorRT-LLM 的构建链（模型转 engine、版本配对）是一个真实的持续成本，小团队慎入。</p>
+
+      <p>还有一个容易忽略的选项：两个引擎同时用。不同的模型实例用不同引擎完全正常——小模型跑 vLLM 求覆盖广，Agent 主力模型跑 SGLang 求缓存命中，都在同一个网关后面。引擎是工厂里的不同机床，不是意识形态。</p>
+
+      <h2 id="deploy">从单实例到集群：部署工程清单</h2>
+
+      <p>引擎装好只是起点。一个实例从"能跑"到"集群里可靠地跑"，中间是一张工程清单：</p>
+
+      <p><strong>GPU 资源发现与拓扑识别。</strong>调度器要知道每台机器有几张卡、卡间拓扑（NVLink 分组、NUMA 亲和）、网络带宽。一个 TP=8 的实例必须拿到同一台机器上 NVLink 全互联的 8 张卡——跨 NUMA 摆放的性能损失能到两位数。工具层面 nvidia-smi topo -m 给出静态拓扑，K8s 场景由设备插件与拓扑感知调度（第 12 章）接手。</p>
+
+      <p><strong>模型实例的资源规划。</strong>每个实例上线前要回答四个数：权重多大（按精度）、KV 池要留多少（第 4 章预算表）、激活与图开销多少、总共占几张卡。这四个数写进实例的"资源画像"，调度器按画像分配而不是按"型号一样就行"分配。显存按 90% 规划、留 10% 余量的做法（对应引擎默认 gpu_memory_utilization 0.92 的量级）是保守起步值，压测后可以收紧或放宽。</p>
+
+      <p><strong>分布式启动。</strong>多卡实例的启动顺序是"拉起 → 权重加载 → 拓扑探测 → 图捕获 → 就绪"。就绪探针必须挂在"图捕获完成、能处理请求"之后而不是进程存活——没做这一步的团队都经历过"实例起来了但第一条请求超时 30 秒"的冷启动事故。健康检查要分层：进程活、端口通、模型加载完、冒烟请求过，四层状态分别上报（第 13 章）。</p>
+
+      <p><strong>失败恢复。</strong>三类失败三套动作：请求级失败（OOM 单请求、超时）由引擎与网关处理，重试；实例级失败（进程崩溃、GPU 掉卡）由编排层重启实例并摘流量；节点级失败（机器没了）由调度器把实例整体迁走。关键参数是每个动作的超时与重试上限——没有上限的自动重启会把坏卡变成无限循环。有状态部分（KV Cache）在实例重启时天然丢失，对在线请求的表现是"缓存全凉、TTFT 尖峰"，网关要有对应的流量整形（第 11 章）。</p>
+
+      <h2 id="heterogeneous">异构硬件：H 系之外的现实</h2>
+
+      <p>真实工厂的硬件池往往是杂色的：H100/H200、H20、A100、A800、消费卡、国产卡。同一引擎在不同硬件上的最优配置不同，选型表要按"硬件 × 引擎"两个维度重建：</p>
+
+      <ul>
+        <li><strong>显存带宽与容量优先</strong>：推理是带宽敏感负载，同代际里 H200（141GB）相对 H100 的提升主要在长上下文与并发容量，H20 的算力低但显存大、能效特殊——把"什么模型什么配置跑哪代卡"写成显式对照表，而不是默认最新卡一定最优。</li>
+        <li><strong>软件栈版本要锁</strong>：驱动、CUDA、PyTorch、引擎版本、（若用）Triton/FlashInfer 的版本组合要作为一个整体测试与发布，升级一个点的随意性是集群里"莫名其妙性能回退"的头号来源。</li>
+        <li><strong>非 NVIDIA 硬件看三件事</strong>：模型支持清单（你的模型在不在）、推理算子的覆盖度（量化/投机解码这些高级特性有没有）、以及社区 troubleshooting 的深度。选型时给它降半档预期是稳妥的。</li>
+      </ul>
+
+      <h2 id="experiment">▶ 实验：硬件 × 引擎对照表</h2>
+
+      <p>这是全书成本最高、也最有长期价值的实验。方法：</p>
+
+      <ol>
+        <li>固定负载（第 14 章的标准 trace）、固定模型；变量只留硬件与引擎。</li>
+        <li>矩阵至少覆盖：你有的一半以上卡型 × 两个引擎 × 两个精度档。</li>
+        <li>记录六列：吞吐/卡、TTFT P95、ITL P99、显存满载值、启动时间（从拉起到就绪）、一周内的崩溃/OOM 次数（稳定性）。</li>
+        <li>最后加一列"运维备注"：安装的坑、版本锁、已知问题。半年后这张表的价值全在这一列。</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>硬件</th><th>引擎</th><th>吞吐/卡（示意）</th><th>启动就绪</th><th>备注（示意）</th></tr></thead>
+          <tbody>
+            <tr><td>H100×8</td><td>引擎 A</td><td>基准</td><td>6 min</td><td>FP8 全链路可用</td></tr>
+            <tr><td>H20×8</td><td>引擎 A</td><td>0.55×</td><td>5 min</td><td>带宽低，长上下文 KV 需 FP8</td></tr>
+            <tr><td>A100×8</td><td>引擎 B</td><td>0.6×</td><td>4 min</td><td>无 FP8，走 INT8 权重量化</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>这张表会随版本过期，但它定义的工作流（固定负载、固定模型、只动硬件引擎）不会。把它做成季度例行，你的工厂就有了自己的"性能汇率表"。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>选型三问：模型新不新、负载形态（前缀命中率、结构化输出比例）、运维人力。引擎是机床不是信仰，混用合法。部署清单五件事：拓扑识别、资源画像、分层就绪探针、三级失败恢复、版本整体锁。异构环境的核心是把"硬件 × 引擎 × 精度"做成自己的对照表并定期复测。</p>
+        <p>下一章进入本书的标志性话题：Prefill 与 Decode 要不要拆到不同机器上，拆了之后 KV Cache 怎么搬。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-06-parallel-quant.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 6 章 · 并行、量化与推理优化</span>
+        </a>
+        <a class="next" href="chapter-08-pd-disaggregation.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 8 章 · Prefill/Decode 分离与 KV Cache 传输</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

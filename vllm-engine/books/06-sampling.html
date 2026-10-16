@@ -210,7 +210,7 @@ child_requests = []
     child_request.request_id = request_id
     child_request.sampling_params = child_params
     child_requests.append(child_request)</pre>
-    <div class="annotation"><b>拆分后的一切归 <code class="inline">ParentRequest</code>（vllm/v1/engine/parallel_sampling.py:13）管：</b>它记账「这 n 个子请求同源」，子请求输出聚合回一份结果（非流式时 <code class="inline">output_aggregator</code> 按序拼）、追踪最长生成进度（流式时父请求推进到「跑得最远的那个孩子」）。两个细节值得注意：① <code class="inline">get_child_info</code> 对每个孩子生成独立 id；如果父请求带 <code class="inline">seed</code>，每个孩子的 sampling_params 单独克隆、种子各不相同（否则 n 条路会采样出完全相同的序列）；② 排队额度按 n 计——<code class="inline">check_admission(parent_params.n, ...)</code>（async_llm.py:316）的 docstring 写明「A request with n&gt;1 counts as n slots」，一个 n=8 的请求会占掉 8 个 <code class="inline">max_num_queued_reqs</code> 名额。调度器里这 n 个子请求各自参与 continuous batching，独立被抢占、独立完成；共享的前缀天然被前缀缓存接住（第 8 章），所以多路采样的边际成本主要是 KV 与算力，不是重复 prefill。</div>
+    <div class="annotation"><b>拆分后的一切归 <code class="inline">ParentRequest</code>（vllm/v1/engine/parallel_sampling.py:13）管：</b>它记账「这 n 个子请求同源」，子请求输出聚合回一份结果（非流式时 <code class="inline">output_aggregator</code> 按序拼）、追踪最长生成进度（流式时父请求推进到「跑得最远的那个孩子」）。两个细节：① <code class="inline">get_child_info</code> 对每个孩子生成独立 id；如果父请求带 <code class="inline">seed</code>，每个孩子的 sampling_params 单独克隆、种子各不相同（否则 n 条路会采样出完全相同的序列）；② 排队额度按 n 计——<code class="inline">check_admission(parent_params.n, ...)</code>（async_llm.py:316）的 docstring 写明「A request with n&gt;1 counts as n slots」，一个 n=8 的请求会占掉 8 个 <code class="inline">max_num_queued_reqs</code> 名额。调度器里这 n 个子请求各自参与 continuous batching，独立被抢占、独立完成；共享的前缀天然被前缀缓存接住（第 8 章），所以多路采样的边际成本主要是 KV 与算力，不是重复 prefill。</div>
   </section>
 
   <section class="block">
@@ -333,7 +333,7 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
     num_accepted_tokens=num_accepted, ...)</pre>
     <p>接受率会周期性打进日志（<code class="inline">vllm/v1/spec_decode/metrics.py</code>），格式是一行 <code class="inline">SpecDecoding metrics: Mean acceptance length: %.2f, Accepted throughput: %.2f tokens/s, Drafted throughput: %.2f tokens/s, ...</code>——<strong>平均接受长度</strong>（含 bonus）就是「每个 decode step 实际前进几个 token」的直观度量，也是判断该调大还是调小 k 的依据。注意投机的代价与参数：<code class="inline">num_speculative_tokens</code>（每步猜几个）越大，单步验证的 prefill 越长、KV 占用越多，而接受率通常随位置递减（Per-position acceptance rate），所以 k 不是越大越快。</p>
     <h3>旋钮：--speculative-config 的一张配置图</h3>
-    <p>上面出现过的所有参数都从同一个入口进来。命令行上写一个 JSON，落进 <code class="inline">SpeculativeConfig</code>（vllm/config/speculative.py:388）：</p>
+    <p>上面出现过的所有参数都从同一个入口进来。命令行上写一个 JSON，落进 <code class="inline">SpeculativeConfig</code>（vllm/config/speculative.py:385）：</p>
     <div class="code-title">vllm/config/speculative.py — SpeculativeConfig 常用字段（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">SpeculativeConfig</span>:
     enforce_eager: <span class="cl">bool</span> | <span class="kw">None</span> = <span class="kw">None</span>      <span class="cmt"># 覆盖主模型的 enforce_eager</span>
@@ -360,7 +360,7 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
   <section class="block">
     <h2><span class="num">6.8</span>结构化输出：让 logits 在采样前先「守规矩」</h2>
     <p>客户端给了个 JSON Schema（或正则），要求模型输出合法 JSON——这件事在推理栈里的位置只有一处：<strong>采样前把会破坏语法合法性的 token 从 logits 里抹掉</strong>。抹多少、按什么依据抹，来自一个「语法自动机」：把 Schema 编译成一个逐 token 状态机，当前状态允许哪些 token，就用一个 bitmask（词表每 32 个 token 一个 int32）把不允许的位置置负无穷。vLLM 把这条链拆成 CPU 侧和 GPU 侧两半。</p>
-    <p><strong>CPU 侧：语法编译是异步的。</strong>编译一个复杂 Schema 可能要几百毫秒，比一个调度步贵几个量级，所以 <code class="inline">StructuredOutputManager</code>（vllm/v1/structured_output/__init__.py:36）不把它放进调度路径，而是<strong>提交给线程池，请求先在队列里等结果</strong>：</p>
+    <p><strong>CPU 侧：语法编译是异步的。</strong>编译一个复杂 Schema 可能要几百毫秒，比一个调度步贵几个量级，所以 <code class="inline">StructuredOutputManager</code>（vllm/v1/structured_output/__init__.py:47）不把它放进调度路径，而是<strong>提交给线程池，请求先在队列里等结果</strong>：</p>
     <div class="code-title">vllm/v1/structured_output/__init__.py — 语法异步编译（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> self._use_async_grammar_compilation:
     <span class="cmt"># 提交线程池编译，立刻返回 Future</span>
@@ -368,8 +368,8 @@ spec_decoding_stats = self.<span class="fn">make_spec_decoding_stats</span>(
 <span class="kw">else</span>:
     grammar = self._create_grammar(request)  <span class="cmt"># 同步兜底</span>
 request.structured_output_request.grammar = grammar</pre>
-    <div class="annotation"><b>线程池大小是有讲究的（:88）：</b>语法编译是 CPU 密集任务，<code class="inline">max(1, (cpu_count+1)//2)</code> 个线程——注释直说 torch 默认的「CPU 数 × 5」对这类任务太高了。请求带着新状态 <code class="inline">WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>（scheduler.py:2449）排队，每步调度时检查 Future：编译完成就转正为 <code class="inline">WAITING</code> 参与调度（scheduler.py:3201），编译失败则记入 <code class="inline">grammar_compile_error_reqs</code> 单独报错、不连坐整批。还有个平台相关的例外：<code class="inline">external_launcher</code> 模式下每个 TP rank 有自己的调度器，异步编译会让各 rank 的「转正时机」不一致、破坏 torchrun 依赖的确定性，所以只有它强制同步（:58 的注释把因果写得很全）。</div>
-    <p><strong>GPU 侧：bitmask 走异步拷贝 + Triton kernel。</strong>每步调度器把<strong>本步被调度的</strong>结构化请求收集起来（<code class="inline">get_grammar_bitmask</code>，scheduler.py:2005——入口先看 <code class="inline">scheduler_output.has_structured_output_requests</code>，该标志在调度循环里逐请求累积，且 prefill chunk 期间不上约束），算出 int32 位掩码张量发给 worker。worker 在采样前把它作用到 logits：</p>
+    <div class="annotation"><b>线程池大小是有讲究的（:88）：</b>语法编译是 CPU 密集任务，<code class="inline">max(1, (cpu_count+1)//2)</code> 个线程——注释直说 torch 默认的「CPU 数 × 5」对这类任务太高了。请求带着新状态 <code class="inline">WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>（scheduler.py:2442）排队，每步调度时检查 Future：编译完成就转正为 <code class="inline">WAITING</code> 参与调度（scheduler.py:3194），编译失败则记入 <code class="inline">grammar_compile_error_reqs</code> 单独报错、不连坐整批。还有个平台相关的例外：<code class="inline">external_launcher</code> 模式下每个 TP rank 有自己的调度器，异步编译会让各 rank 的「转正时机」不一致、破坏 torchrun 依赖的确定性，所以只有它强制同步（:58 的注释把因果写得很全）。</div>
+    <p><strong>GPU 侧：bitmask 走异步拷贝 + Triton kernel。</strong>每步调度器把<strong>本步被调度的</strong>结构化请求收集起来（<code class="inline">get_grammar_bitmask</code>，scheduler.py:1998——入口先看 <code class="inline">scheduler_output.has_structured_output_requests</code>，该标志在调度循环里逐请求累积，且 prefill chunk 期间不上约束），算出 int32 位掩码张量发给 worker。worker 在采样前把它作用到 logits：</p>
     <div class="code-title">vllm/v1/worker/gpu/model_runner.py — sample() 里的施加点（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> grammar_output <span class="kw">is not None and</span> logits.shape[<span class="nu">0</span>] &gt; <span class="nu">0</span>:
     <span class="cmt"># 采样前原地抹掉不合法 token —— rejection sampler 之前</span>
@@ -377,7 +377,7 @@ request.structured_output_request.grammar = grammar</pre>
         logits, input_batch,
         grammar_output.structured_output_request_ids,
         grammar_output.grammar_bitmask)</pre>
-    <div class="annotation"><b><code class="inline">StructuredOutputsWorker</code>（vllm/v1/worker/gpu/structured_outputs.py:38）内部是一条完整的异步流水：</b>掩码和「掩码行→logit 行」的映射先在 CPU 算好，然后用独立 <code class="inline">torch.cuda.Stream()</code> 异步 host-to-device 拷贝（pin memory + non_blocking），主流 <code class="inline">wait_stream</code> 等拷贝落地后才启动 Triton kernel——大 batch 的掩码搬运被藏进了 logits 计算的时间里。掩码张量形状 <code class="inline">(max_num_logits, cdiv(vocab_size, 32))</code>，投机解码时每个草稿位置一行，被拒的行直接复制「最后一个合法状态」的行（<code class="inline">failed_index</code>，structured_output/__init__.py:388 一带）。批量再大还有一层并行：batch 超过 <code class="inline">fill_bitmask_parallel_threshold</code>（:62，默认 128）时，CPU 按每批 16 个请求分组、扔给 <code class="inline">max(1, min(cpu_count//2, 8))</code> 个线程并发填掩码。</div>
+    <div class="annotation"><b><code class="inline">StructuredOutputsWorker</code>（vllm/v1/worker/gpu/structured_outputs.py:75）内部是一条完整的异步流水：</b>掩码和「掩码行→logit 行」的映射先在 CPU 算好，然后用独立 <code class="inline">torch.cuda.Stream()</code> 异步 host-to-device 拷贝（pin memory + non_blocking），主流 <code class="inline">wait_stream</code> 等拷贝落地后才启动 Triton kernel——大 batch 的掩码搬运被藏进了 logits 计算的时间里。掩码张量形状 <code class="inline">(max_num_logits, cdiv(vocab_size, 32))</code>，投机解码时每个草稿位置一行，被拒的行直接复制「最后一个合法状态」的行（<code class="inline">failed_index</code>，structured_output/__init__.py:388 一带）。批量再大还有一层并行：batch 超过 <code class="inline">fill_bitmask_parallel_threshold</code>（:62，默认 128）时，CPU 按每批 16 个请求分组、扔给 <code class="inline">max(1, min(cpu_count//2, 8))</code> 个线程并发填掩码。</div>
     <div class="annotation"><b>后端是引擎级单选：</b>四个实现——xgrammar、guidance 顶层直接导入，outlines、lm-format-enforcer 懒加载——在<strong>第一个</strong>结构化请求到来时按请求里的 backend 实例化一次，之后所有请求共用（grammar_init 的注释原文：「We only support a single backend... not on a per-request basis」）。配置项 <code class="inline">--structured-outputs-config.backend</code>（StructuredOutputsBackend，config/structured_outputs.py:12）默认 <code class="inline">"auto"</code>。自研启示与投机解码同构：<strong>约束施加点是采样前的那一次 logits 修改</strong>，先做一个「正则 → 逐 token DFA → bitmask」的最小实现就能接入调度循环；Schema 编译务必异步化，否则一个复杂 Schema 就能让整批请求卡在准入。</div>
   </section>
 
@@ -435,7 +435,7 @@ request.structured_output_request.grammar = grammar</pre>
 </div>
 
 <footer>
-  深入浅出vLLM · 06 采样 · 版本 v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)
+  深入浅出vLLM · 06 采样 · 版本 proto-v0.6.0-121-g3dcfaeb4e8f (3dcfaeb4e8)
 </footer>
 
 </body>

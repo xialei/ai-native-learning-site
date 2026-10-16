@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 5 章 · 批处理与请求调度 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 5 章 · 批处理与请求调度</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第二篇 · 第 5 章 · Batching and Scheduling</div>
+      <h1 class="title">批处理与请求调度</h1>
+      <p class="lede">
+        引擎内部的调度器每天在回答一个问题：GPU 的下一个前向，把谁的 token 算进去。答得好，产能翻倍；答得差，在线用户的 ITL 全面失控。这一章沿三项机制讲下来——continuous batching、chunked prefill、长短混部的调度策略——每一项都对应一个你在压测里一定会遇到的指标恶化。
+      </p>
+
+      <h2 id="continuous-batching">Continuous Batching：批要随时能进能出</h2>
+
+      <p>先看它的反例。静态批处理（static batching）攒一批请求一起算，必须等整批里最长的那个生成完才能收新请求：一条输出 2000 token 的请求和九十九条输出 20 token 的同批，九十九条要陪着空转几十步。GPU 在算，产的是废 token。静态批的产出率在真实流量下可以低到两三成——因为输出长度的方差远比想象的大。</p>
+
+      <p>Orca（OSDI 2022）提出迭代级调度：不按"请求"组批，按"解码步"组批。每一步前向都用当时还活着的请求组成 batch，完成的立即退出，排队的立即补进。这个机制今天叫 continuous batching（vLLM、SGLang 里都是默认行为），是所有现代推理引擎的地基。它把 GPU 时间从"陪最长请求坐牢"变成"每一步都满员"，这一项改进对真实流量的吞吐提升就是数倍——如果评估一个引擎只看一个特性，看它是否做好了这件事。</p>
+
+      <h2 id="chunked">Chunked Prefill：把长 prefill 切碎</h2>
+
+      <p>continuous batching 解决了 decode 之间的陪跑，没解决另一头：一条 8k 输入的请求进 prefill 时，这个 8k 的前向要一次性占住 GPU——同批所有 decode 请求的这一步 ITL 被拖到几百毫秒甚至秒级。这就是第 2 章说的"ITL 长尾"的最大来源。</p>
+
+      <p>Sarathi-Serve 的解法是 chunked prefill：把长输入切成若干块（比如每块 512 或 1024 token），每步只算一块，算完的块与 decode 请求拼在同一个 batch 里。效果是 prefill 的"巨石"被切成"石子"，均匀摊到多个步里，decode 的每步耗时回到平稳。Sarathi-Serve 论文把这个策略叫 piggybacking——decode 搭 prefill 的车，两者在同一个批里互不阻塞。<span class="src">来源：Sarathi-Serve, OSDI 2024</span></p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  subgraph OFF["不切（整段 prefill）"]
+    A1["步 1：8k prefill 独占<br/>其他 decode 全部停摆"] --> A2["步 2：decode 恢复<br/>ITL 长尾 ~1s"]
+  end
+  subgraph ON["切（chunk 1k × 8）"]
+    B1["步 1：chunk 1k + decode 同批"] --> B2["步 2：chunk 2 + decode"]
+    B2 --> B3["…… decode 每步均匀变慢一点<br/>无长尾"]
+  end
+  OFF ~~~ ON
+  style A1 fill:#fdeeee,stroke:#cc4433
+  style B1 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>chunked prefill 前后。代价是 prefill 的总时长变长（切分有开销），收益是 decode 的 P99 ITL 从秒级回到几十毫秒——用一点 prefill 效率换在线稳定。</figcaption>
+      </figure>
+
+      <p>这个机制如今是默认项：vLLM 的 enable_chunked_prefill 默认开启（当前版本见 vllm/config/scheduler.py），SGLang 的 chunked_prefill_size 按显存分档（4090/32G 档 4096，H100/H200 80–140G 档 8192，见其 memory_hook 的默认解析）。批的 token 总预算（vLLM 叫 max_num_batched_tokens，默认 2048 起步）就是 prefill 块和 decode 步共享的"每步工时上限"。</p>
+
+      <h2 id="mixing">长短请求混部：队列、超时、背压与公平</h2>
+
+      <p>chunked prefill 管好了单实例内部的相位冲突，剩下的调度问题是请求之间的公平：一条要生成 8k 的长请求和一百条生成 20 的短请求在同一个队列里，谁先上卡？这里没有免费答案，只有三种带代价的策略：</p>
+
+      <p><strong>先来先服务（FCFS）</strong>，最简单，也最容易被长请求卡死：队头的长请求占着预算，后面一串短请求全部排队，TTFT 整体恶化。缓解办法是 head-of-line 防护——超过某阈值的请求进独立队列或直接拒绝。</p>
+
+      <p><strong>按优先级/租户加权</strong>，第 11 章的主菜，这里只说引擎内的形态：给不同请求打权重，批预算按权重分。引擎基本都支持程度不一的优先级，够用但粒度粗。</p>
+
+      <p><strong>背压（backpressure）</strong>——当排队深度超过阈值时，网关直接拒绝（快速失败）而不是让请求在队列里慢慢烂掉。这是过载保护的基本动作，第 11 章展开。引擎侧的对应机制是 max_queued_requests 之类的上限参数：队列长度封顶，把过载信号尽早暴露给调用方，好过给所有人超时。</p>
+
+      <p>超时的正确位置也要说一句：客户端超时应该发生在网关（主动取消、引擎释放资源），而不是让请求在引擎里跑完再丢弃。取消传播做不好，超时就会变成"幽灵负载"——客户端早就放弃了，GPU 还在为不存在的读者生成 token。检查你的网关是否把 abort 传到了引擎，这是一个免费的产能修复。</p>
+
+      <h2 id="experiment">▶ 实验：长输入对在线 ITL 的影响与 chunked prefill 的效果</h2>
+
+      <p>这是第二篇最重要的实验，它让你亲眼看到"一条长请求怎么打崩全实例"：</p>
+
+      <ol>
+        <li>基线：固定 32 并发短请求（输入 200 / 输出 200），录 ITL 分布——记下 P50/P99。</li>
+        <li>注入：在流量稳定后，插入一条 32k 输入的请求。观察其余请求的 ITL 尖峰（不切 prefill 的配置下，尖峰应当非常明显）。</li>
+        <li>开 chunked prefill（vLLM 开关或 SGLang 调 chunked_prefill_size 到 1024），重复注入，对比尖峰高度。</li>
+        <li>压测形态：短请求恒定 + 按 1% 比例混入长输入请求，跑 10 分钟，对比开关两种配置的 ITL P99 与吞吐。</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>配置（示意）</th><th>吞吐</th><th>ITL P50</th><th>ITL P99</th><th>TTFT（长请求自身）</th></tr></thead>
+          <tbody>
+            <tr><td>不切 prefill</td><td>基准</td><td>18ms</td><td>420ms</td><td>1.9s</td></tr>
+            <tr><td>chunked（1k）</td><td>-6%</td><td>21ms</td><td>47ms</td><td>2.8s</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>读表：开启 chunked prefill 的代价是长请求自己的 TTFT 变差（被切成八块慢慢算）和吞吐小幅下降，换来的是全部在线请求的 ITL P99 掉一个数量级。你的 SLA 是"在线 P99 ITL"，就开；你的负载全是离线批处理、没人看 ITL，就不必开——这个开关没有绝对答案，答案在你的 SLA 里。另外注意 vLLM 默认开、SGLang 按显存给默认值，两个引擎的"默认行为"不同，混部集群里要显式对齐。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>三项机制三个词：continuous batching 按"步"组批消灭陪跑，chunked prefill 把 prefill 巨石切成石子保住 ITL P99，背压与取消传播把过载挡在门外而不是烂在队列里。调度的取舍永远在"批效率"与"单请求延迟"之间，选哪边不由引擎决定，由你的 SLA 决定。</p>
+        <p>下一章把镜头拉远一档：一张卡不够时，TP/PP/DP/EP 怎么选；再配合量化和投机解码，什么优化是真收益。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-04-inference-primer.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 4 章 · 推理原理速览：从 Prefill/Decode 到 KV Cache</span>
+        </a>
+        <a class="next" href="chapter-06-parallel-quant.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 6 章 · 并行、量化与推理优化</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

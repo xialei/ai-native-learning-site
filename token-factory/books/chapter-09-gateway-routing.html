@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 9 章 · 统一模型网关与智能路由 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 9 章 · 统一模型网关与智能路由</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第三篇 · 第 9 章 · Unified Gateway and Routing</div>
+      <h1 class="title">统一模型网关与智能路由</h1>
+      <p class="lede">
+        【重点章】网关是工厂的厂门：所有业务只认识它，它认识后面所有模型。这一章讲清四件事——为什么必须有统一网关、路由策略的四个层级、Prefix Cache 感知路由这个"捡钱"优化、以及鉴权限流审计这套不出彩但不能缺的地基。本章的原则从第 3 章的控制面/数据面分界直接延伸而来。
+      </p>
+
+      <h2 id="why-gateway">为什么必须有统一网关</h2>
+
+      <p>第二个模型上线那天，统一网关的必要性就成立。在那之前每个业务直连引擎实例，看起来更简单；之后每加一个模型、每做一次扩缩容，都要改一遍所有调用方的配置——这是把路由复杂度摊给全公司。统一网关把这个复杂度收回到一个点上：</p>
+
+      <ul>
+        <li><strong>一套 API 对外</strong>：业务方只见 OpenAI 兼容协议 + 模型名，引擎的扩缩容、替换、迁移对调用方透明。</li>
+        <li><strong>一个策略执行点</strong>：鉴权、限流、配额、审计在同一处落地，安全与合规问题有唯一答案。</li>
+        <li><strong>一个计量口</strong>：所有 token 流量过同一个口，第 15 章的成本核算才有完整的分母。</li>
+        <li><strong>一个故障切换点</strong>：实例挂了、降级了、切流量了，调用方无感。</li>
+      </ul>
+
+      <p>OpenAI 兼容是事实标准：请求/响应结构、流式 SSE 分块、工具调用格式都按它来。自建网关的第一条纪律是<strong>兼容层做薄做对</strong>——不要在网关里发明自己的参数语义，也不要把私有字段扩散到调用方。协议是合同，网关是合同的执行者而不是修订者。开源参照上，LiteLLM 提供了网关层的基础件（多供应商适配、配额、成本追踪），llm-d 的 Gateway/推理感知路由给出了 Kubernetes 环境的参照系，两者的定位是"网关执行层"而非"推理引擎"——分类在第 12 章还会再强调一次。</p>
+
+      <h2 id="routing-layers">路由的四个层次</h2>
+
+      <p>"路由"不是一个算法，是一个决策栈。从上到下四层，每一层先过滤、后放行：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  R1["① 能力路由<br/>请求要什么模型才能办"]
+  R2["② 服务等级路由<br/>谁付得起更好的 SLA"]
+  R3["③ 成本路由<br/>同样能干，谁更便宜"]
+  R4["④ 实例路由<br/>这个模型池里，这台实例最合适"]
+  R1 --> R2 --> R3 --> R4
+  style R4 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>路由四层。前两层是"选型号"，后两层是"选实例"。绝大多数路由 bug 出在把四层逻辑揉在一个 if 里。</figcaption>
+      </figure>
+
+      <p><strong>①能力路由：</strong>按请求声明的需求匹配模型（是否要长上下文、工具调用、视觉、结构化输出）。实现上就是模型元数据表 + 请求特征匹配，但必须显式做——业务方说"随便哪个模型"的时代不存在。</p>
+      <p><strong>②服务等级路由：</strong>同一能力有多个价位（自建小模型 / 自建大模型 / 外部 API），按请求方的服务等级决定走哪条。降级链也在这层定义：大模型实例全忙时，高等级请求排队等待，低等级请求降级到小模型或直接拒绝——第 11 章的降级策略在这里落地。</p>
+      <p><strong>③成本路由：</strong>同能力同等级的多个后端之间，按实时单位成本选。这个策略生效的前提是第 15 章的核算已经跑起来——不知道每个后端的真实单位成本，成本路由就是空谈。</p>
+      <p><strong>④实例路由：</strong>同一模型的多副本之间选一个实例。这是下节的主角，也是对延迟影响最大的一层。</p>
+
+      <h2 id="instance-routing">实例路由：从轮询到缓存感知</h2>
+
+      <p>第四层路由的策略演进，是一条"越来越懂负载"的路：</p>
+
+      <p><strong>轮询/随机</strong>：无状态均衡。简单，但把共享前缀的请求随机撒到所有副本上，每个副本都重建一遍同样的 KV——缓存命中率的反面教材。</p>
+      <p><strong>负载感知</strong>：按队列深度、活跃请求数、KV 池占用选实例。解决"有的副本忙死有的闲死"，但对缓存仍然无感知。</p>
+      <p><strong>Prefix Cache 感知路由</strong>：维护"前缀 → 实例"的亲和映射，把可能共享前缀的请求导向同一实例。Agent 与多轮场景下，这一项同时提升缓存命中率（省 prefill）与 TTFT（命中即跳过大段计算），是典型的高性价比策略。代价是均衡性下降（亲和导致倾斜），所以工程实现通常是"两级"：先按亲和选，候选实例过载时再退回负载均衡。顺带一提前瞻：vLLM 的无 GPU 前端（第 8 章末）让网关能拿到真实的 prompt token ID——按 token 序列做前缀命中，比从原始文本猜测准确得多，路由器的这份输入会越来越便宜。</p>
+
+      <p>这一策略内部还分两代，差距在调度器"看见"多少。<strong>近似版</strong>不真看缓存，靠路由历史预测"哪些请求可能共享前缀"——实现简单，是多数网关的默认形态，但估计在高规模、动态负载下会失准。<strong>精确版</strong>让调度器直视分布式缓存的真实状态：每个引擎实例把缓存块的创建与驱逐事件流式上报（vLLM 的 KVEvents），调度器聚合成"前缀 → 实例"的全局索引，对每条请求计算"每个副本已持有这条前缀的百分之几"——输出的缓存亲和分度量的是"能省多少计算"，不再是猜测。索引的账很轻：只存块哈希不存张量，一个 365GB 的 KV 池（DeepSeek-R1 FP8、8×H200）对应的调度器索引只有约 339KB，百万分之一量级。</p>
+
+      <p>精确版的收益有真实集群的锚点。llm-d 在 8 实例 16 卡 H100 上对比四档策略（B2B 多租户负载：150 家企业客户各 6k 共享前缀，每客户 5 并发提 1.2k 的问题；总 KV 需求达集群容量的 73%，约六倍于任何单实例——前缀必须摊到全集群，这正是调度器价值最大的位置）：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>调度策略（真实基准）</th><th>输出吞吐</th><th>TTFT P90</th><th>TTFT 均值</th></tr></thead>
+          <tbody>
+            <tr><td>精确（KVEvents 全局视图）</td><td>8730 tok/s</td><td>0.54s</td><td>0.30s</td></tr>
+            <tr><td>近似（按路由历史预测）</td><td>6944 tok/s</td><td>31.1s</td><td>13.3s</td></tr>
+            <tr><td>负载感知（缓存无感知）</td><td>4429 tok/s</td><td>94.9s</td><td>47.0s</td></tr>
+            <tr><td>轮询</td><td>4429 tok/s</td><td>92.6s</td><td>45.3s</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>同硬件下精确版比近似版 TTFT P90 快 57 倍、比轮询快 170 倍，吞吐翻倍。差距的机理是<strong>缓存抖动（cache thrashing）</strong>：缓存无感知的调度把同一批前缀在不同副本间复制又驱逐，最贵的 prefill 被重算一遍又一遍，waiting 队列越滚越长、系统吞吐被重复劳动吃掉；精确调度在负载允许时始终命中，队列几乎不攒。表里还有一层提醒：近似版虽然明显优于无感知路由，但它是过渡形态不是终点——高规模下历史预测失准。另一个容易混淆的选项是<strong>会话亲和</strong>（同一用户固定实例）：它只保住单用户连续性，跨用户的前缀够不着——上述负载按会话亲和会拆出 750 个互不复用的会话，每家客户 6k 前缀的共享全部漏掉。选型按负载复杂度逐级上：对称短负载轮询即可，非对称负载加负载感知，有复用模式上近似前缀感知，SLO 紧、规模大、动态强上精确版。<span class="src">来源：llm-d Blog《KV-Cache Wins You Can See: From Prefix Caching in vLLM to Distributed Scheduling with llm-d》, 2025-09-24</span></p>
+
+      <blockquote>
+        <p><strong>路由策略没有全局最优，只有负载适配。</strong>策略选择的第一步是给自己的流量画像：前缀集中度（多少比例的请求共享长前缀）、请求时长的方差、租户间的量级差。三个特征决定了该用哪种策略，第 14 章的负载画像实验给出这三个数。</p>
+      </blockquote>
+
+      <h2 id="api-contract">鉴权、限流、配额、审计</h2>
+
+      <p>网关的另一重身份是策略执行点。四件事按"必须做"的顺序排：</p>
+
+      <p><strong>鉴权</strong>：API key/租户体系，映射到内部配额与服务等级。密钥轮换与吊销要在设计里，出事后"能不能立刻掐掉一个 key"是安全评审必问的。</p>
+      <p><strong>限流与配额</strong>：限流管"每秒多少请求"（保护集群），配额管"每月多少 token"（经营约束）。两者都要按租户分桶，且执行在网关而不是引擎——引擎的排队只会让所有人一起慢，不会让超额者停手。配额超限的动作用"拒绝 + 明确错误码 + 建议动作"，不要用"无限排队"。</p>
+      <p><strong>审计</strong>：谁、何时、什么模型、多少 token、是否合规参数。审计日志与计量日志同源（第 13 章），存储策略按合规要求定保留期。</p>
+      <p><strong>用量反馈</strong>：响应头里带 token 计数与剩余配额，让调用方能自己管预算。这是很多自建网关漏掉的小功能，却是减少"月底配额纠纷"最有效的一件事。</p>
+
+      <h2 id="experiment">▶ 实验：Prefix Cache 感知路由对命中率与 TTFT 的影响</h2>
+
+      <ol>
+        <li>构造两组同量负载：组 A 前缀集中（模拟 Agent/多轮，80% 请求共享一条 4k 系统前缀），组 B 前缀分散（模拟开放问答）。</li>
+        <li>分别在轮询与 Prefix 感知路由下回放，记录：缓存命中率、TTFT P50/P95、各实例间的负载均衡度（活跃请求数的变异系数）。</li>
+        <li>再跑一组"亲和 + 均衡两级"的策略，观察亲和收益与均衡损失的交易点。</li>
+        <li>环境里若有引擎事件流（vLLM KVEvents）可再跑第四档精确版：用真实缓存状态算亲和分，与前两档对比 TTFT P90 与吞吐——集中前缀负载下应能看到与上表同向的量级差。</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>负载 / 路由（示意）</th><th>缓存命中率</th><th>TTFT P95</th><th>均衡度（CV）</th></tr></thead>
+          <tbody>
+            <tr><td>集中前缀 + 轮询</td><td>&lt;10%</td><td>基准</td><td>0.05</td></tr>
+            <tr><td>集中前缀 / 亲和</td><td>~75%</td><td>-55%</td><td>0.35</td></tr>
+            <tr><td>分散前缀 / 亲和</td><td>~10%</td><td>基准 ±3%</td><td>0.03</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>读表要点：亲和路由的收益完全由前缀集中度决定——分散负载下它几乎是空转，还会引入轻微不均衡。所以这个策略上线前必须先量前缀集中度（一条 GROUP BY 前缀哈希的查询），命中率预期低于三成就先不上。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>统一网关把路由复杂度收回到一个点：OpenAI 兼容做合同，四层路由做决策（能力、等级、成本、实例），鉴权限流配额审计做执行。实例路由从无状态均衡走到 Prefix 感知，再到精确版（引擎事件流聚合的全局缓存视图）；收益由负载的前缀集中度决定——先量集中度，再上策略，缓存无感知的调度在高复用负载下会陷入缓存抖动。网关的每一行代码都在控制面与数据面的交界上，变更纪律从第 3 章起一直有效。</p>
+        <p>下一章是全书的贯穿案例：GPU 资源调度器，以及在线请求、定时任务、离线批处理怎么共享同一批卡。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-08-pd-disaggregation.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 8 章 · Prefill/Decode 分离与 KV Cache 传输</span>
+        </a>
+        <a class="next" href="chapter-10-scheduler-mixed-workload.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 10 章 · GPU 资源调度器与混合任务</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

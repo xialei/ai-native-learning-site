@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>概述 · 把 GPU 变成工厂，而不是机房 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">概述</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">概述 · Overview</div>
+      <h1 class="title">把 GPU 变成工厂，而不是机房</h1>
+      <p class="lede">
+        一家公司买了两百张 GPU，半年后算利用率 65%，CFO 问"我们烧的钱换来了什么"，没人答得上来。GPU 有产出，但产出多少、该产出多少、为什么没达到——这三个问题没有答案。这本书回答的就是这三个问题：把"一堆 GPU"看成一工厂，用产能、调度、成本的语言把它管起来。
+      </p>
+
+      <h2 id="thesis">核心命题</h2>
+
+      <p>先说这本书要干什么。<strong>核心命题：如何把一组 GPU，建设成一座高吞吐、低延迟、高利用率、可调度、可计量、可盈利的 Token 工厂。</strong></p>
+
+      <p>"Token 工厂"这个词是本书自己造的抽象，不是哪个开源项目的名字。为什么要造这个词？因为在实际工作里，"我们有一批 GPU 在跑推理"和"我们运营着一座工厂"是两种完全不同的状态。前者的管理单位是"机器"，后者的管理单位是"产能"；前者出了问题看单机日志，后者出了问题看整条产线的瓶颈在哪；前者回答"这个服务占用多少 GPU"，后者回答"这个服务每产出一百万 token 要花多少钱"。</p>
+
+      <p>工厂这个词的分量在于，它自带一套被制造业验证了一百年的管理工具：产能、利用率、良品率、单位成本、瓶颈分析、产线调度。推理基础设施目前缺的正是这套语言——GPU 利用率 65% 听起来还行，但对照工厂的口径，这句话相当于"工厂的机器 65% 时间在转"，至于转着的是合格品还是废品、转着的机器是不是瓶颈工序，都没说。这本书把这套语言移植到推理上，词对词地对应好，然后逐个回答"怎么算、怎么提、怎么卖"。</p>
+
+      <p>有一条概念边界必须先立住，全书反复用到：</p>
+
+      <blockquote>
+        <p><strong>Token 吞吐量不等于有效产能。</strong>有效产能 = 在 TTFT / ITL（TPOT）等 SLA 约束下，单位 GPU 能承载的合格请求所产出的 Token。一台每秒能跑一万 token 的集群，如果其中八千 token 是在违背延迟承诺的情况下跑出来的，它的有效产能只有两千。第 2 章会给这个定义完整的计算方法，之后每一章的性能讨论都用这个口径。</p>
+      </blockquote>
+
+      <p>这条边界为什么重要？因为它解释了一个反复出现的怪现象：推理集群越优化越慢、越"高效"越贵。按吞吐量优化，调度器会尽量把批凑大——prefill 等一批再算、decode 攒满再跑——单看吞吐曲线确实上去了，但首字延迟（TTFT）和间隔延迟（ITL）跟着崩，客户端重试、超时、丢弃，最终产出的合格 token 反而变少。DistServe 论文把这类"在 SLA 约束下的吞吐"命名为 goodput，专门论证过预填充与解码混在一起时这个指标会怎么掉。<span class="src">来源：DistServe, OSDI 2024</span>本书把 goodput 的思想落到工程口径上，就叫有效产能。</p>
+
+      <h2 id="structure">三层结构</h2>
+
+      <p>全书按三层展开，也是一座 Token 工厂从下到上的三层。每层有自己要回答的问题、自己的指标和自己的失败模式。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  L3["第三层 · 工厂运营<br/>SLA · 单位成本 · 容量规划 · 商业化"]
+  L2["第二层 · Token 工厂<br/>模型池 · 路由 · 调度 · 多租户 · 故障恢复 · 计量"]
+  L1["第一层 · Token 生产<br/>GPU · Prefill/Decode · KV Cache · 批处理 · 并行"]
+  L3 --> L2 --> L1
+  style L1 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>Token 工厂的三层结构。第一层管"单台机器怎么多产 token"，第二层管"很多台机器怎么组织"，第三层管"这一切值多少钱、怎么收回来"。</figcaption>
+      </figure>
+
+      <p><strong>第一层，Token 生产。</strong>关心的是一台（或一组绑定的）GPU 上，推理本身怎么跑得快：Prefill 和 Decode 各自的瓶颈是什么，KV Cache 怎么省显存，批处理怎么凑，TP/PP/EP 怎么选。这是推理引擎（vLLM、SGLang、TensorRT-LLM）的本职工作，本书压缩成第二篇的四章——不是因为它不重要，而是因为引擎文档和源码精读资料已经把这块写得很好了（本书姊妹系列就有 vLLM 与 SGLang 的逐章拆解），重复写一遍对读者没有增量。</p>
+
+      <p><strong>第二层，Token 工厂。</strong>关心的是把很多 GPU、很多模型实例组织起来：统一网关与路由、集群调度、在线离线混合任务、多租户与配额、故障恢复、用量计量。这一层是本书的主体，也是市面上资料最少的一层——引擎解决"一台机器"， Kubernetes 解决"一堆容器"，中间"一堆模型实例怎么当一座工厂管"这个位置上，成熟的开箱方案至今不多。</p>
+
+      <p><strong>第三层，工厂运营。</strong>关心的是经济问题：监控与故障排查、压测与容量规划、单位成本核算、按什么计费、怎么保证不亏。这一层在多数技术书里是附录，本书把它升为正式一篇，理由很实际：推理集群的预算在硬件采购那一刻就大体决定了，技术手段只能在剩下的空间里腾挪——不会算成本的团队建不出可持续的工厂。</p>
+
+      <h2 id="readers">写给谁看</h2>
+
+      <p>三类读者，对应三种读法：</p>
+
+      <ul>
+        <li><strong>推理工程师</strong>——从第二篇开始正序读。你已经懂模型和引擎，缺的是把单机性能放到 SLA 和成本坐标系里看的框架；第 2 章的指标体系是后面所有讨论的地基，别跳。</li>
+        <li><strong>AI 平台工程师</strong>——本书的主读者。你在做的事就是第二篇到第四篇：部署引擎、组织集群、扛住业务方的 SLA、回答成本问题。第 10 章（混合任务调度）和第 15 章（成本核算）是你大概率会被问到的两件事，提前读。</li>
+        <li><strong>AI 基础设施创业者 / 企业内部建设者</strong>——第一篇和第三篇先读，第 1、2、3、15 章连起来是一份"要不要自建、怎么算账"的决策材料。中间的工程细节可以按需补。</li>
+      </ul>
+
+      <p>不写给谁：想学 Transformer 原理、想读懂注意力算子的读者。这两个话题都有更好的书，本书只在必要处带一笔。</p>
+
+      <h2 id="lab">贯穿项目：Token Factory Lab</h2>
+
+      <p>每本书都说自己的例子是连贯的，真正做到的不多。本书的做法是把贯穿项目收敛到一个名字上——Token Factory Lab，从单机一直长到可运营，分四个阶段，对应四篇：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  V1["V1 单机工厂<br/>单机多卡 · OpenAI 兼容 API · 基础指标"] --> V2["V2 任务工厂<br/>在线+离线混部 · 队列 · 优先级"]
+  V2 --> V3["V3 集群工厂<br/>多机 · 统一网关 · 资源调度"]
+  V3 --> V4["V4 运营工厂<br/>多租户 · SLA · 计量 · 成本分析"]
+  style V4 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>Token Factory Lab 四阶段。V1 与 V4 做扎实、可复现；V2/V3 以生产案例为主，避免本书变成"再做一个开源项目"。</figcaption>
+      </figure>
+
+      <p>取舍说明：V1（第 5–7 章配套）和 V4（第 13–16 章配套）给可复现的代码与模板；V2 和 V3 依赖真实的集群环境和业务负载，写成"当时怎么做的、踩了什么坑、怎么判断的"，读者拿思路比拿脚本更有用。</p>
+
+      <h2 id="method">方法论：五个维度</h2>
+
+      <p>整本书的方法论可以收成一张表。评估任何优化、任何选型、任何扩容决策时，五个维度一起看，缺一个就是账没算全：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>问题</th><th>代表指标</th></tr></thead>
+          <tbody>
+            <tr><td>生产能力 Capacity</td><td>有多少资源，每种模型要占多少</td><td>GPU 数、显存、算力、通信带宽</td></tr>
+            <tr><td>生产效率 Efficiency</td><td>每卡每秒产多少 token，优化带来多少</td><td>吞吐、缓存命中率、批效率</td></tr>
+            <tr><td>生产调度 Orchestration</td><td>什么任务用哪个模型哪组卡，突发怎么扛</td><td>排队时延、抢占次数、定时任务准时率</td></tr>
+            <tr><td>交付质量 QoS</td><td>SLA 达成没有，故障怎么降级恢复</td><td>TTFT/ITL P99、错误率、SLA 达标率</td></tr>
+            <tr><td>经济性 Economics</td><td>每百万 token 多少钱，各业务边际成本</td><td>单位成本、利用率、毛利</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>这张表里最容易被漏掉的是最后一列对第一列的反向约束：容量规划不能只看"能不能装下"，要看"装下之后单位成本是多少"。第 2 章会看到，同一个模型、同一批卡，调度策略不同，有效产能可以差出一倍以上——这时候只算容量不经济性，等于做了一半决策。</p>
+
+      <h2 id="about-data">关于书里的数字</h2>
+
+      <p>这本书的立场是：推理基础设施的结论必须来自自己的测量。厂商发布会上的数字、论文里的 benchmark、别人博客里的对比图，都只能当线索，不能当依据——硬件代际、软件版本、负载分布、并行配置，任何一个变了结论就变。</p>
+
+      <p>照实说明：书中的实验数据以作者集群实测为基准，正文里出现的具体数字若来自公开论文或示意推算，都随文标注出处；标注"示意"的数字用于说明量级和趋势，不能直接搬到你的环境里用。每个 ▶ 实验框给出复现方法，拿到自己的数据之前，请把书里的数字当占位符。</p>
+
+      <p>版本问题也照实说：推理引擎迭代很快，本书所有原理尽量写"不随版本变"的部分——瓶颈结构、指标定义、调度策略的取舍逻辑；版本相关的具体参数和默认值写在随文标注里，以你装的版本的文档为准。</p>
+
+      <div class="summary">
+        <h2>本篇收束</h2>
+        <p>把 GPU 集群当成工厂来管，三个转变：管理单位从"机器"变成"产能"，评估口径从"吞吐量"变成"有效产能"，决策范围从"工程优化"扩到"成本与商业化"。全书四篇十六章加尾声，沿着这个顺序展开：先认识工厂（第 1–3 章），再看单机怎么生产（第 4–8 章），然后组织成厂（第 9–12 章），最后运营与计费（第 13–16 章）。</p>
+        <p>下一章从最基本的问题开始：AI 推理到底哪里不同于传统 Web 服务，为什么"买几台机器部署起来"的思路在这里行不通。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="placeholder">&nbsp;</a>
+        <a class="next" href="chapter-01-gpu-to-factory.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 1 章 · 从 GPU 集群到 Token 工厂</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

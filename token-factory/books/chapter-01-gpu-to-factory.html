@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 1 章 · 从 GPU 集群到 Token 工厂 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 1 章 · 从 GPU 集群到 Token 工厂</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 1 章 · From GPU Cluster to Token Factory</div>
+      <h1 class="title">从 GPU 集群到 Token 工厂</h1>
+      <p class="lede">
+        大多数推理集群的问题不是性能不行，而是没人说得清它产出了什么、值多少钱。这一章先把四组关系摆清楚：token 与请求、请求与模型、模型与 GPU、GPU 与钱。关系摆正之后，"自建还是买 API"就不再是一个立场问题，而是一道可以算的算术题。
+      </p>
+
+      <h2 id="difference">AI 推理为什么不同于传统 Web 服务</h2>
+
+      <p>做过互联网后端的人接手推理集群，第一反应往往是"这不就是个高并发服务吗"。经验里确实有能直接搬的部分——队列、超时、优雅重启、监控大盘，这些在推理世界里一样要用。但有四个地方，推理和传统 Web 服务在骨子上不同，搬经验搬到这些地方会出事。</p>
+
+      <p><strong>第一，单请求的成本不再是常数。</strong>Web 服务里，一次请求消耗的 CPU 大体是稳定的，容量规划可以按 QPS 乘单次开销来算。推理请求的成本取决于输入长度、输出长度、命中了多少前缀缓存、和哪些请求拼在一个 batch 里——同一个接口，不同请求的成本能差几十倍。粗略算一笔账：一个 1k 输入 8k 输出的请求，decode 阶段的计算量是 8k 次"每 token 一次前向"，而 8k 输入 1k 输出的请求，prefill 只需一次长序列前向——两者的 GPU 时间分布完全不同，单价自然也不同。</p>
+
+      <p><strong>第二，延迟指标是逐 token 的，不是逐请求的。</strong>Web 服务的 P99 延迟是"请求完成时间"，推理服务的用户体验却由三个时间共同决定：首 token 什么时候出来（TTFT），之后每个 token 间隔多长（ITL/TPOT），整体完成要多久。更麻烦的是这些指标会互相打架——批越大吞吐越高，但批里的 decode 每步都要等所有请求算完，ITL 随之变长。传统服务扩容就能同时改善所有延迟指标，推理集群扩容常常只改善其中一个。</p>
+
+      <p><strong>第三，资源在时间轴上不是均匀消耗的。</strong>一个 Web 请求占用服务器几十毫秒，结束即释放。一个推理请求可能占用几分钟显存——KV Cache 随输出增长，直到最后一个 token 生成完才释放。这意味着"并发数"不再是容量单位，同一时刻 100 个在跑的请求，显存占用可能是 10 倍于另外 100 个，取决于它们各自的上下文长度。第 4 章会给出这笔账的具体算法。</p>
+
+      <p><strong>第四，产出难以定义。</strong>Web 服务的产出是响应，2xx 就是成功。推理的"成功"除了 HTTP 状态码，还包括延迟达标、内容合格、没有被截断。于是"这个集群每秒产出多少"这个问题有了两层答案：raw token 吞吐和有效产能——第 2 章的主角。这里先立住结论：只考核吞吐的团队，会在不知不觉中产出大量"技术上成功、商业上失败"的 token。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>传统 Web 服务</th><th>LLM 推理服务</th></tr></thead>
+          <tbody>
+            <tr><td>单请求成本</td><td>近似常数</td><td>随输入/输出长度大幅波动</td></tr>
+            <tr><td>资源占用时长</td><td>毫秒级</td><td>秒到分钟级，且随输出增长</td></tr>
+            <tr><td>核心延迟指标</td><td>请求完成时间</td><td>TTFT + ITL 两个独立指标</td></tr>
+            <tr><td>扩容效果</td><td>各项延迟同步改善</td><td>吞吐与延迟此消彼长</td></tr>
+            <tr><td>容量单位</td><td>QPS</td><td>并发 × 上下文长度 × 输出长度</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="relations">四组关系：token、请求、模型、GPU</h2>
+
+      <p>成本核算和容量规划出错的根源，多数是把这四层关系想当然。逐组过一遍。</p>
+
+      <p><strong>token 与请求。</strong>用户视角的计量单位是请求，工厂视角的计量单位是 token。一个请求消耗的 token 数 = 输入 token + 输出 token（工具调用、多轮会话还会叠加系统提示与历史）。书里反复用到一个示意比例：在线对话场景输入输出比常见在 1:2 到 1:5（长系统提示的应用则反过来），Agent 场景因为要反复带上下文，输入占比会高得多。这个比例决定了你的集群瓶颈在 prefill 还是 decode——第 4 章展开。</p>
+
+      <p><strong>请求与模型。</strong>不同模型承担不同请求，是工厂里的"产线分工"：小模型接简单任务，大模型接难任务，embedding/rerank 模型跑检索类任务。一家公司内常驻三到五个模型实例是常态。每个模型实例是一个独立的"生产单元"，有自己的显存占用、自己的批队列、自己的缓存——后面第 9 章的路由、第 10 章的调度，都在回答"请求该进哪条产线"。</p>
+
+      <p><strong>模型与 GPU。</strong>这是最容易想当然的一组。一个模型实例要占的 GPU 数不是模型大小除以单卡显存那么简单——权重只是显存账的一项，KV Cache、激活值、CUDA Graph、通信缓冲都要切走一块（第 4 章的显存预算表）。反过来说，一组 GPU 也不天然属于一个模型：8 卡机上可以放一个 TP=8 的大模型，也可以放 4 个 TP=2 的中模型，或者 2 个 TP=4 加 2 个独立小模型。模型与 GPU 的组合方式，本质上就是工厂的产线布置问题。</p>
+
+      <p><strong>GPU 与钱。</strong>GPU 是折旧极快的固定资产：按五年折旧算，一张 H100 每天光折旧就是几十元的量级（示意），加上电力、机房、网络、运维人力，一张卡"空转一天"的成本是数百元。这笔账在第 15 章才算完整，但建立"GPU 每天都在花钱"的直觉要从现在开始——它是后文所有调度决策的经济动因。</p>
+
+      <h2 id="paths">三种路径：自建、云 API、推理服务商</h2>
+
+      <p>拿 token 有三条路，各自对应一种"工厂形态"：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  subgraph S1["路径一 · 云 API"]
+    A1["业务方"] --> A2["调用 Anthropic / OpenAI 等"]
+  end
+  subgraph S2["路径二 · 托管推理"]
+    B1["业务方"] --> B2["推理服务商<br/>SiliconFlow / Together 等"]
+  end
+  subgraph S3["路径三 · 自建"]
+    C1["业务方"] --> C2["自有 GPU + 开源引擎<br/>vLLM / SGLang"]
+  end
+  style S3 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>三条路径。差异不在"谁算 token"，而在工厂的运营权在谁手里——这决定了成本结构、数据边界和优化空间。</figcaption>
+      </figure>
+
+      <p><strong>云 API（按 token 付费）。</strong>模型厂直接卖 token，你不碰任何基础设施。优点是零固定成本、按量付费、模型更新免费享受；代价是单价高（厂商要覆盖自己的工厂成本加毛利）、数据出域、被限流时没有第二选择、深度优化无从谈起。适合业务早期、流量不稳定、数据不敏感的场景。</p>
+
+      <p><strong>托管推理（按量或包年）。</strong>推理服务商把工厂建好，你按 token 或按时长付费，介于两者之间。比云 API 便宜一些、支持开源模型，但同样存在数据边界和配额问题。</p>
+
+      <p><strong>自建（买卡或租卡自己运营）。</strong>固定成本前置，边际成本低，数据不出域，一切优化手段可用。代价是你要真的把工厂运营起来——采购、部署、调度、运维、容量规划，全流程自己扛。自建的单元成本通常显著低于按量 API，但前提是利用率够高：一座产能利用率三成的工厂，折旧摊到每个 token 上，可能比 API 还贵。这正是本书要解决的问题。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>云 API</th><th>托管推理</th><th>自建集群</th></tr></thead>
+          <tbody>
+            <tr><td>成本结构</td><td>纯变动成本</td><td>按量或包年</td><td>固定成本为主</td></tr>
+            <tr><td>单元成本</td><td>最高</td><td>居中</td><td>流量饱和时最低</td></tr>
+            <tr><td>数据边界</td><td>出域</td><td>视合同</td><td>完全内控</td></tr>
+            <tr><td>优化自由度</td><td>无</td><td>有限</td><td>完整（调度/量化/缓存全可做）</td></tr>
+            <tr><td>最低门槛</td><td>无</td><td>低</td><td>高（需要本书的全部内容）</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="experiment">▶ 实验：自建与云 API 的单位成本粗对比</h2>
+
+      <p>这是全书第一个实验，目的不是得出精确结论，而是让你拿到"自己的数字"——下面演示的方法比数字本身重要。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>自建（示意）</th><th>云 API（示意）</th></tr></thead>
+          <tbody>
+            <tr><td>算力</td><td>8×H100 节点 ×2，按 3 年直线折旧</td><td>—</td></tr>
+            <tr><td>固定成本/月</td><td>折旧 + 电力 + 机柜 + 网络 + 运维人力</td><td>0</td></tr>
+            <tr><td>实测吞吐</td><td>稳定负载下每节点 X M token/天（▶ 用你的压测数据）</td><td>—</td></tr>
+            <tr><td>每百万 token 成本</td><td>固定成本 ÷ 月产出</td><td>按厂商定价</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>操作步骤：固定一组真实业务流量（第 14 章会讲怎么采集），分别在自建集群和云 API 上跑一天；记录自建侧的月度全成本（别漏电费和人力）与当日产出 token 数；API 侧记录当日账单。两边各算出每百万 token 成本，再问一个关键问题——<strong>如果自建集群的利用率掉到一半，这条曲线怎么走？</strong>算完这道题，你会对"什么流量规模才值得自建"有自己的判断，这个判断是后面所有章节的动机。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>推理不同于传统服务的四点：单请求成本是变量、延迟指标有两个且互斥、资源占用随输出增长、产出要分 raw 吞吐与有效产能。token—请求—模型—GPU—钱五层关系各自独立计量，混着算就是混乱的开始。三条路径里，自建的优势在单元成本与数据边界，代价是把工厂运营的全部复杂度拿回自己手里——这个复杂度接下来的十五章逐一拆。</p>
+        <p>下一章把本章定性讨论的"成本"和"产出"定量化：GPU 小时、单位成本、TTFT/ITL、有效产能，一套完整的指标体系。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-00-overview.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">概述 · 把 GPU 变成工厂，而不是机房</span>
+        </a>
+        <a class="next" href="chapter-02-economics.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 2 章 · Token 工厂的经济学与指标体系</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

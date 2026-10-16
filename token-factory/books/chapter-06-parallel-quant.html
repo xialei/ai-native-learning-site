@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 6 章 · 并行、量化与推理优化 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 6 章 · 并行、量化与推理优化</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第二篇 · 第 6 章 · Parallelism, Quantization and Optimizations</div>
+      <h1 class="title">并行、量化与推理优化</h1>
+      <p class="lede">
+        【压缩章】并行策略的细节留给引擎书，这一章只回答三个工程问题：一个模型该切成几份、什么量化值得开、怎么判断一个"优化"是真收益还是噪声。判断标准统一成一句话——任何优化都要在吞吐、延迟、质量三角里同时报数，只报一边的优化不可信。
+      </p>
+
+      <h2 id="parallelism">四种并行，各切什么</h2>
+
+      <p>并行方式选择的前提是弄清每种方式"切的是什么、代价是什么"。四个名词逐个过，每个给一句物理直觉和一笔通信账。</p>
+
+      <p><strong>TP（张量并行）把每一层的权重矩阵横向切开</strong>，8 张卡各持有一层的八分之一。好处是所有卡始终同步干活，单请求延迟最低；代价是每层都要做两次全局通信（all-reduce），必须依赖 NVLink 级别的带宽。TP 是"让一个装不下的模型跑起来"的手段，跨机 TP 会被跨节点通信严重拖慢，一般 TP 尺寸不超过单机卡数。</p>
+
+      <p><strong>PP（流水线并行）把模型按层前后切开</strong>，卡 1 算前几层、卡 2 算后几层。通信量只有层间的激活值，跨机也能跑，代价是流水线气泡：batch 不满时后排卡空转。推理场景 PP 用得比训练少，因为推理的 batch 是动态的，把气泡填满更难；它主要在"单机装不下、又不想承担 TP 通信"的场景登场。</p>
+
+      <p><strong>DP（数据并行）不切模型，只复制模型</strong>：8 份完整实例各跑各的请求。这是吞吐最便宜的增长方式（没有通信开销、没有短板效应），前提是单卡装得下。工程上还有个变体 DP 注意力：注意力部分按请求切分（各算各的，天然并行），其他部分仍走 TP——长上下文场景常用它把 attention 的 KV 开销摊开。</p>
+
+      <p><strong>EP（专家并行）服务 MoE 模型</strong>：把模型的专家参数散到多卡，token 按路由分发到持有对应专家的卡上。它不是"吞吐加速器"而是"显存放大器"——一个 200B 激活 20B 的 MoE 模型，全部专家装进显存靠的就是 EP。代价是专家通信（all-to-all）和负载不均（热门专家所在卡成为瓶颈）。</p>
+
+      <p>组合规则可以收成一张决策表：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>场景</th><th>首选</th><th>理由</th></tr></thead>
+          <tbody>
+            <tr><td>单卡装得下</td><td>DP（多实例）</td><td>零通信代价，故障域小，扩缩容简单</td></tr>
+            <tr><td>装不下但单机装得下</td><td>TP ≤ 单机卡数</td><td>NVLink 通信快，代价可承受</td></tr>
+            <tr><td>单机装不下</td><td>TP×PP 组合</td><td>TP 限单机内，PP 跨机（或用 EP/大 EP）</td></tr>
+            <tr><td>MoE 大模型</td><td>EP（±TP）</td><td>专家分片比 TP 切分更贴合 MoE 结构</td></tr>
+            <tr><td>高吞吐优先、延迟宽松</td><td>DP 副本 + 网关分流</td><td>实例级水平扩展最便宜</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>决定这张表的硬件事实有两个：NVLink 让单机内多卡"近乎共享显存"，跨机只有 RDMA；NCCL 集合通信的延迟量级是"机内微秒、跨机几十微秒到毫秒"。所以有一个从物理推出来的部署铁律：<strong>TP/EP 的通信环尽量不出机，跨机宁可用 PP 或多副本。</strong>把 TP=16 拆到两台机器的做法在延迟敏感场景几乎总是错的。</p>
+
+      <h2 id="quantization">量化：省显存、换速度、赌质量</h2>
+
+      <p>量化的账有三栏。权重量化（INT8/INT4/AWQ/GPTQ 类）：显存按 2×~4× 省，decode 的权重搬运量同比减少，吞吐上升——代价是精度损失要自己测，INT4 对小模型和难任务的伤害比对大模型明显。KV Cache 量化（FP8）：KV 那座山直接砍半，等效于并发容量翻倍，是长上下文场景性价比最高的开关。激活/通信量化（FP8 全链路）：在 H 系卡上借助硬件 FP8 单元，prefill 与 MoE 通信都受益，但配置和算子支持随版本变化大，上线前必须过质量评测。</p>
+
+      <blockquote>
+        <p><strong>质量怎么验：别拿基准分数验，拿自己的业务样本验。</strong>固定 200 条真实业务请求，量化前后各跑一遍，人工或用强模型当裁判对比。通用 benchmark 的掉分往往在业务样本上被放大（长尾知识、指令遵循、代码），反之亦然。</p>
+      </blockquote>
+
+      <h2 id="other-opts">其他两件武器</h2>
+
+      <p><strong>Speculative Decoding（投机解码）</strong>用一个便宜的小模型（或草稿表）先猜 k 个 token，大模型一次验证——猜中就一步产出多个 token。对 decode 这个带宽受限阶段，这是把"每步搬一次权重"的成本摊薄的办法。收益完全取决于草稿命中率：代码、JSON、高度模板化的文本收益大（草稿好猜），开放式创作收益小甚至为负（草稿老猜错，白验）。给 Agent/代码场景开投机解码是常见的高性价比项，给开放对话场景则要先测再开。</p>
+
+      <p><strong>CUDA Graph</strong>把 decode 步的内核序列预录成图，消掉每步的 kernel 启动开销。decode 的单步就是几十上百个小 kernel 的串联，启动开销占比可观——开了图之后 decode 吞吐通常有一到两成的免费提升。代价是显存（每个 batch 档位一份图）和灵活性（动态 shape 受限）。默认开，显存紧张时缩小 batch 档位范围。</p>
+
+      <h2 id="triangle">吞吐、延迟、质量三角</h2>
+
+      <p>把本章所有优化放进同一个坐标系：每一项都在三角里挪动位置。权重量化：吞吐↑ 延迟↓ 质量待验。投机解码：延迟↓（命中时）吞吐↑ 质量基本不变但实现复杂度↑。TP 扩大：显存容量↑ 延迟↓（单请求）但吞吐效率↓（通信开销+批更难凑满）。没有全绿的优化——<strong>判断"真收益"的唯一办法是把三角测全</strong>，这正是下一个实验。</p>
+
+      <h2 id="experiment">▶ 实验：同一模型在不同并行/量化配置下的三角对比</h2>
+
+      <p>以 32B 模型、4×H100 为基准环境（等价配置同理）：</p>
+
+      <ol>
+        <li>配置矩阵至少四格：FP16/TP4、FP16/TP4+投机解码、INT4(AWQ)/TP2、FP16/TP2+DP2。逐格跑第 14 章的标准压测（同一负载分布）。</li>
+        <li>每格记录五项：吞吐（分输入/输出）、TTFT P95、ITL P99、显存占用、业务样本质量分（第 6.2 节的 200 条对比）。</li>
+        <li>算每格的"单位成本吞吐"：吞吐 ÷ 占用卡数。这一列才是决策列——TP4 的吞吐比 TP2 高 60%，但用了两倍卡，单位产能反而更低。</li>
+      </ol>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>配置（示意）</th><th>吞吐/卡</th><th>ITL P99</th><th>质量分</th><th>结论</th></tr></thead>
+          <tbody>
+            <tr><td>FP16 / TP4</td><td>基准</td><td>24ms</td><td>基准</td><td>延迟最好，成本最高</td></tr>
+            <tr><td>INT4 / TP2</td><td>~1.4×</td><td>31ms</td><td>-1.8%</td><td>吞吐型业务的优选</td></tr>
+            <tr><td>FP16 / TP2 + 投机</td><td>1.2×</td><td>19ms</td><td>-0.1%</td><td>代码/Agent 场景优选</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>示意数字只给形态：结论永远是"按业务场景分格子"，不存在全局最优配置。一张写着各业务线该用哪格的表，就是这一章的交付物。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>TP 切单层换延迟、PP 切深度省跨机、DP 复制换吞吐、EP 服务 MoE 结构；通信物理（NVLink 机内、RDMA 机间）决定并行边界。量化用质量换显存与吞吐，投机解码用命中率为 decode 摊薄带宽，CUDA Graph 不改算法也能拿回一成。一切优化在吞吐-延迟-质量三角里定位，单位产能（吞吐÷卡数）是最后一列。</p>
+        <p>下一章把这些配置落到产品选型：vLLM、SGLang、TensorRT-LLM 各自适合什么样的工厂，异构硬件上怎么排兵。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-05-batching.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 5 章 · 批处理与请求调度</span>
+        </a>
+        <a class="next" href="chapter-07-engine-selection.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 7 章 · 推理引擎选型与集群部署</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

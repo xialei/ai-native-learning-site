@@ -119,7 +119,7 @@
 
     <div class="callout warn">
       <b class="tag">子图里的 token 默认拿不到——症状是「卡住之后整段蹦出」，不是「完全没有」</b>
-      默认 <code class="inline">subgraphs=False</code> 时，子图内部 LLM 调用的<strong>逐 token 事件</strong>会在 <code class="inline">_messages.py:145</code> 被静默丢弃（<code class="inline">len(ns) &gt; 0</code> 说明事件来自子图内部）。实测：子图节点里的 LLM 调用，不开 <code class="inline">subgraphs=True</code> 时逐 token 事件一个都收不到。但这不等于「什么都没有」——节点返回时，消息随状态更新走 <code class="inline">on_chain_end</code> 路径（_messages.py:223）整条 emit 一次。所以前端的表现是：用户盯着空白等十几秒，然后完整回答「啪」地整段蹦出来。见到这个症状，先查 <code class="inline">subgraphs</code>。机制与诊断见 §11.7，常见错误形态见 §11.10③。
+      默认 <code class="inline">subgraphs=False</code> 时，子图内部 LLM 调用的<strong>逐 token 事件</strong>会在 <code class="inline">_messages.py:154</code> 被静默丢弃（<code class="inline">len(ns) &gt; 0</code> 说明事件来自子图内部）。实测：子图节点里的 LLM 调用，不开 <code class="inline">subgraphs=True</code> 时逐 token 事件一个都收不到。但这不等于「什么都没有」——节点返回时，消息随状态更新走 <code class="inline">on_chain_end</code> 路径（_messages.py:232）整条 emit 一次。所以前端的表现是：用户盯着空白等十几秒，然后完整回答「啪」地整段蹦出来。见到这个症状，先查 <code class="inline">subgraphs</code>。机制与诊断见 §11.7，常见错误形态见 §11.10③。
     </div>
   </section>
 
@@ -238,8 +238,8 @@
         <text class="lbl sm code" x="150" y="153" text-anchor="middle">LLM 调用</text>
 
         <text class="lbl sm code" x="290" y="105" text-anchor="middle" fill="var(--brand-3)">token 事件×</text>
-        <text class="lbl sm" x="290" y="124" text-anchor="middle" fill="var(--brand-3)">_messages.py:145 丢弃</text>
-        <text class="lbl sm code" x="290" y="168" text-anchor="middle">on_chain_end:223</text>
+        <text class="lbl sm" x="290" y="124" text-anchor="middle" fill="var(--brand-3)">_messages.py:154 丢弃</text>
+        <text class="lbl sm code" x="290" y="168" text-anchor="middle">on_chain_end:232</text>
         <text class="lbl sm" x="290" y="187" text-anchor="middle">消息整条 emit 一次</text>
 
         <line class="edge" x1="150" y1="90" x2="150" y2="70" marker-end="url(#arr117)"></line>
@@ -271,7 +271,7 @@
         <text class="lbl sm code" x="650" y="272" text-anchor="middle">chunk[1] = (AIMessageChunk('CHILD'), meta)</text>
         <text class="lbl sm" x="650" y="292" text-anchor="middle" fill="var(--brand-3)">3 个事件，边跑边到，ns 标来源</text>
       </svg>
-      <div class="fig-cap">图 11.2：子图边界上的事件过滤。False 时逐 token 事件被 _messages.py:145 丢弃，消息走 on_chain_end 路径整条补发——前端「卡住后整段蹦出」；True 时逐 token 事件实时流出，v1 下 chunk 外层多包一层 ns 元组。</div>
+      <div class="fig-cap">图 11.2：子图边界上的事件过滤。False 时逐 token 事件被 _messages.py:154 丢弃，消息走 on_chain_end 路径整条补发——前端「卡住后整段蹦出」；True 时逐 token 事件实时流出，v1 下 chunk 外层多包一层 ns 元组。</div>
     </div>
 
     <div class="annotation"><b>子图就是这样断流的：</b> <code class="inline">create_react_agent</code> 返回的是一个 <code class="inline">CompiledStateGraph</code>，作为节点嵌进外层图时它就是个子图。不开 <code class="inline">subgraphs=True</code>，<code class="inline">messages</code> 流会在子图边界「断掉」——逐 token 事件被丢，但完整消息会在节点返回时整条补发（§11.4 callout 的实测）。注意 v1 下的形状变化：默认时 chunk 是 <code class="inline">(message, metadata)</code>；<code class="inline">subgraphs=True</code> 后外层多包一层 <code class="inline">(ns, (message, metadata))</code>（图 11.2 右侧）——解析代码要跟着改。多 agent 场景下这是个必踩的坑。</div>
@@ -287,9 +287,9 @@ router_llm = model.bind(tags=[<span class="st">"nostream"</span>])
 decision = router_llm.invoke([...])   <span class="cmt"># 照常执行，但 messages 流里看不到它</span>
 
 <span class="cmt"># 源码依据：constants.py:24  TAG_NOSTREAM = sys.intern("nostream")</span>
-<span class="cmt"># _messages.py:141  if metadata and (not tags or TAG_NOSTREAM not in tags):  (守卫)</span>
+<span class="cmt"># _messages.py:150  if metadata and (not tags or TAG_NOSTREAM not in tags):  (守卫)</span>
 <span class="cmt">#   —— tags 含 nostream 时条件不成立，本次调用不注册进 metadata，token 全部不 emit</span></pre>
-    <div class="annotation"><b>挡的是「所有人」：</b> 源码里 <code class="inline">TAG_NOSTREAM</code>（在 <code class="inline">constants.py</code>）就是字符串 <code class="inline">"nostream"</code>。messages 处理器在 <code class="inline">on_chat_model_start</code> 就检查它（_messages.py:141）：tags 含 <code class="inline">nostream</code> 的调用根本不注册，后续 token 事件全被挡住——同一道守卫也存在于工具流处理器 <code class="inline">_tools.py:110</code>，注释原文是 "caller explicitly opted out"。注意对称性：§11.7 的 <code class="inline">subgraphs=False</code> 挡的是「子图边界外的观众」，这里挡的是「所有人」——调用照常执行，只是从流里消失。这是精细控制流式可见性的标准手段。</div>
+    <div class="annotation"><b>挡的是「所有人」：</b> 源码里 <code class="inline">TAG_NOSTREAM</code>（在 <code class="inline">constants.py</code>）就是字符串 <code class="inline">"nostream"</code>。messages 处理器在 <code class="inline">on_chat_model_start</code> 就检查它（_messages.py:150）：tags 含 <code class="inline">nostream</code> 的调用根本不注册，后续 token 事件全被挡住——同一道守卫也存在于工具流处理器 <code class="inline">_tools.py:110</code>，注释原文是 "caller explicitly opted out"。注意对称性：§11.7 的 <code class="inline">subgraphs=False</code> 挡的是「子图边界外的观众」，这里挡的是「所有人」——调用照常执行，只是从流里消失。这是精细控制流式可见性的标准手段。</div>
   </section>
 
   <section class="block">
@@ -326,12 +326,12 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
     print(part)   <span class="cmt"># 什么都不输出！for 循环一次都不进，也不报错</span>
 
 <span class="cmt"># 原因：checkpoints 事件的 emit 被 `if self._checkpointer_put_after_previous is not None` 守卫</span>
-<span class="cmt"># (见 _loop.py:663)。无 checkpointer 时该字段为 None，emit 被短路 → 静默产出 0 个事件。</span>
-<span class="cmt"># 注意：tasks 模式不受此影响(emit 在 _loop.py:705 无守卫)，没有 checkpointer 也照常输出；</span>
+<span class="cmt"># (见 _loop.py:678)。无 checkpointer 时该字段为 None，emit 被短路 → 静默产出 0 个事件。</span>
+<span class="cmt"># 注意：tasks 模式不受此影响(emit 在 _loop.py:723 无守卫)，没有 checkpointer 也照常输出；</span>
 <span class="cmt"># debug 模式 = checkpoints + tasks，无 checkpointer 时仍会输出 task 事件，只是少了 checkpoint 事件。</span>
 <span class="cmt"># 修复：想看 checkpoint 事件就 compile 时传入 checkpointer；只想看任务流用 tasks 即可，不必配 checkpointer。</span>
 graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">compile</span>(checkpointer=InMemorySaver())</pre>
-    <div class="annotation"><b>不报错、不输出，最隐蔽：</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。「需 checkpointer」的只有 <code class="inline">checkpoints</code> 模式：无 checkpointer 时它<strong>静默产出 0 个事件</strong>，而不是抛异常。源码依据是 <code class="inline">_loop.py:663</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫——无 checkpointer 时该字段为 <code class="inline">None</code>，emit 被短路。但别误伤 <code class="inline">tasks</code>：它的 emit 没有这道守卫，有没有 checkpointer 都正常工作（实测同一张无 checkpointer 的图：checkpoints 模式 0 个事件，tasks 模式 2 个）。排查时一旦发现 <code class="inline">checkpoints</code> 流「空跑」，先查图有没有 <code class="inline">checkpointer</code>，再看 stream_mode（tasks 的 emit 位置：<code class="inline">_loop.py:705</code>）。</div>
+    <div class="annotation"><b>不报错、不输出，最隐蔽：</b> 这是 streaming 最隐蔽的坑——<strong>不报错、不输出</strong>。「需 checkpointer」的只有 <code class="inline">checkpoints</code> 模式：无 checkpointer 时它<strong>静默产出 0 个事件</strong>，而不是抛异常。源码依据是 <code class="inline">_loop.py:678</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫——无 checkpointer 时该字段为 <code class="inline">None</code>，emit 被短路。但别误伤 <code class="inline">tasks</code>：它的 emit 没有这道守卫，有没有 checkpointer 都正常工作（实测同一张无 checkpointer 的图：checkpoints 模式 0 个事件，tasks 模式 2 个）。排查时一旦发现 <code class="inline">checkpoints</code> 流「空跑」，先查图有没有 <code class="inline">checkpointer</code>，再看 stream_mode（tasks 的 emit 位置：<code class="inline">_loop.py:723</code>）。</div>
 
     <div class="code-title">② custom 模式收不到数据——writer 在异步 + Python &lt; 3.11 下拿不到 runtime</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Python 3.10 + 异步运行，节点里调 get_stream_writer()</span>
@@ -357,11 +357,11 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
     ...   <span class="cmt"># 只看到外层图的 updates，子图内 LLM 的逐 token 全部缺失——但不报错</span>
 
 <span class="cmt"># 原因：messages 的事件源是 StreamMessagesHandler，它在 `subgraphs=False` 时</span>
-<span class="cmt"># 对子图内的 LLM 调用直接 `return`(_messages.py:145: if not self.subgraphs and len(ns) > 0 ...)。</span>
+<span class="cmt"># 对子图内的 LLM 调用直接 `return`(_messages.py:154: if not self.subgraphs and len(ns) > 0 ...)。</span>
 <span class="cmt"># 修复：显式传 subgraphs=True，并用 part["ns"] 区分事件来自哪一层子图(见 §11.7)。</span>
 <span class="kw">for</span> part <span class="kw">in</span> graph.<span class="fn">stream</span>(inputs, config, stream_mode=<span class="st">"messages"</span>, subgraphs=<span class="kw">True</span>, version=<span class="st">"v2"</span>):
     ...</pre>
-    <div class="annotation"><b>收口成一条诊断步骤：</b> 这是 §11.4 / §11.7 都强调过的高频坑，这里收口为一条可对照的诊断步骤：<strong>子图 token「卡住后整段蹦出」、且无任何报错</strong>时，检查是否漏传 <code class="inline">subgraphs=True</code>。messages 的源码依据是 <code class="inline">_messages.py:145</code>——当 <code class="inline">subgraphs=False</code> 且事件来自子图内部（<code class="inline">len(ns) &gt; 0 and ns != self.parent_ns</code>）时，逐 token 事件直接丢弃；同一道过滤也存在于工具流处理器 <code class="inline">_tools.py:117</code>。三个坑的共同特征是「静默失败」：没有异常、没有日志，只是流里缺东西（或者晚到）——这是 streaming 调试时最该建立的肌肉记忆。</div>
+    <div class="annotation"><b>收口成一条诊断步骤：</b> 这是 §11.4 / §11.7 都强调过的高频坑，这里收口为一条可对照的诊断步骤：<strong>子图 token「卡住后整段蹦出」、且无任何报错</strong>时，检查是否漏传 <code class="inline">subgraphs=True</code>。messages 的源码依据是 <code class="inline">_messages.py:154</code>——当 <code class="inline">subgraphs=False</code> 且事件来自子图内部（<code class="inline">len(ns) &gt; 0 and ns != self.parent_ns</code>）时，逐 token 事件直接丢弃；同一道过滤也存在于工具流处理器 <code class="inline">_tools.py:117</code>。三个坑的共同特征是「静默失败」：没有异常、没有日志，只是流里缺东西（或者晚到）——这是 streaming 调试时最该建立的肌肉记忆。</div>
   </section>
 
   <section class="block">
@@ -387,13 +387,13 @@ graph = StateGraph(State).add_node(...).add_edge(START, ...).<span class="fn">co
       <div class="a">三个形状：① v1 单模式：裸 dict <code class="inline">{节点名: 更新}</code>，没有 type/ns 元信息；② v2：统一 part <code class="inline">{"type": "updates", "ns": (), "data": {节点名: 更新}}</code>；③ v1 组合模式：每个 chunk 变成 <code class="inline">(mode, data)</code> 二元组，如 <code class="inline">("updates", {"n": {...}})</code>——实测确认，custom 数据也包成 <code class="inline">("custom", {...})</code>。也就是说 v1 下「单模式裸数据、组合模式加元组前缀」两套解析逻辑并存；v2 把两种情况统一成同一种 part 结构。这正是 11.6 建议「生产直接用 v2」的原因：解析代码只写一遍。</div>
     </details>
     <details class="q"><summary><b>Q2</b> · 外层图的节点嵌了一个 <code class="inline">create_react_agent</code> 子图。前端同事报告：「用户等待时一片空白，然后完整回答突然整段出现」。你还没看代码，说出最可能的原因和它背后的机制；再看一条：如果前端偶尔能看到子图内 LLM 的逐字输出，又说明什么？</summary>
-      <div class="a">最可能：外层 stream 用了 <code class="inline">stream_mode="messages"</code> 但没传 <code class="inline">subgraphs=True</code>。机制是子图边界过滤——子图内 LLM 的逐 token 事件在 StreamMessagesHandler 的 namespace 检查处被丢弃（_messages.py:145，事件来自子图内部 <code class="inline">len(ns) &gt; 0</code>），而节点返回时消息经 on_chain_end 路径整条 emit 一次（_messages.py:223），所以是「长时间空白 + 整段蹦出」而不是「完全没有」。如果前端偶尔能看到子图内逐字输出，说明某些请求走了 subgraphs=True 的调用路径（比如不同端点、不同版本的前端代码用了不同 stream 配置），要查的是配置不一致，不是流机制本身。</div>
+      <div class="a">最可能：外层 stream 用了 <code class="inline">stream_mode="messages"</code> 但没传 <code class="inline">subgraphs=True</code>。机制是子图边界过滤——子图内 LLM 的逐 token 事件在 StreamMessagesHandler 的 namespace 检查处被丢弃（_messages.py:154，事件来自子图内部 <code class="inline">len(ns) &gt; 0</code>），而节点返回时消息经 on_chain_end 路径整条 emit 一次（_messages.py:232），所以是「长时间空白 + 整段蹦出」而不是「完全没有」。如果前端偶尔能看到子图内逐字输出，说明某些请求走了 subgraphs=True 的调用路径（比如不同端点、不同版本的前端代码用了不同 stream 配置），要查的是配置不一致，不是流机制本身。</div>
     </details>
     <details class="q"><summary><b>Q3</b> · 没配 checkpointer 的图上，<code class="inline">stream_mode="checkpoints"</code> 和 <code class="inline">stream_mode="tasks"</code> 各输出几个事件？换成 <code class="inline">stream_mode="debug"</code> 呢？这三个行为差异的源码依据是什么？</summary>
-      <div class="a">checkpoints：0 个事件——emit 被 <code class="inline">_loop.py:663</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫，无 checkpointer 时该字段为 None，emit 被短路，且不报错。tasks：正常输出（实测 2 个事件）——它的 emit 在 <code class="inline">_loop.py:705</code>，无守卫。debug：仍输出 task 事件（checkpoint + task_result 等子类型里少了 checkpoint 类）——因为 debug 本质是两种事件的合集，checkpoints 部分被同一道守卫挡住，tasks 部分照发。排查口诀：checkpoints 流「空跑」先查 checkpointer，tasks 流空跑再查图的边和节点（tasks 事件是每个 task 开始/结束触发的，图没跑起来自然没有）。</div>
+      <div class="a">checkpoints：0 个事件——emit 被 <code class="inline">_loop.py:678</code> 的 <code class="inline">if self._checkpointer_put_after_previous is not None</code> 守卫，无 checkpointer 时该字段为 None，emit 被短路，且不报错。tasks：正常输出（实测 2 个事件）——它的 emit 在 <code class="inline">_loop.py:723</code>，无守卫。debug：仍输出 task 事件（checkpoint + task_result 等子类型里少了 checkpoint 类）——因为 debug 本质是两种事件的合集，checkpoints 部分被同一道守卫挡住，tasks 部分照发。排查口诀：checkpoints 流「空跑」先查 checkpointer，tasks 流空跑再查图的边和节点（tasks 事件是每个 task 开始/结束触发的，图没跑起来自然没有）。</div>
     </details>
     <details class="q"><summary><b>Q4</b> · 你想让「路由判断」的 LLM 调用对用户隐藏，但公司另一个团队在同一张图上做调试工具，需要看到所有 LLM 调用的 token。<code class="inline">tags=["nostream"]</code> 方案能满足两边吗？为什么？如果不行，给出替代思路。</summary>
-      <div class="a">满足不了。nostream 是全局开关：_messages.py:141 的守卫在 on_chat_model_start 就不注册该调用，任何观众（包括 stream_events 和调试工具）都收不到它的 token——它挡的是「所有人」，不是「某些观众」。这与 subgraphs=False 形成对比：后者挡的是「子图边界外的观众」，挂着 parent_ns 例外（子图自己 stream 自己的子图时仍能看到）。替代思路：不用 nostream，给路由模型打自定义 tag（如 <code class="inline">tags=["internal"]</code>），token 照常进流，接收端按 metadata 里的 tags 过滤——前端丢掉 internal 事件，调试工具全收。把「可见性决策」从生产端挪到消费端，两边就不打架了。</div>
+      <div class="a">满足不了。nostream 是全局开关：_messages.py:150 的守卫在 on_chat_model_start 就不注册该调用，任何观众（包括 stream_events 和调试工具）都收不到它的 token——它挡的是「所有人」，不是「某些观众」。这与 subgraphs=False 形成对比：后者挡的是「子图边界外的观众」，挂着 parent_ns 例外（子图自己 stream 自己的子图时仍能看到）。替代思路：不用 nostream，给路由模型打自定义 tag（如 <code class="inline">tags=["internal"]</code>），token 照常进流，接收端按 metadata 里的 tags 过滤——前端丢掉 internal 事件，调试工具全收。把「可见性决策」从生产端挪到消费端，两边就不打架了。</div>
     </details>
     <details class="q"><summary><b>Q5</b> · 节点里 <code class="inline">writer({"progress": 0.5})</code> 推了进度，但接收端用的是 <code class="inline">stream_mode="updates"</code>。会报错吗？进度数据去哪了？如果产品要求「进度条断线重连后还能恢复到 0.5」，custom 模式还够用吗？</summary>
       <div class="a">不报错——这是静默 no-op：StreamWriter 的注释写明 "it's a no-op when not using stream_mode='custom'"（types.py:147），数据既不进流也不进通道。换成 stream_mode="custom" 才能收到。至于断线重连恢复：不够用。custom 数据是「路过」的——writer 推的东西不写通道、不进 checkpoint，只活在当次 stream 迭代里，连接断了数据就没了。要恢复进度得把进度写进图状态（如 Annotated 的 progress 字段），靠 checkpointer 持久化，重连后从 get_state() 或 values 流拿。一句话：custom 管「实时推送」，状态 + checkpointer 管「可恢复」，两者不是竞争关系，进度条场景通常两个都要。</div>

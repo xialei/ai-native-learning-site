@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 14 章 · 压测与容量规划 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 14 章 · 压测与容量规划</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第四篇 · 第 14 章 · Benchmarking and Capacity Planning</div>
+      <h1 class="title">压测与容量规划</h1>
+      <p class="lede">
+        压测是这座工厂的计量局：所有章节的性能断言（第 5 章的开关、第 6 章的三角、第 7 章的对照表）都出自同一套方法。这一章把方法完整写下来——离线吞吐测试、在线负载测试、真实分布 trace 的采集与回放，以及从压测数据走到扩容决策的最后一段。
+      </p>
+
+      <h2 id="two-kinds">两种压测：离线吞吐与在线负载</h2>
+
+      <p>两种压测回答两个问题，混着做两边都不准：</p>
+
+      <p><strong>离线吞吐测试</strong>回答"这台机器极限是多少"。固定并发、固定请求集，跑满固定时长，量吞吐与延迟。它用于引擎对比、参数调优、硬件选型（第 6、7 章的所有表格都是它的产物）。要点是隔离：独占机器、关闭无关服务、固定频率——它的价值是可比性。</p>
+      <p><strong>在线负载测试</strong>回答"这台机器能接多少真实业务"。用真实的到达间隔分布（泊松或录制的 trace）回放，量 SLA 达标率随流量的曲线。它用于容量验证与扩容决策。要点是"到达模式真实"——恒定速率的压测会高估容量，因为真实流量的突发会在队列里放大（第 2 章的拐点比恒速压测显示的更早到来）。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>离线吞吐测试</th><th>在线负载测试</th></tr></thead>
+          <tbody>
+            <tr><td>目标</td><td>极限吞吐（可比性）</td><td>SLA 下的容量（决策性）</td></tr>
+            <tr><td>到达模式</td><td>恒并发、关闸放行</td><td>录制间隔分布回放</td></tr>
+            <tr><td>核心指标</td><td>token/s、tokens/s/卡</td><td>TTFT/ITL P99、达标率、有效产能</td></tr>
+            <tr><td>回答</td><td>A 配置比 B 快多少</td><td>还能接多少业务不违约</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="distribution">固定长度与真实分布的差距</h2>
+
+      <p>压测最容易自欺的地方：拿"输入 1024 / 输出 512"的固定长度跑出的数字当容量依据。真实负载的两个特征会让同一套系统表现出完全不同的容量：</p>
+
+      <ul>
+        <li><strong>长度方差</strong>：输入输出长度是长尾分布。调度器凑批的效率、KV 池的峰值占用、ITL 的长尾，全部由方差主导。固定长度压测里 KV 池占用平稳可预测；真实分布下，少数超长请求决定了池的水位峰值——按均值规划的容量在长尾面前系统性偏乐观。</li>
+        <li><strong>前缀结构</strong>：真实流量的前缀集中度（第 9 章量过）决定缓存命中，命中率 70% 和 0% 的集群，TTFT 分布差一个数量级。固定长度随机请求的命中率趋近于零，测出来的是"无缓存世界"的容量。</li>
+      </ul>
+
+      <p>所以容量结论只能从真实分布的 trace 得出。trace 的采集很便宜：从第 13 章的请求日志导出（ts、prompt_tokens/output_tokens、tenant、model 四列就够），脱敏后压成 trace 文件。回放工具不复杂：按录制的时间戳重放请求即可，唯一要处理的是"回放速度"——原速回放用于验证现状，加速回放（1.5×、2×）用于找拐点。分离形态的集群再加一条前置检查（第 8 章的纪律在这里复用）：压测开始前先单发几条长 prompt 读 KV 传输耗时——传输不达标时测出来的一切对比数字都是"网络配置"的而不是"架构"的，结论作废。</p>
+
+      <h2 id="capacity">从压测到扩容决策</h2>
+
+      <p>容量规划的最后一步是把曲线变成数字。方法叫"余量表"：</p>
+
+      <ol>
+        <li>跑在线负载测试，得到"流量水平 vs SLA 达标率"曲线，找到达标率开始跌破 99% 的流量点——这是当前配置的<strong>有效容量</strong>（第 2 章的定义在这里落地）。</li>
+        <li>对比当前日常峰值流量，得出当前余量（建议运营红线：峰值 ≤ 有效容量的 70%）。</li>
+        <li>按业务增长预测外推：下季度峰值是多少、什么时候触线。</li>
+        <li>触线前决定：扩容（买卡/租卡）、优化（第 5、6 章的开关与配置，能再挤出两三成）、或商务手段（限流、提价）。</li>
+      </ol>
+
+      <figure>
+        <div class="mermaid">
+xychart-beta
+  title "峰值流量 vs 有效容量（示意）"
+  x-axis ["Q1", "Q2", "Q3", "Q4", "Q1'", "Q2'"]
+  y-axis "相对流量" 0 --> 120
+  line "业务峰值" [30, 42, 55, 66, 80, 95]
+  line "有效容量(当前配置)" [100, 100, 100, 100, 100, 100]
+  line "70% 红线" [70, 70, 70, 70, 70, 70]
+        </div>
+        <figcaption>容量规划的基本图。业务峰值增速快于扩容节奏时，触线时间就是决策 deadline。图上三条线的交点比任何感觉都可靠。数字为示意。</figcaption>
+      </figure>
+
+      <p>两个容易漏掉的余量项：<strong>故障余量</strong>——一台 8 卡机故障时，它的流量要能被剩余容量接住（N+1 的"1"按最大单机算）；<strong>发布余量</strong>——滚动发布期间有效容量是打折的（新旧实例并存但不完全等效），发布窗口的余量要单独核。</p>
+
+      <h2 id="experiment">▶ 实验：一套可复用的压测方法</h2>
+
+      <p>把本章方法固化成一份可执行的压测套餐（Lab 的交付物之一，脚本随书开源形态）：</p>
+
+      <ol>
+        <li><strong>采集</strong>：从生产日志导出 trace（或用合成分布起步：对数正态长度 + 泊松到达，参数对齐业务描述）。</li>
+        <li><strong>回放</strong>：三档流量——日常峰值（1×）、峰值的 1.5×、2×——各跑 30 分钟原速回放。</li>
+        <li><strong>记录</strong>：与第 2 章实验同款四列（吞吐、TTFT、ITL、达标率），外加缓存命中率与 KV 池水位峰值。</li>
+        <li><strong>输出</strong>：余量表（当前有效容量、余量比、预计触线时间）+ 一份随报告归档的 trace 与配置快照（保证可复现）。</li>
+        <li><strong>例行化</strong>：每次引擎升级、每次模型变更、每月例行，压测报告进归档——三个月后你就拥有了自己环境的"性能史"，第 7 章说过的"版本过期"问题在这份史册面前不再是风险。</li>
+      </ol>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>离线吞吐测极限、在线负载测容量，后者才是扩容决策的依据。固定长度压测系统性高估容量——长尾方差决定 KV 水位峰值，前缀集中度决定 TTFT 分布，容量结论必须出自真实分布 trace。余量表把曲线变成决策：有效容量、70% 红线、触线时间。压测例行化（升级后、变更后、每月）让性能史成为团队的资产。</p>
+        <p>下一章算钱：Token 成本核算与商业化，把前十四章的工程成果折成每百万 token 多少钱。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-13-observability.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 13 章 · 监控、可观测性与故障排查</span>
+        </a>
+        <a class="next" href="chapter-15-cost.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 15 章 · Token 成本核算与商业化</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

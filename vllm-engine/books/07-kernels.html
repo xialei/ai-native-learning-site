@@ -310,7 +310,7 @@
 
 <span class="kw">def</span> <span class="fn">merge_attn_states</span>(output, prefix_output, prefix_lse,
     suffix_output, suffix_lse, output_lse=<span class="kw">None</span>, ...) -&gt; <span class="kw">None</span>:
-    <span class="cl">torch</span>.ops._C.merge_attn_states(...)   <span class="cmt"># prefill 分块后合并各块状态（前缀/后缀的 output 与 lse）</span></pre>
+    <span class="cl">torch</span>.ops._C.merge_attn_states(...)   <span class="cmt"># 合并分块注意力的两份 (output, lse)——decode 上下文并行（DCP）里拼回完整结果</span></pre>
     <p>看 <code class="inline">rms_norm</code> 就够了：Python 里唯一干的事就是把四个参数原样传给 <code class="inline">torch.ops._C.rms_norm</code>。真正的实现是 C++ 侧编译进 <code class="inline">_C</code> 库的 kernel（源在 <code class="inline">csrc/</code>），Python 只是入口/适配层。优点：模型代码不用碰 C++，写出来像普通 PyTorch 函数；<code class="inline">ops.rms_norm(out, input, weight, 1e-6)</code> 一行就完成一次融合的 RMSNorm。</p>
     <p>上一节提的<strong>量化 GEMM</strong>就是这条通道里的重头。<code class="inline">cutlass_scaled_mm</code>（FP8/INT8 量化线性层用的矩阵乘）封装的 <code class="inline">torch.ops._C.cutlass_scaled_mm</code>，C++ 实现在 <code class="inline">csrc/libtorch_stable/quantization/w8a8/cutlass/</code>，基于 NVIDIA 开源的 <strong>CUTLASS</strong> 模板库写成。CUTLASS 和 cuBLAS 的分工值得分清：cuBLAS 是闭源成品库，PyTorch 的 <code class="inline">F.linear</code>（非量化矩阵乘）在 CUDA 上就是调它；CUTLASS 给的是 C++ 模板积木而不是成品，vLLM 用它写 cuBLAS 没有的变体——带 scale 的 FP8 GEMM、DeepSeek V3 那种 blockwise 量化、以及 SM100 上的 MLA decode kernel（<code class="inline">csrc/libtorch_stable/attention/mla/sm100_cutlass_mla_kernel.cu</code>，即 7.2 节后端清单里的 <code class="inline">CUTLASS_MLA</code>）。为什么要自己写？因为量化矩阵乘要把「反量化」融合进 GEMM 内部——scale 乘在累加的哪个阶段、按什么粒度（per-tensor / per-token / 128×128 块），cuBLAS 没有现成入口，CUTLASS 模板可以。</p>
     <p>除了 C++ 算子，vLLM 还用 <strong>Triton</strong> 写了一批「Python 写、照样能跑在 GPU」的算子，集中在 <code class="inline">vllm/v1/attention/ops/</code>（如 <code class="inline">triton_attention_helpers.py</code>、<code class="inline">triton_prefill_attention.py</code>、<code class="inline">triton_decode_attention.py</code>），配合 <code class="inline">vllm/triton_utils/</code> 做一些缓存与自动调参。Triton 的好处是无需手写 CUDA 也能做 kernel 级优化，常用来实现那些没有现成库覆盖的注意力变体。</p>
@@ -336,7 +336,7 @@
     <span class="cmt"># prefill 走 varlen 向量化路径，最终都落到 flash_attn_varlen_func 等</span></pre>
     <div class="annotation"><b>这是「分页」与「后端」的接缝处：</b>它拿到的是物理上分页的 <code class="inline">kv_cache</code> 和 <code class="inline">block table</code>（metadata），而底层 FlashAttention kernel 恰好知道怎么按 block table 去读不连续的 KV。这也正是第 3 章「PagedAttention 就是懂 block table 的 FlashAttention」在代码里的落点。</div>
 
-    <p>摘录只是个缩影，真实的 forward 是一条按顺序检查的决策链。图 7.4 拿两个具体 batch 各走一遍——左边是没有任何共享前缀的常规 batch（绝大多数情况），右边是 8 个请求共用同一个 2048-token system prompt 的 batch（cascade 的用武之地）。图后按「结论 → 为什么 → 锚点」拆三个要点：</p>
+    <p>摘录只是个缩影，真实的 forward 是一条按顺序检查的决策链。图 7.4 拿两个具体 batch 各走一遍——左边是纯文本 batch（绝大多数情况），右边是多模态 batch：每个请求的 prompt 里嵌着一张图片，图像 token 那一段允许前后互看（PrefixLM 式的双向注意力）。图后按「结论 → 为什么 → 锚点」拆三个要点：</p>
 
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 544" xmlns="http://www.w3.org/2000/svg">
@@ -366,54 +366,57 @@
         <rect x="248" y="172" width="70" height="20" fill="#dde8cf" stroke="#93ac62"></rect>
         <text class="lbl sm" x="30" y="211">请求2</text>
         <rect x="100" y="196" width="70" height="20" fill="#f0e3cf" stroke="#c2965a"></rect>
-        <text class="lbl sm" x="30" y="230">没有任何一段 KV 被大家共用 → common_prefix_len ≈ 0</text>
-        <text class="lbl sm" x="30" y="246">（decode / prefill 的常规 batch 都是这样）</text>
+        <text class="lbl sm" x="30" y="230">纯因果文本：每个 query 只准看自己左边 → causal=True</text>
+        <text class="lbl sm" x="30" y="246">（decode / prefill 的绝大多数 batch 都是这样）</text>
 
         <rect class="node" x="460" y="108" width="420" height="34" rx="6"></rect>
-        <text class="lbl" x="670" y="129" text-anchor="middle">例 B：8 个请求共用同一个 2048-token system prompt</text>
+        <text class="lbl" x="670" y="129" text-anchor="middle">例 B：每个请求的 prompt 里嵌一张图片（多模态）</text>
 
         <text class="lbl sm" x="470" y="163">请求0</text>
-        <rect class="node acc" x="540" y="148" width="244" height="20"></rect>
+        <rect class="node acc" x="540" y="148" width="140" height="20"></rect>
         <rect x="792" y="148" width="68" height="20" fill="#cfe0f0" stroke="#8fb4d9"></rect>
         <text class="lbl sm" x="470" y="187">请求1</text>
-        <rect class="node acc" x="540" y="172" width="244" height="20"></rect>
+        <rect x="540" y="172" width="70" height="20" fill="#dde8cf" stroke="#93ac62"></rect>
+        <rect class="node acc" x="618" y="172" width="120" height="20"></rect>
         <rect x="792" y="172" width="68" height="20" fill="#dde8cf" stroke="#93ac62"></rect>
         <text class="lbl sm" x="470" y="211">请求2</text>
-        <rect class="node acc" x="540" y="196" width="244" height="20"></rect>
-        <rect x="792" y="196" width="68" height="20" fill="#f0e3cf" stroke="#c2965a"></rect>
-        <text class="lbl sm" x="470" y="230">橙色段 = 同一段物理 KV：2048-token 共享前缀，8 个请求都指向它</text>
-        <text class="lbl sm" x="470" y="246">s0 / s1 / s2 = 各自的后缀（长度 = seq_len − 2048）；共 8 行</text>
+        <rect x="540" y="196" width="40" height="20" fill="#f0e3cf" stroke="#c2965a"></rect>
+        <rect class="node acc" x="584" y="196" width="110" height="20"></rect>
+        <rect x="700" y="196" width="34" height="20" fill="#f0e3cf" stroke="#c2965a"></rect>
+        <rect x="792" y="196" width="68" height="20" fill="#cfe0f0" stroke="#8fb4d9"></rect>
+        <text class="lbl sm" x="470" y="230">橙色段 = 图像 token 区间（每请求各自的位置，不共享）</text>
+        <text class="lbl sm" x="470" y="246">这些位置上允许双向注意：图内 token 互相看 + 看自己左边的文本</text>
 
         <rect class="node" x="20" y="258" width="420" height="42" rx="6"></rect>
-        <text class="lbl" x="230" y="276" text-anchor="middle">use_cascade？前缀 ≈ 0 &lt; 256 → 否</text>
-        <text class="lbl sm" x="230" y="292" text-anchor="middle">前缀太短，没有可共享的计算 → 绝大多数 batch 停在这里</text>
+        <text class="lbl" x="230" y="276" text-anchor="middle">特殊分支逐个检查：mm_prefix？R-SWA？逐条 causal？</text>
+        <text class="lbl sm" x="230" y="292" text-anchor="middle">都不是 → 走最普通的路径，绝大多数 batch 停在这里</text>
 
         <rect class="node" x="460" y="258" width="420" height="42" rx="6"></rect>
-        <text class="lbl" x="670" y="276" text-anchor="middle">use_cascade？2048 ≥ 256 且请求 8 ≥ 8 → 是</text>
-        <text class="lbl sm" x="670" y="292" text-anchor="middle">长共享前缀 + 足够多的请求 → 值得把共享部分只算一次</text>
+        <text class="lbl" x="670" y="276" text-anchor="middle">is_mm_prefix_lm 且当前 token 落在图像区间 → 是</text>
+        <text class="lbl sm" x="670" y="292" text-anchor="middle">模型（如 Gemma3）声明了图像 token 双向注意 → mask_mod 登场</text>
 
         <line class="edge" x1="230" y1="300" x2="230" y2="310" marker-end="url(#arrow)"></line>
         <line class="edge" x1="670" y1="300" x2="670" y2="310" marker-end="url(#arrow)"></line>
 
         <rect class="node ok" x="20" y="312" width="420" height="46" rx="6"></rect>
         <text class="lbl" x="230" y="331" text-anchor="middle">一次 kernel launch（_FA4_DENSE_ATTENTION_KERNEL）</text>
-        <text class="lbl sm" x="230" y="347" text-anchor="middle">flash_attn_varlen_func 把 3 个请求的 query 一次算完</text>
+        <text class="lbl sm" x="230" y="347" text-anchor="middle">causal=True + window，把所有请求的 query 一次算完</text>
 
         <rect class="node acc" x="460" y="312" width="420" height="42" rx="6"></rect>
-        <text class="lbl" x="670" y="331" text-anchor="middle">kernel ①：全部 query 一起对共享前缀算</text>
-        <text class="lbl sm" x="670" y="347" text-anchor="middle">当成一条序列（causal=False）；这段 KV 只读一遍</text>
+        <text class="lbl" x="670" y="331" text-anchor="middle">kernel launch 前换掉可见性规则</text>
+        <text class="lbl sm" x="670" y="347" text-anchor="middle">causal/window 被关掉，交给 mask_mod：逐 token 判「能看谁」</text>
 
         <line class="edge" x1="670" y1="354" x2="670" y2="364" marker-end="url(#arrow)"></line>
 
         <rect class="node acc" x="460" y="366" width="420" height="42" rx="6"></rect>
-        <text class="lbl" x="670" y="385" text-anchor="middle">kernel ②：每个请求对自己的后缀算</text>
-        <text class="lbl sm" x="670" y="401" text-anchor="middle">causal=True；block_table 跳过前缀那几块，从后缀块读起</text>
+        <text class="lbl" x="670" y="385" text-anchor="middle">mask_mod =（causal ∧ 窗口）∨ 双向区间</text>
+        <text class="lbl sm" x="670" y="401" text-anchor="middle">文本 token：照旧 causal；图像 token：对整个图像区间双向可见</text>
 
         <line class="edge" x1="670" y1="408" x2="670" y2="418" marker-end="url(#arrow)"></line>
 
         <rect class="node" x="460" y="420" width="420" height="42" rx="6"></rect>
-        <text class="lbl" x="670" y="439" text-anchor="middle">merge_attn_states：两份结果合成最终输出</text>
-        <text class="lbl sm" x="670" y="455" text-anchor="middle">按 LSE 加权合并，数学上精确等价于一次算完</text>
+        <text class="lbl" x="670" y="439" text-anchor="middle">仍是同一次 kernel launch，只是多了两个 aux 张量</text>
+        <text class="lbl sm" x="670" y="455" text-anchor="middle">aux = 每 token 的 [start, end] 区间 + query 分组边界</text>
 
         <line class="edge" x1="230" y1="358" x2="320" y2="474" marker-end="url(#arrow)"></line>
         <line class="edge" x1="670" y1="462" x2="580" y2="474" marker-end="url(#arrow)"></line>
@@ -426,15 +429,15 @@
       <div class="svg-legend">
         <span class="lg-item"><span class="sw core"></span>两个例子共用的开头</span>
         <span class="lg-item"><span class="sw ok"></span>例 A 的落点：一次 launch</span>
-        <span class="lg-item"><span class="sw acc"></span>例 B 专属：cascade 三步</span>
+        <span class="lg-item"><span class="sw acc"></span>例 B 专属：mask_mod 路径</span>
       </div>
-      <div class="fig-cap">图 7.4：同一个 forward，两种走法。判断本身只有一处——前缀够不够长、请求够不够多；满足就走「共享前缀算一次 + 各自后缀各算一次 + 合并」，不满足就一次算完。两边的目的地都是同一个 kernel（flash_attn_varlen_func），区别只是调几次、对哪段 KV 算。</div>
+      <div class="fig-cap">图 7.4：同一个 forward，两种走法。判断本身只有几处、按顺序检查——是不是多模态的图像 token、是不是 R-SWA、是不是逐条 causal；命中就走 mask_mod 改写可见性，不命中就一次算完。两边的目的地都是同一个 kernel（_FA4_DENSE_ATTENTION_KERNEL → flash_attn_varlen_func），区别只是可见性规则由谁说了算。</div>
     </div>
 
     <p>图上三处值得多看一眼的地方。每点先给结论，再说为什么，最后标锚点：</p>
     <ul>
       <li><strong>结论：KV 写入不归 forward 管</strong>——attention 层先写缓存、再算注意力。为什么：写缓存与 forward 是两个自定义 op，中间靠一个空张量 <code class="inline">kv_cache_dummy_dep</code> 建立数据依赖，保证 torch.compile 不重排先后。「先写缓存再 forward」不是唯一顺序：接口基类的 <code class="inline">forward_includes_kv_cache_update</code> 默认 <code class="inline">True</code>（写入归 forward 管），FlashAttention、FlashInfer 等绝大多数后端都覆写成 <code class="inline">False</code>，于是走上面这条先写后算的路；真正在 forward 内部写缓存的是少数，如 HPC_ATTN。锚点：<code class="inline">vllm/model_executor/layers/attention/attention.py</code>（写缓存即 <code class="inline">do_kv_cache_update</code>，内部是 <code class="inline">reshape_and_cache_flash</code> 算子）。</li>
-      <li><strong>结论：cascade 拆成两半算，结果精确等价</strong>，不是近似。为什么：softmax 注意力对「先看哪些 KV」可以分块——kernel ① 和 ② 各自除了输出还带出一个 LSE（log-sum-exp，配分函数的对数），<code class="inline">merge_attn_states</code> 拿这两组 (输出, LSE) 按 LSE 加权合成，数学上精确等价于对完整 KV 一次算完。收益在带宽：例 B 里 2048-token 前缀的 KV 如果走例 A 的路，8 个请求每人读一遍就是 8 次重复读取；cascade 只读 1 次。门槛也就由此而来——前缀 ≥256 token、请求 ≥8 个、无 sliding window / alibi，三者缺一就不值得拆。锚点：后两者不支持直接 assert 在 flash_attn.py。</li>
+      <li><strong>结论：特殊注意力模式不换 kernel，只换「可见性规则」</strong>。为什么：像 Gemma3 那种图像 token 双向注意力（mm_prefix），规则是「causal ∨ 在同一图像区间内」——这超出了 kernel 内建 causal/window 参数能表达的范围，所以走的是 <strong>mask_mod</strong>：调用方传入一个逐 token 判「这个 query 能看哪些 key」的函数和两个 aux 张量（每个 query token 的 [start, end] 区间、query 分组边界），kernel 本体还是 <code class="inline">_FA4_DENSE_ATTENTION_KERNEL</code> 这一个，只是内建的 causal 和 window 被关掉、由 mask_mod 全权接管。代价有二：mask_mod 只有 FA4 支持（FA2/FA3 直接不进这条分支），而且要求 batch 里没有逐条 causal——一旦命中，causal=False、window=None 全部让位。门槛的用意也在这：规则表达力最强的通道最贵，只留给真正需要的请求。锚点：<code class="inline">_make_mm_prefix_mask_mod</code>（flash_attn.py:1713）；区间元数据由 <code class="inline">compute_mm_prefix_ranges</code> 从多模态特征算出（vllm/v1/worker/gpu/attn_utils.py:584），再经 <code class="inline">fill_mm_prefix_query_ranges</code> 填成每 token 的区间表（vllm/v1/attention/backends/utils.py:104）。</li>
       <li><strong>结论：CPU 开销被当成一等公民</strong>。为什么：源码里 woosuk 的注释专门警告这段代码跑在 eager 模式（分段 CUDA graph 的间隙），<code class="inline">view</code>、<code class="inline">[:n]</code> 这类操作慢得出人意料，所以整个 forward 的原则是——Python 里只做切片和标量计算，注意力本体一概交给 kernel。</li>
     </ul>
 
@@ -497,7 +500,7 @@
 </div>
 
 <footer>
-  深入浅出vLLM · 07 Kernel · 版本 v0.31.1rc0-272-gf8471164bf9 (f8471164bf9)
+  深入浅出vLLM · 07 Kernel · 版本 proto-v0.6.0-121-g3dcfaeb4e8f (3dcfaeb4e8)
 </footer>
 
 </body>

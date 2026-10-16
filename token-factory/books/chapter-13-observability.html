@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 13 章 · 监控、可观测性与故障排查 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 13 章 · 监控、可观测性与故障排查</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第四篇 · 第 13 章 · Observability and Troubleshooting</div>
+      <h1 class="title">监控、可观测性与故障排查</h1>
+      <p class="lede">
+        运营的第一能力不是修故障，是看见故障。这一章给出三层监控的完整清单（哪些指标、什么粒度、什么告警），然后把生产环境最常见的五类故障做成排查手册——每类按"症状 → 定位 → 证据 → 处置"展开。素材形态取自作者自己的故障案例库，条目为通用化重写。
+      </p>
+
+      <h2 id="three-layers">三层监控</h2>
+
+      <p>监控体系按"看什么"分三层，每层回答一个不同的问题：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>层</th><th>回答的问题</th><th>核心指标</th><th>典型告警</th></tr></thead>
+          <tbody>
+            <tr><td>GPU/硬件层</td><td>机器健康吗</td><td>SM/显存利用率、显存 ECC、温度、功耗、NVLink/NIC 错误计数</td><td>掉卡、ECC 超阈、温度越限</td></tr>
+            <tr><td>模型实例层</td><td>实例健康吗、效率高吗</td><td>队列深度、running/waiting 请求数、KV 池占用、缓存命中率、吞吐</td><td>队列持续增长、KV 池水位 &gt;90%、缓存命中率骤降</td></tr>
+            <tr><td>请求/业务层</td><td>用户体验达标吗</td><td>TTFT/ITL P50/95/99（按模型与租户分列）、错误率、重试率、token 计数</td><td>SLA 达标率跌破阈值、错误率突增</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>三层的关键规则是<strong>分列</strong>：按模型分、按租户分、按请求类型分（在线/定时/离线）。合在一起的平均值会吞掉所有信号——"P99 800ms"看着还行，拆开是"对话业务 300ms + 离线批 2000ms"，根本没有一个是真的。第 2 章的有效产能公式所需要的两个占比（SLA 达标率、合格产出率）就从请求层的聚合来。</p>
+
+      <p>工具链的选型反而是最不重要的一段：Prometheus + Grafana 是事实标准，指标埋点从引擎自带 metrics 端点（吞吐、队列、KV 池水位都有现成暴露）加网关日志聚合（TTFT/ITL 分布）两路合流。成本敏感的组织可以只做"网关日志 + 离线聚合"的最小版，先有账再谈面板。</p>
+
+      <h2 id="per-request">请求级可观测：日志记什么</h2>
+
+      <p>三层监控看大盘，请求级日志管单点定位。每条请求记一行（JSON），字段清单直接给：</p>
+
+      <pre><code>{
+  "ts": "...",                    # 到达时间
+  "tenant": "acme", "tier": "gold",
+  "model": "qwen-32b", "instance": "inst-042",
+  "prompt_tokens": 1830, "output_tokens": 412,
+  "ttft_ms": 742, "itl_p50_ms": 18, "itl_p99_ms": 55,
+  "e2e_ms": 8140,
+  "prefix_hit_ratio": 0.83,
+  "finish": "ok",                 # ok | aborted | timeout | error
+  "retry_of": null,               # 若为重试，指向原请求
+  "route": "affinity:v3"          # 命中的路由策略
+}</code></pre>
+
+      <p>这份日志是全书多个章节的原料：有效产能（第 2 章）从它聚合，路由效果（第 9 章）从 prefix_hit_ratio 验证，租户账单（第 15 章）从 tenant 字段汇总。写日志的那一刻多花的心思，都会在运营期加倍偿还。</p>
+
+      <h2 id="runbook">五类常见故障的排查手册</h2>
+
+      <p>以下五类覆盖了推理集群日常故障的绝大多数。每类给症状、定位路径与典型案例。</p>
+
+      <h3>故障一：显存不足（OOM）</h3>
+      <p><strong>症状</strong>：实例日志 OOM、单请求报错、或整进程被杀。<strong>定位</strong>：先分清三级——单请求 OOM（上下文超长，网关按模型上限拦截即可）、并发累积 OOM（KV 池水位监控缺失 + 突发流量，查队列深度与水位时间线）、碎片型（长跑后可分配块变小，重启可复）。<strong>案例</strong>：某业务上线 32k 上下文支持后夜间批量任务集中打满，KV 池无告警水位线，一周内三次实例崩溃——补上 KV 水位 90% 告警 + 夜间批处理错峰后归零。</p>
+
+      <h3>故障二：排队堆积（过载）</h3>
+      <p><strong>症状</strong>：TTFT 全线恶化，吞吐不涨反降（重试叠加）。<strong>定位</strong>：区分"真过载"（流量确实超过容量，扩容或限流）与"伪过载"（某实例故障未摘流，流量挤到剩余实例）。看队列深度按实例的分列——伪过载的特征是"某实例队列异常而其余正常"。<strong>教训</strong>：限流策略上线要带监控（当前限流值、排队深度、拒绝率），否则过载保护本身会变成新的故障源（第 11 章的自动退出原则）。</p>
+
+      <h3>故障三：通信故障</h3>
+      <p><strong>症状</strong>：多卡实例吞吐骤降或 hang、NCCL 超时报错。<strong>定位</strong>：NCCL 超时多数指向网络或拓扑问题（某条链路降速、RDMA 配置漂移），用引擎日志的集合通信耗时分位 + 网络层错误计数交叉定位。机内 TP 的 all-reduce 耗时从"稳定微秒级"变成"毫秒级抖动"是最典型的早期信号。<strong>教训</strong>：硬件故障的表象常常是"软件变慢"——性能缓慢劣化的告警比崩溃告警更早拯救你。</p>
+
+      <h3>故障四：缓存失效风暴</h3>
+      <p><strong>症状</strong>：TTFT 尖峰 + 缓存命中率归零，通常伴随一次实例重启或调度搬迁。<strong>定位</strong>：命中率分列（按实例、按租户）+ 与变更事件对时（发布、驱逐、实例迁移）。KV 缓存的损失不可恢复，只能用流量整形渡过：临时提高该模型的 TTFT SLA 期望或降低该业务优先级。<strong>教训</strong>：K8s 驱逐策略（第 12 章）不感知缓存价值，把"缓存预热完成度"纳入驱逐优先级是长效解。</p>
+
+      <h3>故障五：长尾超时（客户端放弃）</h3>
+      <p><strong>症状</strong>：完成率下降但错误率正常——请求还在跑，客户端已经走了。<strong>定位</strong>：对齐三处超时（客户端、网关、引擎）的相对大小；常见病因是引擎侧超时 > 客户端超时，引擎在为幽灵请求烧卡。网关要把客户端断连传播到引擎（取消请求，第 5 章讲过取消传播）。<strong>复盘问题</strong>：被放弃的请求消耗了多少 GPU 小时——这个数应当进周报，它是"有效产能"最直接的漏损项。</p>
+
+      <h2 id="experiment">▶ 素材：建立你自己的故障案例库</h2>
+
+      <p>本章的手册形态来自一个持续维护的故障案例库。建库的模板（每条一案）：</p>
+
+      <ol>
+        <li>症状：用户看到什么、监控看到什么（保留原始截图/曲线）。</li>
+        <li>时间线：从发生到恢复的关键动作与时刻。</li>
+        <li>根因：三层分解（直接原因、机制原因、流程原因）。</li>
+        <li>修复与预防：临时措施、长期措施、对应的监控/告警补充。</li>
+        <li>可复用的检查项：沉淀成 runbook 条目（本章五类故障的格式）。</li>
+      </ol>
+
+      <p>案例库的价值会随时间累积：每一次故障至少产出一条"可自动化发现的信号"——三个月后，你的告警系统里有七成规则来自真实故障，而不是来自想象。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>三层监控（GPU、实例、请求）各自回答不同问题，分列（模型/租户/负载类型）是一切分析的前提。请求日志是运营的原料库，字段清单照抄即可起步。五类高频故障各有特征信号：OOM 看水位、堆积看分列、通信看趋势、缓存看命中率、长尾看超时对齐。故障案例库把每一次事故变成资产。</p>
+        <p>下一章回答"该建多大"：压测方法与容量规划，把第 2 章的曲线变成扩容决策。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-12-kubernetes.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 12 章 · Kubernetes 与分布式推理编排</span>
+        </a>
+        <a class="next" href="chapter-14-benchmark-capacity.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 14 章 · 压测与容量规划</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

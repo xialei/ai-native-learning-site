@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 4 章 · 推理原理速览：从 Prefill/Decode 到 KV Cache — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 4 章 · 推理原理速览</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第二篇 · 第 4 章 · Inference Primer</div>
+      <h1 class="title">推理原理速览：从 Prefill/Decode 到 KV Cache</h1>
+      <p class="lede">
+        【压缩章】原理不展开，只立三样后面反复要用的东西：两种阶段的不同瓶颈、一张显存预算表、PagedAttention 与 Prefix Cache 两项机制。要看逐行源码，vLLM/SGLang 的源码精读系列更合适；这一章只保证你读完能自己算"这个模型在我这张卡上能服务多少并发"。
+      </p>
+
+      <h2 id="phases">两个阶段，两种瓶颈</h2>
+
+      <p>一次自回归生成请求，在 GPU 上走两种完全不同的阶段。<strong>Prefill</strong>处理输入的全部 token：它们一次进模型，相互之间可以并行算，一个 2k token 的输入就是一次 2k 长度的前向。计算量大，但每个 token 的算术强度高，是<strong>算力受限（compute-bound）</strong>的阶段。<strong>Decode</strong>逐个生成输出 token：每生成一个，都要把当前序列的注意力算一遍。矩阵-向量运算为主，算术强度低，瓶颈在显存带宽——每一步都要把权重和 KV Cache 从显存搬一遍，是<strong>带宽受限（memory-bound）</strong>的阶段。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  R["请求<br/>输入 2k + 输出 1k"] --> P["Prefill<br/>2k tokens 一次前向<br/>compute-bound"]
+  P --> D1["Decode step 1"]
+  D1 --> D2["Decode step 2"]
+  D2 --> D3["…… × 1000<br/>memory-bound"]
+  D3 --> E["完成"]
+  style P fill:#e3edf5,stroke:#1f5c8b
+  style D2 fill:#fdeeee,stroke:#cc4433
+        </div>
+        <figcaption>同一请求的两个阶段。Prefill 吃算力，Decode 吃带宽——这是后续所有调度决策（混批、分离、chunked prefill）的物理根源。</figcaption>
+      </figure>
+
+      <p>两种瓶颈混在一起，就是调度困难的根源：批处理能救 Decode（多个请求共享一次权重搬运，带宽利用率上去），但会把 Prefill 的延迟拖坏（ Decode 步骤被长 prefill 阻塞）；反过来照顾 Prefill，Decode 的批就凑不满。第 5 章的 chunked prefill 和第 8 章的 PD 分离，都是对这对矛盾的不同解法。</p>
+
+      <h2 id="kv-cache">KV Cache：第二座显存大山</h2>
+
+      <p>Decode 为什么每步都要"重算"注意力？因为自回归生成的每一步都要用到之前所有 token 的 Key/Value 向量。缓存它们，就是 KV Cache。它是继模型权重之后第二座占显存的大山，而且这座山<strong>随并发增长、随上下文增长</strong>。</p>
+
+      <p>一笔算清（公式，量级示意）：</p>
+
+      <pre><code>KV Cache 显存 ≈ 2 (K与V) × 层数 × KV头数 × 头维度 × 精度字节数
+                × 上下文 token 数 × 并发请求数
+
+例（示意）：7B 模型（32 层、8 个 KV 头、head_dim 128、FP16 = 2 字节）
+  每 token KV = 2 × 32 × 8 × 128 × 2 B = 128 KB
+  4k 上下文单请求 ≈ 0.5 MB … 听起来很小
+  但 256 并发 × 4k 上下文 ≈ 128 GB —— 超过一张 H100 的全部显存</code></pre>
+
+      <p>几个工程推论，后面章节会直接引用：长上下文场景里 KV Cache 比权重更吃显存（权重 16GB 的模型，256 并发 × 32k 上下文的 KV 要几十上百 GB）；GQA/MQA 架构（KV 头数远小于注意力头数）之所以成为标配，省钱是首要原因；量化 KV Cache（FP8）能直接砍一半，是长上下文场景的常见开关。</p>
+
+      <h2 id="memory-budget">显存预算表</h2>
+
+      <p>把一张卡上的显存账全部列出来。这张表是本书的"地基表"——容量规划（第 14 章）、调度决策（第 10 章）、分离比例（第 8 章）都从它出发：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>大小（示意，以 7B 模型 / H100-80G 为例）</th><th>随什么增长</th></tr></thead>
+          <tbody>
+            <tr><td>模型权重</td><td>FP16 约 15 GB；INT4 约 4–5 GB</td><td>模型参数量与精度</td></tr>
+            <tr><td>KV Cache</td><td>0（空载）→ 数十 GB（满载）</td><td>并发数 × 上下文长度</td></tr>
+            <tr><td>激活值 / 中间张量</td><td>1–3 GB（与批大小、chunk 长度相关）</td><td>批大小、序列长度</td></tr>
+            <tr><td>CUDA Graph / 框架开销</td><td>1–5 GB</td><td>图数量与 batch 档位</td></tr>
+            <tr><td>框架保留（权重副本、工作区）</td><td>2–6 GB</td><td>引擎实现</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>预算表的用法：引擎启动时会"预分配"一个 KV 池——用 gpu_memory_utilization（vLLM，默认 0.92，见 vLLM cache 配置）之类的参数告诉引擎"你最多用到显存的多少比例"，引擎在装完权重和运行时开销后，把剩下的显存几乎全给 KV 池。<strong>KV 池大小 = 并发能力 × 单请求上下文上限</strong>，所以这张表直接决定"这台机器能扛多少并发、扛多长上下文"——第 14 章的容量公式从这里出发。</p>
+
+      <h2 id="paged">PagedAttention：把虚拟内存搬进 KV Cache</h2>
+
+      <p>早期推理框架给每个请求预分配一整块连续显存放 KV Cache（按最大上下文长度算），浪费惊人：请求实际用到 300 token，却按 4k 预留，碎片率常常超过一半。vLLM 的 PagedAttention（OSDI 2024 之前的 SOSP 2023 论文）把操作系统虚拟内存的思路搬过来：显存切成固定大小的 page（典型 16 token 一个），请求的 KV 按需映射到不连续的 page，用一张页表维护逻辑-物理映射。碎片率从"按最大预留"降到接近零，同样的显存能扛的并发直接翻倍以上。</p>
+
+      <p>对工厂视角的读者，PagedAttention 只需要记住一件事：<strong>它把"显存能装多少请求"从静态预留问题变成了动态分配问题，推理集群的并发容量从此是可调度的资源，而不是被预留锁死的资产。</strong>这也是后面"抢占、换出、分级缓存"这些调度手段（第 10、11 章）能成立的前提。SGLang 的页式分配与 RadixCache 在其源码精读系列有逐行分析，此处不重复。</p>
+
+      <h2 id="prefix">Prefix Cache：工厂的免费产能</h2>
+
+      <p>真实流量有一个对工厂极其友好的性质：大量请求共享相同前缀。同一个 Agent 的系统提示每轮都一样；多轮对话的历史本身就是自己前几轮的输出；同一客户的多名员工提问时共用同一条 6k 级的机构知识前缀。对这些请求，prefill 的绝大部分计算是重复的——算过的 KV 直接复用，TTFT 从"秒级"降到"毫秒级"。RAG 是这条规则的例外：检索回来的文档每次排序和组合都可能不同，简单的前缀匹配接不住，复用要靠更靠后的缓存层或专门的融合方案。</p>
+
+      <p>这就是 Prefix Cache（vLLM 的 automatic prefix caching、SGLang 的 RadixCache）：把请求的前缀 KV 按树/页结构存下来，新请求来了先匹配前缀，命中的部分跳过计算。两个要点：其一，命中率是负载形态的函数——Agent 流量命中率高（系统提示固定），随机问答流量低；其二，缓存占用的显存和"给新请求用"存在竞争，缓存策略（保留多久、多少显存给缓存）是调度器要做的决定之一。</p>
+
+      <blockquote>
+        <p><strong>工厂语言的翻译：</strong>Prefix Cache 是一座"记忆工厂"——用显存换计算，把重复劳动变成库存复用。它的产能贡献（省下的 prefill 时间）可以折成 token 计入有效产能，是少数"不花硬件钱就能提升产能"的手段。第 9 章的路由策略会专门利用它。</p>
+      </blockquote>
+
+      <h2 id="experiment">▶ 实验：不同模型 / 上下文长度下的 KV Cache 占用实测</h2>
+
+      <p>验证上面那张预算表（至少验证 KV 行），并拿到你自己环境的系数：</p>
+
+      <ol>
+        <li>启动引擎，记录空载已用显存（这一项包含权重 + 运行时开销）。</li>
+        <li>发送单条长输入请求（比如 32k），记录增量——这就是"单请求满上下文"的 KV 占用 + 激活。</li>
+        <li>逐档提升并发（1、2、4、8…），记录每档显存，验证"KV 占用随并发线性增长"是否成立、斜率是多少。</li>
+        <li>换输入长度重复（8k / 16k / 32k），拿到"每 GB 显存能换多少 token-上下文"的系数。</li>
+        <li>打开 FP8 KV Cache 重复一遍，记录斜率变化。</li>
+      </ol>
+
+      <p>交付物是一张填了你自己的数字的预算表。有了它，"这批卡能不能扛住下个季度的流量"从玄学变成乘法。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>Prefill 吃算力、Decode 吃带宽，这对物理矛盾是全书调度讨论的根。KV Cache 是随并发与上下文增长的第二座显存大山，显存预算表把它与权重、激活、框架开销一起算清，直接决定并发容量。PagedAttention 把 KV 显存变成可分页的动态资源；Prefix Cache 把重复前缀变成免费产能。原理至此够用，细节归引擎文档与源码精读。</p>
+        <p>下一章讲批处理与请求调度：同一张卡上，长请求和短请求、prefill 和 decode 怎么排班。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-03-architecture.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 3 章 · 一座工厂的完整架构</span>
+        </a>
+        <a class="next" href="chapter-05-batching.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 5 章 · 批处理与请求调度</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

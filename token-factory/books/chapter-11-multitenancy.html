@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 11 章 · 多租户、服务等级与过载保护 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 11 章 · 多租户、服务等级与过载保护</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第三篇 · 第 11 章 · Multitenancy and Overload Protection</div>
+      <h1 class="title">多租户、服务等级与过载保护</h1>
+      <p class="lede">
+        多个业务共处一座工厂，第一个冬天是信任问题：A 业务的突发流量把 B 业务的 P99 打崩，从此每个业务都要求"给我独享的卡"。这一章讲怎么在不回到物理隔离的前提下守住公平：租户模型、两级配额、延迟型与吞吐型业务的分区、以及过载时的降级次序。
+      </p>
+
+      <h2 id="tenant-model">租户模型：隔离的三个层级</h2>
+
+      <p>"多租户"在推理工厂里指三种不同强度的隔离，按代价排列：</p>
+
+      <p><strong>逻辑隔离（默认）</strong>：所有租户共享全部实例，网关按租户标记请求，配额与优先级在网关与调度器执行。成本最低、弹性最大；隔离强度取决于配额执行的严格度——配额松了就是没有隔离。</p>
+      <p><strong>容量隔离（常用）</strong>：按租户等级划分实例池或权重（加权公平队列），突发流量只冲击本等级。适合"有两三个大客户 + 若干小客户"的结构。</p>
+      <p><strong>物理隔离（特例）</strong>：独享实例池甚至独享机器。只用于合规要求或 SLA 惨烈的客户——它同时冻结了弹性（别人的低峰你用不上）和成本优势，是租户管理的失败出口，不是荣誉。</p>
+
+      <p>工程要点是租户元数据要一开始就设计好：租户 ID、服务等级、配额组、账单主体、审计边界，五个字段进请求上下文，全链路透传。事后从 URL 或日志里"认出"租户的补丁方案，是计量混乱的第一来源（第 13、15 章都会回到这五个字段）。</p>
+
+      <h2 id="fairness">公平调度：从先来先服务到加权</h2>
+
+      <p>实例内的请求队列天然是先来先服务——这在多租户下会退化成"谁的并发高谁赢"：大租户 100 路并发永远排在单路请求的前面。修正的阶梯：</p>
+
+      <ul>
+        <li><strong>按租户分桶 + 每桶并发上限</strong>：最简单的公平兜底。超过并发的请求在网关排队而不是进引擎——把不公平拦在集群外。</li>
+        <li><strong>加权调度</strong>：实例内按租户权重分配"进场名额"，权重来自服务等级。引擎多不支持细粒度的租户级加权，工程做法是在网关到实例的入口做令牌分配，或用多实例分池实现粗粒度加权。</li>
+        <li><strong>抢占式公平（进阶）</strong>：高等级租户的请求可以抢占低等级租户在实例内的排队位。实现代价高（涉及请求迁移或队列重组），通常只在专用实例池上做，通用池用前两级就够。</li>
+      </ul>
+
+      <p>公平不等于平均。公平的定义应当写进租户契约："在配额内，你的 P95 TTFT 不劣于 X"——按 SLA 兑现率而不是"每家分到一样多 token"来考核调度器。</p>
+
+      <h2 id="quotas">两级配额：并发限流与 token 配额</h2>
+
+      <p>配额有两个轴，语义完全不同，混用是常见错误：</p>
+
+      <p><strong>并发限流（RPM/并发数）保护系统</strong>：它决定资源占用上界，防止一个租户的突发把实例打满。设置依据是容量（第 14 章的压测拐点），超限动作是"排队或快速拒绝"。</p>
+      <p><strong>Token 配额（TPM/月度）保护经营</strong>：它决定成本分摊，与系统的瞬时压力无关。设置依据是商务（合同、预算、毛利），超限动作是"拒绝并提示充值/下月恢复"。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>维度</th><th>并发限流</th><th>Token 配额</th></tr></thead>
+          <tbody>
+            <tr><td>保护对象</td><td>系统（延迟与稳定）</td><td>经营（成本与收入）</td></tr>
+            <tr><td>时间尺度</td><td>秒级滑动窗口</td><td>分钟/日/月累计</td></tr>
+            <tr><td>超限动作</td><td>排队 → 限速 → 拒绝</td><td>拒绝（商务动作）</td></tr>
+            <tr><td>设置依据</td><td>压测容量 × 等级系数</td><td>合同/预算/毛利</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>两级都要在网关执行（第 3 章的策略执行点），且都要给"突增通道"：重要客户的合法突发要能通过临时提额走掉，而不是撞在死板的限流墙上。提额动作要有审计——它是配额体系里最常被滥用的口子。</p>
+
+      <h2 id="two-classes">延迟型业务与吞吐型业务</h2>
+
+      <p>多租户里最难缠的不是租户数量，是负载类型的混合：对话类业务要 ITL（人在等），批处理类业务要吞吐（机器跑）。两类业务对同一批卡的诉求是冲突的——第 5 章讲过批效率与单请求延迟的取舍，租户维度上是同一矛盾的放大版。解法是"分区 + 等级"：</p>
+
+      <ul>
+        <li><strong>延迟敏感区</strong>：实例参数按延迟调优（小批、chunked prefill 开、低 max batch tokens），吞吐上限换延迟下限。定价最高。</li>
+        <li><strong>吞吐区</strong>：参数按吞吐调优（大批、可接受长队列），价格按 token 量的折扣层。延迟敏感业务禁止路由到这里（路由策略按服务等级强制，第 9 章第二层）。</li>
+        <li><strong>弹性边界</strong>：两区之间保留可流动的实例（类似第 10 章的预测任务池），低谷时延迟区的余量借给吞吐区，高峰前提前收回。</li>
+      </ul>
+
+      <h2 id="overload">过载保护：降级的次序</h2>
+
+      <p>过载不是异常态，是生产的常态时刻（营销活动、热点事件、故障后的重试风暴）。过载保护的要义是<strong>按预先排好的次序丢掉最便宜的东西</strong>，而不是让所有请求一起变慢。一个可用的降级次序：</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  O0["正常"] --> O1["L1 · 收紧<br/>缩并发上限、缓存优先<br/>用户无感"]
+  O1 --> O2["L2 · 排队<br/>新请求进入队列<br/>TTFT 显式告知或超时"]
+  O2 --> O3["L3 · 降级<br/>低等级租户 → 小模型<br/>或缩短 max output"]
+  O3 --> O4["L4 · 熔断<br/>高等级保底，其余快速失败<br/>附 Retry-After"]
+  style O3 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>四级过载响应。关键原则：每一级都要可自动退出（压力恢复后自动升回），且全程对租户可观测（响应头带当前等级与 Retry-After）。</figcaption>
+      </figure>
+
+      <p>几个工程细节决定成败：<strong>熔断要按依赖方分桶</strong>（单实例过载只熔该实例的路由，不是全站熔）；<strong>重试风暴的抑制</strong>要在协议层（Retry-After + 指数退避 + 抖动），并在网关统计"重试消耗"，超过阈值时直接拒绝新重试（第 2 章说过，重试是账本上的废品，要当成本管理）；<strong>降级到小模型</strong>要提前验证质量下限——临时抱佛脚找的降级模型，质量事故比拒绝服务更伤。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>租户隔离分三级，逻辑隔离加严格配额是默认态，物理隔离是合规出口不是常态。公平按 SLA 兑现率定义，不按平均分配。并发限流保护系统、token 配额保护经营，两轴分开设置。延迟型与吞吐型业务分区管理，区间留弹性。过载保护的核心是预排好的降级次序 + 自动退出 + 对租户可观测——让每一次拒绝都有章法。</p>
+        <p>下一章看编排的工业化形态：Kubernetes 上的推理编排，llm-d 与 Dynamo 两种思路的对照。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-10-scheduler-mixed-workload.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 10 章 · GPU 资源调度器与混合任务</span>
+        </a>
+        <a class="next" href="chapter-12-kubernetes.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 12 章 · Kubernetes 与分布式推理编排</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

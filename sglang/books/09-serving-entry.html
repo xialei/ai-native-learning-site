@@ -227,7 +227,7 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
       路由表里评分类那一行最近热闹了两轮。其一，新增 <code class="inline">/v1/systemone</code>（<code class="inline">http_server.py</code>，commit 16d1c93b3d #41208）——System One 兼容的决策 API，与 <code class="inline">/v1/decisions</code> 共用 <code class="inline">OpenAIServingDecisions</code> 的渲染、标签校验与打分（<code class="inline">serving.py</code> 的子类说明写得很直白："Answers System One questions with the rendering, label checks, and scoring of /v1/decisions"）；唯一特化在错误格式：全局 422→400 的改写器单独给它留了口子，保留 System One API 文档规定的 422 detail list（<code class="inline">http_server.py</code> 的注释）。兼容层的「兼容」二字再次显形——不只兼容请求格式，连<strong>错误码语义</strong>都要兼容。其二，打分本身多了一种 setwise 读出（#38965/#41188）：请求带 <code class="inline">score_extraction_token</code>（<code class="inline">protocol.py</code>）后，读出点从「序列最后一个 token」变成「query+item 拼接里每次出现该 token 的位置」，返回嵌套形状 <code class="inline">[num_items][Nᵢ × num_labels]</code>——一次前向给一组候选各自打分（SeqCls 在该 token 处池化，CausalLM 读标签 logprob），嵌套深度本身用来区分 pointwise/setwise 两种返回形状（protocol.py 的 ScoringResponse 注释）。用途是 rerank/评审类负载：逐 item 独立打分对「候选项互相关」是盲的，setwise 让同批候选在同一个上下文里被比出来。
     </div>
 
-    <p>还有一个值得注意的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
+    <p>还有一个正在发生的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
     <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server 的双分支（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> envs.SGLANG_RUST_SERVER.<span class="fn">get</span>():
     <span class="cmt"># Rust 侧同时承担 api-server、tokenizer、detokenizer，</span>
@@ -280,7 +280,7 @@ prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(ren
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      模板这一层最近补上了一道安全闸（commit 3e7e652900，#28135）：请求的 <code class="inline">chat_template_kwargs</code> 会原样展开进 <code class="inline">apply_chat_template</code>（<code class="inline">serving_chat.py</code> 的 <code class="inline">extra_template_kwargs.update</code>），而这个函数的签名里本来就有 <code class="inline">chat_template: str | None</code> 参数——kwargs 里塞进同名键就等于替服务端换掉模板本身，客户端得以重写整套渲染规则。现在 <code class="inline">_validate_request</code>（<code class="inline">serving_chat.py</code>）直接拒掉这个键，报错指路 <code class="inline">--trust-request-chat-template</code>；开关定义在 <code class="inline">serving.py</code>，注释写明「Off by default for safety」。值得注意 <code class="inline">reasoning_effort</code> 走的也是 <code class="inline">chat_template_kwargs</code> 这条路，却不会被误伤——校验只拦名为 <code class="inline">chat_template</code> 的键，其余 kwargs 照常透传。这是「请求体字段流入模板引擎前必须过白名单」的一例，自研适配层里凡是 <code class="inline">**kwargs</code> 直通 Jinja 的地方都值得对照检查。
+      模板这一层最近补上了一道安全闸（commit 3e7e652900，#28135）：请求的 <code class="inline">chat_template_kwargs</code> 会原样展开进 <code class="inline">apply_chat_template</code>（<code class="inline">serving_chat.py</code> 的 <code class="inline">extra_template_kwargs.update</code>），而这个函数的签名里本来就有 <code class="inline">chat_template: str | None</code> 参数——kwargs 里塞进同名键就等于替服务端换掉模板本身，客户端得以重写整套渲染规则。现在 <code class="inline">_validate_request</code>（<code class="inline">serving_chat.py</code>）直接拒掉这个键，报错指路 <code class="inline">--trust-request-chat-template</code>；开关定义在 <code class="inline">serving.py</code>，注释写明「Off by default for safety」。另外 <code class="inline">reasoning_effort</code> 走的也是 <code class="inline">chat_template_kwargs</code> 这条路，却不会被误伤——校验只拦名为 <code class="inline">chat_template</code> 的键，其余 kwargs 照常透传。这是「请求体字段流入模板引擎前必须过白名单」的一例，自研适配层里凡是 <code class="inline">**kwargs</code> 直通 Jinja 的地方都值得对照检查。
     </div>
 
     <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
@@ -522,7 +522,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-11113-g22d63f5e43 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

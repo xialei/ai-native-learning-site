@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 3 章 · 一座工厂的完整架构 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 3 章 · 一座工厂的完整架构</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第 3 章 · Reference Architecture</div>
+      <h1 class="title">一座工厂的完整架构</h1>
+      <p class="lede">
+        前两章立了指标，这一章立结构。全书的架构图只有两张，这是第一张：五层结构加控制面数据面。后面每一章做的事情，都能在这张图上找到自己的位置——把这张图记住，读后面的章节时随时回来看自己在哪一层。
+      </p>
+
+      <h2 id="five-layers">五层结构</h2>
+
+      <p>一座 Token 工厂从下到上分五层。分层的依据是职责变更的频率和问责的对象——层与层之间的接口，就是"下面出事别怪我、上面改需求别动我"的分界线。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart TD
+  L5["⑤ 运营层<br/>计量 · 计费 · 成本核算 · 容量规划"]
+  L4["④ 网关层<br/>OpenAI 兼容 API · 鉴权 · 路由 · 限流 · 审计"]
+  L3["③ 调度层<br/>GPU 资源编排 · 混合任务 · 优先级 · 故障恢复"]
+  L2["② 运行时层<br/>vLLM / SGLang 引擎实例 · 批处理 · KV Cache · 采样"]
+  L1["① 计算层<br/>GPU · NVLink · RDMA · 驱动 · 容器运行时"]
+  style L3 fill:#e3edf5,stroke:#1f5c8b,stroke-width:2px
+        </div>
+        <figcaption>五层结构。第 3 层调度层是本书的核心——它向上对网关承诺 SLA，向下管理引擎实例，是"工厂"区别于"机房"的那一层。</figcaption>
+      </figure>
+
+      <p><strong>① 计算层。</strong>GPU、互连（NVLink/NVSwitch/RDMA）、驱动、容器运行时。这一层的特性决定了上面所有层的可行域：什么模型能放几张卡、什么并行方式可行、KV 传输能走多快。第 4、6 章会用到这一层的物理事实，但本书不深入硬件选型。</p>
+
+      <p><strong>② 运行时层。</strong>推理引擎实例。每个实例持有模型权重和 KV Cache，对外暴露一个推理端点（通常 OpenAI 兼容）。引擎内部——批处理、调度、采样——是第二篇的内容。这里只需立住一个边界：引擎只管"一个实例内的高效"，不管"实例之间怎么协作"。</p>
+
+      <p><strong>③ 调度层。</strong>把引擎实例组织起来：哪个请求进哪个实例、哪组卡跑哪个模型、离线任务什么时候能上卡、某台机器坏了流量怎么搬。第 9–12 章的主体。这一层是全书着墨最重的一层，因为它是当前开源生态里缺口最大的一层。</p>
+
+      <p><strong>④ 网关层。</strong>对业务方暴露的统一入口：一套 OpenAI 兼容 API、鉴权限流配额、按策略路由、审计。业务方只认识这一层，后面三层对它们完全透明。第 9 章展开。</p>
+
+      <p><strong>⑤ 运营层。</strong>计量、计费、成本核算、容量规划、SLA 报表。它消费下面所有层的日志与指标，产出经营视角的数字。第 13–15 章展开。</p>
+
+      <h2 id="planes">控制面与数据面</h2>
+
+      <p>五层纵向切完，再横着切一刀。一个 token 从业务方进来再到回去，走的是数据面；而"哪个模型实例活着、哪条路由生效、配额还剩多少"，走的是控制面。两面的性能特征、故障模式、变更频率完全不同，混在一起设计是推理平台最常见的架构错误。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  subgraph DP["数据面（每个请求都走，微秒~分钟级）"]
+    GW2["网关转发"] --> RT["路由决策"] --> EN["引擎执行"] --> BK["流式返回"]
+  end
+  subgraph CP["控制面（低频，秒~天级）"]
+    SC["调度器"] --> CM["配置/模型管理"] --> HT["健康检查"] --> MT["计量收集"]
+  end
+  CP -.下发配置/路由表.-> DP
+  DP -.上报指标/日志.-> CP
+  style DP fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>控制面与数据面。实线是请求路径（对延迟敏感），虚线是配置与遥测（对正确性敏感）。控制面抖一下，数据面每条请求都跟着遭殃——所以控制面变更要灰度，要能回滚。</figcaption>
+      </figure>
+
+      <p>分开设计的理由，落在三个工程事实上：</p>
+
+      <ul>
+        <li><strong>延迟预算不同。</strong>数据面全程要在请求的延迟预算里完成（路由决策必须亚毫秒级缓存命中）；控制面动作慢几个数量级没关系，但错了影响面大。</li>
+        <li><strong>故障耦合不同。</strong>控制面挂了，数据面应当带着最后已知配置继续跑——网关拿旧路由表照常转发，比全体 503 好。这个"控制面失联时的降级运行"要求两面在部署上是物理隔离的。</li>
+        <li><strong>变更频率不同。</strong>数据面的代码发布按月算，控制面的配置变更（加租户、调配额、切流量）一天可能十几次。变更频率高的那一面，需要独立的审核与回滚机制。</li>
+      </ul>
+
+      <h2 id="evolution">单机 → 多机 → 多模型：架构怎么长</h2>
+
+      <p>第五层结构不是一开始就要建全。按三个阶段长，每个阶段解决上一阶段暴露的新问题：</p>
+
+      <p><strong>阶段一：单机多卡，一两个模型。</strong>架构就是"引擎 + 一个简单网关"。这个阶段的所有"平台问题"都不存在——没有路由（只有一个后端）、没有调度（一台机器）、没有计量（量小到肉眼可数）。要做的只有一件事：把引擎参数按第 6、7 章的原则调对，把基础指标（第 13 章）接上。<span class="tag">MVP</span></p>
+
+      <p><strong>阶段二：多机，一个模型池。</strong>第二个模型上线的那一刻，路由、配额、隔离的需求同时出现：两个业务抢同一批卡怎么办、谁优先、每个业务每月能用多少。这个阶段的标志是把网关从"转发器"升级成"策略执行点"，以及出现第一个真正的调度问题（第 9、11 章）。</p>
+
+      <p><strong>阶段三：多模型池 + 混合任务。</strong>在线对话、定时预测、离线批处理共享同一批 GPU，资源在不同任务间流动。这个阶段需要真正的集群调度器（第 10 章）、完整的可观测与成本核算（第 13–15 章），以及一支愿意对"有效产能"负责的运营机制。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  S1["阶段一<br/>单机工厂"] --> S2["阶段二<br/>多模型 + 网关"] --> S3["阶段三<br/>混合任务 + 运营"]
+  S1 --> N1["新增：引擎调优<br/>基础监控"]
+  S2 --> N2["新增：路由/配额<br/>多租户隔离"]
+  S3 --> N3["新增：集群调度器<br/>计量与成本"]
+  style S3 fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>三个阶段各新增一块能力。跳阶段建设的平台（一开始就上 K8s + 多租户 + 计费）常见结局是每块都半成品；等业务逼出来再建，每块都建在真实需求上。</figcaption>
+      </figure>
+
+      <h2 id="lab-v1">最小可运行工厂：Lab V1 预告</h2>
+
+      <p>第 16 章总装的 Token Factory Lab，其 V1 形态就是上面阶段一的完整版：</p>
+
+      <ul>
+        <li>一台 8 卡机（或云上等价物），部署一个 7B~32B 模型实例（vLLM 或 SGLang）；</li>
+        <li>一层薄网关：OpenAI 兼容转发 + 请求日志落盘（token 数、TTFT、ITL 全记）；</li>
+        <li>一套最小指标：从引擎拉吞吐与缓存命中率，从网关日志算 SLA 达标率；</li>
+        <li>一个每天跑的压测脚本（第 14 章的实验同款），输出当日有效产能。</li>
+      </ul>
+
+      <p>这四件东西加起来不超过几百行配置和脚本，但它已经是一座"有账本的工厂"——从 V1 到 V4，书里做的只是往这套结构上逐层补齐。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>五层结构：计算层给物理边界，运行时层管单实例效率，调度层管实例间的组织（全书核心），网关层管业务契约，运营层管经济。控制面与数据面分开设计，理由是延迟预算、故障耦合、变更频率三者在两面完全不同。架构按单机、多机单池、多池混部三个阶段生长，每阶段只建当阶段需要的能力。</p>
+        <p>第一篇到此收束。第二篇进入 Token 生产：先花一章把推理原理的账本——显存预算表——立起来，后面的调度与优化讨论都要用这张表。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-02-economics.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 2 章 · Token 工厂的经济学与指标体系</span>
+        </a>
+        <a class="next" href="chapter-04-inference-primer.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 4 章 · 推理原理速览：从 Prefill/Decode 到 KV Cache</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 8 章 · Prefill/Decode 分离与 KV Cache 传输 — Token 工厂</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="assets/mermaid.min.js"></script>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      if (window.mermaid) {
+        mermaid.initialize({ startOnLoad: true, theme: 'base', themeVariables: {
+          background: '#ffffff', primaryColor: '#e3edf5', primaryTextColor: '#1b1f24',
+          primaryBorderColor: '#1f5c8b', lineColor: '#98a0a8', fontSize: '15px'
+        }, flowchart: { curve: 'basis', padding: 16 }, sequence: { actorMargin: 50 } });
+      } else {
+        document.querySelectorAll('.mermaid').forEach(function (el) {
+          el.classList.add('mermaid-fallback');
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <a class="brand" href="index.html">Token 工厂<span class="dot">.</span></a>
+      <span class="crumb">第 8 章 · Prefill/Decode 分离与 KV Cache 传输</span>
+    </div>
+  </header>
+
+  <article class="chapter">
+    <div class="wrap">
+      <div class="chap-meta">第二篇 · 第 8 章 · PD Disaggregation</div>
+      <h1 class="title">Prefill/Decode 分离与 KV Cache 传输</h1>
+      <p class="lede">
+        第 4 章立过那对矛盾：prefill 吃算力、decode 吃带宽，挤在同一批卡上互相拖。这一章讨论把两者拆到不同机器上的方案——什么时候该拆、什么时候不该，拆之前必须先量什么，KV Cache 怎么从一台机器搬到另一台（多轮会话还得往回搬），模板与解析这些 CPU 杂活要不要也搬下 GPU 机器，以及那道最难的题：两种机器的比例怎么定。
+      </p>
+
+      <h2 id="why">为什么要分离</h2>
+
+      <p>混部时两种资源形态互相踩：一条 32k 输入的 prefill 想吃满算力，一条 200 个并发对话的 decode 想要稳定的低带宽占用——塞进同一个 batch，要么 prefill 慢（token 预算被 decode 分走），要么 decode 抖（被 prefill 长步打断）。chunked prefill（第 5 章）用切分缓解了抖动，但两种负载仍在争同一个显存池和同一个 token 预算——而且合适的切块大小跟流量形态绑定，换一批流量就要重调。</p>
+
+      <p>Prefill/Decode 分离（PD 分离）把矛盾物理切开：prefill 实例只管吃请求、算首段 KV，decode 实例只管拿现成 KV 逐 token 生成。Splitwise 论文最早系统论证了这件事，还指出两阶段可以用不同的硬件：prefill 用算力强的卡，decode 用带宽便宜的卡，成本曲线整体下移。<span class="src">来源：Splitwise, ISCA 2024</span>DistServe 用 goodput 框架给出同一结论的另一面：分离后两阶段各自的扩容与调参解耦，SLA 约束下的有效产能显著高于混部。<span class="src">来源：DistServe, OSDI 2024</span></p>
+
+      <p>先立一个预期：<strong>分离买的不是峰值吞吐，是尾部稳定。</strong>没有延迟目标时，把同一批卡拆成 prefill 池和 decode 池，每秒产出的 token 未必变多。它买到的东西是"达标率随负载下滑得慢"——vLLM 团队 2026 年 9 月的分离部署指南给了一组直观的对照：双卡 L40S 跑 Qwen2.5-7B、8k 输入、256 输出，混部形态下 ITL P99 从 0.2 req/s 的 23ms 在 0.4 req/s 时跳到 169ms；拆成 P/D 后 P99 全程没超过 52ms，而两档的中位 ITL 几乎一样（21–24ms）。负载再往上走，混部的尾部已经崩了，分离的尾部还在目标线内——这就是第 2 章说的有效产能差距的来源。<span class="src">来源：vLLM Blog《Taking vLLM Apart: A Practical Guide to Disaggregated Serving》, 2026-09-29</span></p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  GW["网关"] --> P1["Prefill 实例 ×N<br/>算力型"]
+  P1 -- "KV Cache 传输" --> D1["Decode 实例 ×M<br/>带宽型"]
+  D1 --> OUT["流式输出"]
+  style P1 fill:#e3edf5,stroke:#1f5c8b
+  style D1 fill:#fdeeee,stroke:#cc4433
+        </div>
+        <figcaption>PD 分离形态。一条请求的生命线是：prefill 算出 KV → KV 搬到 decode 实例 → decode 开始吐字。KV 传输是新增的关键路径——下一节会看到，这条路径不通，分离全盘皆输。</figcaption>
+      </figure>
+
+      <p>一个 vllm serve 进程实际在干三件事，第三件最容易被漏掉：对话模板、分词/反分词、推理痕迹与工具调用的解析——纯 CPU 的工作，跑在租来跑模型的机器上。本章末尾会讲它怎么单独拆出去，这里先回到两种计算形态。</p>
+
+      <h2 id="when">什么时候不该分离</h2>
+
+      <p>分离不是免费午餐，它买来的能力都伴随成本：</p>
+
+      <ul>
+        <li><strong>KV 传输成本</strong>：32k 上下文的 KV 可能几十上百 MB 到 GB 级，跨机搬运吃 RDMA 带宽和时间，搬运期间请求处于"已花费 prefill 算力、未开始产出"的状态。</li>
+        <li><strong>运维复杂度</strong>：两套实例、两套扩缩容、传输链路本身成为新的故障面（对端慢、网络抖、KV 池满）。</li>
+        <li><strong>调度复杂度</strong>：负载形态变化时（长输入占比突增），P/D 配比瞬间失配，需要动态调整（见本章末）。</li>
+      </ul>
+
+      <p>所以判断标准回到负载：<strong>分离解决的是"prefill 与 decode 互相干扰"的问题。</strong>你的负载长输入占比高、在线延迟 SLA 严格、且规模大到足以让专用实例饱和——分离收益显著。三者缺一：输入短（prefill 不构成干扰）、SLA 宽松（抖动可容忍）、流量小（拆开后的专用实例互相吃不饱）——都指向"不分离"。一个可操作的经验阈：当混部形态下 ITL P99 已经逼近 SLA、且继续靠 chunked prefill 调不出余量时，分离才进入候选清单。反过来的错误更常见：小规模集群照搬大厂 PD 分离架构，结果两组机器都闲着一半。</p>
+
+      <p>"规模够大"这条要读准：门槛不是"集群级"，是"拆开后的两个池各自吃得饱"——单机也可以拆。AMD 在一台 8 卡 MI300X 上就做了：4 卡 prefill、4 卡 decode 跑 Qwen3-235B（2k 输入 / 1k 输出、8 req/s），同样 8 张卡，单实例 TP8 混部达标 26/100，拆成两个 TP4 实例的混部 30/100，拆成 4P+4D 的分离形态 70/100（拉模式）与 73/100（推模式）——goodput 是混部对照的 2.4–2.5 倍。更有信息量的是失败形态的迁移：混部的 ITL 长尾呈双峰（约 30ms 与约 150ms 两簇，后者全部违约），分离后 ITL 违约清零，剩下的不达标全是 TTFT 超 1s——分离把"输出抖"治好了，代价如上文所说记在首 token 上。<span class="src">来源：vLLM Blog《Next-Level Inference: Why Your Single-Node vLLM Setup Needs Prefill-Decode Disaggregation》（AMD / Embedded LLM，MoRI-IO）, 2026-04-07</span>另有一个放大器值得记住：MoE 模型的专家路由让每步计算量天然波动，ITL 抖动比稠密模型更明显——这组数字正是拿 MoE 测的。所以"照搬 PD 分离"的错误不在"单机也拆"，在"两池都吃不饱还拆"：两三张卡的总盘子硬拆出 P 组 D 组，谁都不饱。</p>
+
+      <p>vLLM 那份指南给了一张按"你的处境"查表的决策清单，和上面的判据互相印证，抄录并注解如下：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>你的处境</th><th>该做什么</th><th>本书注解</th></tr></thead>
+          <tbody>
+            <tr><td>生产负载下 ITL P99 顶到 SLA</td><td>分离（主用例）</td><td>第 2 章有效产能的主战场</td></tr>
+            <tr><td>长输入 × 高并发</td><td>分离，前提是 KV 传输够快</td><td>prefill 干扰最凶的场景</td></tr>
+            <tr><td>聊天 / Agent 多轮长上下文</td><td>分离 + 双向传输（见下）</td><td>配 KV 分层缓存或共享池（Mooncake 类）</td></tr>
+            <tr><td>模板化 / 分词 / 解析占满 GPU 节点 CPU</td><td>拆出无 GPU 前端层（见本章末）</td><td>和 PD 分离是两件独立的事</td></tr>
+            <tr><td>TTFT 是卡脖子的约束</td><td>先别拆，或先测传输</td><td>传输耗时记在每个首 token 头上</td></tr>
+            <tr><td>KV 传输慢</td><td>修传输，否则维持混部</td><td>网络配置错也会拖慢集合通信，一并查</td></tr>
+            <tr><td>流量小、突发、对延迟不敏感</td><td>维持混部</td><td>拆开只会让两组实例互相吃不饱</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="transfer-first">拆之前：先量 KV 传输</h2>
+
+      <p>把这条从实验步骤提到纪律，因为它是 PD 分离失败案例的第一名：<strong>动手拆之前，先量 KV 传输耗时。</strong>同样的实验里还有一个反例值得记住：那对 L40S 不支持 P2P 拷贝（nvidia-smi topo -p2p r 显示 NS），每条 8k 提示词约 470MB 的 KV 要 1.3 秒才到 decode——带宽根本解释不了这个数（PCIe 4.0 过主机内存也只要几十毫秒），大头是拷贝周边的开销，包括 decode 只能在自己的前向步间隙轮询才能发现传输完成。结果分离形态的中位 TTFT 反而从混部的 0.7s 涨到 2.2s，任何低于 2s 的 TTFT 目标全数落空——尽管它的 ITL 尾部依然平得漂亮。</p>
+
+      <p>这个反例的教训是双面的：传输慢，分离买到的那点 ITL 稳定会被 TTFT 的全面恶化抵消甚至倒赔。所以基准测试别的什么都不测，也要先测这一条：机内确认两卡之间 P2P 通（nvidia-smi topo -p2p r 报 OK），跨机走 RDMA（IB 或 RoCE），然后单发几条长 prompt，看 decode 实例的 KV 传输指标——平均传输时间在几百毫秒量级，先把传输修好再谈别的。网络配置错不光拖慢传输，通常连集合通信一起拖慢，第 7 章的部署检查清单里值得为它加一行。轮询开销在引擎里是有源码出处的：decode 侧的请求在 KV 没到齐时处于专门的等待状态，调度器每一步都把它弹出再放回，直到传输完成才进就绪队列（vLLM 的 WAITING_FOR_REMOTE_KVS）——也就是说数据即使已经到齐，请求也要等下一次调度检查才被放行，等待按 decode 步长向上取整，小请求的大传输被进一步放大。推模式能把一部分传输等待与 prefill 计算重叠掉（见下一节的推/拉模式），但传输本身该多快还是多快。</p>
+
+      <h2 id="kv-transfer">KV Cache 怎么搬</h2>
+
+      <p>分离架构的技术核心是一条数据通路：prefill 算完的 KV，要完整、快速、不占推理卡太多资源地送到 decode 实例。这条通路有几个工程要点：</p>
+
+      <p><strong>走什么网络。</strong>机内复用 NVLink（AMD 侧对应 XGMI），跨机走 RDMA（RoCEv2 或 IB）。KV 传输的量级决定了"每张 prefill 卡配多少传输带宽"——按 8k 上下文、每请求 KV 几十 MB、每卡每秒处理 N 条请求，可以算出每卡需要的持续带宽，这个数通常要求 NIC 直挂 GPU（GPUDirect），过 CPU 中转的路径在高峰期会先堵。量级感可以直接按参数算：Llama-3.1-70B BF16 每 token 存 320KiB KV，一条 10k 的 prompt 就是约 3GB——按 400Gb/s 线速裸算要 65ms，全记在 TTFT 上，还没算任何协议开销。带宽预算由此倒推，不是拍出来的。</p>
+
+      <p><strong>谁发起搬：推还是拉。</strong>传输的组织方式有两种，区别在发起方和代理层的编排，MoRI-IO 把两种都实现了（环境变量切换，推模式是默认）：<strong>拉模式</strong>——代理先等 prefill 算完，拿到 KV 块的位置（remote_block_ids），转手交给 decode，由 decode 发起 RDMA 读把块拉过来。编排简单，但 TTFT 的账上多了一整段"代理串行等待"：TTFT = 排队 + prefill 计算 + 代理中转 + RDMA 拉取 + decode 排队 + 采样出首 token。<strong>推模式</strong>——代理把请求同时发给 prefill 和 decode，prefill 每算完一层就把 KV 用 RDMA 写直接推进 decode 预先分配好的显存，算完即写完。代理的串行等待消失（TTFT ≈ max(prefill 计算+写入, decode 排队) + 出首 token），TTFT 罚金更小——AMD 的基准里推模式 73/100 对拉模式 70/100，差距就在这。推拉的取舍一句话带走：推模式 TTFT 更优，但要求 decode 侧预先分配好目标块、引擎支持边算边写；拉模式编排简单、代理只做转手——你的代理层能承受多复杂的编排，决定选哪种。<span class="src">来源：同上，MoRI-IO 文（读/写模式与 TTFT 分解）</span></p>
+
+      <p><strong>分层存不存。</strong>Mooncake 的思路是把 KV 变成分布式缓存池：KV 不只直传，还存下来供复用——同前缀的请求共享一份 prefill 结果（命中缓存连 prefill 都省了）。它把 KV 缓存的层次从"实例内"提到"集群级"，用 RDMA 传输 + SSD/HBM 分层实现。<span class="src">来源：Mooncake, FAST 2025</span>这实际上是第 4 章 Prefix Cache 思想的跨机版：单机内省 prefill 计算，集群内连 prefill 实例都能复用。LMCache 等组件在同一位面提供引擎侧的实现。NIXL、MoRI-IO 这类传输库则把"怎么搬"标准化成接口（多后端、显存直传、异步），让上层不用绑死具体网络硬件——NIXL 服务 NVIDIA 栈，MoRI-IO 建在 AMD 的 MORI（Modular RDMA Interface）上，是同一件事在另一家硬件上的答案；两者首次传输前都要做一次元数据握手（对端 KV 基地址、块大小、每层张量布局），握手异步跑、会话缓存复用，不在关键路径上反复付。<span class="src">来源：MoRI-IO 文（握手机制）；NIXL（NVIDIA Inference Xfer Library）项目说明</span></p>
+
+      <p><strong>失败怎么算。</strong>传输链路上的每一步都要有超时与降级：对端收不动（decode 侧 KV 池满）时要反馈给调度端削流，而不是让 KV 堆在中间状态。传输失败的请求要么重试（KV 重算）要么降级到混部实例——这条降级路径要在设计时存在，事故时现场发明来不及。两个值得抄的默认值设计：prefill 实例算完的 KV 块要"持有"一段时间等 decode 来取，这个持有租期是过载时最先要调的超时（vLLM 的 kv_lease_duration 默认 30 秒）；传输失败时给两条路——直接报错（请求失败，客户端重试）或让 decode 自己重算缺失的 KV（慢，但请求活下来）。你的 SLA 决定默认走哪条，但两条路都得存在。</p>
+
+      <h2 id="bidirectional">多轮会话：KV 得往回搬</h2>
+
+      <p>标准 PD 分离的 KV 单向流动，在多轮对话上是结构性的浪费：第二轮进来的 prompt，包含 decode 实例上一轮刚生成的回答——这些 token 的 KV 在 decode 侧现成放着，prefill 侧却从没算过，于是 prefill 老老实实重算一遍。会话越长，重算的部分越长，这笔账在第 4 章的 prefix cache 语境里等于"明明命中了却当未命中算"。</p>
+
+      <p>解法是把传输做成双向：prefill 回头从 decode 把上一轮的 KV 块拉回来，只算真正新增的 token。前提是有一条"会话 → KV 块归属"的映射——通常由代理层维护，客户端带一个会话标识，代理据此知道该从哪个 decode 实例取回哪些块。vLLM 的双向传输实测能把长多轮 prompt 的 TTFT 最多降到三分之一（官方口径 up to 3.3×）。<span class="src">来源：vLLM Blog《Improve TTFT for Multi-Turn Agentic Workloads with Bi-Directional KV Transfer in vLLM》, 2026-10-12</span></p>
+
+      <p>一个专门写给推理模型的警告：decode 持有的 KV 块里包含它生成的思考痕迹（thinking 内容）。如果下一轮的 prompt 按模板把这些痕迹删了——不少对话模板默认这么干——prefill 要对齐的 prompt 就和 decode 手里的块对不上，产出的不是慢的答案，是错的答案。这个错配目前引擎不报错，只能靠自己在模板侧核对。Agent 场景把双向传输和思考输出一起用的时候，这是最容易踩的坑。</p>
+
+      <h2 id="ratio">容量比例怎么定</h2>
+
+      <p>分离后最重要的一道算术：P 和 D 各配多少。定比例的依据是"两类实例的忙闲平衡"：</p>
+
+      <pre><code>每秒进入的请求 × 平均 prefill 时间 = 需要的 prefill 卡·秒
+每秒产出 token ÷ 每 decode 步时延 × 并发因子 = 需要的 decode 卡·秒
+
+P:D 配比 = prefill 需求 : decode 需求（按你的负载算）</code></pre>
+
+      <p>这笔账的输入全是第 4、14 章的量：输入长度分布决定 prefill 时间，输出长度分布决定 decode 占用。负载形态变（比如上线一个长文档分析业务），配比就要重算——所以生产系统里配比不能是写死的副本数，要么靠定期重算 + 人工调整，要么靠调度器弹性伸缩（第 10 章）。比例失衡的症状有明显特征：P 长了 decode 饿（TTFT 长但 decode 实例利用率低），P 短了请求在 prefill 侧排队（TTFT 全面恶化）——第 13 章的监控要把这两个信号分列出来。分离还有一层混部没有的自由度：两边可以用不同的并行策略——prefill 可以往 TP 大配（算力优先），decode 按批形态定 TP（吞吐优先），任何一边的调整都不拖动另一边。</p>
+
+      <h2 id="frontend">拆出去的第三份工作：无 GPU 前端</h2>
+
+      <p>开头留的那第三件事——对话模板、分词/反分词、推理痕迹解析、工具调用解析——现在处理。它和 prefill/decode 的矛盾无关（不抢算力不抢带宽），但从头到尾占着 GPU 机器的 CPU。vLLM 把它做成了独立的"渲染层"（render tier）：一台没有 GPU 的服务器跑 /render 和 /derender 两个端点，/render 把 OpenAI 格式请求变成 token ID 序列，引擎只做 token 进 token 出，/derender 再把输出 token ID 拼回带 reasoning / tool_calls 分量的标准响应。</p>
+
+      <figure>
+        <div class="mermaid">
+flowchart LR
+  C["客户端"] --> RD["Render 层 ×N<br/>无 GPU · 纯 CPU"]
+  RD -- "token IDs" --> E["推理引擎<br/>token-in / token-out"]
+  E -- "token IDs" --> RD
+  RD --> C
+  style RD fill:#e3edf5,stroke:#1f5c8b
+        </div>
+        <figcaption>无 GPU 前端层。引擎收发纯 token ID，模板与解析全部离开 GPU 机器。render 层不持有任何请求状态，流式模式下连状态都由调用方逐块回传，因此可以当普通无状态 Web 服务扩容。</figcaption>
+      </figure>
+
+      <p>这本账便宜得超出直觉：同一测试环境上，9k token 的对话 prompt 模板化加分词约 15ms CPU；一台默认配置的 render 服务器用一个多核就顶到 73 req/s——在混部尾部开始崩溃的 0.4 req/s 上，渲染消耗不到一个核的 1%。分词从来不该是买 GPU 的理由，但在拆分之前，它确实一直占着 GPU 机器的 CPU。多模态预处理也随这一层外移（图像解码和 processor 跑在 render 机器上），注意处理后的张量可能比原图大得多，请求体上限要按它调。</p>
+
+      <p>更深一层的价值在 token ID 本身成了接口：路由器可以按真实 prompt token 的前缀命中选副本（第 9 章的 Prefix 感知路由不用再从文本猜）；RL 和评测管线拿到模型真正"看过"和"产出"的 ID——文本重新分词不一定还原出同样的序列，这在训练数据回收场景是硬需求。工程上的配套纪律是配置同步：render、引擎、derender 三方的模板与解析器参数必须一致，配错了不报错——只是 content / reasoning / tool_calls 的切分悄悄变得和正常服务不同。</p>
+
+      <p>短期要认的成本：流式输出走解析器时，derender 每个块都要重建解析器并重放全部历史 token，长生成的 CPU 开销近似立方式增长（vLLM 实测约 9 倍的进程内 CPU、E2E P50 +15%），缓存方案还在路上——上这套架构时，render 层的 worker 数和副本数要按"并发解析流"压测后再定，别按默认值上。另外每个分块都全量重发 prompt token ID，10 万 token 的 prompt 配 1k 输出，请求体的 99% 是 prompt——这个缺陷引擎侧已知待修。</p>
+
+      <h2 id="experiment">▶ 实验：单体 vs 分离在你的负载下的收益/代价</h2>
+
+      <p>分离的决策必须来自自己的负载。实验设计：</p>
+
+      <ol>
+        <li>先测混部基线：标准 trace + 你的 SLA，记下 ITL P99 与 TTFT P95 的余量。注意用泊松到达而不是恒速（第 14 章），并复用固定 seed 时关闭 prefix cache——否则后面的流量命中率被前面的缓存藏住，恰好把你要测的 prefill 干扰盖掉。</li>
+        <li>若混部余量充足（P99 低于 SLA 一半以上），先记录结论，实验到此为止——分离不在你的当期清单上。</li>
+        <li><strong>测 KV 传输（在一切基准之前）</strong>：单发数条长 prompt，读 decode 实例的 KV 传输耗时。均值在几百毫秒量级就先修传输（P2P/NVLink/RDMA、网卡直挂），别让基准测出一个"分离总是更慢"的假结论。</li>
+        <li>余量不足时做分离实验：同量卡拆成 P 组与 D 组（比如 8 卡拆 4P+4D 起步），同 trace 回放。记录同一组指标，外加 KV 传输耗时分布与传输失败的请求比例。</li>
+        <li>扫配比：3P/5D、4P/4D、5P/3D 各跑一轮，找到你的负载的平衡点。</li>
+        <li>把结论写成一句可复核的话："在我们 X% 长输入的负载、Y 的 SLA 下，拆分带来 Z% 有效产能提升 / 代价是 W% 吞吐与一条新故障链路。"</li>
+      </ol>
+
+      <p>一个可直接套用的基准形态（来自 vLLM 指南的"从哪开始"一节，换卡换模型后照抄结构）：单机双卡，先跑通 1P1D + 代理，再对同一批卡跑混部对照组（data-parallel-size 2 的单体实例），两端都从低流量起步，逐档上调直到混部的 ITL P99 崩掉为止——崩点就是你这台"机器"的分离决策点：</p>
+
+      <pre><code>vllm bench serve --model Qwen/Qwen2.5-7B-Instruct --port 8192 \
+  --dataset-name random --random-input-len 8192 --random-output-len 256 --ignore-eos \
+  --request-rate 0.4 --num-prompts 100 \
+  --percentile-metrics ttft,tpot,itl --metric-percentiles 50,99 \
+  --goodput ttft:2000 tpot:30</code></pre>
+
+      <p>读数的三个要点：一是对照"同卡数"（实验里混部用的是 data-parallel 2，和 1P1D 占一样多的卡），否则赢是白赢——MoRI-IO 文的对照设计值得照抄：单实例 TP8、同卡数拆两个混部实例、拆成 1P+1D，三组一起看，中间那组才是分离真正要打赢的对手；二是看 p99 ITL 崩点而非均值——中位数在两种形态下几乎不动，差距全在尾部；三是 goodput（--goodput 参数给 TTFT/TPOT 上限）才是要比的数，它就是第 2 章有效产能的压测形态。聊天 / Agent 负载再加一步：打开双向传输后，量第五轮对话的 TTFT，不是第一轮——第一轮人人都是冷启动，差距藏在后续轮次。</p>
+
+      <div class="summary">
+        <h2>本章小结</h2>
+        <p>PD 分离把算力型与带宽型负载拆开，各自用合适的硬件与参数；Splitwise/DistServe 论证了 SLA 约束下它对有效产能的提升。但分离买的不是峰值吞吐而是尾部稳定，前提是负载特征成立：长输入占比高、SLA 严格、两池各自吃得饱——注意门槛不是"集群级"，单机拆两池同样成立（8 卡 2.5× goodput 的实证）。动手拆之前先量 KV 传输——传输慢的集群分离全盘皆输；传输有推拉两种组织，推模式 TTFT 更优、拉模式编排更简单。多轮会话用双向传输避免重算，但推理模型的思考痕迹块要和模板对齐，否则出的是错的不是慢的。模板与解析可以拆到无 GPU 前端，按 CPU 扩容；解析流式输出是当前的成本大头，上线前单独压测。配比是分离后的持续运营问题，靠账算不靠感觉。</p>
+        <p>第二篇（单机生产）到此收束。第三篇开始回答全书的主菜：多台机器、多个模型、多种任务，怎么组织成一座真正的工厂——从统一网关开始。</p>
+      </div>
+
+      <nav class="pagenav">
+        <a class="prev" href="chapter-07-engine-selection.html">
+          <span class="dir">← 上一章</span>
+          <span class="ttl">第 7 章 · 推理引擎选型与集群部署</span>
+        </a>
+        <a class="next" href="chapter-09-gateway-routing.html">
+          <span class="dir">下一章 →</span>
+          <span class="ttl">第 9 章 · 统一模型网关与智能路由</span>
+        </a>
+      </nav>
+    </div>
+  </article>
+</body>
+</html>
