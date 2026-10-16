@@ -120,7 +120,7 @@
         <span class="lg-item"><span class="sw acc"></span>训练 / 微调里程碑</span>
         <span class="lg-item"><span class="sw back"></span>持续迭代</span>
       </div>
-      <div class="fig-cap">图 12.1：六里程碑。每个都是「能演示的最小闭环」——不要在 M3 之前调模型，不要在 M5 之前优化部署。</div>
+      <div class="fig-cap">图 12.1：六里程碑。每个都是「能演示的最小单元」——不要在 M3 之前调模型，不要在 M5 之前优化部署。</div>
     </div>
   </section>
 
@@ -180,7 +180,7 @@ lerobot-rollout \
 <span class="cmt"># 回放验证</span>
 ./isaaclab.sh -p scripts/reinforcement_learning/play.py \
   --task IsaacContrib-Lift-Cube-Franka --num_envs <span class="nu">64</span> --checkpoint <span class="st">.../model_1500.pt</span></pre>
-    <div class="annotation"><b>注：</b>3.0 重组了脚本布局——<code class="inline">train.py</code> / <code class="inline">play.py</code> 从 <code class="inline">scripts/reinforcement_learning/rsl_rl/</code> 上移到 <code class="inline">scripts/reinforcement_learning/</code>，且成为多 RL 库统一入口（<code class="inline">--rl_library</code> 选择后端）。<b><code class="inline">--rl_library</code> 在 contrib 任务上是必填的</b>：dispatch 只在任务注册了 <code class="inline">default_agent</code> 时才自动推断（isaaclab_rl/entrypoints/dispatch.py:94-100，找不到就报「argument is required: --rl_library」并退出码 2），而 <code class="inline">IsaacContrib-Lift-Cube-Franka</code> 的 gym.register 没有这个键；<code class="inline">Isaac-Lift-Franka</code>（core 新任务）带 <code class="inline">default_agent="rsl_rl"</code>，才可以省略。gym id 按任务代次取用：contrib 经典任务无 <code class="inline">-v0</code> 后缀，core 新任务是 <code class="inline">Isaac-Lift-Franka</code>。入口均经 <code class="inline">isaaclab.sh -p</code> 调用（升级后此入口标了 deprecated，改用 <code class="inline">uv run isaaclab train</code> / <code class="inline">uv run isaaclab play</code>，任务 id 与参数不变，见 10.4）。</div>
+    <div class="annotation"><b>注：</b>3.0 重组了脚本布局——<code class="inline">train.py</code> / <code class="inline">play.py</code> 从 <code class="inline">scripts/reinforcement_learning/rsl_rl/</code> 上移到 <code class="inline">scripts/reinforcement_learning/</code>，且成为多 RL 库统一入口（<code class="inline">--rl_library</code> 选择后端）。<b><code class="inline">--rl_library</code> 在 contrib 任务上是必填的</b>：dispatch 只在任务注册了 <code class="inline">default_agent</code> 时才自动推断（isaaclab_rl/entrypoints/dispatch.py:157，找不到就报「argument is required: --rl_library」并退出码 2，:103-104），而 <code class="inline">IsaacContrib-Lift-Cube-Franka</code> 的 gym.register 没有这个键；<code class="inline">Isaac-Lift-Franka</code>（core 新任务）带 <code class="inline">default_agent="rsl_rl"</code>，才可以省略。gym id 按任务代次取用：contrib 经典任务无 <code class="inline">-v0</code> 后缀，core 新任务是 <code class="inline">Isaac-Lift-Franka</code>。入口均经 <code class="inline">isaaclab.sh -p</code> 调用（升级后此入口标了 deprecated，改用 <code class="inline">uv run isaaclab train</code> / <code class="inline">uv run isaaclab play</code>，任务 id 与参数不变，见 10.4）。</div>
     <div class="annotation"><b>验收：</b>TensorBoard 里 Episode_Reward 逐项爬升、success rate 曲线过 0.9；play 回放肉眼确认抓稳不抖。<b>不收敛排查次序：</b>先看 10.7 节的排查次序（哪段接力棒断了）→ 检查观测是否缺关键信息（object position 没进 obs？）→ 降低任务难度（缩短初始距离）再逐步放开。<b>常见翻车：</b>第一次装 Isaac Sim 就想训练——先用 GUI 模式跑通一个内置任务，确认驱动与显存没问题。</div>
   </section>
 
@@ -191,15 +191,17 @@ lerobot-rollout \
 lerobot-train \
   --dataset.repo_id=${USER}/pick_place \
   --policy.path=lerobot/smolvla_base
-<span class="cmt"># 真机跑：同步推理用 lerobot-rollout（M3 已示范），异步推理栈走下面两个进程（第 11 章详读）</span>
-python -m lerobot.async_inference.policy_server --host=<span class="nu">127.0.0.1</span> --port=<span class="nu">8080</span> --fps=<span class="nu">30</span>
-python -m lerobot.async_inference.robot_client \
-  --robot.type=so101_follower --robot.port=/dev/ttyUSB0 --robot.id=<span class="st">my_follower</span> \
-  --server_address=<span class="nu">127.0.0.1</span>:<span class="nu">8080</span> \
-  --policy_type=smolvla --pretrained_name_or_path=${USER}/smolvla_pick_place \
-  --actions_per_chunk=<span class="nu">50</span>
-<span class="cmt"># --actions_per_chunk 无默认值（configs.py:119），必须显式给</span>
-<span class="cmt"># 注意：SUPPORTED_ROBOTS 目前是 so100/so101/bi_so/omx follower（constants.py:29）</span></pre>
+<span class="cmt"># 真机跑：同步推理用 lerobot-rollout（M3 已示范），远程推理栈走下面两个进程（第 11 章详读）</span>
+<span class="cmt"># 服务器侧：写一份 server.yaml（examples/remote_inference/server.yaml 有现成模板）</span>
+lerobot-policy-server --config_path=server.yaml
+<span class="cmt"># 机器人侧：不加载权重，只带硬件与契约参数；checkpoint 由服务器持有</span>
+lerobot-rollout \
+  --inference.type=remote \
+  --inference.endpoint=tcp/<span class="nu">127.0.0.1</span>:<span class="nu">7447</span> \
+  --inference.deployment=manipulation \
+  --inference.semantics=so101-degrees-gripper-percent-v1 \
+  --robot.type=so101_follower --robot.port=/dev/ttyUSB0 \
+  --fps=<span class="nu">30</span> --task=<span class="st">"pick up the cube"</span></pre>
     <div class="annotation"><b>验收：</b>换语言指令（"把方块放到左边"）仍能执行——这是 VLA 相对 ACT 的核心增量。<b>关键开关：</b>50 集小数据务必用 <code class="inline">freeze_vision_encoder + train_expert_only</code>（6.5 节）——解冻视觉塔几乎必然过拟合；先 smolvla_base 后试 pi0（7.1 节）；跨本体/人形需求则用 GR00T 原厂权重起步（7.3 节）。<b>常见翻车：</b>语言 prompt 与录制时的 task 字段不一致（训练 "pick the cube" 推理 "抓方块"）；显存 OOM——降 batch 或开梯度检查点，别硬扛。</div>
   </section>
 
@@ -215,7 +217,7 @@ python -m lerobot.async_inference.robot_client \
 
   <section class="block">
     <h2><span class="num">12.8</span>收尾：六个里程碑与全书收束</h2>
-    <p>12.1 的三个问题，答案收拢：① 路线排成「硬件 → 数据 → 模仿 → RL → VLA → 部署」，每个都是能演示的最小闭环，前一步的产出是后一步的输入；② 验收标准逐级提升——从 get_observation 全通，到 replay 无跳变、成功率 > 80%（ACT）、> 90%（PPO）、换指令仍可执行（VLA）；③ 翻车点集中在节拍（M1）、重置对齐（M2）、冻结面与数据量的匹配（M5）、队列健康度（M6）。一张总表：</p>
+    <p>12.1 的三个问题，答案收拢：① 路线排成「硬件 → 数据 → 模仿 → RL → VLA → 部署」，每个都是能演示的最小单元，前一步的产出是后一步的输入；② 验收标准逐级提升——从 get_observation 全通，到 replay 无跳变、成功率 > 80%（ACT）、> 90%（PPO）、换指令仍可执行（VLA）；③ 翻车点集中在节拍（M1）、重置对齐（M2）、冻结面与数据量的匹配（M5）、队列健康度（M6）。一张总表：</p>
     <table class="tbl">
       <tr><th>里程碑</th><th>产出</th><th>验收</th></tr>
       <tr><td>M1 硬件</td><td>可编程的机器人</td><td>get_observation/send_action 全通</td></tr>
@@ -233,7 +235,7 @@ python -m lerobot.async_inference.robot_client \
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>六个里程碑，每个都是能演示的最小闭环，前一步的产出是后一步的输入：硬件点亮（get_observation 全通）→ 50 集数据（replay 无跳变）→ ACT 成功率 &gt; 80% → PPO 仿真收敛 &gt; 90% → VLA 换指令仍可执行 → 异步推理 + 数据飞轮。翻车点集中在节拍（M1）、重置对齐（M2）、冻结面与数据量的匹配（M5）、队列健康度（M6）。</p>
+    <p>六个里程碑，每个都是能演示的最小单元，前一步的产出是后一步的输入：硬件点亮（get_observation 全通）→ 50 集数据（replay 无跳变）→ ACT 成功率 &gt; 80% → PPO 仿真收敛 &gt; 90% → VLA 换指令仍可执行 → 异步推理 + 数据飞轮。翻车点集中在节拍（M1）、重置对齐（M2）、冻结面与数据量的匹配（M5）、队列健康度（M6）。</p>
     <p>读到这里有似懂非懂的术语？<a href="13-glossary.html">第 13 章：术语表</a>备查。</p>
   </div>
 
@@ -250,7 +252,7 @@ python -m lerobot.async_inference.robot_client \
 </div>
 
 <footer>
-  深入浅出具身智能 · 12 实战路线 · 基于 lerobot / IsaacLab（v3.0.0，release/3.0.0 @ 6864dd126）/ SmolVLA / π0 源码 · 行号随版本演进可能偏移
+  深入浅出具身智能 · 12 实战路线 · 基于 lerobot / IsaacLab（v3.0.0，release/3.0.0 @ 1241f4b57）/ SmolVLA / π0 源码 · 行号随版本演进可能偏移
 </footer>
 
 </body>
