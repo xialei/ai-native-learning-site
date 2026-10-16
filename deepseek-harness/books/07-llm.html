@@ -50,13 +50,13 @@
       <li><strong>llm-deepseek-api-key</strong>：注册 <code class="inline">deepseek-official</code> 路由。凭据是 API key（credentials 服务或环境变量 <code class="inline">DEEPSEEK_API_KEY</code>），请求头 <code class="inline">x-api-key</code>。</li>
       <li><strong>llm-deepseek-account</strong>：注册 <code class="inline">deepseek-account</code> 路由。凭据是登录账号的 token，请求头 <code class="inline">x-dsh-auth-token</code>，配额错误和 401 有专门的重映射。</li>
     </ul>
-    <p>两个认证插件的差异全部收进一个函数签名：<code class="inline">resolveAuth(connection)</code> 返回 <code class="inline">{ headers, onRequestError? }</code>（DeepSeekRequestAuth，types.ts:85）。适配器只管「把 headers 原样发出去、出错时把 error 交给 onRequestError 映射」（adapter.ts:82），不再关心你用的是 key 还是账号。这一节读完你会明白：为什么拆分后新加一种登录方式不用动传输层，以及「模型请求因凭据失败」的语义怎么从传输错误里分离出来。其余各节沿请求的一生走——词汇表（7.2）、错误码（7.3）、重试（7.4）、一次请求的完整流水线（7.5）、会话日志扩展缝（7.6）。</p>
+    <p>两个认证插件的差异全部收进一个函数签名：<code class="inline">resolveAuth(connection)</code> 返回 <code class="inline">{ headers, onRequestError? }</code>（DeepSeekRequestAuth，types.ts:85）。适配器只管「把 headers 原样发出去、出错时把 error 交给 onRequestError 映射」（adapter.ts:98），不再关心你用的是 key 还是账号。这一节读完你会明白：为什么拆分后新加一种登录方式不用动传输层，以及「模型请求因凭据失败」的语义怎么从传输错误里分离出来。其余各节沿请求的一生走——词汇表（7.2）、错误码（7.3）、重试（7.4）、一次请求的完整流水线（7.5）、会话日志扩展缝（7.6）。</p>
     <div class="annotation"><b>边界声明：harness 关心模型的哪些特性</b>。dsh 全仓库搜不到 MLA、MoE、FP8、MTP 这些词——这不是遗漏而是分界：模型怎么算（多头注意力的显存账、专家并行的通信、量化内核）是推理引擎的事，本站《深入浅出vLLM》《深入浅出SGLang》讲的就是那一层。harness 与模型的全部接触面收在适配器边界内，只关心三件事：<strong>思考模式</strong>（reasoning 块进不进历史、effort 怎么映射，7.5）、<strong>缓存前缀</strong>（哪些请求头变化会打断 KV 复用，7.2 的 LlmCallConfig 取舍）、<strong>文件输入</strong>（Files 引用与内联退化，7.5）。模型能力升级只要不破这三件事，harness 一行不改。</div>
   </section>
 
   <section class="block">
     <h2><span class="num">7.2</span>StreamChunk：流的封闭词汇表</h2>
-    <div class="code-title">packages/llm/llm/src/types.ts:452</div>
+    <div class="code-title">packages/llm/llm/src/types.ts:470</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export type</span> <span class="cl">StreamChunk</span> =
   | { type: <span class="st">'block-start'</span>; index: <span class="kw">number</span>; blockType: <span class="cl">ContentBlockType</span> }
   | { type: <span class="st">'text-delta'</span>; index: <span class="kw">number</span>; text: <span class="kw">string</span> }
@@ -73,7 +73,7 @@
     <div class="annotation"><b>读法</b>：块以 <code class="inline">index</code> 分组——<code class="inline">block-start</code> 开、若干 delta、<code class="inline">block-end</code> 收口并携带完整块。reasoning（思考）与 text 是不同块类型，因此「思考不进模型历史、但可上 UI」这类策略有结构依据。finish 的 reason 直接驱动循环的 step 结局（第 3 章）。<code class="inline">usage</code> 的缓存读写 token 计数是<strong>分离字段</strong>，不是互斥联合。</div>
 
     <p>请求侧的 <code class="inline">GenerateOptions</code>（同文件）里，0.2.0 新增了 <code class="inline">toolHistory</code>，它是动态工具更新的数据源（7.5 末尾展开）：</p>
-    <div class="code-title">packages/llm/llm/src/types.ts — GenerateOptions（节选，types.ts:511）</div>
+    <div class="code-title">packages/llm/llm/src/types.ts — GenerateOptions（节选，types.ts:529）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">GenerateOptions</span> {
   <span class="cmt">/** Registered provider route selecting the adapter instance. */</span>
   provider: <span class="kw">string</span>
@@ -86,7 +86,7 @@
    * leading system-role message carries the system prompt; a hand-built
    * one-shot may include identity-free user inputs.
    */</span>
-  messages: <span class="cl">RequestMessage</span>[]        <span class="cmt">// RequestMessage = Message | RequestUserInput（types.ts:495）</span>
+  messages: <span class="cl">RequestMessage</span>[]        <span class="cmt">// RequestMessage = Message | RequestUserInput（types.ts:513）</span>
   <span class="cmt">/**
    * System prompt text for one-shot callers; adapters map it to the provider's
    * system slot ahead of `messages`. Loop-built requests leave it undefined.
@@ -117,7 +117,7 @@
    */</span>
   purpose?: <span class="st">'compaction'</span> | <span class="st">'session-title'</span>
 }</pre>
-    <div class="annotation"><b>messages 的类型签名在讲故事</b>：循环构建的请求传的是<strong>派生历史</strong>（dsh-agent-loop，第 2 章），首条系统消息带着 system prompt——所以 <code class="inline">system</code> 字段文档明确写着「one-shot 调用者专用；循环构建的请求不设它」。一次性调用者（会话标题、compaction）没有日志身份可引用，于是有了 <code class="inline">RequestUserInput</code>（types.ts:487）——<code class="inline">id?: never; source?: never</code> 用类型系统声明「这个 user 输入没有持久会话身份，别给它编 id」。工具定义侧还有一个 <code class="inline">deferLoading?: true</code>（ToolSchema，types.ts:479）：请求把工具定义延后装载进模型上下文，用 Anthropic 的 defer_loading 术语——工具清单变长时，不常用的定义不必占每次请求的前缀。deferLoading 与 0.2.0 的 toolUpdate 是一对：<code class="inline">ToolUpdate = 'in-history' | 'addition-only'</code>（types.ts:407）描述<strong>模型路由</strong>怎么消费后续的声明变化，deferLoading 描述<strong>单个工具</strong>要不要立刻进上下文；前者靠后者的配合才能把「先声明、后激活」落成线上协议。</div>
+    <div class="annotation"><b>messages 的类型签名在讲故事</b>：循环构建的请求传的是<strong>派生历史</strong>（dsh-agent-loop，第 2 章），首条系统消息带着 system prompt——所以 <code class="inline">system</code> 字段文档明确写着「one-shot 调用者专用；循环构建的请求不设它」。一次性调用者（会话标题、compaction）没有日志身份可引用，于是有了 <code class="inline">RequestUserInput</code>（types.ts:505）——<code class="inline">id?: never; source?: never</code> 用类型系统声明「这个 user 输入没有持久会话身份，别给它编 id」。工具定义侧还有一个 <code class="inline">deferLoading?: true</code>（ToolSchema，types.ts:497）：请求把工具定义延后装载进模型上下文，用 Anthropic 的 defer_loading 术语——工具清单变长时，不常用的定义不必占每次请求的前缀。deferLoading 与 0.2.0 的 toolUpdate 是一对：<code class="inline">ToolUpdate = 'in-history' | 'addition-only'</code>（types.ts:425）描述<strong>模型路由</strong>怎么消费后续的声明变化，deferLoading 描述<strong>单个工具</strong>要不要立刻进上下文；前者靠后者的配合才能把「先声明、后激活」落成线上协议。</div>
     <div class="annotation"><b>还没定案的事：哪些字段算 epoch 级</b>：循环构建请求时用的 config 是 <code class="inline">LlmCallConfig</code>（call-config.ts:31）——provider/model 加上继承自 <code class="inline">LlmCallControls</code>（call-config.ts:16）的 reasoningEffort/temperature/maxTokens/stop 四个采样字段，每个请求从日志 header 重建而非逐调用传入。哪些字段该进这个集合，作者自己留了 <code class="inline">TODO(call-config-shape)</code>（call-config.ts:23）：「Revisit which fields are epoch-level for cache reuse and where provider-specific request options belong」。为什么这个问题不好答：字段越多，header 变化越频繁（第 3 章 reason 'change' 的触发条件），每次变化都可能打断 KV 缓存前缀；字段越少，供应商特有的采样选项又没有安放位置。目前的分界线是「影响缓存复用的请求头状态」——temperature 和 maxTokens 都在集合里，所以改采样参数会记一条 request/header change，这是有意为之的可见性而非遗漏。</div>
   </section>
 
@@ -144,7 +144,7 @@
 }</pre>
     <table class="tbl">
       <tr><th>码</th><th>来源</th><th>可重试（默认策略）</th></tr>
-      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:995）</td><td>否</td></tr>
+      <tr><td><code class="inline">NO_ADAPTER</code></td><td>provider 未注册（llm/src/index.ts:1018）</td><td>否</td></tr>
       <tr><td><code class="inline">MISSING_CREDENTIAL</code></td><td>请求时解析不到 API key（api-key 路由抛出，llm-deepseek-api-key/src/index.ts:31；区别于 AUTH：修法不同——前者补凭据，后者换凭据）</td><td>否</td></tr>
       <tr><td><code class="inline">ACCOUNT_SIGN_IN_REQUIRED</code></td><td>账号路由拿不到 token，或请求目的地不允许账号认证（llm-deepseek-account）</td><td>否（终态：先登录）</td></tr>
       <tr><td><code class="inline">ACCOUNT_TOKEN_INVALID</code></td><td>账号 token 收到 401 后的映射码；映射同时 rejectToken 移除凭据</td><td>否（终态：重新登录）</td></tr>
@@ -233,11 +233,11 @@
 
   <section class="block">
     <h2><span class="num">7.5</span>官方适配器：传输归传输，认证归认证</h2>
-    <p>拆分后 <code class="inline">packages/llm/llm-deepseek/src/index.ts</code> 的最后一行很说明问题：<code class="inline">export { catalogModelInfo } from './model-info.ts'; export { registerDeepSeekProvider } from './host.ts'</code>——它不再自己 apply，只是把零件交给真正注册路由的插件。注册逻辑收拢在新的 <code class="inline">src/host.ts</code>（49 行）里，签名把「两个认证插件之间不变的部分」与「各自独有的部分」切开：</p>
-    <div class="code-title">packages/llm/llm-deepseek/src/host.ts:15 — registerDeepSeekProvider()</div>
+    <p>拆分后 <code class="inline">packages/llm/llm-deepseek/src/index.ts</code> 的最后一行很说明问题：<code class="inline">export { catalogModelInfo } from './model-info.ts'; export { registerDeepSeekProvider } from './host.ts'</code>——它不再自己 apply，只是把零件交给真正注册路由的插件。注册逻辑收拢在新的 <code class="inline">src/host.ts</code>（65 行）里，签名把「两个认证插件之间不变的部分」与「各自独有的部分」切开：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/host.ts:18 — registerDeepSeekProvider()</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">registerDeepSeekProvider</span>&lt;<span class="cl">C</span> <span class="kw">extends</span> <span class="cl">DeepSeekConnectionOptions</span>&gt;(
   ctx: <span class="cl">Context</span>, provider: <span class="kw">string</span>, dependencies: <span class="cl">Pick</span>&lt;<span class="cl">DeepSeekAdapterOptions</span>&lt;<span class="cl">C</span>&gt;,
-  <span class="st">'options'</span> | <span class="st">'resolveAuth'</span> | <span class="st">'providerName'</span> | <span class="st">'discoverModels'</span>&gt;): <span class="kw">void</span> {
+  <span class="st">'options'</span> | <span class="st">'resolveAuth'</span> | <span class="st">'providerName'</span> | <span class="st">'discoverModels'</span> | <span class="st">'connect'</span> | <span class="st">'admit'</span>&gt;): <span class="kw">void</span> {
   …
   <span class="kw">const</span> adapter = <span class="kw">new</span> <span class="cl">DeepSeekAdapter</span>({
     …dependencies,
@@ -260,30 +260,30 @@
     registeredPolicy = policy
   })
 }</pre>
-    <div class="annotation">回调注入（resolveUserId、onReplayDegrade、prepareExtensions…）是宿主环境的东西，两个路由共用；依赖参数里留的四个钩子——options、resolveAuth、providerName、discoverModels——才是插件各写各的。尾部那段 <code class="inline">loader/volatile-update</code> 监听管重试策略热更新：配置改了就 <code class="inline">registration.replace([provider])</code> 重新注册，请求不用重启进程。</div>
-    <p>再看两个插件各自写的那半。api-key 侧（<code class="inline">packages/llm/llm-deepseek-api-key/src/index.ts:15</code>）的 resolveAuth 就一行核心：<code class="inline">headers: { 'x-api-key': await resolveApiKey(connection) }</code>，凭据走 credentials 服务、退回启动环境变量，两边都落空才抛 MISSING_CREDENTIAL。account 侧（<code class="inline">packages/llm/llm-deepseek-account/src/index.ts:15</code>）要厚得多，因为它要管 token 的生命周期：</p>
-    <div class="code-title">packages/llm/llm-deepseek-account/src/index.ts — resolveAuth（节选）</div>
-    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> resolveAuth = <span class="kw">async</span> (connection) =&gt; {
-  <span class="kw">const</span> account = ctx.<span class="fn">get</span>(<span class="st">'deepseekAccount'</span>)
-  <span class="kw">const</span> token = <span class="kw">await</span> account?.<span class="fn">resolveToken</span>(connection.baseURL)
+    <div class="annotation">回调注入（resolveUserId、onReplayDegrade、prepareExtensions…）是宿主环境的东西，两个路由共用；依赖参数里留的六个钩子——options、resolveAuth、providerName、discoverModels、connect、admit（后两个 v0.2.1-alpha.4 起加入，给账号路由的模型目录与版本门禁用）——才是插件各写各的。尾部那段 <code class="inline">loader/volatile-update</code> 监听管重试策略热更新：配置改了就 <code class="inline">registration.replace([provider])</code> 重新注册，请求不用重启进程。</div>
+    <p>再看两个插件各自写的那半。api-key 侧（<code class="inline">packages/llm/llm-deepseek-api-key/src/index.ts:15</code>）的 resolveAuth 就一行核心：<code class="inline">headers: { 'x-api-key': await resolveApiKey(connection) }</code>，凭据走 credentials 服务、退回启动环境变量，两边都落空才抛 MISSING_CREDENTIAL。account 侧（<code class="inline">packages/llm/llm-deepseek-account/src/index.ts:22</code>）要厚得多，因为它要管 token 的生命周期：</p>
+    <div class="code-title">packages/llm/llm-deepseek-account/src/index.ts — resolveAuth（节选，:55）</div>
+    <pre class="code"><span class="lang-tag">typescript</span><span class="kw">const</span> account = () =&gt; ctx.<span class="fn">get</span>(<span class="st">'deepseekAccount'</span>)
+<span class="kw">const</span> resolveAuth = <span class="kw">async</span> (connection) =&gt; {
+  <span class="kw">const</span> token = <span class="kw">await</span> account()?.<span class="fn">resolveToken</span>(connection.baseURL)
   <span class="kw">if</span> (token === <span class="kw">undefined</span>) <span class="kw">throw new</span> <span class="cl">LlmError</span>(<span class="st">'Sign in to DeepSeek…'</span>, <span class="st">'ACCOUNT_SIGN_IN_REQUIRED'</span>)
   <span class="kw">return</span> {
-    headers: { <span class="st">'x-dsh-auth-token'</span>: token },
+    headers: { [TOKEN_HEADER]: token },
     onRequestError: <span class="kw">async</span> (error) =&gt; {
       <span class="kw">if</span> (!(error <span class="kw">instanceof</span> <span class="cl">LlmError</span>)) <span class="kw">return</span> error
       <span class="kw">if</span> (error.code === <span class="cl">QUOTA_EXCEEDED_CODE</span>)
         <span class="kw">return new</span> <span class="cl">LlmError</span>(error.message, <span class="cl">ACCOUNT_QUOTA_EXCEEDED_CODE</span>, { …error.failure, cause: error })
       <span class="kw">if</span> (error.failure.status !== <span class="nu">401</span>) <span class="kw">return</span> error
       <span class="kw">const</span> rejected = <span class="kw">new</span> <span class="cl">LlmError</span>(error.message, <span class="st">'ACCOUNT_TOKEN_INVALID'</span>, { …error.failure, cause: error })
-      <span class="kw">try</span> { <span class="kw">await</span> account?.<span class="fn">rejectToken</span>(token) }
+      <span class="kw">try</span> { <span class="kw">await</span> account()?.<span class="fn">rejectToken</span>(token) }
       <span class="kw">catch</span> (_credentialRemovalFailed) { <span class="cmt">/* Storage failure cannot replace the inference failure. */</span> }
       <span class="kw">return</span> rejected
     },
   }
 }</pre>
-    <div class="annotation"><b>onRequestError 是这次拆分里最值得看的设计</b>。传输层在 request 的 catch 里调用它，把错误映射权交还给凭据的持有者：通用配额码 QUOTA 在账号路由上没有意义（那是账户余额问题），重映射成 ACCOUNT_QUOTA；401 说明 token 失效，映射成 ACCOUNT_TOKEN_INVALID 并顺手 <code class="inline">rejectToken</code> 把坏 token 从凭据存储里移除。注意 catch 的写法——<code class="inline">rejectToken</code> 本身失败（存储层故障）被显式吞掉，注释原话是「存储失败不能顶替推理失败」：用户看到的必须是请求的真实失败，而不是清理动作的失败。适配器侧则完全不知道这些细节，它只看到「headers」和「一个错误映射回调」。类型上这也可见：DeepSeekAdapter 变成了 <code class="inline">&lt;C extends Connection&gt;</code> 的泛型（adapter.ts:20），两个插件各自用自己的连接类型实例化它。</div>
-    <p>传输本体是 <code class="inline">LlmAdapter</code> 的直接子类（<code class="inline">src/adapter.ts</code>，160 行），请求生成器分三层。先看完整流水线：</p>
-    <div class="code-title">packages/llm/llm-deepseek/src/adapter.ts — generate() 与 request()（节选，:51/:75）</div>
+    <div class="annotation"><b>onRequestError 是这次拆分里最值得看的设计</b>。传输层在 request 的 catch 里调用它，把错误映射权交还给凭据的持有者：通用配额码 QUOTA 在账号路由上没有意义（那是账户余额问题），重映射成 ACCOUNT_QUOTA；401 说明 token 失效，映射成 ACCOUNT_TOKEN_INVALID 并顺手 <code class="inline">rejectToken</code> 把坏 token 从凭据存储里移除。注意 catch 的写法——<code class="inline">rejectToken</code> 本身失败（存储层故障）被显式吞掉，注释原话是「存储失败不能顶替推理失败」：用户看到的必须是请求的真实失败，而不是清理动作的失败。适配器侧则完全不知道这些细节，它只看到「headers」和「一个错误映射回调」。类型上这也可见：DeepSeekAdapter 变成了 <code class="inline">&lt;C extends Connection&gt;</code> 的泛型（adapter.ts:22），两个插件各自用自己的连接类型实例化它。</div>
+    <p>传输本体是 <code class="inline">LlmAdapter</code> 的直接子类（<code class="inline">src/adapter.ts</code>，178 行），请求生成器分三层。先看完整流水线：</p>
+    <div class="code-title">packages/llm/llm-deepseek/src/adapter.ts — generate() 与 request()（节选，:65/:91）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">private async *</span> <span class="fn">generate</span>(options, connection): <span class="cl">AsyncGenerator</span>&lt;<span class="cl">StreamChunk</span>&gt; {
   <span class="kw">const</span> signal = options.signal === <span class="kw">undefined</span> ? consumer.signal : <span class="cl">AbortSignal</span>.<span class="fn">any</span>([consumer.signal, options.signal])
   <span class="kw">using</span> watchdog = <span class="fn">idleWatchdog</span>(signal, connection.streamIdleTimeoutMs, <span class="st">'MESSAGES_IDLE'</span>)
@@ -301,9 +301,10 @@
     <span class="kw">throw new</span> <span class="cl">LlmError</span>(…, <span class="st">'TRANSPORT'</span>)               <span class="cmt">// 连接层故障 → 可重试</span>
   } <span class="kw">finally</span> {
     consumer.<span class="fn">abort</span>()
-    <span class="kw">try</span> { <span class="kw">await</span> iterator.<span class="fn">return</span>(<span class="kw">undefined</span>) } <span class="kw">catch</span> (_abortedRequestCleanup) {
-      <span class="cmt">// The request already settled; aborting its reader cannot replace that outcome.</span>
-    }
+    <span class="cmt">// The abort above owns the socket teardown. A demand the deadline abandoned
+    // can stay pending forever, and this generator queues its own return behind
+    // that demand, so awaiting the drain would re-hang the settled outcome.</span>
+    <span class="kw">void</span> iterator.<span class="fn">return</span>(<span class="kw">undefined</span>).<span class="fn">catch</span>(() =&gt; {})
   }
 }
 
@@ -353,7 +354,7 @@
     <span class="kw">return</span>
   }
 } <span class="cmt">// 整个 request 体包在 try/catch 里，catch 调 auth.onRequestError 映射错误（见上）</span></pre>
-    <div class="annotation"><b>读这个结构：三层各管一件事</b>。<code class="inline">generate()</code>（:51）管<strong>生命周期</strong>——idle watchdog（<code class="inline">@deepseek-ai/dsh-timeout</code>）用 <code class="inline">using</code> 守护，任何一次流读超过 streamIdleTimeoutMs（默认 300_000）就放弃读并把错误归为 TIMEOUT（可重试）；消费方取消归 ABORTED，其余归 TRANSPORT；<code class="inline">finally</code> 里 <code class="inline">iterator.return()</code> 保证取消时底层 fetch reader 被关闭，但注释明确写着 aborting its reader cannot replace that outcome——已结算的请求不许被清理动作改写结局。<code class="inline">request()</code>（:75）管<strong>内容</strong>——图像先试 Files 引用；解析失败且仅当失败类型是 <code class="inline">FileResolutionFailure</code> 时整体退回 base64 内联，从 beginAttempt 重走；<code class="inline">serialize()</code> 组装线上体；beta 头现在按需拼两种（Files、工具变更），一个都没有时不发 anthropic-beta；插件扩展字段在 fetch 前注入、2xx 后 <code class="inline">accept()</code>。<code class="inline">translate()</code>（translate.ts:104）管<strong>翻译</strong>——把供应商 SSE 事件翻成 7 种 StreamChunk，thinking 块原生重放（回放降级时回调 onReplayDegrade 上报，不暴露内容）。三层共享同一个 <code class="inline">activity()</code> 回调喂 watchdog 呼吸——连 Files API 等待期间也在续命，超时计的只是「无任何进展」的时间。</div>
+    <div class="annotation"><b>读这个结构：三层各管一件事</b>。<code class="inline">generate()</code>（:65）管<strong>生命周期</strong>——idle watchdog（<code class="inline">@deepseek-ai/dsh-timeout</code>）用 <code class="inline">using</code> 守护，任何一次流读超过 streamIdleTimeoutMs（默认 300_000）就放弃读并把错误归为 TIMEOUT（可重试）；消费方取消归 ABORTED，其余归 TRANSPORT；<code class="inline">finally</code> 里 <code class="inline">iterator.return()</code> 保证取消时底层 fetch reader 被关闭——注意它<strong>不再 await</strong>：被超时放弃的 demand 可能永远悬着，这个生成器的 return 排在那条 demand 后面，await 排水会把已结算的结局重新挂死，所以是 fire-and-forget 的 <code class="inline">void …catch(() =&gt; {})</code>，注释原话是「awaiting the drain would re-hang the settled outcome」——已结算的请求不许被清理动作改写结局（v0.2.1-alpha.2 起，dbb150ff0e）。<code class="inline">request()</code>（:91）管<strong>内容</strong>——图像先试 Files 引用；解析失败且仅当失败类型是 <code class="inline">FileResolutionFailure</code> 时整体退回 base64 内联，从 beginAttempt 重走；<code class="inline">serialize()</code> 组装线上体；beta 头现在按需拼两种（Files、工具变更），一个都没有时不发 anthropic-beta；插件扩展字段在 fetch 前注入、2xx 后 <code class="inline">accept()</code>。<code class="inline">translate()</code>（translate.ts:104）管<strong>翻译</strong>——把供应商 SSE 事件翻成 7 种 StreamChunk，thinking 块原生重放（回放降级时回调 onReplayDegrade 上报，不暴露内容）。三层共享同一个 <code class="inline">activity()</code> 回调喂 watchdog 呼吸——连 Files API 等待期间也在续命，超时计的只是「无任何进展」的时间。</div>
 
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg">
@@ -418,7 +419,7 @@
       tools: options.tools.map(tool =&gt; ({ name: tool.name, description: tool.description, input_schema: tool.parameters })),
     },
   }</pre>
-    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled/disabled + <code class="inline">output_config.effort</code> 两个字段（serialize.ts:154-155）；<code class="inline">off</code> 不作为线上 effort 暴露——wire 上表现为 thinking disabled。适配器不再按 purpose 分叉生成策略——0.2.1 起那类调整统一走 prepareCall 的 <code class="inline">configure</code> 回调（call-config.ts:45）：调用方拿到捕获的模型元数据、返回最终采样控制，适配器只认结果。session-title 就是这样强制 effort 的：它传入 <code class="inline">selectReasoningEffort</code> 选出的 effort，覆盖默认值（compaction 则只通过请求头 x-deepseek-harness-compact 标记，不改 effort）。可选字段一律省略而非发 null，让供应商默认值生效。developer 消息的落点是 system 角色——「Harness 在 user 输入之前承认系统更新，Messages 把同一条更新放在该 user/tool-result 回合之后、下一个 assistant 之前」（flushSystemUpdates 注释）。</div>
+    <div class="annotation"><b>effort 映射</b>：配置的 <code class="inline">'off'|'low'|'high'|'max'</code> 解析为 thinking enabled/disabled + <code class="inline">output_config.effort</code> 两个字段（serialize.ts:155-156）；<code class="inline">off</code> 不作为线上 effort 暴露——wire 上表现为 thinking disabled。适配器不再按 purpose 分叉生成策略——0.2.1 起那类调整统一走 prepareCall 的 <code class="inline">configure</code> 回调（call-config.ts:45）：调用方拿到捕获的模型元数据、返回最终采样控制，适配器只认结果。session-title 就是这样强制 effort 的：它传入 <code class="inline">selectReasoningEffort</code> 选出的 effort，覆盖默认值（compaction 则只通过请求头 x-deepseek-harness-compact 标记，不改 effort）。可选字段一律省略而非发 null，让供应商默认值生效。developer 消息的落点是 system 角色——「Harness 在 user 输入之前承认系统更新，Messages 把同一条更新放在该 user/tool-result 回合之后、下一个 assistant 之前」（flushSystemUpdates 注释）。</div>
     <p>模型目录与默认值（<code class="inline">src/models.ts:6</code> 与 <code class="inline">src/defaults.ts</code>）：</p>
     <div class="code-title">packages/llm/llm-deepseek/src/models.ts</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="cmt">/** Advisory official model entries; deployments may replace the catalog. */</span>
@@ -451,10 +452,10 @@
 
     <h3>动态工具更新：一条声明史怎么走到线上</h3>
     <p>0.2.0 之前，工具清单变了就意味着下一请求整体换掉 tools 数组——对 KV 缓存是一次前缀重写。0.2.0 给了另一条路：声明留在历史里，变化以消息形式追加。整条链路分四段：</p>
-    <p><strong>第一段，模型侧声明能力</strong>。目录里 deepseek-flash 声明 <code class="inline">toolUpdate: 'addition-only'</code>——这条路由能把 developer 消息里的 <code class="inline">tool-addition</code> 块读作「激活某个 deferLoading 声明的工具」，但不支持删除语义；<code class="inline">'in-history'</code> 则连 <code class="inline">tool-removal</code> 也走历史（types.ts:401 的文档）。两个都没声明的路由维持旧行为：每次请求发完整清单。</p>
+    <p><strong>第一段，模型侧声明能力</strong>。目录里 deepseek-flash 声明 <code class="inline">toolUpdate: 'addition-only'</code>——这条路由能把 developer 消息里的 <code class="inline">tool-addition</code> 块读作「激活某个 deferLoading 声明的工具」，但不支持删除语义；<code class="inline">'in-history'</code> 则连 <code class="inline">tool-removal</code> 也走历史（types.ts:410 的文档）。两个都没声明的路由维持旧行为：每次请求发完整清单。</p>
     <p><strong>第二段，循环侧记账</strong>。循环在 buildRequest 里把新旧 header 的工具名单做差集（agent.ts:652-664），差异写成一条 <code class="inline">developer/message</code> 事件，content 是 <code class="inline">tool-addition</code>/<code class="inline">tool-removal</code> 块，addition 部分携带 <code class="inline">headerSeq</code> 指回定义所在的 request/header 事件。这个事件本身进了会话日志，所以重启后可重放。</p>
     <p><strong>第三段，会话侧折叠</strong>。新文件 <code class="inline">packages/core/session/src/tool-history.ts</code> 的 ToolHistoryProjection 把 request/header 与 developer/message 两类事件折成不可变的 <code class="inline">ToolHistory</code>（tools + updates）：当前声明系列从哪个 header 开始、每条 update 激活了哪些定义，都从 headerSeq 反查出来。折叠与模型能力无关——日志里怎么记，这里就怎么折。Session.toolHistory()（session/src/index.ts:953）按增量消费事件返回快照。</p>
-    <p><strong>第四段，发送侧投影</strong>。循环把 toolHistory 放进 GenerateOptions；llm 层在真正派发给适配器前调用 <code class="inline">projectToolUpdates</code>（content.ts:424，派发点在 llm/src/index.ts:1084），按路由的 toolUpdate 模式决定发什么：</p>
+    <p><strong>第四段，发送侧投影</strong>。循环把 toolHistory 放进 GenerateOptions；llm 层在真正派发给适配器前调用 <code class="inline">projectToolUpdates</code>（content.ts:424，派发点在 llm/src/index.ts:1107），按路由的 toolUpdate 模式决定发什么：</p>
     <div class="code-title">packages/llm/llm/src/content.ts:424 — projectToolUpdates()（节选）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export function</span> <span class="fn">projectToolUpdates</span>(
   messages, tools, toolUpdate: <span class="cl">ToolUpdate</span> | <span class="kw">undefined</span>, history?: <span class="cl">ToolHistory</span>,
@@ -467,7 +468,7 @@
     <span class="kw">return</span> { messages: <span class="fn">withoutDeveloperMessages</span>(messages), tools: immediateTools }
   }
   …</pre>
-    <div class="annotation"><b>同一个日志，三种发送形态</b>：不支持的路由收到剥掉 developer 工具消息、立即全量声明的请求；addition-only 路由（deepseek-flash）的历史投影必须把已失活工具从声明清单里剔除（content.ts:401 的注释：没有删除支持，声明列表必须略去失活工具），保留 tool-addition 消息；in-history 路由则连声明也留着，只追加更新。序列化时两种引用块映射成线上的 tool_addition/tool_removal（serialize.ts:94-95），request() 里看到的那条 beta 头就是在这时挂上的。投影逐路由发生——日志层面工具变更永远记全，各路由「该看见什么」由各自的模式决定。这延续了全书反复出现的分层：记录归会话，投影归发送方。</div>
+    <div class="annotation"><b>同一个日志，三种发送形态</b>：不支持的路由收到剥掉 developer 工具消息、立即全量声明的请求；addition-only 路由（deepseek-flash）的历史投影必须把已失活工具从声明清单里剔除（content.ts:401 的注释：没有删除支持，声明列表必须略去失活工具），保留 tool-addition 消息；in-history 路由则连声明也留着，只追加更新。序列化时两种引用块映射成线上的 tool_addition/tool_removal（serialize.ts:95-96），request() 里看到的那条 beta 头就是在这时挂上的。投影逐路由发生——日志层面工具变更永远记全，各路由「该看见什么」由各自的模式决定。这延续了全书反复出现的分层：记录归会话，投影归发送方。</div>
   </section>
 
   <section class="block">
@@ -517,7 +518,7 @@
 </div>
 
 <footer>
-  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.2.1-alpha.2 (HEAD d743267388) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出 DeepSeek Harness · 07 LLM 层 · 版本 dsh-v0.2.1-alpha.4 (HEAD 86a402200d) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>
