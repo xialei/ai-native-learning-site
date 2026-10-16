@@ -52,7 +52,7 @@ n_layers: <span class="cl">int</span> = <span class="nu">43</span>
 n_routed_experts: <span class="cl">int</span> = <span class="nu">256</span>
 n_activated_experts: <span class="cl">int</span> = <span class="nu">6</span>   <span class="cmt"># top_k</span></pre>
     <p>每个专家是三个矩阵：gate_up（2I×H）、down（H×I），合计 3IH 个权重。乘上层数与专家数，就是 routed experts 的全部体积。OffloadMoeCache 把每专家字节数写成了公式表（moe/offload_cache.py:87-98）：</p>
-    <div class="code-title">python/freetoken/moe/offload_cache.py:89-98 — 每专家字节公式（摘录，注释为译注）</div>
+    <div class="code-title">python/freetoken/moe/offload_cache.py:88-98 — 每专家字节公式（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># keyed by the config-time format tag (expert_quant / moe_weight_format), not
 # quant_format: "mxfp4" sizes the mxfp4_triton banks, "nvfp4" also covers its
 # repacked variants</span>
@@ -79,7 +79,7 @@ _BANK_BYTES_PER_EXPERT = {
 
   <section class="block">
     <h2><span class="num">11.2</span>flat id 与双映射：共享槽池</h2>
-    <p>OffloadMoeCache 的核心是三层结构：host 源（每层一份 [E, ...] 的 pinned 内存 bank）、GPU 槽池（每个 bank 一条 [cache_size, ...] 的显存）、以及两本映射账。注意 <strong>cache_size 是全部层的总槽位数</strong>，不是每层各留一份——热层多占、冷层少占，池子共享。#689 起池子还可以切成<strong>多个子池</strong>（pool_of_layer/pool_sizes：每层归属一个池，池内独立 LRU；默认 None = 全部层一个池，行为同旧版），本章先讲单池，12 章再回到多池：</p>
+    <p>OffloadMoeCache 的核心是三层结构：host 源（每层一份 [E, ...] 的 pinned 内存 bank）、GPU 槽池（每个 bank 一条 [cache_size, ...] 的显存）、以及两本映射账。注意 <strong>cache_size 是全部层的总槽位数</strong>，不是每层各留一份——热层多占、冷层少占，池子共享。#689 起池子还可以切成<strong>多个子池</strong>（pool_of_layer/pool_sizes：每层归属一个池，池内独立 LRU；默认 None = 全部层一个池，行为同旧版），本章先讲单池：</p>
     <div class="code-title">python/freetoken/moe/offload_cache.py:197-213 — 双映射（摘录，注释为译注）</div>
 
     <pre class="code"><span class="lang-tag">python</span><span class="kw">self</span>.slot_for_id = torch.full(
@@ -99,7 +99,7 @@ _BANK_BYTES_PER_EXPERT = {
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 430" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t11 d11">
         <title id="t11">OffloadMoeCache 结构</title>
-        <desc id="d11">host bank 经 PCIe 进入扁平槽池，slot_for_id/id_of_slot 双映射，前 2E 槽被 prefill 双缓冲借用</desc>
+        <desc id="d11">host bank 经 PCIe 进入扁平槽池，slot_for_id/id_of_slot 双映射，bank 头部字节段作 prefill 双缓冲</desc>
         <defs>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0 0 L10 5 L0 10 z" fill="#55685e"></path>
@@ -115,8 +115,8 @@ _BANK_BYTES_PER_EXPERT = {
         <rect class="node core" x="350" y="40" width="280" height="330" rx="10"></rect>
         <text class="lbl" x="490" y="70" text-anchor="middle" font-weight="bold" fill="#1d6b4f">GPU 槽池 [cache_size, ...]（每 bank 一条）</text>
         <rect class="node warn" x="380" y="88" width="220" height="56" rx="6"></rect>
-        <text class="lbl" x="490" y="110" text-anchor="middle">slot 0 … 2E-1</text>
-        <text class="lbl sm" x="490" y="128" text-anchor="middle">prefill 双缓冲借用区</text>
+        <text class="lbl" x="490" y="110" text-anchor="middle">bank 头部字节段</text>
+        <text class="lbl sm" x="490" y="128" text-anchor="middle">prefill 双缓冲暂存区</text>
         <text class="lbl sm" x="490" y="186" text-anchor="middle">…… 自由槽 ……</text>
         <rect class="node acc" x="380" y="214" width="220" height="46" rx="6"></rect>
         <text class="lbl" x="490" y="236" text-anchor="middle">slot cache_size-1</text>
@@ -139,7 +139,7 @@ _BANK_BYTES_PER_EXPERT = {
         <line class="edge" x1="200" y1="152" x2="348" y2="130"></line>
         <text class="lbl sm" x="210" y="172">PCIe（fused copy）</text>
       </svg>
-      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#d6e8de;border-color:#1d6b4f"></span>GPU 槽池</span><span class="lg-item"><span class="sw" style="background:#fdecec;border-color:#d33"></span>普通 expert slot</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#c97a10"></span>常驻 slot</span></div><div class="fig-cap">图 11.1：默认一个扁平槽池服务所有层的所有 bank（#689 后可切成多个子池，12 章展开）。双映射让「路由改写」查 slot_for_id、「驱逐」查 id_of_slot 各走各的；开头字节平时也当普通缓存用，prefill overlap 时被临时征用为双缓冲（11.5）。</div>
+      <div class="svg-legend"><span class="lg-item"><span class="sw" style="background:#d6e8de;border-color:#1d6b4f"></span>GPU 槽池</span><span class="lg-item"><span class="sw" style="background:#fdecec;border-color:#d33"></span>普通 expert slot</span><span class="lg-item"><span class="sw" style="background:#fdf2e3;border-color:#c97a10"></span>常驻 slot</span></div><div class="fig-cap">图 11.1：默认一个扁平槽池服务所有层的所有 bank（#689 后可切成多个子池，池内独立 LRU）。双映射让「路由改写」查 slot_for_id、「驱逐」查 id_of_slot 各走各的；bank 头部字节平时也当普通缓存用，prefill overlap 时被临时征用为双缓冲（11.5）。</div>
     </div>
   </section>
 
@@ -247,7 +247,7 @@ cache.copy_missing()                                <span class="cmt"># 缺失�
 
   <section class="block">
     <h2><span class="num">11.5</span>prefill 路径：整层流式与双缓冲</h2>
-    <p>prefill 与 decode 的处境完全不同：一个 chunk 可达数千 token，几乎必然激活<strong>每层的全部 256 个专家</strong>（6/256 是每 token 的分布，乘上几千 token 后命中每一个专家的概率接近 1）。逐专家 LRU 毫无意义——干脆整层整层地搬。<strong>prefill 默认不走 LRU：槽位 = 专家 id，路由 id 原样通过</strong>（_prefill_routed，moe.py:351-354 的注释 "position == expert id, so the routing ids pass through unmapped"）。例外是 DeepSeek-V4：它 override 了 _prefill_routed，对小于整层的小 chunk 会退回 LRU 路径（models/deepseek_v4/moe.py:115-129），免得为几百 token 搬满整层。</p>
+    <p>prefill 与 decode 的处境完全不同：一个 chunk 可达数千 token，几乎必然激活<strong>每层的全部 256 个专家</strong>（6/256 是每 token 的分布，乘上几千 token 后命中每一个专家的概率接近 1）。逐专家 LRU 毫无意义——干脆整层整层地搬。<strong>prefill 默认不走 LRU：槽位 = 专家 id，路由 id 原样通过</strong>（_prefill_routed，moe.py:351-354 的注释 "position == expert id, so the routing ids pass through unmapped"）。例外是 DeepSeek-V4：它 override 了 _prefill_routed，对小于整层的小 chunk 会退回 LRU 路径（models/deepseek_v4/moe.py:114-128），免得为几百 token 搬满整层。</p>
     <p>整层搬运若串行，PCIe 时间会直接叠在 GEMM 时间上。prefill_overlap 的方案：把槽池<strong>最前面的字节临时征用为两个 prefill 暂存缓冲</strong>——层 L 用 L%2 号缓冲，层 L 的 GEMM 与层 L+1 的 H2D 并行。缓冲不是独立分配的显存，是每条 bank cache 开头切出来的两个视图（offload_cache.py:298-299 的注释 + :789-794 初始化）：</p>
     <div class="code-title">python/freetoken/moe/offload_cache.py:298-301 — 暂存缓冲的定义（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># The two prefill staging buffers are the first 2 * _stage_bytes[k] bytes of</span>
@@ -326,7 +326,7 @@ overlap = overlap <span class="kw">and</span> moe_cache_size &gt;= <span class="
 total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 <span class="kw">assert</span> total &lt;= budget_bytes, (...)</pre>
     <div class="annotation">策略是 <strong>MoE 优先的贪心</strong>：先给 KV 留底（kv_reserve_tokens 默认 8192，engine/config.py:54 注释明说 "small by design (MoE-priority)"），剩下的预算专家全拿，KV 吃残余。地步（lo）不是装饰：开了 prefill overlap 就至少要 2E 个槽（双缓冲借用），这个约束在这里与第 11.5 节的运行时断言首尾呼应。<strong>约束的两端都要写</strong>——规划端保证不产生非法几何，运行端断言兜底，两处注释互相引用。</div>
-    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:988 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:152）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
+    <p>预算不止启动时算一次。池子支持运行时重调（engine/engine.py:988 rebuild_runtime_cache：原地 resize 槽池/KV 页/GDN 槽，重捕获 CUDA Graph，不重载权重），暴露为 <code class="inline">POST /v1/cache/rebuild</code> 和 <code class="inline">ft ctl cache --moe N --kv N</code>（docs/cli.md:154）。重调的安全性靠两段式拒绝：先做纯几何校验（0a）与预算 fit-check（0b），<strong>校验不过就带着旧缓存原样拒绝</strong>，绝不先 free 再发现不够——「先拆后建失败」的服务器只能重启。</p>
   </section>
 
   <section class="block">
@@ -368,7 +368,7 @@ total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>回到开头的账：137 GiB（ds_fp4）对 12 GiB 显存，靠 top_k=6 的稀疏性，一个小槽池就能吃到高命中。支撑这个槽池的是一套刻意保持简单的机制：扁平槽池 + slot_for_id/id_of_slot 双映射，LRU 只是 usage 时间戳加 argmin，没有链表没有堆，可以整段编进 CUDA Graph；8 种量化格式只在 _BANK_SCHEMAS 里声明 bank 布局，缓存机制对 bank 内部字节一概不感兴趣，只按行搬字节。decode 走三步：ensure_experts（选槽改写）→ copy_missing（fused copy）→ GEMM，簿记全在设备端；prefill 则整层流式，借槽池前 2E 槽当双缓冲，begin_prefill fence 防 decode 踩字节，hit-D2D 把命中行分流出去。磁盘侧 FTW 把全模型排成 4096 对齐的连续字节区供 O_DIRECT 直读，pin-after-fill 免掉一轮白搬；预算侧 MoE 优先贪心 + 两段式运行时重调，拒绝发生在算术层而不是 CUDA 分配上。llama.cpp 的对照是静态 buffer override——张量不动计算动，简单，且不共享热度（上游 2026-10 起补了一个可选的 GPU 专家缓存，方向与本章殊途同归）。</p>
+    <p>回到开头的账：137 GiB（ds_fp4）对 12 GiB 显存，靠 top_k=6 的稀疏性，一个小槽池就能吃到高命中。支撑这个槽池的是一套刻意保持简单的机制：扁平槽池 + slot_for_id/id_of_slot 双映射，LRU 只是 usage 时间戳加 argmin，没有链表没有堆，可以整段编进 CUDA Graph；8 种量化格式只在 _BANK_SCHEMAS 里声明 bank 布局，缓存机制对 bank 内部字节一概不感兴趣，只按行搬字节。decode 走三步：ensure_experts（选槽改写）→ copy_missing（fused copy）→ GEMM，簿记全在设备端；prefill 则整层流式，暂存双缓冲从 bank 头部按字节段切出，begin_prefill fence 防 decode 踩字节，hit-D2D 把命中行分流出去。磁盘侧 FTW 把全模型排成 4096 对齐的连续字节区供 O_DIRECT 直读，pin-after-fill 免掉一轮白搬；预算侧 MoE 优先贪心 + 两段式运行时重调，拒绝发生在算术层而不是 CUDA 分配上。llama.cpp 的对照是静态 buffer override——张量不动计算动，简单，且不共享热度（上游 2026-10 起补了一个可选的 GPU 专家缓存，方向与本章殊途同归）。</p>
     <p>槽池解决「谁在显存里」。下一步是「剩下的缺失怎么办」：PCIe 搬与 CPU 算这两条路怎么分、怎么并行。<a href="12-hybrid-exec.html">第 12 章：CPU/GPU 带宽协同</a>。</p>
   </div>
 
