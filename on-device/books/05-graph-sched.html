@@ -45,7 +45,7 @@
   <section class="block">
     <h2><span class="num">5.1</span>图复用：为什么 decode 第二步起不用重建图</h2>
     <p>每个 ubatch 的图拓扑只由「形状参数」决定——token 数、序列数、输入种类。参数不变，图就不变，于是 llama.cpp 缓存上一张图，先问一句「还能用吗」：</p>
-    <div class="code-title">src/llama-context.cpp:1421-1465 — process_ubatch 的图复用（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:1514-1558 — process_ubatch 的图复用（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="kw">auto</span> * res = <span class="fn">get_gf_res_prev</span>();   <span class="cmt">// 双 arena 之一：按「本批有无输出」二选一</span>
 <span class="kw">auto</span> * gf  = res-&gt;<span class="fn">get_gf</span>();
 
@@ -119,7 +119,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
   <section class="block">
     <h2><span class="num">5.2</span>sched_reserve：三次 reserve 的启动仪式</h2>
     <p>启动时 llama.cpp 会用「最坏情况」图把计算缓冲一次性预留到位，推理期间 galloc 只在其中做原地分配。reserve 序列是 pp → tg → pp 三次：</p>
-    <div class="code-title">src/llama-context.cpp:669-742 — 三次 reserve（摘录，注释为译注）</div>
+    <div class="code-title">src/llama-context.cpp:759-833 — 三次 reserve（摘录，注释为译注）</div>
     <pre class="code"><span class="cmt">// 先用 pp（prompt processing）图预留 —— 缓冲只分配一次</span>
 {
     <span class="kw">auto</span> * gf = <span class="fn">graph_reserve</span>(n_tokens, n_seqs, n_outputs_pp, mctx.get(), ...);
@@ -164,7 +164,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     };
     ...
 }</pre>
-    <div class="annotation">启动日志里的「compute buffer size = xxx MiB」「graph (pp bs=512, tg bs=1): nodes = …, splits = …, input objects = …, input tensors = …」就是这里打出来的（#26625 之前日志是分开的两行「graph nodes = …」「graph splits = …」，现在合并成一行还顺带报了图输入计数）。三次 reserve 各有任务：第一遍 pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；第二遍跑一遍 tg 图，测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；第三遍再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 与 KIMI_LINEAR 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长，这个特例清单还在随新架构缓慢加长。这段代码近期还有两处加法：tg reserve 外面套了 <code class="inline">cparams.training</code> 分支（#28520，训练模式没有 tg 图，计数直接抄 pp）；sched 创建处多了一行 <code class="inline">ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this)</code>（调度器重建失败的 retry 路径里也要补挂一次）——#29943 把 selective expert copying 从引擎内核搬成了用户侧回调，引擎只留一个钩子＋调度器在拷贝点询问回调，相关机制见第 11 章对照节。</div>
+    <div class="annotation">启动日志里的「compute buffer size = xxx MiB」「graph (pp bs=512, tg bs=1): nodes = …, splits = …, input objects = …, input tensors = …」就是这里打出来的（#26625 之前日志是分开的两行「graph nodes = …」「graph splits = …」，现在合并成一行还顺带报了图输入计数）。三次 reserve 各有任务：第一遍 pp 图最大（要装下 n_ubatch 个 token 的激活），先按它分配；第二遍跑一遍 tg 图，测出 decode 场景的 splits 数——这决定运行时切图次数，必须保证 decode 图也放得下；第三遍再以 pp 收尾，确保最终驻留的缓冲是最大形状。MINIMAX_01 与 KIMI_LINEAR 的 switch 提醒我们「最坏情况」不总是 bs 最大的那个——个别架构的中间激活随序列数平方增长，这个特例清单还在随新架构缓慢加长。这段代码近期有三处加法：tg reserve 外面套了 <code class="inline">cparams.training</code> 分支（#28520，训练模式没有 tg 图，计数直接抄 pp）；调度器的创建/重建被收拢进一个 <code class="inline">sched_new(max_nodes, parallel)</code> 成员函数——#29943 的 copy 回调（selective expert copying，机制见第 11 章对照节）和 #30329 新加的 realloc 回调都挂在这里面， pp 预留失败退掉流水线重试的路径里也只需一行 <code class="inline">sched_new(max_nodes, false)</code> 重建；pp 块的末尾还记了一笔 <code class="inline">graph_has_logits</code>（#30255）——图里没有 logits 输出时（pooled embedding 等）连 logits 缓冲都省掉不分配。</div>
   </section>
 
   <section class="block">
