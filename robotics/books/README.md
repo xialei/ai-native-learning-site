@@ -26,7 +26,7 @@ open /Users/lei.xia/workspace/github/ai-native-learning-site/robotics/books/inde
 | `08-sim-isaaclab.html` | Isaac Lab 全景 | monorepo 分层、configclass 任务、SimulationContext、4096 环境并行、actuator 家族 |
 | `09-manager-based-env.html` | 环境内核 | step() 八步流程、八大 Manager、_reset_idx 顺序、LiftCube episode 走查 |
 | `10-rl-training.html` | RL 训练 | 奖励接力棒设计、课程学习、域随机化四种 mode、rsl_rl PPO 回路 |
-| `11-sim2real.html` | Sim2Real | 差距清单、gRPC 异步推理、must-go 直通、队列聚合、师生蒸馏 |
+| `11-sim2real.html` | Sim2Real | 差距清单、远程异步推理（remote_inference/Zenoh）、契约协商、饿死宽限、对齐替换+混合、师生蒸馏 |
 | `12-build-own.html` | 实战路线 | 六个里程碑 M1-M6：硬件点亮→数据→模仿→RL→VLA→部署 |
 | `13-glossary.html` | 术语表 | 按主题分组的术语速查 |
 
