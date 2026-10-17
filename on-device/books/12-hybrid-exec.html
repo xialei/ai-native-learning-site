@@ -123,7 +123,7 @@ gpu_routed = self._expert_gemm(cache, hidden_states, gpu_w, gpu_slots,
     <span class="kw">return</span> gpu_routed + cpu_routed_early
 <span class="kw">return</span> executor.<span class="fn">decode_sync</span>(pending, add_to=gpu_routed)  <span class="cmt"># CPU 部分直接累加进 GPU 结果</span></pre>
     <p>「每条路由恰好算一次」靠的是<strong>双向置零</strong>：GPU 侧把 CPU 负责的路由权重置 0（不支持跳过 -1 的内核把 id clamp 到槽 0，乘出来是 0）；CPU 侧把 GPU 负责的路由 id 置 -1（C++ 内核跳过 id&lt;0）。#685（2026-10）把「拆分」本身挪进了 ensure 内核——旧版在 Python 里用两条 torch.where 从改写后的 topk_ids 反推两半路由，现在内核一次读完路由直接输出 gpu_slots/gpu_w/cpu_ids 三元组，Python 侧少两遍全量张量扫描。两边都跑、各自只算自己那份、结果相加——没有 if 分支，全部是形状固定的张量操作，CUDA Graph 可捕获。更早的 #603 收过一次尾：新内核直接声明 supports_inactive_slots，槽 -1 一行读都不读，连「clamp 到槽 0 借道」都省了——置零的数学不变，搭车的开销减到零。</p>
-    <p>cap 的语义（offload_cache.py:1048-1070 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计；返回值就是拆好的 HybridRoutes。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:224-229）。</p>
+    <p>cap 的语义（offload_cache.py:1076-1098 ensure_experts_hybrid docstring）：每步每层最多把 hybrid_max_fetch 个（或 fetch_fraction×misses 个）缺失拉上 GPU，超出的记为 -1 交给 CPU；fetch 数量记进 num_indices 给 copy_missing，cap 前的总缺失数记进 num_missing_full 给统计；返回值就是拆好的 HybridRoutes。抓哪些缺失优先？看 expert_recency——最近活跃的专家优先上 PCIe（:236-241）。</p>
     <div class="annotation">为什么「CPU 部分先提交、后等待」是安全的？decode_submit 只做三件事：D2H 拷激活与路由到 pinned IO、发 doorbell（12.4）、返回句柄——GPU 流上的后续节点（PCIe gather、GEMM）与 CPU 池的计算天然并行，汇合点在 decode_sync 的 WAIT 上。A/B 开关 FREETOKEN_HYBRID_OVERLAP=0 把 sync 提前到 gather 之前，串行跑两边——这个环境变量只用于测量重叠收益，不是功能开关（moe.py:324-328 注释明说 "Measurement knob"）。</div>
   </section>
 
