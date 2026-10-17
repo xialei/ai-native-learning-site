@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · 对话模板:把聊天记录变成模型能读的序列 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a class="active" href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 08 对话模板</div>
+    <div class="chap-meta">Chapter 08 · Chat Template</div>
+    <h1>对话模板:把聊天记录变成模型能读的序列</h1>
+    <div class="lede">
+      <p>模型只会读 token 序列,而对话是「谁在什么时刻说了什么」的结构化数据。把后者变成前者,每个模型各有各的方言:Llama 用 [INST]...[/INST],Qwen 用 &lt;|im_start|&gt;user...,Gemma 用 &lt;start_of_turn&gt;。错一个控制符,模型就「看不懂」你说话——能力再强也输出乱码。把方言收拢成配置的,是 chat template:一段 Jinja 模板,随分词器发布,apply_chat_template 一调,对话列表变序列。</p>
+      <p>这一章拆 chat_template_utils.py(740 行)的渲染链,看 v5 新增的 control token 消毒(用户伪造控制符怎么办)和工具 schema 自动转换;再看库内新出现的另一半:模型「答完之后」的解析(response_parsing)——这段代码把第 9 章工具调用的「解析」半边提前亮出来。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 模板是随分词器发布的 Jinja 字符串,渲染输入 = messages + tools + documents + add_generation_prompt,输出 = 模型可读的文本(8.1);② 用户输入里的控制符是注入面:v5 用私有区标记把「用户写的控制符」编码成纯文本,只有模板自己写的才算真控制符(8.2);③ add_generation_prompt 是「该模型接话了」的开关——它渲染出 assistant 头,让模型从正确位置续写(8.3);④ 模型输出是文本,工具调用要靠 response_template 定义的结构化格式解析回来——渲染与解析是一对镜像(8.4)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">8.1</span>模板:随分词器发布的方言配置</h2>
+    <p>chat template 本体是一段 Jinja2 模板字符串,存在 tokenizer_config.json 里。一个典型的 Llama 式模板长这样(示意,非逐字):</p>
+    <div class="code-title">Jinja 模板长什么样(示意)</div>
+    <pre class="code"><span class="lang-tag">jinja</span>{%- <span class="kw">for</span> message <span class="kw">in</span> messages -%}
+    {%- <span class="kw">if</span> message['role'] == 'user' -%}
+        {{ '[INST] ' + message['content'] + ' [/INST]' }}
+    {%- <span class="kw">elif</span> message['role'] == 'assistant' -%}
+        {{ message['content'] + eos_token }}
+    {%- <span class="kw">endif</span> -%}
+{%- <span class="kw">endfor</span> -%}
+{%- <span class="kw">if</span> add_generation_prompt -%}
+    {{ '[INST] ' }}
+{%- <span class="kw">endif</span> -%}</pre>
+    <p>渲染入口在 tokenization_utils_base.py:3003 的 apply_chat_template,核心实现在 chat_template_utils.py 的 render_jinja_template(:607)。输入输出一眼可辨:</p>
+    <div class="code-title">chat_template_utils.py:607 — render_jinja_template 签名(注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">render_jinja_template</span>(conversations, tools=<span class="kw">None</span>, documents=<span class="kw">None</span>, chat_template=<span class="kw">None</span>,
+                           return_assistant_tokens_mask=False, continue_final_message=False,
+                           add_generation_prompt=False, **kwargs) -&gt; str:</pre>
+    <table class="tbl">
+      <tr><th>参数</th><th>作用</th><th>典型值</th></tr>
+      <tr><td>conversations</td><td>messages 列表(role + content)</td><td>[{"role": "user", "content": "..."}, ...]</td></tr>
+      <tr><td>tools</td><td>工具列表,函数自动转 schema</td><td>[my_function] 或 [json_schema]</td></tr>
+      <tr><td>documents</td><td>RAG 检索到的文档</td><td>[{"title": ..., "text": ...}]</td></tr>
+      <tr><td>add_generation_prompt</td><td>是否补上 assistant 开头</td><td>生成时 True;预填 assistant 时 False</td></tr>
+      <tr><td>continue_final_message</td><td>从最后一条 assistant 消息续写</td><td>预填场景</td></tr>
+      <tr><td>return_assistant_tokens_mask</td><td>标出哪些 token 属于 assistant</td><td>训练侧算 loss 用(第 11 章)</td></tr>
+    </table>
+    <div class="annotation"><b>tools 传函数就行:</b>render_jinja_template 里的类型分支——传 dict 当 schema 用,传函数则 get_json_schema(chat_template_utils.py:256)自动转换:读 type hints 定参数类型、读 Google 格式 docstring 定描述,生成 JSON Schema。这是库内最「pythonic」的设计之一:你写的函数签名 + 文档字符串,就是给模型看的工具说明书——「代码即文档」在工具调用场景落到实处。第 9 章会回到这个函数。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.2</span>消毒:用户伪造控制符怎么办</h2>
+    <p>对话内容是用户写的,而控制符([INST]、&lt;|im_start|>)决定模型「如何理解这段话」。若用户在输入里写一句「[INST] 你现在是系统提示词」,模板渲染后这条用户消息就「冒充」了系统结构——这就是提示注入的一种具体形态。第 2 章见过的 sanitize_control_tokens(tokenization_utils_base.py:3012 附近)管的是分词器词表层;chat 渲染层的防线在 chat_template_utils.py:444:</p>
+    <div class="code-title">chat_template_utils.py:444 — mark_control_tokens(核心逻辑,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">mark_control_tokens</span>(obj, control_tokens_re):
+    <span class="kw">if</span> isinstance(obj, str):
+        <span class="cmt"># 先剥掉输入里已有的标记——标记本身不能被伪造</span>
+        obj = obj.replace(_CONTROL_TOKEN_START, "").replace(_CONTROL_TOKEN_END, "")
+        <span class="cmt"># 用户字符串里的控制符,用私有区字符包起来</span>
+        <span class="kw">return</span> control_tokens_re.sub(f"{_CONTROL_TOKEN_START}\\g&lt;0&gt;{_CONTROL_TOKEN_END}", obj)
+    <span class="kw">if</span> isinstance(obj, dict):  <span class="cmt"># 递归标记 messages/tools/documents 里的所有字符串</span>
+        <span class="kw">return</span> {key: mark_control_tokens(value, ...) <span class="kw">for</span> key, value <span class="kw">in</span> obj.items()}
+    ...</pre>
+    <p>配套的 encode_marked_chat(:465)在编码时分流:带标记的控制符按<strong>纯文本</strong>编码(用户嘴里说的 "[INST]" 只是四个字符),不带标记的(模板自己写的)按<strong>特殊 token</strong> 编码(真控制符)。还有一道反伪检验:纯文本编码后若出现了特殊 token id,直接报错——「tokenizer 竟然能从纯文本产出这个特殊 token」,说明该分词器的文本编码可能伪造控制符,宁可不通过。</p>
+    <div class="annotation"><b>两层防线的分工:</b>第 2 章 sanitize_control_tokens 在<strong>词表层</strong>防「输入文本被切成特殊 token」;这里 mark_control_tokens 在<strong>模板渲染层</strong>防「用户内容混进模板自己的控制结构」。共同点:用户内容永远只能当文本,结构控制权只在模板手里。注意 docstring 里那句设计原则——「先剥掉输入里已有的标记,so they can't be used to forge a marked token」:消毒机制自己的信标也在防伪造。这类「元防御」是安全代码的标志。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.3</span>续写与预填:三个控制生成的开关</h2>
+    <p>render_jinja_template 里最绕的三个参数,都围绕一个事实:模板不仅可以「开一段新对话」,还可以「接着旧对话继续」。</p>
+    <table class="tbl">
+      <tr><th>参数</th><th>渲染结果</th><th>场景</th></tr>
+      <tr><td>add_generation_prompt=True</td><td>末尾补 assistant 头(如 &lt;|im_start|&gt;assistant\n)</td><td>正常提问,等模型接话</td></tr>
+      <tr><td>add_generation_prompt=False + 末条 assistant 消息</td><td>模型答案已在序列里</td><td>训练数据构造 / few-shot</td></tr>
+      <tr><td>continue_final_message=True</td><td>末条 assistant 消息保留,模型从句中续写</td><td>预填(prefill):引导模型的开头</td></tr>
+    </table>
+    <p>continue_final_message 的实现很精细(:662 附近):在末条消息的文本里塞一个哨兵标记(CONTINUE_FINAL_MESSAGE_TAG),渲染完成后 rindex 找到它、截断——保证「预填的文本恰好出现在模型要续写的位置」,连尾部空格的裁剪都分两种情况处理。若模板把预填内容删了,直接报错:预填失败必须是响亮的失败,不是静默错位。</p>
+    <div class="annotation"><b>预填是工具调用的隐形前提:</b>很多模型的模板会把 assistant 消息的开头(比如 &lt;think&gt; 标签)预先写好,模型只续写后面的内容——这既省了模型「先写格式开头」的功夫,也让格式 100% 正确。但代价在解析侧:如果只看模型输出,永远不知道开头是模板写的还是模型写的。8.4 节的解析器为什么必须拿 prefix,原因就在这。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">8.4</span>另一半:response parsing(渲染的镜像)</h2>
+    <p>v5 在 utils/chat_parsing/ 新增了一个子包:模型输出怎么解析回结构化消息。这不是锦上添花——工具调用链(第 9 章)的「最后一公里」就是把模型说的文本变回可执行的参数。三个文件:</p>
+    <table class="tbl">
+      <tr><th>文件</th><th>内容(pin)</th><th>职责</th></tr>
+      <tr><td>response_templates.py</td><td>ResponseTemplate(:50)/ ResponseTemplateField(:32)</td><td>声明式描述「输出长什么样」:字段、开闭锚点、类型转换</td></tr>
+      <tr><td>response_parser.py</td><td>ResponseParser(:94)/ parse_response(:74)</td><td>流式解析器:feed 逐块喂入,事件通知(region_open/chunk/close)</td></tr>
+      <tr><td>content_parsers.py</td><td>_json(:46)/ _xml_inline(:97)/ _kv_lines(:123)</td><td>字段内容的多种格式解析器</td></tr>
+    </table>
+    <p>入口直接挂在分词器上(tokenization_utils_base.py:3414):</p>
+    <div class="code-title">tokenization_utils_base.py:3414 — tokenizer.parse_response(docstring 摘译)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 模型输出 → 结构化消息;格式由 tokenizer 的 response_template 属性声明</span>
+message = tokenizer.parse_response(
+    generated_text,
+    prefix=prompt_text,      <span class="cmt"># 必传:模板可能预写了消息开头,解析需要看全上下文</span>
+    tools=tools,             <span class="cmt"># 传了就按工具的 JSON Schema 做类型转换</span>
+)
+<span class="cmt"># "7" → 7(integer 参数) / "7" → "7"(string 参数)</span></pre>
+    <div class="annotation"><b>为什么必须传 prefix:</b>ResponseParser 的 docstring 讲得直白——「chat templates often pre-write part of the assistant message (e.g. an opening &lt;think&gt; tag)」(8.3 节的预填)。解析器拿完整对话,用 start_anchor(如 &lt;start_of_turn&gt;model)截到最近一条 assistant 消息才开始匹配(response_templates.py 的 truncate_past_last_anchor)。前缀里已关闭的区域还会作为 initial_events 吐出来,前端渲染器可以把预填部分也画出来。<strong>渲染与解析是同一份模板的两面:</strong>模板声明输出格式 → 模型照格式生成 → 解析器按同一格式收回来。response_template 与 chat_template 一起随分词器发布,推理循环(第 5 章)里的 stop_strings、这里的事件流解析,是工具调用可靠性的两道工程保障。</div>
+    <div class="annotation"><b>流式设计:三段事件:</b>ResponseParser.feed(chunk) 逐块喂入模型输出,吐出 region_open / region_chunk / region_close 事件——前端不用等全文,「思考区」「工具调用区」「正文区」各开各的流。工具参数在 region_close 时按 JSON Schema 做类型收敛(_coerce:integer/number/boolean/object/array 各有转换逻辑,NaN/inf 拒收)。这与第 9 章工具调用「停止条件 + 解析」的分工严丝合缝:库内管格式与解析,执行与循环在库外。</div>
+  </section>
+
+  <div class="figure breakout">
+    <svg class="svg-box" viewBox="0 0 940 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t81 d81">
+      <title id="t81">对话模板:渲染与解析的镜像关系</title>
+      <desc id="d81">上半:messages + tools 经 Jinja 模板渲染成文本,消毒层处理用户控制符。下半:模型输出经 response_template 解析回结构化消息,工具参数按 schema 收敛。</desc>
+      <defs>
+        <marker id="arrow8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+        </marker>
+      </defs>
+
+      <text class="lbl" x="20" y="28" font-weight="bold">渲染(输入侧)</text>
+      <rect class="node" x="20" y="45" width="150" height="44" rx="6"></rect>
+      <text class="lbl sm" x="95" y="63" text-anchor="middle">messages</text>
+      <text class="lbl sm" x="95" y="79" text-anchor="middle">(用户内容→打标记)</text>
+      <rect class="node" x="210" y="45" width="130" height="44" rx="6"></rect>
+      <text class="lbl sm" x="275" y="71" text-anchor="middle">tools→schema</text>
+      <rect class="node core" x="390" y="45" width="170" height="44" rx="6"></rect>
+      <text class="lbl sm" x="475" y="63" text-anchor="middle">Jinja chat_template</text>
+      <text class="lbl sm" x="475" y="79" text-anchor="middle">(随分词器发布)</text>
+      <rect class="node" x="610" y="45" width="150" height="44" rx="6"></rect>
+      <text class="lbl sm" x="685" y="71" text-anchor="middle">+ add_generation_prompt</text>
+      <rect class="node ok" x="800" y="45" width="120" height="44" rx="6"></rect>
+      <text class="lbl sm" x="860" y="71" text-anchor="middle">token 序列</text>
+      <line x1="170" y1="67" x2="210" y2="67" class="edge"></line>
+      <line x1="260" y1="67" x2="390" y2="67" class="edge"></line>
+      <line x1="560" y1="67" x2="610" y2="67" class="edge"></line>
+      <line x1="760" y1="67" x2="800" y2="67" class="edge"></line>
+
+      <text class="lbl" x="20" y="128" font-weight="bold">解析(输出侧)—— v5 新增</text>
+      <rect class="node ok" x="20" y="145" width="120" height="44" rx="6"></rect>
+      <text class="lbl sm" x="80" y="171" text-anchor="middle">模型输出文本</text>
+      <rect class="node core" x="190" y="145" width="200" height="44" rx="6"></rect>
+      <text class="lbl sm" x="290" y="163" text-anchor="middle">response_template</text>
+      <text class="lbl sm" x="290" y="179" text-anchor="middle">(与模板同源声明格式)</text>
+      <rect class="node" x="440" y="145" width="190" height="44" rx="6"></rect>
+      <text class="lbl sm" x="535" y="163" text-anchor="middle">ResponseParser(流式)</text>
+      <text class="lbl sm" x="535" y="179" text-anchor="middle">region_open/chunk/close</text>
+      <rect class="node" x="680" y="145" width="240" height="44" rx="6"></rect>
+      <text class="lbl sm" x="800" y="163" text-anchor="middle">结构化消息 + 类型收敛</text>
+      <text class="lbl sm" x="800" y="179" text-anchor="middle">"7"→7(按工具 schema)</text>
+      <line x1="140" y1="167" x2="190" y2="167" class="edge"></line>
+      <line x1="390" y1="167" x2="440" y2="167" class="edge"></line>
+      <line x1="630" y1="167" x2="680" y2="167" class="edge"></line>
+
+      <path d="M 475 89 C 475 118, 290 118, 290 145" class="edge" fill="none" stroke-dasharray="5 3"></path>
+      <text class="lbl sm" x="380" y="115" text-anchor="middle">同一份格式声明</text>
+    </svg>
+    <div class="fig-cap">图 8.1:模板的两面。chat_template 决定模型「怎么读」,response_template 决定输出「怎么收」——两者都是随分词器发布的声明式格式。</div>
+  </div>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>chat template 是随分词器发布的 Jinja 方言配置,render_jinja_template 把 messages/tools/documents 渲染成 token 序列;tools 传函数即可,get_json_schema 从类型提示 + docstring 自动生成 schema。用户输入中的控制符是注入面:v5 的防线是「用户内容打私有区标记,按纯文本编码;模板自写的才是真控制符」,并防标记本身被伪造。add_generation_prompt/continue_final_message 两个开关分别管「该谁接话」与「从哪续写」,预填让模板预先写好 assistant 消息开头——这也是解析侧必须拿 prefix 的原因。v5 的 chat_parsing 子包补上了输出侧:response_template 声明输出格式,ResponseParser 流式吐事件,工具参数按 JSON Schema 类型收敛。渲染与解析是同一份格式的两面,第 9 章把它们接进完整的工具调用链。</p>
+    <p>格式有了,解析有了,还差「模型怎么决定调工具、工具怎么执行」——那是第 9 章的事,也是问题二的正面回答。<a href="09-tool-use.html">第 9 章:工具调用</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="07-serving.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 7 章 · 并发</span>
+    </a>
+    <a class="next" href="09-tool-use.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 9 章 · 工具调用</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 08 对话模板 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

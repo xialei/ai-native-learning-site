@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · 训练:能力是怎么灌进权重的 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a class="active" href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 11 训练</div>
+    <div class="chap-meta">Chapter 11 · Training</div>
+    <h1>训练:能力是怎么灌进权重的</h1>
+    <div class="lede">
+      <p>前 10 章反复说「这个在权重里」「那个是训练产物」——这一章补上源头。第 0 章问题三的答案是「解决问题的能力来自训练,库内是表达机制」:Trainer 就是把「表达能力」变成「模型能力」的机器——预训练记住语言,后训练(SFT/RLHF/RL)灌入工具调用、指令跟随、解题模式。RL 与对齐的后训练在 TRL 库,不在 transformers 库内;但 SFT 用的骨架、loss 计算、显存技巧都在这 4726 行的 trainer.py 里。</p>
+      <p>这一章拆训练循环的四个节拍:training_step(:2023)与 compute_loss(:2102)——特别是「loss 除以什么」这个踩过无数人坑的问题;再看三类显存技术(梯度检查点、长度分组采样、padding-free 拼接)与「在数据里教工具调用」的循环逻辑。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 一个训练步 = 前向 + loss + 反向 + 优化器,Trainer 包住它做的是分布式/累积/检查点这些「工程外圈」(11.1);② loss 的归一化是训练正确性的暗礁:梯度累积时除以「真实 token 数」还是「累积步数」,两个算法差之毫厘训练谬以千里——v5 用 num_items_in_batch 显式传递(11.2);③ 显存的三板斧:梯度检查点(重算换显存)、长度分组采样(少 padding)、padding-free 拼接(零 padding),配合第 1 章的并行计划(11.3);④ 工具调用是被「教」出来的:SFT 数据里 assistant 消息带工具调用、工具消息带执行结果,return_assistant_tokens_mask 标出只在 assistant 段算 loss(11.4)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">11.1</span>最小训练步:四个动作</h2>
+    <p>Trainer 类(trainer.py:260)有 4726 行,但核心循环 _inner_training_loop(:1566)每步调用的 training_step 其实只有四拍:</p>
+    <div class="code-title">trainer.py:2023 — training_step(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">training_step</span>(self, model, inputs, num_items_in_batch=<span class="kw">None</span>) -&gt; torch.Tensor:
+    <span class="kw">with</span> self.compute_loss_context_manager():
+        loss = self.compute_loss(model, inputs, num_items_in_batch=num_items_in_batch)   <span class="cmt"># 前向 + loss</span>
+
+    <span class="cmt"># 梯度累积的归一化:若 loss 尚未按累积步缩放,先除掉</span>
+    <span class="kw">if</span> <span class="kw">not</span> loss_is_scaled_for_ga:
+        loss = loss / self.current_gradient_accumulation_steps
+
+    self.accelerator.backward(loss, **kwargs)      <span class="cmt"># 反向传播</span>
+    <span class="kw">return</span> loss.detach()</pre>
+    <p>优化器步进在 _maybe_log_save_evaluate 等钩子里,梯度累积满 N 步才走一次。Trainer 的价值不在循环本身——循环 30 行谁都会写——在于外圈:分布式包装(accelerator)、梯度检查点、混合精度、断点续训、日志评估。工程外圈占了 4000 行,核心算法只有百行。</p>
+    <div class="annotation"><b>「库内/库外」在训练侧的画法:</b>transformers 提供<strong>监督训练</strong>的全套(Trainer,SFT 够用);RLHF/PPO/DPO/GRPO 这些对齐与强化方法在 TRL 库(基于 Trainer 扩展)。做 Agent 要「用 RL 灌解题能力」,写的是 TRL 的训练循环——但它 import 的模型、loss、数据collator全是本章这些。第 13 章自研路线会把「库内(Trainer)/半库内(TRL)/库外(自研 harness)」画成一张清单。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.2</span>loss 除以什么:一个踩过全世界的坑</h2>
+    <p>compute_loss(:2102)最值得读的不是分支,而是 num_items_in_batch 参数的旅程。背景:语言模型 loss 是「全 batch token 的交叉熵平均」。当梯度累积开启(等效 batch = micro batch × N),「平均」就有歧义——按 micro batch 各自平均再平均(错误:长短句权重失衡),还是全累积 batch 的总 token 数平均(正确)。</p>
+    <div class="code-title">trainer.py:2102 — compute_loss 的关键分支(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">compute_loss</span>(self, model, inputs, return_outputs=False, num_items_in_batch=<span class="kw">None</span>):
+    <span class="cmt"># 模型自己声明支持 loss kwargs(FOR_CAUSAL_LM 家族):把「总 token 数」传进去</span>
+    <span class="kw">if</span> self.model_accepts_loss_kwargs:
+        kwargs = {}
+        <span class="kw">if</span> num_items_in_batch <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            kwargs["num_items_in_batch"] = num_items_in_batch
+        inputs = {**inputs, **kwargs}
+    outputs = model(**inputs)
+
+    <span class="cmt"># 自定义 loss 函数(compute_loss_func)优先;默认走 label smoother 或模型自带 loss</span>
+    <span class="kw">if</span> self.compute_loss_func <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        loss = self.compute_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch)
+    ...</pre>
+    <p>配套的还有两个开关。其一,模型 forward 里 loss 的归一化:ForCausalLM 家族接受 num_items_in_batch 后用 sum/总 token 数计算,而不是 micro batch 内平均。其二,training_step 里的 loss_is_scaled_for_ga 判定:如果 loss 已经按总 token 数归一(模型或自定义 loss 做了),累积时不再除以累积步数;否则照旧除——两条路径的数学结果一致,梯度累积 bug(2024 年那场著名的 gradient accumulation loss bug)之后,这套约定被显式化了:</p>
+    <div class="annotation"><b>为什么这件事值得半章篇幅:</b>训练的正确性错在 loss 归一化上最难察觉——loss 数字看起来正常,收敛也正常,只是长短样本的权重悄悄偏了,最终模型质量差几个点。v5 的方案是「约定显式化」:num_items_in_batch 沿调用链显式传递,compute_loss_func 的 docstring 直接示范正确写法(F.cross_entropy(..., reduction="sum") / num_items_in_batch),自定义 loss 必须声明 loss_is_scaled_for_ga。长上下文训练(样本长度差异巨大)里,这是最高频的正确性坑——写书的人踩过,读源码的人才能绕开。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.3</span>显存三板斧与并行计划</h2>
+    <p>训练 7B 模型,权重梯度 + 优化器状态(Adam 保守要 16 字节/参数)之外,激活值是大头。三板斧依次启用:</p>
+    <table class="tbl">
+      <tr><th>技术</th><th>位置(pin)</th><th>原理</th><th>代价</th></tr>
+      <tr><td>梯度检查点</td><td>modeling_utils.py:3109 gradient_checkpointing_enable</td><td>前向不存激活,反向时重算(默认 use_reentrant=False)</td><td>约 30% 额外计算</td></tr>
+      <tr><td>长度分组采样</td><td>trainer_pt_utils.py:519 LengthGroupedSampler</td><td>长度相近的样本聚成批,padding 最小化</td><td>一点随机性(批内乱序受限)</td></tr>
+      <tr><td>padding-free 拼接</td><td>data/data_collator.py:1255 DataCollatorWithFlattening</td><td>整个 batch 拼成一条 [1, total_tokens],position_ids 重起,cu_seq_lens 标边界</td><td>注意力实现必须支持变长(flash-attn varlen)</td></tr>
+    </table>
+    <div class="annotation"><b>三者的依赖关系:</b>长度分组是「少浪费」,padding-free 是「零浪费」——但后者要求注意力能识别「拼接序列内的边界」(separator 用 labels=-100 标记,FlashAttentionKwargs 传 cu_seq_lens)。DataCollatorWithFlattening 的 docstring 特别警告了 RoBERTa 系模型:它们的位置编号从 padding_idx+1 开始,默认 0 起头会静默偏移位置嵌入——「能处理拼接序列」不只是注意力的事,还有位置编码的约定。梯度检查点与第 4 章 StaticLayer 的取舍同构:重算换显存,还是预分配换编译——训练用前者,推理用后者。</div>
+    <p>多卡侧,第 1 章 1.3 节的三个 plan 在这里生效:_tp_plan/_pp_plan/_fsdp_plan(modeling_llama.py:412-414)声明每个子模块的并行策略,Trainer 通过 accelerate 读取执行。声明式并行的价值在训练侧兑现:换并行方案 = 换配置,不改模型代码。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">11.4</span>数据侧:工具调用是怎么「教」的</h2>
+    <p>回到问题三的正面:「解决问题的办法」怎么进权重?预训练给了语言与知识,后训练给行为。SFT 阶段的工具调用数据长这样:</p>
+    <div class="code-title">SFT 工具调用数据的一条样本(示意)</div>
+    <pre class="code"><span class="lang-tag">json</span>[
+  {"role": "user", "content": "北京今天多少度?"},
+  {"role": "assistant", "content": "", "tool_calls": [{"name": "get_weather", "arguments": {"city": "北京"}}]},
+  {"role": "tool", "content": "{\"temp\": 25}"},
+  {"role": "assistant", "content": "北京今天 25°C。"}
+]</pre>
+    <p>这段对话经第 8 章的模板渲染成序列后,训练要在「正确的位置」算 loss:只对 assistant 生成的部分回传梯度(用户的输入不该被「学着生成」),工具返回的结果同样不是模型该学的内容。第 8 章 8.1 节的 return_assistant_tokens_mask 在这里用上:模板里的 {% generation %} 标记标出 assistant 段,渲染时返回 assistant_masks,训练侧用它把非 assistant 位置的 labels 置 -100(交叉熵忽略)。</p>
+    <div class="annotation"><b>「多轮对齐」的训练视角:</b>工具调用、思考链、拒答、格式遵循——全部是「assistant 段的 token 分布」问题。模型在几万条这样的对话上反复训练,「读到工具说明书后产出调用」就成了条件反射。这也解释了 9.2 节那句话:决定「调不调」的没有代码,只有权重——因为「决定」本身就是训练时统计出来的条件分布。RL 阶段(TRL)再往上叠:不只学「格式对」,还学「结果好」——奖励模型给分,策略梯度更新。两层加起来,才是第 0 章问题三的完整答案。</div>
+  </section>
+
+  <div class="figure breakout">
+    <svg class="svg-box" viewBox="0 0 940 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t111 d111">
+      <title id="t111">一个训练步与显存三板斧</title>
+      <desc id="d111">左:训练步四拍(前向/loss/反向/优化器)。右:数据流水线经过长度分组和 padding-free 拼接进入前向,梯度检查点在前向与反向之间重算。</desc>
+      <defs>
+        <marker id="arrow11" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+        </marker>
+      </defs>
+
+      <text class="lbl" x="20" y="28" font-weight="bold">数据流水线</text>
+      <rect class="node" x="20" y="45" width="140" height="44" rx="6"></rect>
+      <text class="lbl sm" x="90" y="71" text-anchor="middle">原始对话数据</text>
+      <rect class="node" x="200" y="45" width="160" height="44" rx="6"></rect>
+      <text class="lbl sm" x="280" y="63" text-anchor="middle">模板渲染</text>
+      <text class="lbl sm" x="280" y="79" text-anchor="middle">+ assistant mask</text>
+      <rect class="node" x="400" y="45" width="180" height="44" rx="6"></rect>
+      <text class="lbl sm" x="490" y="63" text-anchor="middle">长度分组采样</text>
+      <text class="lbl sm" x="490" y="79" text-anchor="middle">(相近长度成批)</text>
+      <rect class="node core" x="620" y="45" width="160" height="44" rx="6"></rect>
+      <text class="lbl sm" x="700" y="63" text-anchor="middle">padding-free 拼接</text>
+      <text class="lbl sm" x="700" y="79" text-anchor="middle">[1, total_tokens]</text>
+      <rect class="node ok" x="820" y="45" width="100" height="44" rx="6"></rect>
+      <text class="lbl sm" x="870" y="71" text-anchor="middle">前向</text>
+      <line x1="160" y1="67" x2="200" y2="67" class="edge"></line>
+      <line x1="360" y1="67" x2="400" y2="67" class="edge"></line>
+      <line x1="580" y1="67" x2="620" y2="67" class="edge"></line>
+      <line x1="780" y1="67" x2="820" y2="67" class="edge"></line>
+
+      <text class="lbl" x="20" y="140" font-weight="bold">训练步(梯度累积 N 步为一个优化器步)</text>
+      <rect class="node" x="20" y="155" width="170" height="44" rx="6"></rect>
+      <text class="lbl sm" x="105" y="181" text-anchor="middle">前向(compute_loss)</text>
+      <rect class="node warn" x="230" y="155" width="230" height="44" rx="6"></rect>
+      <text class="lbl sm" x="345" y="175" text-anchor="middle">num_items_in_batch 显式传递</text>
+      <text class="lbl sm" x="345" y="191" text-anchor="middle">loss = sum CE / 总 token 数</text>
+      <rect class="node" x="500" y="155" width="150" height="44" rx="6"></rect>
+      <text class="lbl sm" x="575" y="181" text-anchor="middle">backward</text>
+      <rect class="node" x="690" y="155" width="150" height="44" rx="6"></rect>
+      <text class="lbl sm" x="765" y="181" text-anchor="middle">累积满 N → 优化器</text>
+      <line x1="190" y1="177" x2="230" y2="177" class="edge"></line>
+      <line x1="460" y1="177" x2="500" y2="177" class="edge"></line>
+      <line x1="650" y1="177" x2="690" y2="177" class="edge"></line>
+    </svg>
+    <div class="fig-cap">图 11.1:训练步与数据流水线。loss 归一化(num_items_in_batch)与数据侧的长度分组/padding-free,是长上下文训练正确性与效率的两个支点。</div>
+  </div>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>训练侧的核心是 training_step 四拍(前向、loss、反向、优化器),Trainer 的 4000 行在外圈(分布式、累积、检查点、续训)。loss 归一化是训练正确性的暗礁:梯度累积时按「全累积 batch 的总 token 数」平均才是对的,v5 用 num_items_in_batch 沿调用链显式传递 + loss_is_scaled_for_ga 声明约定,compute_loss_func 的示范写法是 sum-reduction 除以总 token。显存三板斧:梯度检查点(重算换显存,use_reentrant=False)、长度分组采样(相近长度成批)、padding-free 拼接(变长注意力 + cu_seq_lens 边界,注意 RoBERTa 系位置编号陷阱)。多卡并行靠第 1 章的三个 plan 声明。工具调用是 SFT 教出来的:assistant 段按 return_assistant_tokens_mask 算 loss,RL 阶段(TRL)再叠「结果好坏」。问题三的完整答案 = 预训练的语言能力 + SFT 的行为模式 + RL 的偏好对齐,库内全链路支持监督训练。</p>
+    <p>权重训练好之后,怎么把它塞进更小的显存?<a href="12-quantization.html">第 12 章:量化</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="10-multimodal.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 10 章 · 多模态</span>
+    </a>
+    <a class="next" href="12-quantization.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 12 章 · 量化</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 11 训练 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · 多模态:图片和声音也是 token — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a class="active" href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 10 多模态</div>
+    <div class="chap-meta">Chapter 10 · Multimodal</div>
+    <h1>多模态:图片和声音也是 token</h1>
+    <div class="lede">
+      <p>前三章的记忆机制、第 8-9 章的对话与工具链,全部建立在「输入是 token 序列」上。多模态没有打破这个前提——它把图片、音频<strong>翻译成</strong> token 序列,再交给同一个语言模型。Llama 3 Vision 的视觉编码器、Whisper 的音频编码器,产出的向量被「填进」文本序列里特定占位符的位置,语言模型照常算注意力、照常出 token。这就是本章要讲的:「多模态也是 token」不是修辞,是 masked_scatter 一行代码。</p>
+      <p>这一章拆 processing_utils.py(2455 行)的处理器层与 llava/modeling_llava.py 的合并机制,看「图片进来」的完整路径:像素值 → 特征图 → 投影到语言维度 → 填进占位符;以及生成循环怎么扔掉第二张图(MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL)。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 处理器(ProcessorMixin)是「分词器 + 特征提取器」的组合件:文本走 tokenizer,像素/波形走 image/audio processor,占位符把两边缝起来(10.1);② 「图变 token」分两步:视觉编码器出特征向量,投影层对齐到语言模型的嵌入维度;模型侧只做一件事——把占位符位置的嵌入换成图片特征(masked_scatter)(10.2);③ 生成侧多模态只影响 prefill:第一张图进缓存后,后续解码步不再需要像素值(MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL)(10.3);④ 「多模态能力」同样在权重(视觉编码器 + 对齐训练),库内是接线机制(10.4)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">10.1</span>处理器层:组合件与占位符</h2>
+    <p>处理器的职责在 ProcessorMixin(processing_utils.py:603)的属性表里写得明白:tokenizer / feature_extractor / image_processor / video_processor——多模态模型把这几件「子处理器」打包成一个 AutoProcessor,一次加载、一次调用:</p>
+    <div class="code-title">processing_utils.py:658 — ProcessorMixin.__call__(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, images=<span class="kw">None</span>, text=<span class="kw">None</span>, videos=<span class="kw">None</span>, audio=<span class="kw">None</span>, **kwargs):
+    images, text, videos, audio = self.prepare_inputs_layout(...)
+    self.validate_inputs(...)
+    merged_kwargs = self._merge_kwargs(self.valid_processor_kwargs, ...)   <span class="cmt"># 各模态 kwargs 分桶</span>
+
+    <span class="kw">if</span> images <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> hasattr(self, "image_processor"):
+        processed_images, images_replacements = self._process_images(images, **merged_kwargs["images_kwargs"])
+    ...  <span class="cmt"># videos / audio 同理</span>
+
+    <span class="cmt"># 把图片特征"变成"文本里的占位符串,然后交给 tokenizer</span>
+    text, text_replacement_offsets = self.get_text_with_replacements(
+        text, images_replacements, videos_replacements, audio_replacements)
+    text_inputs = self.tokenizer(text, **merged_kwargs["text_kwargs"])
+    self._check_special_mm_tokens(text, text_inputs, modalities=["image", "video", "audio"])</pre>
+    <p>关键一步是 get_text_with_replacements:文本里的 <code class="inline">&lt;image&gt;</code> 占位符被展开成与图片特征数相同的特殊 token(image_token)。LLaVA 例子里一张 336×336 图切 24×24 个 patch,文本里就有 576 个连续的 image token——「一张图 = 一串 token」在处理器层就定型了。_check_special_mm_tokens(:2371)做对账:占位符 token 数必须等于特征数,不等直接报错。</p>
+    <div class="annotation"><b>kwargs 体系是这份代码最「重」的部分:</b>TextKwargs(:167)/ImagesKwargs(:236)/VideosKwargs(:310)/AudioKwargs(:387) 四组 TypedDict 定义每个模态的合法参数,_merge_kwargs 把 processor 的、tokenizer 的、用户的三层 kwargs 按模态拆开分发。这是声明式模式的又一个实例(第 1 章 1.3 节 capability-by-declaration):「每个模态接受什么参数」是类型声明,不是运行时 if-else。另外 MultiModalData(:569)数据类专门为 vLLM 准备(docstring 直说「aimed to be used only in vLLM」)——服务引擎需要知道每张图占多少 token 以便显存预算,库内主动配合。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.2</span>模型侧:占位符处的嵌入替换</h2>
+    <p>处理器产出两样东西:input_ids(含连续 image token)和 pixel_values(像素张量)。模型侧的合并逻辑在 LlavaModel.forward(modeling_llava.py:219),核心是三步:</p>
+    <div class="code-title">models/llava/modeling_llava.py:219 — 合并三步(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># ① 像素值过视觉塔 + 投影层,得到「图片特征」(形状 = 占位符数 × 语言维度)</span>
+mm_encoder_outputs["image"] = self.get_image_features(pixel_values, ...)
+image_features = torch.cat(image_features, dim=<span class="nu">0</span>).to(inputs_embeds.device, inputs_embeds.dtype)
+
+<span class="cmt"># ② 找到 input_ids 里所有 image_token_id 的位置</span>
+special_image_mask = self.get_placeholder_mask(input_ids, inputs_embeds=inputs_embeds, ...)
+
+<span class="cmt"># ③ 按掩码把嵌入替换成图片特征——"多模态"发生的那个瞬间</span>
+inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
+
+<span class="cmt"># ④ 之后语言模型只吃 inputs_embeds,再不知道有图片这回事</span>
+outputs = self.language_model(inputs_embeds=inputs_embeds, past_key_values=past_key_values, ...)</pre>
+    <div class="annotation"><b>语言模型是「模态盲」的:</b>masked_scatter 之后,语言模型收到的就是一份普通嵌入序列——它不知道第 3 到 578 个位置是图片、第 1 个是文字。注意力、缓存、生成循环(第 3-5 章)全部原样工作。这就是「多模态也是 token」的代码事实:模态融合发生在嵌入层,不在注意力层。get_placeholder_mask 里还有一道对账(「Image features and image tokens do not match」报错):特征数 ≠ 占位符数是用户最常犯的错(比如一张图配两个占位符),错误信息直接给出两个数。</div>
+    <div class="annotation"><b>视觉塔的取舍留在 config:</b>vision_feature_layer(取第几层隐状态)与 vision_feature_select_strategy(default 去掉 CLS token)是构造参数——同一个视觉塔,取浅层还是深层、要不要 CLS,决定「图片信息的抽象程度」。LLaVA 默认取倒数第二层:最后一层太「分类特化」,倒数第二层保留更多空间细节。这类选择没有对错,是工程权衡,代码里都暴露成参数。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.3</span>生成侧:图片只在 prefill 住一次</h2>
+    <p>第 5 章 5.1 节见过一个常量,这里正式介绍它:</p>
+    <div class="code-title">generation/utils.py:156 — MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span>MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL = (
+    "mm_encoder_outputs",   <span class="cmt"># 预编码的多模态输出</span>
+    "pixel_values",         <span class="cmt"># 图片像素</span>
+    "pixel_mask", "input_features", "input_values",   <span class="cmt"># 视频掩码 / 音频特征 / 原始波形</span>
+    "pixel_values_videos", "high_res_pixel_values", "image_sizes",
+    ...)</pre>
+    <p>这些 kwargs 只在 prefill(第一次前向)传入模型,进了解码循环就被丢弃——因为图片信息已经变成 K/V 写进缓存了。这就是第 4 章「缓存是对话的记忆」的多模态版:图片记住了,像素值就不需要了。这张清单也是「多模态输入」的完整清单——哪些模型参数属于「模态数据」,扫一眼便知。</p>
+    <div class="annotation"><b>三个工程后果:</b>① 多模态对话的第二轮不再重算图片(KV 缓存里有),对话越长图片的「摊销成本」越低;② 但也意味着第 7 章的连续批处理里,带图请求的 prefill 明显比纯文本贵(一张图几百到几千 token),调度器要按 prefill 长度算预算——vLLM 对此有专门的 multimodal 调度策略,库内的 token 预算机制是它的前置;③ mm_encoder_outputs 允许「视觉特征预计算/缓存」——同一张图反复对话,视觉塔只跑一次。这也是 MultiModalData 给 vLLM 的原因。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">10.4</span>接线机制 vs 能力本身</h2>
+    <p>回到第 0 章问题三的口径:「库内是表达机制」。多模态的「能力」= 视觉编码器的表征 + 大量图文对齐训练(第 11 章),库内是接线机制:占位符约定(masked_scatter)、处理器组合件、prefill 后丢弃。532 个模型目录里,多模态家族(vision-language/audio/speech)占相当比例,但接线方式高度同构——LLaVA 的三步合并在 Qwen-VL、Gemma 3、Llama 3 Vision 里换汤不换药:占位符 token id 不同、视觉塔不同、投影层不同,「嵌入替换」这步完全一样。</p>
+    <div class="figure breakout">
+      <svg class="svg-box" viewBox="0 0 940 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t101 d101">
+        <title id="t101">多模态输入的完整路径</title>
+        <desc id="d101">图片经视觉塔和投影层得到特征向量,处理器把文本占位符替换成对应数量的 image token,模型侧在嵌入层 masked_scatter 替换,语言模型无感知地照常工作。</desc>
+        <defs>
+          <marker id="arrow10" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="28" font-weight="bold">处理器侧(输入准备)</text>
+        <rect class="node" x="20" y="45" width="150" height="44" rx="6"></rect>
+        <text class="lbl sm" x="95" y="63" text-anchor="middle">图片</text>
+        <text class="lbl sm" x="95" y="79" text-anchor="middle">PIL / URL / bytes</text>
+        <rect class="node" x="210" y="45" width="170" height="44" rx="6"></rect>
+        <text class="lbl sm" x="295" y="63" text-anchor="middle">image_processor</text>
+        <text class="lbl sm" x="295" y="79" text-anchor="middle">缩放 / 归一化 / 切 patch</text>
+        <rect class="node" x="420" y="45" width="180" height="44" rx="6"></rect>
+        <text class="lbl sm" x="510" y="63" text-anchor="middle">文本 + 占位符替换</text>
+        <text class="lbl sm" x="510" y="79" text-anchor="middle">&lt;image&gt; → 576 个特殊 token</text>
+        <rect class="node ok" x="640" y="45" width="280" height="44" rx="6"></rect>
+        <text class="lbl sm" x="780" y="63" text-anchor="middle">input_ids + pixel_values</text>
+        <text class="lbl sm" x="780" y="79" text-anchor="middle">对账:占位符数 == 特征数</text>
+        <line x1="170" y1="67" x2="210" y2="67" class="edge"></line>
+        <line x1="380" y1="67" x2="420" y2="67" class="edge"></line>
+        <line x1="600" y1="67" x2="640" y2="67" class="edge"></line>
+
+        <text class="lbl" x="20" y="128" font-weight="bold">模型侧(融合瞬间)</text>
+        <rect class="node" x="20" y="150" width="180" height="44" rx="6"></rect>
+        <text class="lbl sm" x="110" y="167" text-anchor="middle">视觉塔 + 投影层</text>
+        <text class="lbl sm" x="110" y="183" text-anchor="middle">像素 → 特征(576 × d)</text>
+        <rect class="node core" x="250" y="145" width="200" height="52" rx="6"></rect>
+        <text class="lbl sm" x="350" y="166" text-anchor="middle">masked_scatter</text>
+        <text class="lbl sm" x="350" y="182" text-anchor="middle">占位符嵌入 ← 图片特征</text>
+        <rect class="node ok" x="490" y="145" width="200" height="52" rx="6"></rect>
+        <text class="lbl sm" x="590" y="166" text-anchor="middle">语言模型(模态盲)</text>
+        <text class="lbl sm" x="590" y="182" text-anchor="middle">照常注意力 / 缓存 / 生成</text>
+        <rect class="node" x="730" y="145" width="190" height="52" rx="6"></rect>
+        <text class="lbl sm" x="825" y="166" text-anchor="middle">解码循环</text>
+        <text class="lbl sm" x="825" y="182" text-anchor="middle">像素值已丢弃,缓存里有图</text>
+        <line x1="170" y1="171" x2="250" y2="171" class="edge"></line>
+        <line x1="450" y1="171" x2="490" y2="171" class="edge"></line>
+        <line x1="690" y1="171" x2="730" y2="171" class="edge"></line>
+      </svg>
+      <div class="fig-cap">图 10.1:多模态输入的完整路径。融合只发生在嵌入层的一次替换;语言模型从头到尾不知道「图」的存在。</div>
+    </div>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>多模态没有改变「输入是 token 序列」这个底层契约,只是加了两段翻译:处理器侧,image/audio processor 把像素/波形变成特征,文本占位符展开成等量的特殊 token,两路对账(数量必须相等);模型侧,视觉特征经投影层对齐到语言维度后,masked_scatter 一次性替换占位符位置的嵌入——语言模型模态盲,注意力/缓存/生成全部照旧。生成侧的 MULTIMODAL_INPUTS_TO_DROP_OUTSIDE_PREFILL 常量声明了「模态输入只在 prefill 住一次」:图片信息进缓存后,像素值即弃;对话越长,图片成本摊得越薄。多模态能力(视觉表征 + 对齐)在权重,库内是接线机制——与工具调用(9.2)同一个结论的第三个实例。</p>
+    <p>接线机制反复出现:能力声明(_supports_*)、工具 schema、模态占位符——下一章回到这些机制的来源:模型怎么被训练出来。<a href="11-trainer.html">第 11 章:训练</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="09-tool-use.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 9 章 · 工具调用</span>
+    </a>
+    <a class="next" href="11-trainer.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 11 章 · 训练</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 10 多模态 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

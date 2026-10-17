@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · 工具调用:模型侧的完整链条,以及库外的一切 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a class="active" href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 09 工具调用</div>
+    <div class="chap-meta">Chapter 09 · Tool Use</div>
+    <h1>工具调用:模型侧的完整链条,以及库外的一切</h1>
+    <div class="lede">
+      <p>这一章正面回答第 0 章的问题二:transformer 怎么支持 agent 调用各种工具?先给结论——模型侧的全部职责是「说对话」:把工具说明书织进 prompt(schema 渲染)、决定什么时候调用(模型能力,在权重里)、按约定格式产出调用(生成)、被停止条件截住(推理循环)、把文本解析回参数(response parsing)。执行工具、把结果喂回去、决定下一步——那是 Agent 循环,在库外,本站已有四本书(pi-agent、langgraph、deepseek-harness、claude-code)拆过各自的实现。</p>
+      <p>这一章把库内的五个环节连成一条链,标清每一环的文件与函数;然后在最后给一张「分界表」——做 Agent 该从库里拿什么、自己写什么。你读完应该能回答:「transformer 在工具调用这件事里,到底是哪个部件?」</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 工具说明书 = JSON Schema,随 tools 参数进模板,与普通文本一样被 tokenize——「模型认识工具」只是「模型读过说明书」(9.1);② 决定「调不调、调哪个、参数是什么」的是模型权重,库内管不到;库内能管的是格式正确性与解析可靠性(9.2);③ 从生成到解析的五环链:schema 织入 → 生成 → 停止截取 → 流式解析 → 类型收敛,五环全部在库内(9.3);④ 执行、记忆、重试、多轮决策在库外——第 0 章分界表在工具场景的落地(9.4)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">9.1</span>第一环:schema 织入 prompt</h2>
+    <p>工具说明书走的是 get_json_schema(chat_template_utils.py:256),第 8 章见过它的入口;这一环的完整细节:</p>
+    <div class="code-title">chat_template_utils.py:256 — 函数 → JSON Schema(核心流程,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_json_schema</span>(func: Callable) -&gt; dict:
+    doc = inspect.getdoc(func)
+    <span class="kw">if</span> <span class="kw">not</span> doc:                      <span class="cmt"># 无 docstring 直接拒绝——没说明书就没法给模型看</span>
+        <span class="kw">raise</span> DocstringParsingException(...)
+    main_doc, param_descriptions, return_doc = parse_google_format_docstring(doc)
+    json_schema = _convert_type_hints_to_json_schema(func)   <span class="cmt"># type hints → 参数类型</span>
+    <span class="kw">for</span> arg, schema <span class="kw">in</span> json_schema["properties"].items():
+        <span class="kw">if</span> arg <span class="kw">not in</span> param_descriptions:    <span class="cmt"># 每个参数必须有描述,少一个都不行</span>
+            <span class="kw">raise</span> DocstringParsingException(...)
+        enum_choices = re.search(r"\(choices:\s*(.*?)\)\s*$", desc, flags=re.IGNORECASE)
+        <span class="kw">if</span> enum_choices:                 <span class="cmt"># docstring 里写 (choices: ["tea","coffee"]) → enum</span>
+            schema["enum"] = json.loads(enum_choices.group(<span class="nu">1</span>))
+    <span class="kw">return</span> {"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}</pre>
+    <div class="annotation"><b>这个函数的三条纪律值得记住:</b>① 无 docstring 就抛异常——「写不出说明书的函数,不配给模型调用」;② 每个参数都要有描述——模型只能按说明填参,没说明的参数就是猜;③ (choices: [...]) 语法把 docstring 里的一行注释变成 schema 的 enum——参数取值范围在文档里声明,不用写配置文件。模型的「工具理解力」上限由这份 schema 的质量决定:类型、描述、枚举、必填,每项都直接影响调用准确率。库内走到 schema 为止;schema 怎么写得好,是提示工程,也是库外的事。</div>
+    <p>schema 进模板后长什么样?由各模型的 chat template 决定——通用做法是把工具列表以 JSON 形式织进 system 消息或专用区段,并把「调用格式」的示例写进指令(第 8 章 8.1 节)。从此工具说明书就是普通 token,走第 2-4 章的全部路径:编码、进缓存、算注意力。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.2</span>第二环:决定权在权重</h2>
+    <p>「模型怎么知道该调工具了?」——这个问题没有代码答案。决定「读到这里该调 search_weather 还是直接回答」的,是模型在训练时见过的海量「工具调用对话」(第 11 章训练侧)。库内能做的只有两件事:</p>
+    <p>第一,保证格式选择面:chat template 把「怎么调」的格式规范写进 prompt,模型照葫芦画瓢;若模型训练时见过这种格式,产出就格式正确。第二,保证硬约束可表达:6.2 节的处理器族里有 PrefixConstrainedLogitsProcessor(logits_process.py:1502)——按前缀限制可选 token;配合第 5 章的 StopStringCriteria(stop_strings),可以强行约束输出以指定格式开头、到指定字符串为止。这两样是「结构化输出」的库内地基:不靠模型自觉,靠 logit 面上做手脚。</p>
+    <div class="annotation"><b>「会不会调」与「让不让调」是两件事:</b>前者在权重(训练产物),后者在推理栈(可编程)。工程上常说的「引导性生成/guided decoding」都活在后者:约束解码器,让模型只能在合法 token 里选——模型还是那个模型,但行为被架构框住了。这也是第 0 章说的「表达机制」的准确含义:库不能给模型能力,但能把能力约束成可靠的行为。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.3</span>第三到五环:生成、截取、解析</h2>
+    <p>模型开始产出。以下三环全部在库内,拼起来是「从 token 到可执行参数」的路:</p>
+    <table class="tbl">
+      <tr><th>环</th><th>机制(pin)</th><th>作用</th></tr>
+      <tr><td>生成</td><td>generate 循环(第 5 章)</td><td>模型按格式产出文本(含工具调用)</td></tr>
+      <tr><td>截取</td><td>StopStringCriteria(stopping_criteria.py:118)</td><td>检测到 JSON 尾部/结束标记就停,不浪费 token</td></tr>
+      <tr><td>解析(流式)</td><td>ResponseParser(response_parser.py:94)</td><td>逐块喂入,region 事件通知前端</td></tr>
+      <tr><td>解析(整段)</td><td>tokenizer.parse_response(tokenization_utils_base.py:3414)</td><td>全文解析回消息 dict</td></tr>
+      <tr><td>类型收敛</td><td>_coerce(response_parser.py:43)</td><td>按工具 schema 把 "7" 变 7、NaN/inf 拒收</td></tr>
+    </table>
+    <p>一整条链的使用视角(pipeline 场景,代码省略为骨架):</p>
+    <div class="code-title">一次工具调用的库内旅程(伪代码,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span>prompt = tokenizer.apply_chat_template(messages, tools=[get_weather], add_generation_prompt=True)
+out = model.generate(prompt, stop_strings=["&lt;/tool_call&gt;"])          <span class="cmt"># 生成 + 截取</span>
+msg = tokenizer.parse_response(out, prefix=prompt_text, tools=[get_weather])
+<span class="cmt"># msg = {"tool_calls": [{"name": "get_weather", "arguments": {"city": "北京"}}]}</span>
+<span class="cmt"># arguments 已按 schema 类型收敛:数字是 int,float 是 float——不是全字符串</span>
+<span class="cmt"># ↓ 以下全部在库外:</span>
+result = my_registry[msg.tool_calls[0].name](**msg.tool_calls[0].arguments)   <span class="cmt"># 执行</span>
+messages.append(assistant_tool_call); messages.append(tool_result)           <span class="cmt"># 喂回,进入下一轮</span></pre>
+    <div class="annotation"><b>流式解析的价值在并发与前端:</b>ResponseParser 的 region 事件(8.4 节)让前端在模型还在生成时就知道「现在写的是思考区/参数区/正文区」,工具参数在 region_close 时收敛——不用等全文。配合第 7 章的连续批处理,「同时给 100 个对话做工具调用解析」是事件流驱动的,不是轮询。这三层(批处理执行、停止截取、流式解析)是 v5 把「工具调用」从「应用层拼装」变成「库内一等公民」的工程证据。</div>
+    <p>还有一处值得点名:第 2 章 2.4 节的 sanitize_control_tokens 与第 8 章的 mark_control_tokens,在工具场景有了双重身份——模型产出的文本里若混入控制符,解析层必须能区分「格式标记」与「内容里恰好长像控制符的字符」。分界仍是那个原则:结构权在模板与解析器,内容权在用户与模型。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">9.4</span>分界表:Agent 循环在库外</h2>
+    <p>五环之外的一切,属于 Agent 运行时。下表是第 0 章问题二分界的完整落地——左边库内(本章各节),右边库外(去哪里学):</p>
+    <table class="tbl">
+      <tr><th>环节</th><th>库内(transformers)</th><th>库外(参考本站书籍)</th></tr>
+      <tr><td>工具说明书</td><td>get_json_schema + 模板渲染(9.1)</td><td>工具注册表、权限模型 → claude-code 书第 9 章</td></tr>
+      <tr><td>决定调用</td><td>—(权重里,训练侧第 11 章)</td><td>决策循环、重试策略 → pi-agent 书第 3 章</td></tr>
+      <tr><td>生成调用</td><td>generate + 停止条件(9.3)</td><td>流式协议、中断处理 → deepseek-harness 书协议章</td></tr>
+      <tr><td>解析回参</td><td>ResponseParser + schema 收敛(9.3)</td><td>执行沙箱、结果校验 → pi-agent 书第 9 章</td></tr>
+      <tr><td>多轮循环</td><td>—(需要外部状态)</td><td>会话状态、上下文管理 → langgraph 书第 4-5 章</td></tr>
+      <tr><td>服务化</td><td>generate_batch(第 7 章,单节点)</td><td>多机调度、KV 复用 → sglang/vLLM 相关书</td></tr>
+    </table>
+    <div class="annotation"><b>读表的方式:</b>「transformer 是工具调用里的什么?」——它是<strong>把「工具说明书 + 对话」变成「工具调用文本」、再把文本变回「结构化调用」的那个函数</strong>。它是链条上最贵的一环(一次前向),也是唯一「有智能」的一环;但链条的长度、韧性、可运维性,全在库外。这个认知分界决定了:调优模型行为看训练与 prompt(库内能改的部分),调优系统行为看 harness 设计(库外)。本站四本 agent 书覆盖右列,合起来才是完整的「AI 解决问题」图景——这也是第 0 章问题三要接着讲的:解决问题的能力从哪来。</div>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>工具调用的模型侧五环全部在库内:get_json_schema 从函数签名 + docstring 生成 schema(无文档拒绝转换,choices 语法生成 enum),随 tools 参数进模板织入 prompt;「会不会调」在权重,「让不让调」在推理栈(PrefixConstrained 截断可选 token,stop_strings 截取调用);ResponseParser/parse_response 按与模板同源的 response_template 把输出解析回结构化消息,工具参数按 schema 类型收敛。执行、多轮循环、权限、服务化在库外——本站四本 agent-runtime 书覆盖。transformer 在链条中的角色:把「说明书 + 对话」变「调用文本」再变回「结构化调用」的那个最贵且唯一有智能的环节。</p>
+    <p>文本之外的输入怎么进来?图片、音频也是 token——<a href="10-multimodal.html">第 10 章:多模态</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="08-chat-template.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 8 章 · 对话模板</span>
+    </a>
+    <a class="next" href="10-multimodal.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 10 章 · 多模态</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 09 工具调用 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

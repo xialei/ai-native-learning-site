@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · 生成循环:一次 generate 的完整旅程 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a class="active" href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 05 生成循环</div>
+    <div class="chap-meta">Chapter 05 · Generation Loop</div>
+    <h1>生成循环:一次 generate 的完整旅程</h1>
+    <div class="lede">
+      <p>第 3 章的前向把 logit 向量吐出来,第 4 章的缓存让增量解码成为可能。但「一个 token 一个 token 循环生成、条件满足才停」这件事本身,是谁在驱动?答案是一个你可能天天在调、但很少打开的函数:generation/utils.py 的 generate()——4434 行文件里最长的入口方法,从校验参数到分发解码策略,串起整库推理侧的所有子系统。</p>
+      <p>这一章拆它的九步流程(:2569 起),再看唯一留在库内的解码主循环 _sample(:3104)——其余解码策略或被并入、或已移出库外改为按需从 Hub 拉取——最后看两个特殊机制:chunked prefill 与 MPS 设备上的「晚一步停」。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 生成循环是「前向 + 取 logit + 选词 + 追加判停」的重复,缓存让它每步只前向一个新位置(5.1/5.2);② 对话回合之间的粘合是 kwargs 演进(_update_model_kwargs_for_generation)与缓存续写——上一步的输出就是下一步的输入(5.2/5.6);③ 策略入口收敛成 GenerationMode 枚举 + 一张映射表,greedy 并入 sample,四种长尾策略改为 Hub 插件按需拉取(5.3);④ 判停本身有同步代价,MPS 设备用「晚一步停 + 回滚」把每步的设备同步挤掉(5.5)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">5.1</span>入口:九步准备,一次分发</h2>
+    <p>generate() 的文档字符串就有 150 行,但骨架是源码注释里编好号的九步。压到最干:</p>
+    <div class="code-title">generation/utils.py:2569 — generate() 骨架(注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">generate</span>(self, inputs=<span class="kw">None</span>, generation_config=<span class="kw">None</span>, ..., custom_generate=<span class="kw">None</span>, **kwargs):
+
+    <span class="cmt"># 0.a. custom_generate:从 Hub 加载一个「换心脏」的 generate 实现</span>
+    <span class="cmt"># 0.b. cache_implementation=="paged" → 转发到连续批处理 generate_batch(第 7 章)</span>
+
+    <span class="cmt"># 1. 校验 kwargs,解析 GenerationConfig,判定 generation_mode</span>
+    generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+    generation_mode = generation_config.get_generation_mode(assistant_model)
+    decoding_method = getattr(type(self), GENERATION_MODES_MAPPING[generation_mode])
+
+    <span class="cmt"># 3. 整理输入:补 attention_mask / position_ids,批式生成的左 padding 检查</span>
+    inputs_tensor, model_input_name, model_kwargs = self._prepare_model_inputs(...)
+
+    <span class="cmt"># 5. 准备 input_ids(编码器-解码器模型另造 decoder_input_ids)</span>
+    <span class="cmt"># 6. 折算 max_length / max_new_tokens → max_cache_length</span>
+    <span class="cmt"># 7. 备缓存(第 4 章拆过的 _prepare_cache_for_generation)</span>
+    <span class="cmt"># 8. 装配 logits 处理器链 + 停止条件链(第 6 章)</span>
+    prepared_logits_processor = self._get_logits_processor(...)
+    prepared_stopping_criteria = self._get_stopping_criteria(...)
+
+    <span class="cmt"># 9. 分发到具体解码策略</span>
+    result = decoding_method(self, input_ids, ...)</pre>
+    <p>两个值得停一停的入口分流:</p>
+    <div class="annotation"><b>custom_generate——把解码策略当插件:</b>传一个 Hub 仓库名,generate 会拉取该仓库 custom_generate/generate.py 里的函数替换默认逻辑,签名不变、返回类型可以不同;传本地路径也行(需 trust_remote_code)。四个老策略(contrastive/dola/group-beam/constrained-beam)就是这么「降级」成 Hub 插件的:库内删代码,不再维护四条并行的 while 循环,需要的人按需拉取。另一个方向是传 <code class="inline">Callable</code>——库内走完九步准备,循环体换成你的函数:参数校验/缓存/处理器链这些公共设施照用,策略本身自便。</div>
+    <div class="annotation"><b>paged 触发的自动分流:</b>generate 检测到 cache_implementation=="paged" 会打警告并把输入转发给 generate_batch——连续批处理在 v5 里已是一等公民,只是入口兼容旧写法(「你该直接用 generate_batch」的提示与自动转发并存,第 7 章展开)。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.2</span>主循环:六拍循环与 kwargs 演进</h2>
+    <p>分发下去的策略方法里,最核心的是 _sample——v5 里 greedy 与 multinomial sampling 合并成一个方法(do_sample 开关决定选词方式),它是生成主循环的基准实现:</p>
+    <div class="code-title">generation/utils.py:3104 — _sample 主循环(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_sample</span>(self, input_ids, logits_processor, stopping_criteria, generation_config, ...):
+    <span class="cmt"># 预填充:整个 prompt 一次前向,建立缓存</span>
+    outputs = self._prefill(input_ids, generation_config, model_kwargs, ...)
+
+    <span class="kw">while</span> self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=...):
+        <span class="kw">if</span> prefill_consumed:
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids, next_sequence_length=<span class="nu">1</span> <span class="kw">if</span> use_cache <span class="kw">else</span> <span class="kw">None</span>, **model_kwargs)
+            outputs = model_forward(**model_inputs, <span class="kw">return_dict</span>=<span class="kw">True</span>)   <span class="cmt"># ① 前向一步</span>
+
+        model_kwargs = self._update_model_kwargs_for_generation(outputs, model_kwargs, ...)
+        <span class="cmt"># ② 取最后一位 logit(fp32 拷贝,避免引用大张量)</span>
+        next_token_logits = outputs.logits[:, -<span class="nu">1</span>].to(copy=True, dtype=torch.float32, ...)
+
+        <span class="cmt"># ③ 处理器链(第 6 章)→ ④ 选词</span>
+        next_token_scores = logits_processor(input_ids, next_token_logits)
+        <span class="kw">if</span> do_sample:
+            probs = nn.functional.softmax(next_token_scores, dim=-<span class="nu">1</span>)
+            next_tokens = torch.multinomial(probs, num_samples=<span class="nu">1</span>).squeeze(<span class="nu">1</span>)
+        <span class="kw">else</span>:
+            next_tokens = torch.argmax(next_token_scores, dim=-<span class="nu">1</span>)
+
+        <span class="cmt"># ⑤ 追加 + ⑥ 判停</span>
+        next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
+        input_ids = torch.cat([input_ids, next_tokens[:, <span class="kw">None</span>]], dim=-<span class="nu">1</span>)
+        unfinished_sequences = unfinished_sequences &amp; ~stopping_criteria(input_ids, scores)
+        this_peer_finished = stop_check(unfinished_sequences, next_tokens, input_ids.shape[<span class="nu">1</span>])
+        <span class="kw">del</span> outputs</pre>
+    <p>逐拍看:</p>
+    <p><strong>① prepare_inputs_for_generation。</strong>缓存就位后每步只需喂新 token——next_sequence_length=1 让模型侧裁到「缓存长度之后的那一位」。第一个循环轮跳过前向,因为 prefill 已替它做完(prefill_consumed 开关),直接从判停接续。</p>
+    <p><strong>② logits[:, -1].to(copy=True, dtype=torch.float32)。</strong>一行三件事:拷贝、升 fp32(采样数值稳定性)、放回 input_ids 所在设备。注释解释为什么要 copy——不留 copy,outputs.logits 这个大张量会活到下一轮;首步 logits 可能有 [batch, 全序列长, 词表] 那么大。</p>
+    <p><strong>⑤ 已结束的序列继续喂 pad。</strong>batch 里某条序列碰到 EOS 后 unfinished_sequences 置 0,后续每步它的「下一个 token」被那行乘加盖成 pad_token_id——继续占位、不再影响其他序列,batch 对齐的惯用法。</p>
+    <div class="annotation"><b>del outputs 那行注释值得读:</b>「This is needed to properly delete outputs.logits ... Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration」——循环体不留 outputs 引用,显存才能在长生成里保持平稳。大模型工程里的显存 bug 往往不是「没释放」,而是「有个变量悄悄引用着」。这 20 行是全库性能最敏感的代码,每一步都在跟张量生命周期搏斗。</div>
+
+    <h3>kwargs 演进:上一步的输出如何变成下一步的输入</h3>
+    <p>循环里最不起眼但最要紧的是 _update_model_kwargs_for_generation(:1231):attention_mask 追加一列 1、position_ids 用缓存长度接续、encoder-decoder 模型的 decoder_input_ids 换成新 token——上一步的全部痕迹经它滚进下一步。第 3 章 3.1 节骨架 ③ 的 past_seen_tokens 也是在这里从缓存账本更新。对话「记得之前说过什么」的工程事实,一半在缓存,一半在这行 kwargs 演进。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.3</span>解码策略:一个枚举,一张映射表</h2>
+    <p>v5 把解码策略入口收敛成两个数据结构。先是模式枚举,generation/configuration_utils.py:82:</p>
+    <div class="code-title">generation/configuration_utils.py:82 — GenerationMode 枚举(注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">GenerationMode</span>(ExplicitEnum):
+    <span class="cmt"># 非束类</span>
+    CONTRASTIVE_SEARCH = "contrastive_search"    <span class="cmt"># → Hub 插件</span>
+    GREEDY_SEARCH = "greedy_search"              <span class="cmt"># → _sample(do_sample=False)</span>
+    SAMPLE = "sample"
+    ASSISTED_GENERATION = "assisted_generation"  <span class="cmt"># → _assisted_decoding(第 6 章)</span>
+    DOLA_GENERATION = "dola_generation"          <span class="cmt"># → Hub 插件</span>
+    <span class="cmt"># 束类</span>
+    BEAM_SEARCH = "beam_search"                  <span class="cmt"># → _beam_search</span>
+    BEAM_SAMPLE = "beam_sample"                  <span class="cmt"># → _beam_search(do_sample=True)</span>
+    CONSTRAINED_BEAM_SEARCH = "constrained_beam_search"  <span class="cmt"># → Hub 插件</span>
+    GROUP_BEAM_SEARCH = "group_beam_search"      <span class="cmt"># → Hub 插件</span></pre>
+    <p>配置怎么变成模式?get_generation_mode(:539)是一串 if:传了 assistant_model → ASSISTED;num_beams&gt;1 → BEAM_*;do_sample → SAMPLE;否则 GREEDY。随后 GENERATION_MODES_MAPPING(generation/utils.py:143)把模式映射到方法名或 Hub 仓库名:</p>
+    <div class="code-title">generation/utils.py:143 — 模式 → 方法(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span>GENERATION_MODES_MAPPING = {
+    GenerationMode.SAMPLE: "_sample",
+    GenerationMode.GREEDY_SEARCH: "_sample",        <span class="cmt"># greedy 并入 sample,只差选词方式</span>
+    GenerationMode.BEAM_SEARCH: "_beam_search",
+    GenerationMode.BEAM_SAMPLE: "_beam_search",
+    GenerationMode.ASSISTED_GENERATION: "_assisted_decoding",
+    <span class="cmt"># Deprecated methods</span>
+    GenerationMode.DOLA_GENERATION: "transformers-community/dola",
+    GenerationMode.CONTRASTIVE_SEARCH: "transformers-community/contrastive-search",
+    GenerationMode.GROUP_BEAM_SEARCH: "transformers-community/group-beam-search",
+    GenerationMode.CONSTRAINED_BEAM_SEARCH: "transformers-community/constrained-beam-search",
+}</pre>
+    <div class="annotation"><b>为什么砍掉四个策略?</b>每条策略都是一条独立的 while 循环,彼此共享的只有「前向 + 处理器链」骨架;每修一个 bug、每加一种缓存类型都要乘四。库内保住三条主路径(sample/beam/assisted),长尾转 Hub 插件——与 2.4 节分词后端收敛到 Rust 是同一个趋势:库的边界画在「高频使用的核心」处。generate 里还有一段 _get_deprecated_gen_repo 专门为老写法生成兼容跳转,注释标注 v4.62 移除——过渡期的礼貌。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.4</span>prefill 与 chunked prefill</h2>
+    <p>生成第一步是 prefill:整个 prompt 一次前向,建立缓存。_prefill(:4251)有两个分支,分界线是 generation_config.prefill_chunk_size:</p>
+    <div class="code-title">generation/utils.py:4251 — _prefill 两个分支(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_prefill</span>(self, input_ids, generation_config, model_kwargs, is_first_iteration=<span class="kw">True</span>):
+    <span class="cmt"># 分支一:一次前向,适合短/中 prompt</span>
+    <span class="kw">if</span> generation_config.prefill_chunk_size <span class="kw">is</span> <span class="kw">None</span>:
+        model_inputs = self.prepare_inputs_for_generation(input_ids, ...)
+        <span class="kw">return</span> self(**model_inputs, <span class="kw">return_dict</span>=<span class="kw">True</span>)
+
+    <span class="cmt"># 分支二:prompt 切块逐块喂,缓存逐块长(超长 prompt / 显存吃紧)</span>
+    <span class="kw">else</span>:
+        getattr(torch, "_dynamo").config.cache_size_limit = <span class="nu">64</span>  <span class="cmt"># flex 编译图会变多,提前放宽上限</span>
+        input_chunks = torch.split(input_ids, chunk_size, dim=-<span class="nu">1</span>)
+        attention_mask = model_kwargs.pop("attention_mask", <span class="kw">None</span>)
+        past_length = <span class="nu">0</span>
+        <span class="kw">for</span> input_chunk <span class="kw">in</span> input_chunks:
+            current_length = past_length + input_chunk.shape[-<span class="nu">1</span>]
+            model_kwargs["attention_mask"] = attention_mask[:, :current_length]
+            ...  <span class="cmt"># 前向一块,缓存追加一块</span></pre>
+    <div class="annotation"><b>为什么需要 chunked prefill:</b>100 万 token 的 prompt,一次前向意味着一个 [1, 1000000, hidden] 的激活张量直接打爆显存。切块后峰值显存 = 单块激活 + 缓存,代价是 flex_attention 的编译图数量翻倍——所以循环前先把 dynamo 缓存上限从默认 8 提到 64,注释里说免得撞上「非常难读懂的报错」。服务端引擎(vLLM/SGLang)把「prefill 与 decode 分时复用」做成了独立的调度问题,Transformers 这里的 chunked prefill 是单机版的前置形态,第 7 章会再遇到这个术语。</div>
+    <p>另一个细节在 _prefill 开头:从已有缓存续写(接着上次对话)时,输入可能是「完整序列」或「只有新 token」两种,分支依据是 attention_mask 长度与 input_ids 长度的比较——续写不是重算,而是切片后只前向新的一段。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.5</span>判停:停止条件、streamer 与「晚一步停」</h2>
+    <p>循环怎么停?generate 第 8 步装配的停止条件链是第一道,StopCheck 是循环里的实际判停点,它同时是流式输出的出口:</p>
+    <div class="code-title">generation/utils.py:385 — StopCheck(注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">StopCheck</span>:
+    <span class="str">"""Decides when the decoding loop should stop, and hands each new token to a streamer."""</span>
+
+    <span class="kw">def</span> <span class="fn">__call__</span>(self, unfinished_sequences, tokens, length) -&gt; <span class="kw">bool</span>:
+        <span class="kw">if</span> self.streamer <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+            self.streamer.put(tokens.cpu())          <span class="cmt"># 流式输出与判停共用同一处钩子</span>
+        <span class="kw">return</span> <span class="kw">bool</span>(unfinished_sequences.max() == <span class="nu">0</span>)</pre>
+    <p>内置停止条件(stopping_criteria.py)有四类:MaxLengthCriteria(:62,按总长)、MaxTimeCriteria(:93,按墙钟时间)、EosTokenCriteria(:543,按 EOS)、StopStringCriteria(按字符串,如 <code class="inline">stop_strings=["&lt;/answer&gt;"]</code>)。用户自定义条件继承 StoppingCriteria(:48)塞进列表即可——判停是开放扩展点。</p>
+    <div class="annotation"><b>「晚一步停」(DeferredStopCheck, :403) 是全文件最讲究的优化:</b>判停要读 unfinished_sequences.max() == 0——这是一次设备→主机同步,每步卡住主机等设备追上。v5 的解法:异步拷贝 stop 标志到 pinned 内存,下一轮才读上一轮的结果,主机永远比设备快一步;多用一次前向,finish() 返回要回滚的步数,循环外把多算的步数撤掉。目前只在 MPS 设备启用(is_supported 里 device.type != "mps" → False),注释写明「cuda 上若实测有收益再开」。流式 token 同样要同步,所以也晚一步——「多余的那个 token 永远不会流出:循环断掉时它还在飞,finish 时丢弃」。用一次冗余前向换掉每步一次的同步,这笔账在低算力设备上划算。</div>
+    <p>StopStringCriteria 是内置条件里最复杂的一个:停止串可能跨 token 边界,token 与停止串还可能部分重叠。它把「token → 停止串位置」的映射在开始前预计算成 embedding 向量,运行时一次查表 + 张量比较完成匹配——把 Python 逐串循环换成纯张量操作。第 9 章工具调用的「检测 JSON 收尾」场景会回到这里。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">5.6</span>输出与续写:缓存拿在手里接着聊</h2>
+    <p>generate 默认只返回张量;return_dict_in_generate=True 时返回 GenerateDecoderOnlyOutput(:184),把 sequences/scores/logits/attentions/hidden_states/past_key_values 打包。其中 past_key_values 字段最实用:一个回合结束后把缓存拿出来,下一回合把新 prompt 追加进去传入,就能「接着聊」而不重算历史——第 4 章 4.4 节「默认缓存类由模型决定」的机制在这里接上了:模型侧用 config.layer_types 选缓存类,用户侧 return_dict_in_generate 拿到缓存,下一回合原样传回。</p>
+    <div class="figure breakout">
+      <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t51 d51">
+        <title id="t51">一次 generate 调用的完整旅程</title>
+        <desc id="d51">从 inputs 到输出序列:九步准备横排在上方,下方是六拍解码循环,右侧是判停与流式出口。</desc>
+        <defs>
+          <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+          </marker>
+        </defs>
+
+        <text class="lbl" x="20" y="30" font-weight="bold">准备阶段(generate 入口,九步)</text>
+        <rect class="node" x="20" y="45" width="150" height="40" rx="6"></rect>
+        <text class="lbl sm" x="95" y="62" text-anchor="middle">校验 + 解析</text>
+        <text class="lbl sm" x="95" y="77" text-anchor="middle">GenerationConfig</text>
+
+        <rect class="node" x="200" y="45" width="150" height="40" rx="6"></rect>
+        <text class="lbl sm" x="275" y="62" text-anchor="middle">判模式</text>
+        <text class="lbl sm" x="275" y="77" text-anchor="middle">GenerationMode</text>
+
+        <rect class="node" x="380" y="45" width="150" height="40" rx="6"></rect>
+        <text class="lbl sm" x="455" y="62" text-anchor="middle">备输入 + 备缓存</text>
+        <text class="lbl sm" x="455" y="77" text-anchor="middle">左 padding / layer_types</text>
+
+        <rect class="node" x="560" y="45" width="150" height="40" rx="6"></rect>
+        <text class="lbl sm" x="635" y="62" text-anchor="middle">装配两条链</text>
+        <text class="lbl sm" x="635" y="77" text-anchor="middle">处理器 + 停止条件</text>
+
+        <rect class="node core" x="740" y="45" width="150" height="40" rx="6"></rect>
+        <text class="lbl sm" x="815" y="62" text-anchor="middle">分发</text>
+        <text class="lbl sm" x="815" y="77" text-anchor="middle">_sample / _beam_search / ...</text>
+
+        <line x1="170" y1="65" x2="200" y2="65" class="edge"></line>
+        <line x1="350" y1="65" x2="380" y2="65" class="edge"></line>
+        <line x1="530" y1="65" x2="560" y2="65" class="edge"></line>
+        <line x1="710" y1="65" x2="740" y2="65" class="edge"></line>
+
+        <text class="lbl" x="20" y="130" font-weight="bold">解码循环(_sample,每步六拍)</text>
+        <rect class="node" x="20" y="145" width="130" height="36" rx="6"></rect>
+        <text class="lbl sm" x="85" y="167" text-anchor="middle">① 前向一步</text>
+        <rect class="node" x="180" y="145" width="130" height="36" rx="6"></rect>
+        <text class="lbl sm" x="245" y="167" text-anchor="middle">② 取末位 logit</text>
+        <rect class="node" x="340" y="145" width="130" height="36" rx="6"></rect>
+        <text class="lbl sm" x="405" y="167" text-anchor="middle">③ 处理器链</text>
+        <rect class="node" x="500" y="145" width="130" height="36" rx="6"></rect>
+        <text class="lbl sm" x="565" y="167" text-anchor="middle">④ 选词</text>
+        <rect class="node" x="660" y="145" width="120" height="36" rx="6"></rect>
+        <text class="lbl sm" x="720" y="167" text-anchor="middle">⑤ 追加</text>
+        <rect class="node warn" x="810" y="145" width="110" height="36" rx="6"></rect>
+        <text class="lbl sm" x="865" y="167" text-anchor="middle">⑥ 判停</text>
+
+        <line x1="150" y1="163" x2="180" y2="163" class="edge"></line>
+        <line x1="310" y1="163" x2="340" y2="163" class="edge"></line>
+        <line x1="470" y1="163" x2="500" y2="163" class="edge"></line>
+        <line x1="630" y1="163" x2="660" y2="163" class="edge"></line>
+        <line x1="780" y1="163" x2="810" y2="163" class="edge"></line>
+        <path d="M 865 181 C 865 215, 85 215, 85 181" class="edge" fill="none" marker-end="url(#arrow5)"></path>
+        <text class="lbl sm" x="470" y="212" text-anchor="middle">未停 → 回到 ①(缓存里已多一个 token)</text>
+
+        <rect class="node ok" x="810" y="228" width="110" height="26" rx="6"></rect>
+        <text class="lbl sm" x="865" y="245" text-anchor="middle">停 → 返回</text>
+      </svg>
+      <div class="fig-cap">图 5.1:generate 的两段结构。准备阶段把一切装配好,循环里只剩六拍;「判停」一路通向流式出口,一路通向返回。</div>
+    </div>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>generate 是九步流水线:custom_generate/paged 分流 → GenerationConfig 校验 → 模式判定(GenerationMode 枚举 + GENERATION_MODES_MAPPING)→ 输入准备 → 长度折算 → 备缓存 → 装配两条链 → 分发。核心循环 _sample 是六拍:前向、取末位 logit(fp32 拷贝)、处理器链、选词、追加、判停;greedy 并入 sample(只差选词方式),contrastive/dola/group-beam/constrained-beam 四策略转 Hub 插件。prefill 一次前向建立缓存,prefill_chunk_size 切块摊薄长 prompt 峰值显存。判停双链:StoppingCriteriaList(长度/时间/EOS/字符串四类内置,开放扩展)+ StopCheck(兼流式出口);StopStringCriteria 预计算 embedding 向量做跨 token 匹配;MPS 设备的 DeferredStopCheck 用「晚一步停 + 回滚」消掉每步设备同步。return_dict_in_generate 返回的缓存可直接续写对话。</p>
+    <p>循环里「选词」一拍被压成一行——背后是整条 logits 处理器链和采样参数体系。<a href="06-logits.html">第 6 章:选词</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="04-kv-cache.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 4 章 · KV Cache</span>
+    </a>
+    <a class="next" href="06-logits.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 6 章 · 选词</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 05 生成循环 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

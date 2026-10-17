@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>00 · 概述:三个问题 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a class="active" href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 00 概述</div>
+    <div class="chap-meta">Chapter 00 · Overview</div>
+    <h1>三个问题:模型怎么记住互联网,怎么接上工具,解决问题的能力从哪来</h1>
+    <div class="lede">
+      <p>大多数人用 Transformers 的方式是三行代码:加载模型、喂进文本、拿回输出。这个抽象太成功了,成功到人们开始对它产生两种相反的误解——一种觉得「模型什么都懂」,另一种觉得「模型就是个接缝预测器,什么都不真懂」。两种说法都把一件事糊在黑盒里:几百 GB 的权重文件,是怎么和「记住互联网」「调用工具」「解决问题」这三件具体的事对上号的。</p>
+      <p>这本书把黑盒打开。全书锚定 huggingface/transformers 仓库主干(v5 时代,版本 5.21.0.dev0 快照),每一章讲清一段真实源码。本章不进任何代码,只把三个问题摆正,并且诚实标注每个问题的答案有几分在库内、有几分在库外。</p>
+    </div>
+  </div>
+
+  <section class="block">
+    <h2><span class="num">0.1</span>为什么值得读这个库的源码</h2>
+    <p>先说一个不太对称的现象。推理引擎(vLLM、SGLang)和 Agent 运行时(pi、Codex)的源码,工程师是愿意精读的,本站其他几本书讲的都是它们。但 Transformers 这个几乎所有大模型应用的第一行 <code class="inline">import</code>,多数人对它的了解停在「会调 API」。原因大概有两条。一是它太顺手,出了问题绕一下总能过去;二是它的体量吓人——仓库里 532 个模型架构、51 万多行建模代码,谁都不知道从哪下手。</p>
+    <p>但这个体量有很强的欺骗性。532 个架构里,真正独立的设计不到二十个,其余的全是从互相衍生的代码生成的(第 1 章讲这套生成机制)。而所有模型共同依赖的核心设施,集中在 <code class="inline">src/transformers/</code> 顶层的十几个文件里:<code class="inline">modeling_utils.py</code> 5182 行、<code class="inline">trainer.py</code> 4726 行、<code class="inline">generation/utils.py</code> 4434 行、<code class="inline">tokenization_utils_base.py</code> 3764 行、<code class="inline">cache_utils.py</code> 2166 行。把这十几个文件读懂,532 个模型在你眼里就收敛成了一张图纸的 532 次参数化。</p>
+    <p>还有一层时机上的原因。2025 年底到 2026 年,这个库完成了 v4 → v5 的断代迁移:TensorFlow 和 Jax 整体移除、权重加载推倒重做、分词器后端化重构、注意力实现后端化、对话模板成为工具调用的正式入口。读 v4 时代的旧文章,很多细节已经对不上;读 v5 的源码,看到的是一条收敛后的主线。断代迁移本身也是内容——为什么一个库要花一年时间做减法,第 1 章和第 12 章都会回到这个问题。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.2</span>三个问题,各自拆到什么粒度</h2>
+    <p>全书围绕三个问题展开。这三个问题不是并列的:第一个问「模型怎么知道的」,第二个问「模型怎么表达的」,第三个问「能力本身从哪来」。先把每个问题拆到源码能回答的粒度,再标清边界。</p>
+
+    <h3>问题一:模型怎么「记住」整个互联网的</h3>
+    <p>这个问题能拆成四段,每段都有实码作答。互联网的文本先经过分词器(<code class="inline">tokenization_utils_base.py</code>)变成 token 序列——这是进入模型的唯一入口,第 2 章讲。token 序列在训练时被压进权重:注意力层(Geva et al. 2021 给出的解释)按内容做检索,前馈层是一张巨大的键值记忆表——「记忆」的物理形态就是这两层里的矩阵数值,第 3 章讲压进去的机制和为什么是「有损的」。推理时,当前对话的记忆由 KV Cache 承担(<code class="inline">cache_utils.py</code> 整个类家族):本次会话记得住、进程结束就忘,它和权重记忆的分工是第 4 章的主题。窗口长度怎么撑到百万 token,RoPE 缩放(yarn、longrope)也在第 4 章。</p>
+    <p>边界要诚实:「记住了什么」存在权重文件的数值里,那是某次预训练 run 的产物,不在 GitHub 仓库里。书里能讲清的是<strong>记的机制</strong>——为什么几百 GB 权重装得下互联网的统计结构,以及为什么「模型知道某个具体事实」这个说法要打个引号。它不是数据库,没有「某条知识存在第几层」这种账可查——可解释性研究(Mechanistic Interpretability)还在追赶这件事。</p>
+
+    <h3>问题二:模型怎么支持 Agent 调用工具的</h3>
+    <p>这个问题在库里有一段非常具体的代码链。工具的定义(JSON Schema)经 <code class="inline">apply_chat_template(tools=...)</code> 被织进提示词(tokenization_utils_base.py:3003 起);对话被渲染成模型专属的控制符格式(chat template,第 8 章);模型生成时,停止条件盯着工具调用的结束标记(generation/utils.py);生成完成后,文本按 schema 被解析回结构化的函数调用(第 9 章)。这条链的每一环都在本仓库里,证据链完整。</p>
+    <p>边界同样要诚实:<strong>「循环」不在库里。</strong>执行工具、把结果回填、再调模型、判断何时停——这是 Agent Runtime 的活。本站已有四本书(pi、Codex、Claude Code、DeepSeek Harness)讲循环这一侧;这本书讲的是循环的另一半——「模型吐出一个 tool call」这个动作,在模型侧是怎么实现的。两半拼起来,才是「Agent 调用工具」的完整答案。第 9 章会把这条分界线画在代码上。</p>
+
+    <h3>问题三:「一套解决问题的办法」从哪来</h3>
+    <p>先承认:解题能力是训练灌进权重的,主要靠后训练阶段的强化学习——那个过程发生在 TRL 等训练框架里,不在这个仓库。库内能看到的是能力的<strong>表达机制</strong>:同一次前向,怎么把概率分布变成不同的行为。贪心解码产出稳定答案,采样带温度产出多样性,beam search 拿质量换算力,投机解码拿小模型赌大模型(<code class="inline">generation/candidate_generator.py</code>);logits 加工(<code class="inline">generation/logits_process.py</code> 3252 行)负责重复惩罚、禁止词、格式约束;服务端场景下,continuous_batching 子系统让成百个并发对话共享一次调度(第 7 章)。</p>
+    <p>第 5、6、7 章讲这条生成主线,第 11 章讲权重怎么被训练改写——那是能力来源在库内的最近一段。第 13 章收口:把「模型侧」和「Agent 侧」的分工画成一张清单,想自己拼一套系统的人按图取件。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.3</span>库内与库外的边界</h2>
+    <p>把三个问题的答案按「证据在哪」摆成一张表,这张表就是全书的边界声明:</p>
+    <table class="tbl">
+      <tr><th>问题</th><th>库内可讲(本书范围)</th><th>库外,本书只指路</th></tr>
+      <tr><td>怎么记住互联网</td><td>分词入口、注意力检索 + FFN 键值记忆的机制、KV Cache 短期记忆、RoPE 长窗口、预训练目标(Trainer)</td><td>具体知识的存在形态(权重文件本身);Mechanistic Interpretability 的进展</td></tr>
+      <tr><td>怎么调用工具</td><td>chat template 织入 tools schema、控制符对话格式、生成停止条件、结构化输出解析</td><td>Agent 循环(执行/回填/再调用)——本站 pi、Codex、Claude Code、DeepSeek Harness 四本书</td></tr>
+      <tr><td>解决问题的能力</td><td>解码策略与 logits 加工(能力的表达)、训练循环(能力的写入)、量化与加载(权重的变换)</td><td>RL 后训练的具体过程——TRL 库;奖励模型设计——独立研究方向</td></tr>
+    </table>
+    <p>这张表还有一个用途:帮你把「模型不行」和「模型外面那层不行」分开。工具调用失败,可能坏在模型没生成对格式(库内,第 9 章),也可能坏在 Runtime 没把上一轮结果回填对(库外)——两边看的代码不同,修法也不同。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">0.4</span>全书结构与读法</h2>
+    <p>十四章分成四段,顺着「token 进、token 出」这条数据流走:</p>
+    <div class="figure breakout">
+      <svg class="svg-box" viewBox="0 0 940 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t01 d01">
+        <title id="t01">全书四段结构</title>
+        <desc id="d01">地图段(00/01)、记忆段(02/03/04)、生成段(05/06/07)、对话与能力段(08/09/10)、工程段(11/12/13)的章节分布与主线</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="20" y="30" width="164" height="72" rx="8"></rect>
+        <text class="lbl" x="102" y="58" text-anchor="middle">地图</text>
+        <text class="lbl sm" x="102" y="78" text-anchor="middle">00 概述 · 01 架构</text>
+
+        <rect class="node" x="224" y="30" width="164" height="72" rx="8"></rect>
+        <text class="lbl" x="306" y="58" text-anchor="middle">记忆:怎么记住的</text>
+        <text class="lbl sm" x="306" y="78" text-anchor="middle">02 分词 · 03 权重 · 04 缓存</text>
+
+        <rect class="node core" x="428" y="30" width="164" height="72" rx="8"></rect>
+        <text class="lbl" x="510" y="58" text-anchor="middle">生成:token 怎么出</text>
+        <text class="lbl sm" x="510" y="78" text-anchor="middle">05 循环 · 06 选词 · 07 并发</text>
+
+        <rect class="node" x="632" y="30" width="140" height="72" rx="8"></rect>
+        <text class="lbl" x="702" y="58" text-anchor="middle">对话与多模态</text>
+        <text class="lbl sm" x="702" y="78" text-anchor="middle">08 · 09 · 10</text>
+
+        <rect class="node ok" x="812" y="30" width="108" height="72" rx="8"></rect>
+        <text class="lbl" x="866" y="58" text-anchor="middle">工程</text>
+        <text class="lbl sm" x="866" y="78" text-anchor="middle">11 · 12 · 13</text>
+
+        <line class="edge" x1="184" y1="66" x2="222" y2="66"></line>
+        <line class="edge" x1="388" y1="66" x2="426" y2="66"></line>
+        <line class="edge" x1="592" y1="66" x2="630" y2="66"></line>
+        <line class="edge" x1="772" y1="66" x2="810" y2="66"></line>
+
+        <text class="lbl sm" x="20" y="160">问题一「怎么记住互联网」 → 02 03 04 11;问题二「怎么调用工具」 → 08 09;问题三「能力从哪来」 → 05 06 07 11</text>
+        <text class="lbl sm" x="20" y="185">第 13 章把三问收口成一张「模型侧自研清单」,并标注哪些件要去库外取(Agent 循环 → pi/Codex 等四本书,RL 后训练 → TRL)。</text>
+        <text class="lbl sm" x="20" y="225">三条阅读路径:想懂机理,按 2→3→4→6 顺序精读;想接 Agent,读 5→8→9 三章;想自己做服务,读 5→7→12。</text>
+      </svg>
+      <div class="fig-cap">图 0.1:全书结构。三章一组对应一个主问题,10 与 12 是两块垫在主线下面的通用地基(多模态输入统一化、权重的装载与变换)。</div>
+    </div>
+
+    <p>每章的写法沿用本站体例:真实源码摘录、带文件路径与行号 pin、SVG 图不借用外部渲染。行号对准主干快照 d4804f9d76(2026-10-17),版本演进后行号会漂,以符号名搜索为准。</p>
+
+    <div class="callout info">
+      <b class="tag">怎么读</b>
+      如果只读三章:第 3 章(权重为什么能「记住」)、第 4 章(KV Cache,当前对话的记忆本体)、第 9 章(工具调用的完整代码链)。这三章分别回答三个问题里最核心的一截,且互相不依赖前文细节。
+    </div>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>三个问题的答案有几分在库内、几分在库外,这是全书先立好的边界:「记住互联网」的机制(分词、注意力检索、FFN 键值记忆、KV Cache)全在库内,但「记住了什么」在权重文件里;「调用工具」的模型侧(schema 织入、控制符渲染、停止条件、解析)全在库内,但 Agent 循环在库外;「解题能力」是训练写进权重的,库内能讲清它的表达机制(解码策略、logits 加工)和写入路径(Trainer)。</p>
+    <p>体量的欺骗性也先拆掉:532 个模型收敛到十几个核心文件的图纸,下一章就从这张图纸讲起。</p>
+    <p>下一章:<a href="01-architecture.html">第 1 章 · 整体架构</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="placeholder">&nbsp;</a>
+    <a class="next" href="01-architecture.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 1 章 · 整体架构</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 00 概述 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

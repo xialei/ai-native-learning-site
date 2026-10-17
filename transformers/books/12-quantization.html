@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="initial-scale=1.0, width=device-width">
+<title>12 · 量化与装载:权重的变换 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a class="active" href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 12 量化与装载</div>
+    <div class="chap-meta">Chapter 12 · Quantization &amp; Loading</div>
+    <h1>量化与装载:权重的变换</h1>
+    <div class="lede">
+      <p>前 11 章讲的是「模型已经就位之后」的事——注意力怎么算、token 怎么出、工具怎么调。这一章讲「就位之前」:一份 15 GB 的 bf16 权重怎么变成 4 GB 出头跑进你的显卡;一份 llama.cpp 的 GGUF 文件怎么进 transformers;一个第三方命名五花八门的 checkpoint 怎么被改写成本库的键名。第 1 章埋的三个钩子——26 个 quantizer 后端、from_pretrained 总入口、并行计划怎么进装载——在这里一起收口。</p>
+      <p>这一章先拆 26 个后端共用的一套协议(HfQuantizer 的钩子族),再走一遍 from_pretrained 从 config 到可用模型的装配线,然后是 bitsandbytes 4-bit 的完整旅程、装载器本体的「键改名 + 张量变换」两段式,最后是 GGUF 这条最特别的路径——权重以压缩块形态常住内存,前向时才解开。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 「量化」不是模型能力,是权重的变换:26 个后端各一个 quantizer 文件,实现同一组 HfQuantizer 钩子(validate_environment / update_device_map / preprocess_model / postprocess_model),from_pretrained 在固定点位调用它们(12.1);② from_pretrained 是一条装配线:meta 设备建空壳 → 量化器/精度计划/设备映射完成协商 → 权重以「最终形态」流入(12.2);③ 4-bit 的旅程是「换层 + 在线量化」(12.3),GGUF 的旅程是「保块 + 前向按批大小选 GEMV 或分块解压」(12.4)——两种账法,显存充裕与紧张的机器各有胜场;④ 键名对不上的 checkpoint 靠 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回原格式;词表对不上不自动重塑,靠 LOAD REPORT 报错(12.3b、12.5、12.6)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">12.1</span>26 个后端,一套钩子协议</h2>
+    <p>第 1 章盘点过 quantizers/ 目录:26 个 quantizer 文件加一个 base.py 和一个 auto.py。每个文件对应一种量化方案——bitsandbytes 4/8-bit、GPTQ、AWQ、HQQ、torchao、GGUF、mxfp4、nvfp4……名字不同,结构完全一致:实现 HfQuantizer(quantizers/base.py:74)声明的一组钩子。基类长这样:</p>
+    <div class="code-title">quantizers/base.py:74 — HfQuantizer 钩子族(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">HfQuantizer</span>(ABC):
+    requires_calibration: bool   <span class="cmt"># 该方法要不要校准数据(AWQ/Quark 要,bnb 不要)</span>
+    serialized_names: dict = {}  <span class="cmt"># 一个权重变成几个文件键(量化常数、scale...)的对照表(:321)</span>
+
+    <span class="kw">def</span> <span class="fn">validate_environment</span>(self, **kwargs): ...   <span class="cmt"># 依赖库/硬件检查,不满足直接报错</span>
+    <span class="kw">def</span> <span class="fn">update_device_map</span>(self, device_map): ...    <span class="cmt"># 填默认设备、改放置策略(:112)</span>
+    <span class="kw">def</span> <span class="fn">update_dtype</span>(self, dtype): ...              <span class="cmt"># 建议或强制计算精度(:100)</span>
+    <span class="kw">def</span> <span class="fn">param_element_size</span>(self, model, param_name, param): ...  <span class="cmt"># 量化后每元素几字节,喂给设备映射(:129)</span>
+    <span class="kw">def</span> <span class="fn">preprocess_model</span>(self, model, **kwargs): ...   <span class="cmt"># 加载前:换模块,此时权重还在 meta 设备(:184)</span>
+    <span class="kw">def</span> <span class="fn">postprocess_model</span>(self, model, **kwargs): ...  <span class="cmt"># 加载后:写回 config、打标记(:207)</span>
+    <span class="kw">def</span> <span class="fn">get_quantize_ops</span>(self): ...                <span class="cmt"># 在线量化:checkpoint 的 fp16 → 4bit 参数(:314)</span>
+    <span class="kw">def</span> <span class="fn">get_load_operations</span>(self): ...             <span class="cmt"># 反过来:预量化 checkpoint 的块 → 参数(:323)</span></pre>
+    <p>钩子之间是「声明 + 协商」,不是硬编码流程。派发在 get_hf_quantizer(quantizers/auto.py:338):读 config 里有没有 quantization_config(有的话说明 checkpoint 本身是预量化的),和用户传参合并,经 AutoHfQuantizer.from_config(auto.py:202)按 quant_method 字符串查 AUTO_QUANTIZER_MAPPING(:77)实例化,再当场跑 validate_environment——bnb 没装、GPU 不在,从这一步就报错,而不是加载到一半。之后 from_pretrained 在固定点位调用:model 构造后 hf_quantizer.preprocess_model(modeling_utils.py:4304),权重加载完 hf_quantizer.postprocess_model(:4379),中途的 device_map 协商和 dtype 决定分别走 update_device_map 与 update_dtype(12.2 的装配线上标了位置)。</p>
+    <div class="annotation"><b>「哪个模块不量化」是各钩子交接最多的信息:</b>get_keys_to_not_convert(base.py:39)自动挑出三类必须保持原精度的模块——权重绑定的(tied weights)、模型最后一个模块、输出嵌入(lm_head)——理由写在 docstring 里:「keep the lm_head in full precision for numerical stability reasons」(:41)。模型还能用 _keep_in_fp32_modules 类属性追加清单(见 12.3b)。这段逻辑是量化的第一个坑位指南:量化完模型输出乱码,八成是 lm_head 被一起压了。</div>
+    <table class="tbl">
+      <tr><th>钩子</th><th>时机</th><th>bnb-4bit 做什么</th><th>GGUF 做什么</th></tr>
+      <tr><td>validate_environment</td><td>实例化后立刻</td><td>accelerate/bnb 已装?(:56);CPU/disk 混放要显式开关 llm_int8_enable_fp32_cpu_offload(:71)</td><td>有 kernel?没有就整体转 dequantize(:61)</td></tr>
+      <tr><td>update_device_map</td><td>device_map 协商</td><td>没给就默认当前加速卡(:94)</td><td>拒绝 disk 卸载(:86);MPS 机器默认上 MPS(:93)</td></tr>
+      <tr><td>update_dtype</td><td>dtype 决定</td><td>不动</td><td>块计算在 fp32 最快,否则每次 matmul 都要类型转换(:118)</td></tr>
+      <tr><td>param_element_size</td><td>设备映射预算</td><td>0.5 字节/元素(:53)</td><td>不覆写——uint8 参数自身就是块尺寸</td></tr>
+      <tr><td>preprocess_model</td><td>权重加载前</td><td>Linear → Linear4bit(:113)</td><td>可打包的换 GgufLinear(:144)</td></tr>
+      <tr><td>postprocess_model</td><td>权重加载后</td><td>打 is_loaded_in_4bit 标(:137)</td><td>挂 ggml kernel、选注意力(:154)</td></tr>
+    </table>
+    <div class="annotation"><b>读这张表的正确姿势:</b>左边一列是协议,右边两列是同一协议下的两种实现哲学。bnb 是「换层」哲学——Linear 换成 Linear4bit,权重进层时被压成 4-bit 参数;GGUF 是「保块」哲学——权重从头到尾是文件里的压缩块,模块换成了懂块的 GgufLinear。26 个后端全部落在这两极之间,协议不变。另外注意 requires_calibration 的分野:全库只有 9 个 quantizer 文件声明 True(aqlm、auto-round、awq、bitnet、compressed-tensors、gemma、quark、spqr、vptq)——这类「算出来」的量化要校准数据(量化前跑一批样本统计激活分布);bnb、GPTQ(quantizer_gptq.py:46 显式声明 False)这类「换表示」的不用。一个布尔值,两种量化范式的分界线。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.2</span>加载主线:from_pretrained 的装配线</h2>
+    <p>第 1 章留了两句话:「from_pretrained 是权重装载的总入口,第 12 章拆」和「AutoModel 怎么找到类,12.2 节会回到这里」。现在兑现。先说分发:你写 <code class="inline">AutoModelForCausalLM.from_pretrained(...)</code>,工厂(auto_factory.py:266)先读 config——本地有对应实现时经 _get_model_class(:182)从映射表拿到类,拿不到就按 config.architectures 字段猜;多模态套娃配置还会做一层继承:父 config 带 quantization_config 时,把它拷给 text_config(:250-252),否则量化配置在子模型上会丢。所有「Auto 前缀」类共用 _LazyAutoMapping 这张懒表——类只有被查到才 import,这正是第 1 章说的 _LazyModule import 秒开的另一半。</p>
+    <p>类定下来,真正的装配线在 modeling_utils.py:3823 起步。摘出与量化/装载有关的站点:</p>
+    <table class="tbl">
+      <tr><th>站</th><th>位置(pin)</th><th>发生什么</th></tr>
+      <tr><td>① 协商 quantizer</td><td>get_hf_quantizer(:4234)</td><td>checkpoint 的 config.json 已带 quantization_config(预量化)→ 与用户传参合并;都没有则 hf_quantizer=None,后面所有量化站点旁路</td></tr>
+      <tr><td>② 读文件头</td><td>hf_quantizer.read_header(:4267)</td><td>仅 GGUF:注释原话「Read before the dtype is settled」——GGUF 自己的浮点类型就是 dtype="auto" 要解析的对象</td></tr>
+      <tr><td>③ 定 dtype</td><td>_get_dtype(:810)→ update_dtype(:883)</td><td>从 checkpoint 推断主精度;quantizer 在这里行使否决权(GGUF 见 12.4)</td></tr>
+      <tr><td>④ meta 建壳</td><td>get_init_context(:3733)→ cls(config)</td><td>上下文挂上 torch.device("meta"),模型空壳不占显存地建出来</td></tr>
+      <tr><td>⑤ 结构改造</td><td>hf_quantizer.preprocess_model(:4304)</td><td>换层/改并行计划,全在权重到达前完成(12.1、12.3、12.4)</td></tr>
+      <tr><td>⑥ 精度计划</td><td>dtype_plan = model._get_dtype_plan(dtype)(:4317)</td><td>哪些模块强制 fp32,先算好账(12.3b)</td></tr>
+      <tr><td>⑦ 设备映射</td><td>_get_device_map(:4327)</td><td>accelerate.py:338 接手:infer_auto_device_map(:642)按「GPU→CPU→disk」优先级排布,逐模块预估尺寸时用的是 quantizer 报的元素字节数</td></tr>
+      <tr><td>⑧ 权重流入</td><td>_load_pretrained_model(:4353)</td><td>进 core_model_loading 的装载循环(12.5 拆)</td></tr>
+      <tr><td>⑨ kernel 化</td><td>model.set_use_kernels(:4358)</td><td>hub kernel 替换收尾(12.6)</td></tr>
+      <tr><td>⑩ 收尾</td><td>postprocess_model(:4379)→ _finalize_model_loading(:4512)</td><td>quantizer 打标记;缺键补初始化、tie_weights、打 LOAD REPORT</td></tr>
+    </table>
+    <div class="annotation"><b>为什么⑤要在 meta 设备上换层:</b>PyTorch 换模块的标准做法是 set_submodule,这要求父模块已存在。meta 建壳阶段(④)把模型「空壳」建出来——不占显存,可以随便动刀。量化、TP 切分计划、kernel 替换全部赶在权重到达之前完成结构改造,权重从 checkpoint 流进来的每一站面对的都是「最终形态」的模型。这是 v5 装载系统与 v4 的本质区别:v4 是「先装好再改」,v5 是「先改好再装」。第 1 章说的并行计划(模型类属性上的 tp_plan/ep_plan)也在这一站被 quantizer 补写——update_parallel_plan(base.py:201)把量化参数(scale 之类)加进切分计划,保证 TP 时它们跟着正确的分片走。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3</span>bnb 4-bit:一次量化的完整旅程</h2>
+    <p>拿最常见的配方走一遍:</p>
+    <div class="code-title">用户视角的三行(与 MIGRATION_GUIDE_V5.md:493 的范例一致)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> transformers <span class="kw">import</span> AutoModelForCausalLM, BitsAndBytesConfig
+
+quantization_config = BitsAndBytesConfig(load_in_4bit=<span class="kw">True</span>)   <span class="cmt"># v5:只能走 quantization_config</span>
+model = AutoModelForCausalLM.from_pretrained(<span class="st">"meta-llama/Llama-3.2-3B"</span>, device_map=<span class="st">"auto"</span>, quantization_config=quantization_config)</pre>
+    <p>v5 把裸的 load_in_4bit/load_in_8bit 参数从 from_pretrained 里删了(MIGRATION_GUIDE_V5.md:483),统一收敛到 BitsAndBytesConfig(utils/quantization_config.py:390)——一个类同时管 4/8-bit,靠 load_in_4bit/load_in_8bit 两个布尔区分;AutoHfQuantizer.from_config 在派发时给 bnb 做特判:bnb 只有一个 quant_method,按哪个布尔是真拼成 bitsandbytes_4bit / bitsandbytes_8bit 两个不同的键(quantizers/auto.py:211-219)。配置进模型后的旅程分四站:</p>
+    <table class="tbl">
+      <tr><th>站</th><th>位置(pin)</th><th>发生什么</th></tr>
+      <tr><td>① 协商</td><td>get_hf_quantizer(quantizers/auto.py:338)</td><td>checkpoint 自带 quantization_config(预量化)→ 与用户传参合并;都没有则全程旁路</td></tr>
+      <tr><td>② 换层</td><td>preprocess_model → _process_model_before_weight_loading(quantizer_bnb_4bit.py:113)</td><td>模型还在 meta 设备上,只有骨架没有权重;replace_with_bnb_linear(integrations/bitsandbytes.py:162)遍历子模块,nn.Linear 换成 bnb.nn.Linear4bit(meta 空壳,:208),不在白名单的(lm_head 等)保持原样</td></tr>
+      <tr><td>③ 灌权重</td><td>convert_and_load_state_dict_in_model(core_model_loading.py:1546)</td><td>checkpoint 的 fp16 张量流入 Linear4bit;Bnb4bitQuantize.convert(bitsandbytes.py:30)现场调 bnb.nn.Params4bit 把它压成 4-bit 块(:58)</td></tr>
+      <tr><td>④ 收尾</td><td>postprocess_model → _process_model_after_weight_loading(quantizer_bnb_4bit.py:137)</td><td>打 is_loaded_in_4bit 标;postprocess_model 基类把 quantization_config 写回 model.config(base.py:218),保存时随行</td></tr>
+    </table>
+    <div class="annotation"><b>②里换层时有个容易忽略的细节——被换掉的模块保留一个 source_cls 属性</b>(bitsandbytes.py:224,注释:「Store the module class in case we need to transpose the weight later」),记着原来的类。这是因为 GPT-2 系模型用 Conv1D 而不是 nn.Linear,权重矩阵是转置存的;③量化时看到 source_cls 是 Conv1D 就先转置再压(:52-55)。「库内到处是这种补偿历史包袱的折页」,第 1 章说过,这里是又一例。</div>
+    <div class="annotation"><b>白名单是三方合成的:</b>换层前先算 modules_to_not_convert(quantizer_bnb_4bit.py:121)——get_keys_to_not_convert 的自动项 + 配置里 llm_int8_skip_modules 的用户项 + 模型声明的 _keep_in_fp32_modules,三方叠加(base.py 的 get_modules_to_not_convert)。另外 max_memory 还会被整体打 9 折(adjust_max_memory,quantizer_bnb_4bit.py:89)——注释说量化过程要临时空间,预算先留出来。加载后 config.json 里会看到 quantization_config.bnb_4bit_quant_type="nf4" 这类字段——它们不只是元数据,下次 from_pretrained 时会读回来原样复现这份量化。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.3b</span>精度计划:keep_in_fp32 与量化例外</h2>
+    <p>量化的反面是「哪些地方不许降精度」。v5 把这件事做成了 dtype_plan(modeling_utils.py:3764):两个类属性各管一种场景——</p>
+    <div class="code-title">modeling_utils.py:3764 — _get_dtype_plan(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_get_dtype_plan</span>(self, dtype: torch.dtype) -&gt; dict:
+    dtype_plan = {}
+    <span class="cmt"># _keep_in_fp32_modules:只在「bf16 模型被强行用 fp16 加载」时兜底,</span>
+    <span class="cmt"># 把指定模块留在 fp32,防止 bf16→fp16 的精度损耗(#20287,:3768 注释)</span>
+    <span class="kw">if</span> self._keep_in_fp32_modules <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> dtype == torch.float16:
+        dtype_plan.update(dict.fromkeys(self._keep_in_fp32_modules, torch.float32))
+    <span class="cmt"># _keep_in_fp32_modules_strict:fp16/bf16 都强制升 fp32</span>
+    <span class="kw">if</span> self._keep_in_fp32_modules_strict <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">and</span> dtype <span class="kw">in</span> (torch.float16, torch.bfloat16):
+        dtype_plan.update(dict.fromkeys(self._keep_in_fp32_modules_strict, torch.float32))
+    <span class="kw">return</span> dtype_plan</pre>
+    <p>两个属性的区别是「条件豁免」和「绝对豁免」。前者是历史行为的显式化:bf16 权重配 fp16 计算是出了名的坑,各模型在类属性上声明豁免名单;后者更进一步,fp16/bf16 一律升 fp32——MoE 的路由打分是重灾区,dots1 把 e_score_correction_bias 列进 strict 名单(dots1 :441),ernie4_5_vl_moe 把 gate.weight 和 moe_statics 列进去(:687):路由差一位,token 就走错专家,精度误差在这里被放大成行为差异。另一个用途见 11.3 节的 afmoe:它把 7 个 layernorm 变体和 expert_bias 列进非 strict 清单(:469)——归一化层的方差统计对精度敏感,是量化时最常被豁免的模块类型。全库 33 个模型用 strict 清单,12 个只用非 strict。</p>
+    <div class="annotation"><b>dtype_plan 如何进装载:</b>from_pretrained 在权重到达前算出 plan(:4317),按「模块名 glob → 目标 dtype」的映射传给装载器(core_model_loading.py:1644);装载循环里每个张量名先过一遍 glob 匹配(:1677 建索引,:1717 匹配),命中则按 plan 的精度落盘,未命中才用全局 dtype。它的表亲是 quantizer 的 param_element_size(base.py:129):设备映射推断要预估每个模块占多少字节,量化器在这里回答「我的权重每元素几字节」(bnb 4-bit 是 0.5,quantizer_bnb_4bit.py:53)——「多大的模型装得进哪张卡」这道预算题,就是拿这个数算的。精度计划和显存预算是同一套模块尺寸账本的两个读法。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.4</span>GGUF:权重不解压,前向才算</h2>
+    <p>前三节的所有路径,权重到达模型时都已经是普通张量。GGUF 路线反其道而行:llama.cpp 的量化文件,权重在模型里也保持压缩块形态。这条路径是「量化不是加载时的一次性变换,而是运行时的一种存在方式」的极端版本,v5 对它的重做幅度也最大。</p>
+    <p>旧实现(modeling_gguf_pytorch_utils.py 的 legacy 路径)把整个文件解压成浮点模型再加载;新实现(GgufHfQuantizer,quantizer_gguf.py:39,配 integrations/gguf/ 子包)把「能不解压的都别解压」做成一次规划:get_gguf_plan(integrations/gguf/utils.py:44)逐张量检查「从文件键到模型键的沿途变换是否全部 supports_packed」——块不跨行,行向操作(Unsqueeze :284、PermuteRows :306、行向拼接 ConcatenateRows :426)不碰字节,声明 supports_packed=True;列向重排 PermuteInputFeatures(:333)会切开块,它参与打包的方式是把置换取逆存成 input_permutation(:338),让 GgufLinear 前向时对激活做重排,权重保持原样——docstring 写得很直白(:327):「Columns cross blocks, so a packed tensor is left as stored and <code class="inline">GgufLinear</code> permutes its input instead」。</p>
+    <p>规划完成,替换开始:packable 的模块换成 GgufLinear(utils.py:126)——一个 weight 参数是 uint8 块的 nn.Linear。它的前向(:144)是这条路线的纲领:</p>
+    <div class="code-title">integrations/gguf/utils.py:144 — GgufLinear.forward(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, x):
+    flat = x.reshape(-<span class="nu">1</span>, self.in_features)
+    <span class="kw">if</span> self.input_permutation <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:     <span class="cmt"># 列置换转为对激活的重排</span>
+        flat = flat.index_select(<span class="nu">1</span>, self.input_permutation)
+    <span class="kw">if</span> flat.shape[<span class="nu">0</span>] &lt;= MAX_GEMV_ROWS:      <span class="cmt"># ≤8 行:走专门的多向量-矩阵 kernel</span>
+        out = mul_mat_vec(self.weight, flat, self.ggml_type, self.out_features)
+    <span class="kw">else</span>:
+        out = self._unpack_matmul(flat)      <span class="cmt"># 大批:分块解压 × 矩阵乘,永不整体解压</span>
+    ...</pre>
+    <div class="annotation"><b>两条前向路径的分工:</b>解码阶段一次只有一个新 token(行数 ≤8,MAX_GEMV_ROWS=8,kernels.py:26),走 mul_mat_vec——hub 上的 ggml-org/ggml-quantization kernel(kernels.py:97)直接在 uint8 块上算 GEMV,权重全程不解压;prefill 或批量场景行数超限,退到 _unpack_matmul:按 64M 元素一块地解压、乘完就扔(:160 docstring 原话「never fully materialized」)。MoE 专家同理打包成 GgufExperts(utils.py:177),top-k 的 token 用 mul_mat_id 一次算完(:200)。这正好是第 7 章「双路径」的量化版:decode 走窄 kernel,prefill 走宽路径。「解压与否」不是开关,是按批大小的连续谱。</div>
+    <p>这条路线还顺带演示了量化与 kernel 生态(12.6)的合流:能不能走打包路径,先看 validate_environment 里 get_gguf_kernel() 有没有当前机器的预编译 kernel(:69)——没有就连 kernel 都不装,整个模型转 dequantize 模式(:71,警告写明「It will need several times the memory the file does」);有,则 kernelize_ggml_layers(kernels.py:143)把 ggml 的 fused 层 kernel 挂到模型上,挂不上就回退到模型自己的层(:158 的日志:「no ggml kernel for ...; it keeps the model's own layer」)。注意力还有一个可选的 ggml-org/ggml-attn kernel(quantizer_gguf.py:166)。目前打包级支持(不解压)的架构有 qwen35、qwen35moe、lfm2 三个(GGUF_ARCHS,gguf_conversion_mapping.py:237),其余走 legacy 解压路径——架构覆盖面还在扩张中,读代码时以 GGUF_ARCHS 为准。</p>
+    <div class="annotation"><b>为什么 GGUF 值得单独一节:</b>它是「权重文件格式、内存布局、计算 kernel」三层被当成一个整体设计的实例。bnb 4-bit 的世界观是「加载时压好,运行时就是普通层」;GGUF 的世界观是「压缩块就是运行时形态,解压才是异常路径」。前者的解压成本在加载时一次性付掉,后者的解压成本按需摊进每次前向——两种账法在显存充裕与紧张的机器上各有胜场,没有哪个全面胜出。服务引擎(vLLM/SGLang)同样要对量化格式做「解压或不解压」的决策,这里的规划逻辑(get_gguf_plan 的「沿途变换是否碰字节」)是理解那个更大世界的最小样本。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.5</span>装载器本体:WeightRenaming 与 WeightConverter</h2>
+    <p>12.2 装配线的第⑧站背后,是 v5 全新写的装载器。MIGRATION_GUIDE_V5.md:32 宣布了这次重做:「This weight loading API is designed to apply operations to the checkpoints loaded by transformers」——设计目标是「对 checkpoint 施加操作」,而不是按序列化原样加载。设计的核心是两类变换:</p>
+    <div class="code-title">core_model_loading.py — 两大类与配套算子(结构摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">WeightTransform</span>:                    <span class="cmt"># :798 基类,__slots__ 限死可挂的属性(:800)</span>
+    source_patterns / target_patterns      <span class="cmt"># 键的来源与去向</span>
+    distributed_operation / quantization_operation   <span class="cmt"># 挂载点:TP 切分(:804)、量化(:805)</span>
+    collected_tensors: dict[str, list[Future]]       <span class="cmt"># 异步收集池(:825)</span>
+
+<span class="kw">class</span> <span class="cl">WeightRenaming</span>(WeightTransform):     <span class="cmt"># :1027 只改键名,不动张量</span>
+<span class="kw">class</span> <span class="cl">WeightConverter</span>(WeightTransform):    <span class="cmt"># :1187 改键名 + 张量操作链</span>
+    operations: list[ConversionOps]        <span class="cmt"># Chunk/Split/Concatenate/Interleave/Transpose/...</span>
+    <span class="cmt"># 每个算子都带 reverse_op(:97),保存时原路倒放</span></pre>
+    <p>映射表按 model_type 组织在 conversion_mapping.py(2320 行)里,_build_checkpoint_conversion_mapping(:150)登记了 741 条 WeightRenaming 和 72 条 WeightConverter。看两个真实条目,操作链的「味道」就出来了:</p>
+    <div class="code-title">conversion_mapping.py:1131 — mixtral 的专家权重合并(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="st">"mixtral"</span>: [
+    WeightRenaming(<span class="st">".block_sparse_moe."</span>, <span class="st">".mlp."</span>),
+    WeightConverter(
+        source_patterns=[<span class="st">".experts.*.w1.weight"</span>, <span class="st">".experts.*.w3.weight"</span>],
+        target_patterns=<span class="st">".experts.gate_up_proj"</span>,
+        operations=[
+            MergeModulelist(dim=<span class="nu">0</span>),   <span class="cmt"># 8 个专家各一列 w1/w3 → 各聚成 1 份(:1140)</span>
+            Concatenate(dim=<span class="nu">1</span>),        <span class="cmt"># gate 与 up 拼成 gate_up(:1143)</span>
+        ],
+    ), ...]</pre>
+    <p>另一条是 kimi_k25 视觉塔的 qkv 拆分(:535,该条目从 :496 起),方向相反:checkpoint 里存的是一个融合的 wqkv,本库要三个独立矩阵,还要顺手做 RoPE 的维度重排——</p>
+    <div class="code-title">conversion_mapping.py:535 — qkv 拆分 + rope 重排(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Unfuse qkv and apply rope permutation</span>
+WeightConverter(
+    source_patterns=[r<span class="st">"wqkv"</span>],
+    target_patterns=[r<span class="st">"attn.q_proj"</span>, r<span class="st">"attn.k_proj"</span>, r<span class="st">"attn.v_proj"</span>],
+    operations=[
+        Chunk(dim=<span class="nu">0</span>),                 <span class="cmt"># 一份 wqkv 切三份</span>
+        PermuteForRope(subconfig_key=<span class="st">"vision_config"</span>, permute_layer_names=[<span class="st">"q_proj"</span>, <span class="st">"k_proj"</span>]),
+    ], ...)</pre>
+    <div class="annotation"><b>PermuteForRope 是「键名转换」和「数值语义」纠缠的最好例子</b>(core_model_loading.py:461):这个视觉塔的 checkpoint 来自另一个训练框架,它的 q/k 排布与本库 RoPE 实现的约定差一个置换。权重数值没错,只是「谁的约定」的问题——装载器把它转成本库约定。换句话说,conversion_mapping 处理的不只是「键名对不上」,还有「同一数学对象的不同内存排布」。qwen2_moe 的 gate/up 融合、各家族 MoE 的 w13→gate_up、跨家族的 embed_tokens 改名(:172),都是这张表上的条目。72 条 WeightConverter 还各带一个 distributed_operation 槽位(:804)——TP 切分不是装载后的后处理,是同一张表里的另一种变换,第 1 章的并行计划在这里落地。</div>
+    <p>装载循环(convert_and_load_state_dict_in_model,core_model_loading.py:1546)把这张表跑成流水线:checkpoint 的每个张量先按改名规则改键名(:1685),命中哪个 converter 就把自己挂到那个 converter 的收集池(collected_tensors,元素是 Future——异步加载);全部挂完,逐 converter 执行 convert:先把 Future 收割成真张量,再跑操作链,最后 set_param_for_module(:1378)把结果写进模型参数并盖上 _is_hf_initialized 章(:1417)——旁边的注释写「super important otherwise _init_weight will re-init the param」(:1416),盖了章的参数在「缺键补初始化」时会被跳过(modeling_utils.py:2364)。</p>
+    <div class="annotation"><b>异步加载是这张流水线的第二引擎:</b>spawn_materialize(:1279)在线程池上提交张量搬运,GLOBAL_WORKERS = min(4, CPU 核数)(:1268),主线不等拷贝完成就处理下一个键——读 checkpoint 的 I/O 与换算的 CPU 时间重叠起来。三处例外强制同步(:1659-1669):磁盘卸载(内存受限)、在线量化(:1663,注释写明防止工作线程把全精度张量灌满 GPU 造成显存尖峰)、环境变量 HF_DEACTIVATE_ASYNC_LOAD(:1665)。迁移指南把异步搬运列为重做收益之一(「Faster model loading thanks to scheduling of tensor materialization」,MIGRATION_GUIDE_V5.md:70)。加载完的错误报告也是结构化的:LoadStateDictInfo(utils/loading_report.py:156)收齐 missing/unexpected/mismatched/conversion_errors 四类,log_state_dict_report(:273)打成终端宽度的 LOAD REPORT 表;conversion_errors 直接抛错(:310),形状不符且没开 ignore_mismatched_sizes 也抛(:315)——「加载一个键名对不上的老 checkpoint」从「读不懂的 traceback」变成了「一张带修复建议的账单」。</div>
+    <div class="annotation"><b>词表对不上怎么办:老实报错,不自动重塑。</b>第 2 章埋过一个问题:换分词器意味着 embedding 行数对不上。v5 的答案是:shape 不符的键进 mismatched_keys,LOAD REPORT 列出来,默认抛 RuntimeError——库不做静默重塑,因为「新词表的行用什么初始化」是训练决策,不是装载决策。真要换词表,走显式 API resize_token_embeddings:新增行用旧嵌入的均值初始化(modeling_utils.py:3020),同样盖 _is_hf_initialized 章防止被补初始化覆盖(:3017)。装载器只管「照章办事」,改动语义的事留给明确的调用。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">12.6</span>kernel 化、保存侧与断代收口</h2>
+    <p>量化管「权重怎么存」,kernel 管「计算怎么算」——v5 把后者也接进了同一套声明式体系。每个模型的建模文件里散布着装饰器:</p>
+    <div class="code-title">models/llama/modeling_llama.py:51 — 两类装饰器(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span>@use_kernel_forward_from_hub(<span class="st">"RMSNorm"</span>)      <span class="cmt"># :51 整层替换:RMSNorm 换成 hub kernel</span>
+<span class="kw">class</span> <span class="cl">LlamaRMSNorm</span>(nn.Module): ...
+
+@use_kernelized_func(apply_rotary_pos_emb)          <span class="cmt"># :205 函数替换:rotary 计算换实现</span>
+<span class="kw">class</span> <span class="cl">LlamaAttention</span>(nn.Module): ...</pre>
+    <p>装饰器只是「贴标签」:kernels 库没装时它们原样返回类(hub_kernels.py:749 的 stub),模型照常工作。真正生效在装配线第⑨站——set_use_kernels(modeling_utils.py:3780)调用 kernelize(hub_kernels.py:953):按一张映射表(_KERNEL_MAPPING,:146,28 个条目:RMSNorm、rotary_pos_emb、SwiGLUMLP、激活函数家族、mamba 全家、MegaBlocksMoeMLP 等)把贴了标签的层换成 hub 上的预编译 kernel。映射表里连设备能力都写了条件——Qwen3.5 的 GatedDeltaNet 只在 SM121(GB10)与 ROCm gfx1151(Strix Halo)两个特定芯片上启用对应仓库的 kernel(:163,:162 的注释解释了原因:那两块卡上没有 fla/causal_conv1d 的常规编译),通用 CUDA 机器保持 PyTorch 原实现。290 处装饰器散布在 185 个模型文件里(llama 的 RMSNorm :51、qwen3 同款 :48),写新模型时,凡是映射表里有的层,都该挂上装饰器「等着被 kernelize」。</p>
+    <div class="annotation"><b>为什么这件事出现在「量化」一章:</b>kernel 化与量化是同一个问题的两面——「默认实现慢,换一个更快的」。量化把「存 16 位」变成「存 4 位」,kernel 化把「PyTorch 组合算子」变成「一个 fused kernel」;两者都在装载期声明、按环境协商、失败优雅回退。运行期想关也关不掉:use_kernels 的 setter 明说「Disabling kernels at runtime is a no-op as there is no 'unkernelize' routine」(modeling_utils.py:4711)——kernel 化发生在装载期,是结构的一部分,不是运行开关。</div>
+    <p>最后是保存侧。12.5 说过每个算子带 reverse_op(:97);save_pretrained 带 save_original_format=True 时,装载被整个倒放:revert_weight_conversion(core_model_loading.py:1824)按相反顺序套逆操作,把本库的键名和张量排布还原成 checkpoint 原来的样子(modeling_utils.py:3461)。装载是可逆的——「进来是什么格式,出去还是什么格式」,第三方 checkpoint 不被本库「劫持」。</p>
+    <div class="annotation"><b>回到第 0 章的问题:为什么一个库要花一年时间做减法。</b>这一章给的全是「减」的证据:TensorFlow 和 Jax 整体移除;裸的 load_in_4bit/load_in_8bit 参数删掉,只剩 quantization_config 一条路;v4 时代「先装好再改」的装载,换成「先改好再装」的一条装配线;所有键名变换、张量重排、TP 切分、量化操作,收进同一张声明式映射表——741 条改名、72 条变换、20 余种算子,每个带逆操作。减掉的是「同一件事的第五种做法」,留下的是「一件事只有一种声明方式」。声明式的好处在这一章处处可见:GGUF 的打包规划是在这张表上「决定,不是猜测」(get_gguf_plan 的 docstring:「this is decided, not guessed」,utils.py:50);TP 切分与量化共用一个挂载点;保存的逆变换是同一张表的倒放。读完 v5 的装载系统再回头看第 1 章的 import 表和第 5 章的生成循环:这个库最重的资产不是哪一段算法,而是「所有变化都过同一张声明表」的纪律。</div>
+  </section>
+
+  <div class="figure breakout">
+    <svg class="svg-box" viewBox="0 0 940 310" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t121 d121">
+      <title id="t121">from_pretrained 装配线上的量化与变换</title>
+      <desc id="d121">从 config 读取 quantization_config 开始,经 get_hf_quantizer 协商、meta 设备建壳、preprocess 换层、权重流入(在线量化/保块/普通变换)、postprocess 收尾;bnb 与 GGUF 在「权重形态」分道。</desc>
+      <defs>
+        <marker id="arrow12" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+        </marker>
+      </defs>
+
+      <text class="lbl" x="20" y="28" font-weight="bold">装配线(from_pretrained 内部的站点)</text>
+      <rect class="node acc" x="20" y="45" width="150" height="52" rx="6"></rect>
+      <text class="lbl sm" x="95" y="66" text-anchor="middle">① 协商 quantizer</text>
+      <text class="lbl sm" x="95" y="82" text-anchor="middle">get_hf_quantizer :4234</text>
+      <rect class="node" x="205" y="45" width="150" height="52" rx="6"></rect>
+      <text class="lbl sm" x="280" y="66" text-anchor="middle">② meta 建壳</text>
+      <text class="lbl sm" x="280" y="82" text-anchor="middle">get_init_context :3733</text>
+      <rect class="node core" x="390" y="45" width="160" height="52" rx="6"></rect>
+      <text class="lbl sm" x="470" y="66" text-anchor="middle">③ 结构改造</text>
+      <text class="lbl sm" x="470" y="82" text-anchor="middle">preprocess_model :4304</text>
+      <rect class="node" x="585" y="45" width="160" height="52" rx="6"></rect>
+      <text class="lbl sm" x="665" y="66" text-anchor="middle">④ 权重流入</text>
+      <text class="lbl sm" x="665" y="82" text-anchor="middle">_load_pretrained_model :4353</text>
+      <rect class="node ok" x="780" y="45" width="140" height="52" rx="6"></rect>
+      <text class="lbl sm" x="850" y="66" text-anchor="middle">⑤ 收尾</text>
+      <text class="lbl sm" x="850" y="82" text-anchor="middle">postprocess :4379</text>
+      <line x1="170" y1="71" x2="205" y2="71" class="edge"></line>
+      <line x1="355" y1="71" x2="390" y2="71" class="edge"></line>
+      <line x1="550" y1="71" x2="585" y2="71" class="edge"></line>
+      <line x1="745" y1="71" x2="780" y2="71" class="edge"></line>
+
+      <text class="lbl" x="20" y="140" font-weight="bold">④ 内部:权重形态分道</text>
+      <rect class="node" x="20" y="155" width="280" height="60" rx="6"></rect>
+      <text class="lbl sm" x="160" y="173" text-anchor="middle">bnb 路线(换层)</text>
+      <text class="lbl sm" x="160" y="189" text-anchor="middle">fp16 checkpoint → Params4bit</text>
+      <text class="lbl sm" x="160" y="205" text-anchor="middle">在线量化,一次性付清</text>
+      <rect class="node warn" x="340" y="155" width="280" height="60" rx="6"></rect>
+      <text class="lbl sm" x="480" y="173" text-anchor="middle">GGUF 路线(保块)</text>
+      <text class="lbl sm" x="480" y="189" text-anchor="middle">uint8 块常住,GEMV ≤8 行</text>
+      <text class="lbl sm" x="480" y="205" text-anchor="middle">大批走分块解压</text>
+      <rect class="node" x="660" y="155" width="260" height="60" rx="6"></rect>
+      <text class="lbl sm" x="790" y="173" text-anchor="middle">普通路线</text>
+      <text class="lbl sm" x="790" y="189" text-anchor="middle">renaming → 精度计划 →</text>
+      <text class="lbl sm" x="790" y="205" text-anchor="middle">TP 切分 → 写入</text>
+      <line x1="300" y1="97" x2="160" y2="153" class="edge back"></line>
+      <line x1="470" y1="97" x2="480" y2="153" class="edge back"></line>
+      <line x1="640" y1="97" x2="790" y2="153" class="edge back"></line>
+
+      <text class="lbl" x="20" y="252">协商点细节:checkpoint 自带 quantization_config → 与用户参数合并(pre_quantized);键改名(WeightRenaming)与张量变换(WeightConverter)在 ④ 的循环里统一执行,保存时经 revert_weight_conversion :1824 原路倒放。</text>
+    </svg>
+    <div class="fig-cap">图 12.1:量化与装载在 from_pretrained 里的位置。所有路径共享「meta 建壳 → 结构改造 → 权重流入」的三段式;bnb 与 GGUF 的差别只在④的权重形态。</div>
+  </div>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>「量化与装载」是同一个系统的两个名字:v5 把 from_pretrained 重写成一条装配线——meta 设备建空壳,量化器/精度计划/设备映射/kernel 替换完成协商与结构改造,权重以「最终形态」流入。26 个量化后端实现同一组 HfQuantizer 钩子(validate/update/preprocess/postprocess);bnb 4-bit 的旅程是「换层 + 在线量化」,GGUF 的旅程是「保块 + 前向按批大小选 GEMV 或分块解压」,打包与否由「沿途变换是否碰字节」决定,不猜。装载器本体是 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回 checkpoint 原格式;缺键、形状不符、转换失败统一进 LOAD REPORT,词表重塑不自动做、留给 resize_token_embeddings。精度计划(_keep_in_fp32_modules 两级)与设备映射预算(param_element_size)是同一本模块尺寸账的两个读法。kernel 化(290 处装饰器、28 条映射)把「换更快的计算」接进同一套「声明→协商→回退」协议,且装上就卸不下——它是结构,不是开关。下一章收口:把全书拆过的部件拼成一张「自研路线图」。</p>
+    <p>部件都拆过了,怎么拼一套自己的系统?<a href="13-build-own.html">第 13 章:自研路线</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="11-trainer.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 11 章 · 训练</span>
+    </a>
+    <a class="next" href="13-build-own.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 13 章 · 自研路线</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 12 量化与装载 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

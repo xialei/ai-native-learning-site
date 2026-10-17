@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · 记忆:权重怎么「记住」互联网 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a href="02-tokenizer.html">分词</a>
+      <a class="active" href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 03 记忆</div>
+    <div class="chap-meta">Chapter 03 · How Weights Remember</div>
+    <h1>记忆:几百 GB 的权重,怎么装下整个互联网</h1>
+    <div class="lede">
+      <p>这是全书最核心的一章,回答问题一。一个 7B 模型的权重约 14 GB,它「知道」的东西横跨几十种语言、几万亿字——数量级上严重不对等,靠的是什么?答案分两半:注意力层做「按内容寻址的检索」,前馈层做「键值对的叠加存储」。两者都是矩阵运算,没有数据库、没有索引结构,「记忆」就写在乘法里。</p>
+      <p>这一章以 llama 的 501 行实现为解剖台,按一次前向的数据流走:归一化 → 位置编码 → 注意力(检索) → 前馈(存储) → 出口。读完应该能对着 modeling_llama.py 的任何一段,说出它在这台「记忆机器」里扮演的角色。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① 「记住」的物理形态是权重矩阵里的数值,写入发生在预训练(11 章),读取就是一次前向(3.2);② 注意力用 Q·K 匹配 + V 加权,是按内容寻址的软检索——每层 32 头并行检索,各管一种模式(3.3);③ FFN 是键值记忆库——两层投影夹一个激活,参数量占全模型三分之二,记忆主要存在这里(Geva et al. 2021)(3.4);④ 几百 GB 装下互联网,靠的是叠加存储 + 统计压缩:知识以「激活模式的倾向」形式重叠在共享参数里,代价是每条知识都不精确(3.5)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">3.1</span>一分钟版本</h2>
+    <p>把「模型记住互联网」翻译成源码视角,是三层结构:</p>
+    <ul>
+      <li><strong>写入(训练时):</strong>预训练目标是「预测下一个 token」,梯度下降把「这个上下文之后大概率是什么」的统计规律压进矩阵——第 11 章拆这个过程;</li>
+      <li><strong>存储(静态):</strong>权重矩阵就是存储介质。FFN 层占参数大头,是主要记忆载体;注意力层的 K/V 投影决定「什么内容会被想起来」;</li>
+      <li><strong>读取(推理时):</strong>每次前向,输入向量在每一层「问」一遍:注意力按内容检索相关上下文,FFN 按内容触发相关记忆。最终 logits 是所有层读取结果的汇总。</li>
+    </ul>
+    <p>本章讲存储与读取;写入在第 11 章。一次前向的完整数据流先看全景,然后逐站拆:</p>
+    <div class="code-title">src/transformers/models/llama/modeling_llama.py:356 — LlamaModel.forward(骨架,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">forward</span>(self, input_ids, attention_mask, position_ids, past_key_values, ...):
+    <span class="kw">if</span> (input_ids <span class="kw">is</span> <span class="kw">None</span>) ^ (inputs_embeds <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>):
+        <span class="kw">raise</span> <span class="cl">ValueError</span>(<span class="st">"You must specify exactly one of input_ids or inputs_embeds"</span>)
+
+    <span class="kw">if</span> inputs_embeds <span class="kw">is</span> <span class="kw">None</span>:
+        inputs_embeds = self.embed_tokens(input_ids)      <span class="cmt"># ① ID → 向量(查表)</span>
+
+    <span class="kw">if</span> use_cache <span class="kw">and</span> past_key_values <span class="kw">is</span> <span class="kw">None</span>:
+        past_key_values = <span class="cl">DynamicCache</span>(config=self.config) <span class="cmt"># ② 建 KV 缓存(04 章)</span>
+
+    <span class="kw">if</span> position_ids <span class="kw">is</span> <span class="kw">None</span>:
+        past_seen_tokens = past_key_values.get_seq_length() <span class="kw">if</span> past_key_values <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span> <span class="kw">else</span> <span class="nu">0</span>
+        position_ids = torch.arange(...) + past_seen_tokens  <span class="cmt"># ③ 位置编号接着上次排</span>
+
+    causal_mask = create_causal_mask(...)                 <span class="cmt"># ④ 因果遮罩(masking_utils.py:850)</span>
+
+    hidden_states = inputs_embeds
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)  <span class="cmt"># ⑤ RoPE 表</span>
+
+    <span class="kw">for</span> decoder_layer <span class="kw">in</span> self.layers[: self.config.num_hidden_layers]:
+        hidden_states = decoder_layer(                    <span class="cmt"># ⑥ N 层循环:每层 = 注意力 + FFN</span>
+            hidden_states, attention_mask=causal_mask, position_embeddings=position_embeddings, ...)
+
+    hidden_states = self.norm(hidden_states)              <span class="cmt"># ⑦ 最后一道归一化</span>
+    <span class="kw">return</span> BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=past_key_values)</pre>
+    <div class="annotation"><b>骨架里没有一行「算力玄学」:</b>①②④⑤ 都是准备工——查表、建缓存、算遮罩、算位置频率;真正承载「记忆」的只有 ⑥ 那个循环。每个 DecoderLayer 里就是两个子模块:LlamaAttention 和 LlamaMLP。理解记忆机制 = 理解这两个模块,接下来逐个拆。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.2</span>地基:归一化与残差,数值稳定的两根柱子</h2>
+    <p>进注意力之前,有两个小模块先立住,它们不参与「记忆」,但没有它们记忆机制跑不起来。</p>
+    <div class="code-title">modeling_llama.py:52 — RMSNorm(全文)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LlamaRMSNorm</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, hidden_size, eps: <span class="cl">float</span> = <span class="nu">1e-6</span>) -> <span class="kw">None</span>:
+        <span class="kw">super</span>().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)      <span class="cmt"># 统计在 fp32 做防溢出</span>
+        variance = hidden_states.pow(<span class="nu">2</span>).mean(-<span class="nu">1</span>, keepdim=<span class="kw">True</span>)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        <span class="kw">return</span> self.weight * hidden_states.to(input_dtype)   <span class="cmt"># 缩放回原 dtype</span></pre>
+    <div class="annotation"><b>比 LayerNorm 砍掉什么:</b>LayerNorm 要算均值和方差两次归一,RMSNorm 只算均方根(去均值)。省一次统计和一次减法,换来的是几十层堆叠时每层省下的带宽——按大模型的规模算这笔账是值得的。注意 dtype 舞步:fp32 里算统计量、原 dtype 里做乘法,这是混合精度训练时代的标准防御,避免 fp16 下方差平方溢出。</div>
+    <p>另一个隐形的柱子是<strong>残差连接</strong>:每一层的输出是 <code class="inline">hidden_states + f(hidden_states)</code>。它保证信息有一条「直通车道」——哪怕某一层学废了,信号也能原样通过。对记忆机制的意义是:检索结果(注意力输出)和触发结果(FFN 输出)都是「叠加」到主流上的增量,而不是替换。读 DecoderLayer 的 forward(273 行)能看到这个模式:</p>
+    <div class="code-title">modeling_llama.py:273 — DecoderLayer 中的残差结构(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span>residual = hidden_states
+hidden_states = self.input_layernorm(hidden_states)
+<span class="cmt"># 自注意力子层</span>
+hidden_states, self_attn_weights = self.self_attn(...)
+hidden_states = residual + hidden_states          <span class="cmt"># ① 注意力结果叠加进主流</span>
+
+residual = hidden_states
+hidden_states = self.post_attention_layernorm(hidden_states)
+<span class="cmt"># 前馈子层</span>
+hidden_states = self.mlp(hidden_states)
+hidden_states = residual + hidden_states          <span class="cmt"># ② FFN 结果再叠加进主流</span></pre>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.3</span>注意力:按内容寻址的软检索</h2>
+    <p>注意力是「记忆」的一半:一个<strong>可微分的检索器</strong>。当前 token 的查询向量(Q)和所有历史 token 的键向量(K)做点积,相似度高的加权高,再把对应的值向量(V)加权平均取回。检索是「软」的——不是取回一条,是按相关度混合所有条目。</p>
+    <div class="code-title">modeling_llama.py:185 — eager_attention_forward:检索的裸形态(全文)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">eager_attention_forward</span>(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+    key_states = repeat_kv(key, module.num_key_value_groups)     <span class="cmt"># GQA:K/V 头数补齐到 Q 头数</span>
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(<span class="nu">2</span>, <span class="nu">3</span>)) * scaling  <span class="cmt"># ① 相关度打分</span>
+    <span class="kw">if</span> attention_mask <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
+        attn_weights = attn_weights + attention_mask             <span class="cmt"># ② 遮罩:未来位置 -inf</span>
+    attn_weights = nn.functional.softmax(attn_weights, dim=-<span class="nu">1</span>, dtype=torch.float32).to(query.dtype)  <span class="cmt"># ③ 归一成权重</span>
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)       <span class="cmt"># ④ 按权重取回值的加权和</span>
+    attn_output = attn_output.transpose(<span class="nu">1</span>, <span class="nu">2</span>).contiguous()
+
+    <span class="kw">return</span> attn_output, attn_weights</pre>
+    <div class="annotation"><b>五行就是全部数学:</b>Q·Kᵀ 打分 → 遮罩 → softmax 归一 → 加权求和。scaling = 1/√head_dim(初始化里 self.scaling = self.head_dim**-0.5),作用是把点积方差拉回 1 附近,否则 softmax 会被大数值推向「赢者通吃」,检索退化成硬查询。这份 eager 实现是教学基准;生产中走的是后端路由(3.6 节)——FlashAttention 把 ①–④ 融成一个核函数,不物化 N×N 的注意力矩阵。</div>
+
+    <h3>多头并行:32 个检索头,各管一种模式</h3>
+    <p>一次检索只是一种「问法」。多头机制把同一份输入投影成 32 组不同的 Q/K/V(Llama 2 7B:32 头,每头 128 维),各自独立检索再拼接。各头分工没有显式指派,是训练中涌现的:有头盯语法结构,有头做位置对齐,有头做长距离指代消解。源码里多头只是一次 view + transpose:</p>
+    <div class="code-title">modeling_llama.py:240 — Q/K/V 投影与变形(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span>hidden_shape = (*input_shape, -<span class="nu">1</span>, self.head_dim)      <span class="cmt"># [batch, seq, heads, head_dim]</span>
+query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(<span class="nu">1</span>, <span class="nu">2</span>)
+key_states   = self.k_proj(hidden_states).view(hidden_shape).transpose(<span class="nu">1</span>, <span class="nu">2</span>)
+value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(<span class="nu">1</span>, <span class="nu">2</span>)</pre>
+    <p>注意 k_proj 的输出维度用的是 <code class="inline">num_key_value_heads</code> 而不是 num_attention_heads——这就是 GQA(Grouped-Query Attention):K/V 的头数比 Q 少(如 32 个 Q 头共享 8 组 K/V),多个查询头复用同一组键值。检索质量几乎不掉,KV Cache 显存省 4 倍——这是 7B 模型能塞进单卡的关键设计之一,完整的账在第 4 章算。repeat_kv(168 行)就是「共享的 K/V 复制给各 Q 头」的那一步。</p>
+
+    <h3>位置信息:RoPE,把「距离」写进点积</h3>
+    <p>注意力打分本身不知道 token 的先后顺序(Q·Kᵀ 是集合运算)。位置信息靠旋转位置编码(RoPE)注入:把 Q、K 向量的每两维当作平面上的点,按位置角度旋转。效果是 <strong>Q·K 的点积只依赖于两个 token 的相对位置差</strong>——「隔 5 个词」和「隔 5000 个词」的打分模式自动不同。</p>
+    <div class="code-title">modeling_llama.py:72 — RoPE 频率表(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LlamaRotaryEmbedding</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config: <span class="cl">LlamaConfig</span>):
+        <span class="kw">super</span>().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.rope_type = self.config.rope_parameters[<span class="st">"rope_type"</span>]
+        rope_init_fn = self.compute_default_rope_parameters
+        <span class="kw">if</span> self.rope_type != <span class="st">"default"</span>:
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]    <span class="cmt"># yarn/linear/llama3… 按类型换函数</span>
+        inv_freq, self.attention_scaling = rope_init_fn(self.config)
+        self.inv_freq = nn.Buffer(inv_freq, persistent=<span class="kw">False</span>)
+        self.original_inv_freq = nn.Buffer(inv_freq.clone(), persistent=<span class="kw">False</span>)</pre>
+    <div class="annotation"><b>inv_freq 是整张位置表的核心:</b>一串按几何级数排列的频率(低频维度转得慢、高频维度转得快),让不同维度编码不同尺度的位置。注意两个设计点:① inv_freq 是 Buffer 且 persistent=False——它可以从配置重新推导,不进 state_dict;② rope_type 走查表(ROPE_INIT_FUNCTIONS)——「换个位置编码方案」在库里的含义就是换一个频率初始化函数,前向代码不变。这个抽象让「长窗口扩展」变成配置问题,4.5 节展开。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.4</span>前馈层:键值记忆库,记忆的主要载体</h2>
+    <p>注意力负责「在本条上下文里检索」,FFN 负责「触发存储的世界知识」。学术上有直接证据:Geva et al. 2021(《Transformer Feed-Forward Layers Are Key-Value Memories》)论证 FFN 的第一层投影相当于一组 key(检测特定输入模式),第二层投影相当于对应的 value(该模式触发时往输出里写入的信息)——每层就是一张「模式 → 值」的键值表。Llama 的门控变体把表分成两半:</p>
+    <div class="code-title">modeling_llama.py:152 — 门控 FFN(全文)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LlamaMLP</span>(nn.Module):
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, config):
+        <span class="kw">super</span>().__init__()
+        self.hidden_size = config.hidden_size          <span class="cmt"># 4096</span>
+        self.intermediate_size = config.intermediate_size  <span class="cmt"># 11008,约 2.7 倍</span>
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.up_proj   = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]        <span class="cmt"># silu</span>
+
+    <span class="kw">def</span> <span class="fn">forward</span>(self, x):
+        <span class="kw">return</span> self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))</pre>
+    <div class="annotation"><b>一行 forward,三个矩阵,占全模型参数的三分之二:</b>7B 模型 32 层,每层 FFN 有 3×4096×11008 ≈ 1.35 亿参数,32 层合计 43 亿——比注意力层的份额大得多。「模型记的东西主要在 FFN 里」这个论断,参数量上就是对的。门控设计(SwiGLU)里 gate_proj 的作用是个逐维阀门:先算「这个位置应该激活哪些记忆条目」(gate 经过 silu),再和 up_proj 的内容相乘——只放行被选中的通道,down_proj 把结果压回 4096 维主流。</div>
+    <p>「知识存哪」这个问题在源码层面可以再具体一步。Geva 的框架里,FFN 第一层的每个「键」是一个 4096 维方向;训练让「包含某模式的输入」投影到对应键上激活。单个 FFN 条目 ≈ 一条可触发的模式-响应对,但没有任何索引或条目名——查「『巴黎是法国首都』存在第几层第几行」是没有账可查的,能查到的只有训练后的权重分布和可解释性研究的统计结论(如事实性知识集中在部分中后层)。这也是第 0 章说的边界:「记住了什么」不可枚举,「记的机制」可以讲透。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.5</span>算一笔账:几百 GB 怎么装下互联网</h2>
+    <p>现在可以回答数量级问题。以 7B(fp16,约 14 GB)为参照:</p>
+    <table class="tbl">
+      <tr><th>部件</th><th>参数量(7B 量级)</th><th>「记忆」角色</th></tr>
+      <tr><td>embed_tokens</td><td>32000 × 4096 ≈ 1.3 亿</td><td>token ↔ 向量的字典(第 2 章)</td></tr>
+      <tr><td>注意力层 ×32</td><td>每层 4×4096² ≈ 6700 万,合计 21 亿</td><td>检索结构:决定「想起什么、怎么混合」</td></tr>
+      <tr><td>FFN ×32</td><td>每层 3×4096×11008 ≈ 1.35 亿,合计 43 亿</td><td>键值记忆库:世界知识的主要存储</td></tr>
+      <tr><td>lm_head(常绑定)</td><td>与 embed 共享(第 2 章)</td><td>读出:向量 → 词表分布</td></tr>
+    </table>
+    <p>互联网语料(数十万亿 token)压缩进几十亿参数,压缩比在千倍以上,靠两个机制:</p>
+    <ul>
+      <li><strong>叠加存储(superposition)。</strong>每条「知识」不是占一行参数,而是分布在大量参数的微小偏置上;参数同时参与成千上万条知识的表达,互相重叠。这和硬盘「一条数据一个扇区」完全不同——更像全息存储,任何一块局部都参与所有全局;</li>
+      <li><strong>统计压缩。</strong>存的是模式而不是事实条目:「『首都』后面常跟城市名」「代码里 if 后面常有缩进」。反常但重要的推论:模型对高频、规律性强的内容记得牢(且费参数少),对低频孤立事实记得虚——这正是「幻觉」的机制根源之一:检索是按相关度混合,不是按引用还原。</li>
+    </ul>
+    <p>这也解释了参数量与能力的非线性关系:参数翻倍,可表达的「独立模式数」不止翻倍(叠加维度的扩张)。缩放定律研究的就是这条曲线,本书不展开数字,只指出它在源码里的对应物——上面这张表的第三行。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">3.6</span>后端路由:同一份检索,四种实现</h2>
+    <p>3.3 节的 eager 实现不是生产路径。每次注意力前向,真正被调用的函数由一个注册表决定:</p>
+    <div class="code-title">modeling_llama.py:253 — 路由点(摘录)与 modeling_utils.py:5121 — 注册表</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="cmt"># LlamaAttention.forward 内:</span>
+attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+    self.config._attn_implementation,      <span class="cmt"># config 里声明的后端名</span>
+    eager_attention_forward                <span class="cmt"># 查不到时的兜底</span>
+)
+
+<span class="cmt"># modeling_utils.py:5121 全局注册表 _global_mapping:</span>
+<span class="st">"flash_attention_2/3/4"</span>: flash_attention_forward,   <span class="cmt"># FA 系列:核函数融合,不物化 N×N</span>
+<span class="st">"flex_attention"</span>:        flex_attention_forward,    <span class="cmt"># torch.flex:可编程注意力</span>
+<span class="st">"sdpa"</span>:                  sdpa_attention_forward,    <span class="cmt"># torch.scaled_dot_product_attention</span>
+<span class="st">"paged|eager"</span>:           eager_paged_attention_forward,  <span class="cmt"># 分页 KV(服务场景,07 章)</span></pre>
+    <div class="annotation"><b>路由怎么选:</b>config._attn_implementation 的值在 from_pretrained 时协商——按模型声明(LlamaPreTrainedModel 的 _supports_flash_attn/_supports_sdpa/_supports_flex_attn)和运行环境(CUDA 版本、是否装了 FA)取交集。AttentionInterface 是个 MutableMapping(modeling_utils.py:5161 的全局实例),社区可以用 register() 挂自己的实现——第 1 章讲的「机制统一 + 声明表达」在注意力层的形态。对读者有一条实用结论:同一个 checkpoint,不同后端产出数值上有微小差异(实现顺序不同),复现实验要固定 attn_implementation。</div>
+    <p>另一个每个模型都要过的关:遮罩。create_causal_mask(masking_utils.py:850)按选定的后端产出不同形态的遮罩——eager/sdpa 要 4D 浮点矩阵,FlashAttention 后端走 is_causal 快路连遮罩对象都不建,flex_attention 走 BlockMask 块稀疏表示。v5 把遮罩体系也函数化了(and_masks/or_masks 组合,sliding_window/chunked 等 overlay),这是「同一语义,按后端物化」的又一个实例。</p>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>「记住互联网」的机制拆完了:注意力层是按内容寻址的软检索器(Q·K 打分、softmax 加权、取回 V),多头并行、GQA 省显存、RoPE 把相对位置写进点积;FFN 是键值记忆库,参数占大头,是知识的主要存储;两者都靠叠加存储 + 统计压缩把数十万亿 token 压进几十亿参数,代价是每条知识都不精确——幻觉的机制根源就在检索方式本身。实现层面,同一份检索语义路由到四种后端,遮罩按后端物化,这是全库「声明 + 机制」模式的又一次出现。</p>
+    <p>注意力检索的「数据库」——历史 token 的 K/V——在哪存、怎么存、怎么长到百万级?下一章拆 KV Cache。<a href="04-kv-cache.html">第 4 章:KV Cache</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="02-tokenizer.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 2 章 · 分词</span>
+    </a>
+    <a class="next" href="04-kv-cache.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 4 章 · KV Cache</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 03 记忆 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>

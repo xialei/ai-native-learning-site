@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 分词:文本如何进入模型 — 深入浅出 Transformers</title>
+<link rel="stylesheet" href="assets/transformers-learn.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="index.html"><span class="logo-dot"></span>Transformers</a>
+    <input type="checkbox" id="menu-toggle" class="menu-toggle" aria-label="打开章节目录">
+    <label for="menu-toggle" class="menu-btn" aria-hidden="true">☰</label>
+    <nav>
+      <a href="00-overview.html">概述</a>
+      <a href="01-architecture.html">架构</a>
+      <a class="active" href="02-tokenizer.html">分词</a>
+      <a href="03-memory.html">记忆</a>
+      <a href="04-kv-cache.html">KV Cache</a>
+      <a href="05-generation.html">生成循环</a>
+      <a href="06-logits.html">选词</a>
+      <a href="07-serving.html">并发</a>
+      <a href="08-chat-template.html">对话</a>
+      <a href="09-tool-use.html">工具调用</a>
+      <a href="10-multimodal.html">多模态</a>
+      <a href="11-trainer.html">训练</a>
+      <a href="12-quantization.html">量化</a>
+      <a href="13-build-own.html">自研路线</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="page-header">
+    <div class="breadcrumb"><a href="index.html">首页</a> / 02 分词</div>
+    <div class="chap-meta">Chapter 02 · Tokenization</div>
+    <h1>分词:互联网的文字,先变成一串整数</h1>
+    <div class="lede">
+      <p>模型的世界里没有字,只有整数。你输入的一句话在进入第一层网络之前,要被切成 token、查表变成 ID 序列;模型输出的一串 ID,也要查表拼回文字。这一步看着像字符串处理,实际上决定了三件大事:一段话花多少算力(中文和英文的 token 效率差几倍)、模型「没见过」的东西怎么处理(字节回退)、以及第八、九章要讲的——工具调用和控制符,全靠 token 表里的特殊符号撑起来。</p>
+      <p>这一章讲三件事:token 从哪来(词表和算法)、v5 把分词器动成什么样(双后端重构)、一条文本编码成张量的完整路径。锚定 tokenization_utils_base.py(3764 行)和 tokenizers 库的接缝层。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <b class="tag">答案地图</b>
+    四问的答案依次是:① token 的边界由词表 + 合并规则决定,不是空格——BPE 把高频字节对合并成单元,词表是训练语料的统计产物(2.2);② 中文慢在 UTF-8 一字三字节,常见汉字在词表里是单 token,生僻字要退回字节(2.3);③ v5 删掉慢分词器,只留 tokenizers 库后端 + 一层 Python 纯实现(2.4);④ token 不是模型「理解」的最小单位,是工程折中——词表大小、分词质量、解码效率在互相拉扯(2.6)。
+  </div>
+
+  <section class="block">
+    <h2><span class="num">2.1</span>一分钟版本</h2>
+    <p>分词器在回答一个问题:<strong>「文本的哪一段,应该被当作一个不可分的单位?」</strong> 切法不是语言学,是统计学:训练语料里高频出现的字节序列,合并成一个单元。由此得到一张词表(vocab)+ 一套切分规则,编码是「文本 → token 串 → ID 序列」的两步查表,解码反过来,还有一步查不到时的回退。</p>
+    <p>库里的层次结构在 v5 之后变得非常干净,总共三层:</p>
+    <ul>
+      <li><strong>PreTrainedTokenizerBase(tokenization_utils_base.py:968)</strong> — 抽象基类:编码/解码/截断/填充/特殊 token 的统一接口,加上了 v5 里从 SpecialTokensMixin 合并进来的特殊 token 管理;</li>
+      <li><strong>TokenizersBackend(tokenization_utils_tokenizers.py:86)</strong> — 唯一的重量级后端,把 HuggingFace tokenizers 库(Rust 实现)包进来;</li>
+      <li><strong>各模型目录的 tokenization_*.py</strong> — 只有几十到一百多行,声明这个模型用哪种算法(BPE/Unigram)、哪些特殊 token、什么前后处理。</li>
+    </ul>
+    <div class="code-title">src/transformers/models/llama/tokenization_llama.py:39 — v5 的 llama 分词器(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">LlamaTokenizer</span>(TokenizersBackend):
+    vocab_files_names = {<span class="st">"vocab_file"</span>: <span class="st">"tokenizer.model"</span>, <span class="st">"tokenizer_file"</span>: <span class="st">"tokenizer.json"</span>}
+    padding_side = <span class="st">"left"</span>            <span class="cmt"># 左填充:生成场景新 token 从右边长</span>
+    model_input_names = [<span class="st">"input_ids"</span>, <span class="st">"attention_mask"</span>]
+    model = BPE                       <span class="cmt"># 算法:byte-level BPE</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, vocab=None, merges=None, ...):
+        ...
+        self._tokenizer = <span class="cl">Tokenizer</span>(
+            <span class="cl">BPE</span>(vocab=self._vocab, merges=self._merges,
+                fuse_unk=<span class="kw">True</span>, byte_fallback=<span class="kw">True</span>, dropout=<span class="kw">None</span>)
+        )
+        self._tokenizer.normalizer = <span class="kw">None</span>   <span class="cmt"># 不做大小写归一等规范化——代码/术语对大小写敏感</span>
+        self._tokenizer.pre_tokenizer = pre_tokenizers.Metaspace(
+            replacement=<span class="st">"▁"</span>, prepend_scheme=..., split=<span class="kw">False</span>)  <span class="cmt"># 空格变成词首的 ▁</span></pre>
+    <div class="annotation"><b>五行声明就是一份完整的分词器:</b>BPE 算法 + 字节回退(byte_fallback,查不到的序列退回 UTF-8 字节)+ 词首空格标记(▁)。对比 v4:同名文件里还有一个几百行的纯 Python 慢实现,加一个 LlamaTokenizerFast——v5 里两个类合并成一个,文件尾只剩一行别名 <code class="inline">LlamaTokenizerFast = LlamaTokenizer</code>。慢/快之分在这个库的历史里结束了,2.4 节讲为什么。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.2</span>token 边界从哪来:BPE 的一条合并链</h2>
+    <p>以 byte-level BPE(GPT-2、Llama 系列、Qwen 系列都用它)为例,词表的构建过程是:</p>
+    <ol>
+      <li>把训练语料全部按 UTF-8 展开成字节序列——256 种字节,保证<strong>任何</strong>文本都能表示;</li>
+      <li>统计相邻字节对的共现频率,把最高频的一对合并成一个新单元,记进 merges 表;</li>
+      <li>重复第 2 步,直到词表达到目标大小(Llama 2 是 32000,Llama 3 扩到 128256,Qwen3 也到 15 万级)。</li>
+    </ol>
+    <p>所以词表不是「词的列表」,而是<strong>训练语料的压缩摘要</strong>:英文里 "the" 会被早早合并成单 token,因为出现太频繁;一个冷门化学名则要拆七八块。推理时用词表 + merges 表执行同样的合并,token 边界由此确定。</p>
+    <p>这带来一个容易被误读的后果:<strong>token 数量 ≈ 算力与显存的计价单位。</strong>注意力计算量随序列长度平方涨,KV Cache 随长度线性涨(第 4 章的账)。同一段内容,英文一个 token 约 4 字符,中文常见字一个 token 一字,生僻中文字一个 token 一个字节还要乘三。所谓「模型的长上下文是多少 token」,换算到中文文本,实际能装的字数要打 6 到 7 折,再打折——这不是 bug,是词表构建语料的偏置:英文语料占大头,合并规则自然偏向英文。</p>
+    <div class="callout warn">
+      <b class="tag">常见的误读</b>
+      「模型按词理解文本」不成立——"unbelievable" 可能是一个 token,"un" + "believ" + "able" 也可能是三个,取决于训练语料里的频率,和语义无关。反过来说,「模型理解不了 token 边界内外的字符」也不成立——字节回退保证了任何字节序列都可表示,只是代价是多个 token、更多算力。token 化是统计压缩,不是语义单位。
+    </div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.3</span>特殊 token:控制符的物理载体</h2>
+    <p>词表的前几个位置不装文字,装控制符。看 LlamaConfig 里的默认值:</p>
+    <div class="code-title">src/transformers/models/llama/configuration_llama.py:76 — 控制 ID(摘录)</div>
+    <pre class="code"><span class="lang-tag">python</span>    bos_token_id: <span class="cl">int</span> | <span class="kw">None</span> = <span class="nu">1</span>      <span class="cmt"># &lt;s&gt;  序列开始</span>
+    eos_token_id: <span class="cl">int</span> | <span class="cl">list</span>[<span class="cl">int</span>] | <span class="kw">None</span> = <span class="nu">2</span>   <span class="cmt"># &lt;/s&gt; 序列结束(可以是多个,见 05 章)</span></pre>
+    <p>这两个 ID 之外的「特殊 token」家族,在 v5 里被分成两组,基类里能直接看到这个划分:</p>
+    <div class="code-title">src/transformers/tokenization_utils_base.py:968 — 特殊 token 的 v5 分组(摘录,注释为译注)</div>
+    <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PreTrainedTokenizerBase</span>(PushToHubMixin):
+    <span class="cmt"># 命名特殊 token:每个名字一个槽位,v5 从 SpecialTokensMixin 合并进基类</span>
+    SPECIAL_TOKENS_ATTRIBUTES = [
+        <span class="st">"bos_token"</span>, <span class="st">"eos_token"</span>, <span class="st">"unk_token"</span>,
+        <span class="st">"sep_token"</span>, <span class="st">"pad_token"</span>, <span class="st">"cls_token"</span>, <span class="st">"mask_token"</span>,
+    ]
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(self, **kwargs):
+        ...
+        <span class="cmt"># v5:命名特殊 token 与模型专属 token 分开存</span>
+        self._special_tokens_map = <span class="cl">dict</span>.fromkeys(self.SPECIAL_TOKENS_ATTRIBUTES)
+        self._extra_special_tokens = []  <span class="cmt"># 模型专属:图像 token、工具 token 这类</span></pre>
+    <div class="annotation"><b>为什么要分两组:</b>命名槽位是协议级的(所有模型共用这几个名字);extra 是模型自留地——视觉模型要 &lt;image&gt; 占位符,工具调用模型要有包住函数调用的标记。第 8、9 章会看到,chat template 的本质就是「把对话渲染成控制符序列」,而这些控制符必须是词表里的真 token,模型才能在训练时学会「看到它意味着什么」。这正是问题二(工具调用)在模型侧的第一块基石:工具调用的语法,是靠特殊 token 和普通文本一起拼出来的。</div>
+    <p>还有一个安全细节值得提前知道:v5 新增了 <code class="inline">sanitize_control_tokens</code> 参数(apply_chat_template 的签名里,tokenization_utils_base.py:3012)。用户输入里如果混着 <code class="inline">&lt;/s&gt;</code> 这样的字面量,默认会被编码成普通文本而不是控制 token——防止用户伪造「对话结束」或「工具调用」标记。提示注入的一个攻击面,就是从分词这一层堵的。</p>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.4</span>v5 的断代:慢分词器退场</h2>
+    <p>v4 时代的分词器是双轨的:每个模型一份 <code class="inline">tokenization_&lt;model&gt;.py</code>(纯 Python,慢)和一份 <code class="inline">tokenization_&lt;model&gt;_fast.py</code>(Rust 的 tokenizers 库,快)。两份代码实现同样的行为,但总会有行为不一致的角落——这是长期积累的技术债。</p>
+    <p>v5 的迁移指南(MIGRATION_GUIDE_V5.md)写得很直白:慢分词器文件整体移除,原 <code class="inline">_fast</code> 后缀的文件改名顶替;sentencepiece 等其他后端以「轻量适配层」的方式保留在加载失败时的回退路径里。配套的 API 精简:encode_plus → <code class="inline">__call__</code>、batch_decode → <code class="inline">decode</code>、prepare_seq2seq_batch → <code class="inline">__call__(text_target=...)</code>。</p>
+    <p>纯 Python 侧没有全删——tokenization_python.py 里的 PythonBackend(400 行)保留,但定位变了:它是「没有 Rust 环境时的兜底」,以及在 doctest 和单元测试里跑得起来的一份参考实现。那份文件里的 Trie(45 行起)值得一看:最长匹配优先的 special token 扫描器,是「文本里混进控制符怎么办」这个问题的原始答案。</p>
+    <div class="annotation"><b>为什么值得记住这次删减:</b>分词器是全库「双轨并存」时间最长的组件,双轨的动机(渐进迁移)和代价(行为漂移)都写在了 git 历史里。v5 用「一个 Rust 后端 + 一层声明」收敛它,和第 1 章的 modular 机制是同一个思路——<strong>把「每模型一份重复实现」换成「一份机制 + 每模型一份声明」。</strong>这也是全书反复出现的模式。</div>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.5</span>从字符串到张量:一次编码的完整路径</h2>
+    <p>日常用的入口是 <code class="inline">tokenizer(text, return_tensors="pt")</code>。它背后的调用链:</p>
+    <div class="figure breakout">
+      <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t21 d21">
+        <title id="t21">一次编码的完整路径</title>
+        <desc id="d21">__call__ → _get_padding_truncation_strategies → _encode_plus → tokenizers 库 encode → BatchEncoding(input_ids / attention_mask) → model(input_ids)</desc>
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#6e675b"></path>
+          </marker>
+        </defs>
+
+        <rect class="node acc" x="20" y="40" width="150" height="60" rx="8"></rect>
+        <text class="lbl" x="95" y="65" text-anchor="middle">tokenizer(text)</text>
+        <text class="lbl sm" x="95" y="84" text-anchor="middle">base.py:2432</text>
+
+        <rect class="node" x="210" y="40" width="170" height="60" rx="8"></rect>
+        <text class="lbl" x="295" y="59" text-anchor="middle">截断/填充策略</text>
+        <text class="lbl sm" x="295" y="78" text-anchor="middle">按 model_max_length</text>
+
+        <rect class="node core" x="420" y="40" width="190" height="60" rx="8"></rect>
+        <text class="lbl" x="515" y="59" text-anchor="middle">TokenizersBackend</text>
+        <text class="lbl sm" x="515" y="78" text-anchor="middle">tokenization_utils_tokenizers.py:970</text>
+
+        <rect class="node" x="630" y="40" width="130" height="60" rx="8"></rect>
+        <text class="lbl" x="695" y="65" text-anchor="middle">Rust 编码</text>
+        <text class="lbl sm" x="695" y="84" text-anchor="middle">BPE + 回退 + 后处理</text>
+
+        <rect class="node ok" x="790" y="40" width="130" height="60" rx="8"></rect>
+        <text class="lbl" x="795" y="59" text-anchor="middle">BatchEncoding</text>
+        <text class="lbl sm" x="795" y="78" text-anchor="middle">input_ids + mask</text>
+
+        <line class="edge" x1="170" y1="70" x2="208" y2="70"></line>
+        <line class="edge" x1="380" y1="70" x2="418" y2="70"></line>
+        <line class="edge" x1="590" y1="70" x2="628" y2="70"></line>
+        <line class="edge" x1="760" y1="70" x2="788" y2="70"></line>
+
+        <text class="lbl sm" x="20" y="150">encode(base.py:2255)是单序列薄封装:策略解析 → _encode_plus → 取回 input_ids。</text>
+        <text class="lbl sm" x="20" y="175">返回值不只是 ID 列表:attention_mask(哪些位置是真 token)、可选的 offset_mapping(字符↔token 映射)一起打包。</text>
+        <text class="lbl sm" x="20" y="200">v5:apply_chat_template 默认也返回 BatchEncoding(此前裸 input_ids)——对话渲染与普通编码在返回类型上统一了(08 章接)。</text>
+      </svg>
+      <div class="fig-cap">图 2.1:编码路径。BatchEncoding(tokenization_utils_base.py:201)是字典的子类,既当 dict 用,又携带字符↔token 的映射信息——下游的对齐、抽取、训练标签错位检查全靠它。</div>
+    </div>
+
+    <p>三个工程细节值得记:</p>
+    <ul>
+      <li><strong>padding_side 不是装饰参数。</strong>LlamaTokenizer 声明 left(第 88 行)——生成场景下模型从右边续写,左边补 pad 才能让所有序列的最后一个真实 token 对齐;BERT 这类理解模型用 right。填错边,生成模型的输出会整体错位;</li>
+      <li><strong>truncation 默认关。</strong>超长输入不会自动截断而是报错——刻意为之,静默截断对训练数据是灾难;</li>
+      <li><strong>tokenizer 和模型的词表尺寸要一致。</strong>LLM 加载时校验 embedding 行数与 vocab_size;换分词器(比如给 Llama 换 Qwen 的词表)意味着 embedding 矩阵尺寸对不上——装载器不会静默重塑,LOAD REPORT 会列出 mismatch 并抛错;真要换词表,走显式的 resize_token_embeddings(第 12 章)。</li>
+    </ul>
+  </section>
+
+  <section class="block">
+    <h2><span class="num">2.6</span>为什么不用字、不用词:一个三方权衡</h2>
+    <p>把 BPE 放回设计空间里,能看清它为什么成了默认选择:</p>
+    <table class="tbl">
+      <tr><th>切法</th><th>词表大小</th><th>序列长度</th><th>问题</th></tr>
+      <tr><td>按字/字节切</td><td>极小(256 起)</td><td>极长</td><td>序列平方增长的注意力算不动态;每个字都要「拼」出语义</td></tr>
+      <tr><td>按词切</td><td>巨大(百万级)</td><td>短</td><td>词表本身就是知识瓶颈:新词、拼写变体、任何语言外文本全成 OOV;embedding 矩阵大到离谱</td></tr>
+      <tr><td>BPE/子词(业界选择)</td><td>3 万 ~ 25 万</td><td>适中</td><td>边界是统计产物,与语义无关;跨语言效率不均</td></tr>
+    </table>
+    <p>这张表也解释了词表扩容的动机:Llama 2 的 32000 词表在多语言和代码场景下明显吃亏,Llama 3 直接翻四倍到 128256——词表越大,同样文本切的 token 越少,同样的上下文窗口装的内容越多。代价是 embedding 矩阵和输出投影(lm_head)的参数量线性涨:128256×4096 ≈ 5.25 亿参数,这是 2.1 节提过的权重绑定(tie_word_embeddings)存在的理由——输入 embedding 和输出投影共享一份矩阵,直接省下这 5 亿参数。</p>
+
+    <div class="callout info">
+      <b class="tag">要点</b>
+      分词器是「互联网 → 模型」的关税关卡:所有内容在这里被计价(token 数)、被整形(控制符)、被卡住或放行(特殊 token、字节回退)。第 3 章开始,模型拿到这些 ID 之后发生的事——权重怎么「记住」互联网——才正式开场。
+    </div>
+  </section>
+
+  <div class="chapter-summary">
+    <h2>本章小结</h2>
+    <p>token 边界由词表和合并规则决定,是训练语料的统计产物,不是语义单位;字节级 BPE 用 256 字节打底加字节回退,保证任何文本可表示,代价是序列长度(中文尤其明显);特殊 token 是控制符的物理载体,v5 把命名槽位与模型专属 token 分开管理,sanitize_control_tokens 从分词层堵提示注入;v5 删掉双轨分词器,收敛成「一个 Rust 后端 + 每模型一层声明」,与 modular 机制同一个思路。</p>
+    <p>文本已变成 ID 序列。下一章看它流进的第一个部件:注意力层,以及权重为什么能「记住」互联网。<a href="03-memory.html">第 3 章:记忆</a>。</p>
+  </div>
+
+  <nav class="pagenav">
+    <a class="prev" href="01-architecture.html">
+      <span class="dir">← 上一章</span>
+      <span class="ttl">第 1 章 · 整体架构</span>
+    </a>
+    <a class="next" href="03-memory.html">
+      <span class="dir">下一章 →</span>
+      <span class="ttl">第 3 章 · 记忆</span>
+    </a>
+  </nav>
+</div>
+
+<footer>
+  深入浅出 Transformers · 02 分词 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+</footer>
+
+</body>
+</html>
