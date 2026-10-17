@@ -78,7 +78,7 @@
 
 <span class="cmt">// 无论新建还是复用，输入都要重新填写</span>
 res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
-    <p><code class="inline">can_reuse</code> 的判定分两层。外层先比形状参数（<code class="inline">src/llama-graph.h:832-845</code>）：</p>
+    <p><code class="inline">can_reuse</code> 的判定分两层。外层先比形状参数（<code class="inline">src/llama-graph.h:836-850</code>）：</p>
     <div class="code-title">src/llama-graph.h — allow_reuse 的 ubatch 检查（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">c++</span><span class="cmt">// return true if the "other" params would result in a graph with the same topology</span>
 <span class="kw">bool</span> <span class="fn">allow_reuse</span>(<span class="kw">const</span> llm_graph_params &amp; other) <span class="kw">const</span> {
@@ -228,7 +228,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 
   <section class="block">
     <h2><span class="num">5.4</span>对照：FreeToken 的 CUDA Graph</h2>
-    <p>llama.cpp 的图是「每次推理现建的张量 DAG」（哪怕复用也要填输入）；FreeToken 把 decode 前向<strong>整段录制成 CUDA Graph</strong>，运行时一次 replay 消掉上千次 kernel launch 的 CPU 开销。先看 batch 尺寸候选怎么定（<code class="inline">python/freetoken/engine/graph.py:79-98</code>，函数体到 :98）：</p>
+    <p>llama.cpp 的图是「每次推理现建的张量 DAG」（哪怕复用也要填输入）；FreeToken 把 decode 前向<strong>整段录制成 CUDA Graph</strong>，运行时一次 replay 消掉上千次 kernel launch 的 CPU 开销。先看 batch 尺寸候选怎么定（<code class="inline">python/freetoken/engine/graph.py:82-101</code>，函数体到 :101）：</p>
     <div class="code-title">python/freetoken/engine/graph.py — bs 候选（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_determine_cuda_graph_bs</span>(cuda_graph_bs, cuda_graph_max_bs, free_memory):
     <span class="kw">if</span> cuda_graph_bs <span class="kw">is not</span> <span class="kw">None</span>:
@@ -244,7 +244,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     candidates = [<span class="nu">1</span>, <span class="nu">2</span>, <span class="nu">4</span>] + list(range(<span class="nu">8</span>, cuda_graph_max_bs + <span class="nu">1</span>, <span class="nu">8</span>))
     <span class="kw">return</span> [bs <span class="kw">for</span> bs <span class="kw">in</span> candidates <span class="kw">if</span> bs &lt;= cuda_graph_max_bs]</pre>
     <p>捕捉阶段每个 bs 录一张图，共享同一个内存池：</p>
-    <div class="code-title">python/freetoken/engine/graph.py:173-213 — capture 与 replay（摘录，注释为译注）</div>
+    <div class="code-title">python/freetoken/engine/graph.py:200-241 — capture 与 replay（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> bs <span class="kw">in</span> pbar:
     graph = torch.cuda.<span class="cl">CUDAGraph</span>()
     batch = <span class="cl">Batch</span>(reqs=[self.dummy_req] * bs, phase=<span class="st">"decode"</span>)
@@ -255,6 +255,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
         <span class="cmt"># 否则录制下来的图会带着冷缓存的专家拷贝</span>
         <span class="kw">with</span> torch.cuda.<span class="fn">graph</span>(graph, pool=pool, stream=self.stream):
             self.buffer.logits[:bs] = model.<span class="fn">forward</span>()
+        self.<span class="fn">_upload_graph</span>(graph, self.stream)   <span class="cmt"># #697：捕捉完立刻上传图</span>
         self.<span class="fn">_reset_moe_offload_cache</span>()
     <span class="kw">if</span> pool <span class="kw">is</span> <span class="kw">None</span>:
         pool = graph.<span class="fn">pool</span>()  <span class="cmt"># 复用同一块 graph 内存池，省显存</span>
@@ -267,7 +268,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
     self.attn_backend.<span class="fn">prepare_for_replay</span>(batch)
     g.<span class="fn">replay</span>()
     <span class="kw">return</span> self.buffer.logits[: batch.size]</pre>
-    <div class="annotation">容易混淆的是两种「图」解决的问题不同：llama.cpp 的 can_reuse 省的是<strong>建图 + 分配</strong>（CPU 上的张量拓扑搭建），CUDA Graph 省的是<strong>kernel launch</strong>（每秒上万次小提交的驱动开销）。FreeToken 能录整张图的前提是形状完全静态：bs 用 <code class="inline">padded_size</code> 补齐到候选档位、GDN 槽位经由 copy_from 写入、每档捕捉前先跑一遍热身 forward 把 offload cache 烘热——源码注释说得很直白：「Resetting here forces CUDA graph capture to replay cold-cache expert copies」，所以 reset 只能放在<strong>捕捉之后</strong>，为下一档复位。代价是一段可观捕捉时间和一块固定池显存——消费级卡上 max_bs=160 的候选要录 20+ 张。llama.cpp 走的是另一极：图每次可变、灵活但 CPU 开销大。第 13 章会把这个对照收进自研清单。</div>
+    <div class="annotation">容易混淆的是两种「图」解决的问题不同：llama.cpp 的 can_reuse 省的是<strong>建图 + 分配</strong>（CPU 上的张量拓扑搭建），CUDA Graph 省的是<strong>kernel launch</strong>（每秒上万次小提交的驱动开销）。FreeToken 能录整张图的前提是形状完全静态：bs 用 <code class="inline">padded_size</code> 补齐到候选档位、GDN 槽位经由 copy_from 写入、每档捕捉前先跑一遍热身 forward 把 offload cache 烘热——源码注释说得很直白：「Resetting here forces CUDA graph capture to replay cold-cache expert copies」，所以 reset 只能放在<strong>捕捉之后</strong>，为下一档复位。代价是一段可观捕捉时间和一块固定池显存——消费级卡上 max_bs=160 的候选要录 20+ 张。2026-10 的 #697 又给捕捉收尾加了一步 <code class="inline">_upload_graph</code>：图录完只是驻在主机端描述里，首次 replay 时驱动才把节点实体化，而这些节点会被排在图自身的 stream WAIT 之后——图一大，cudaGraphLaunch 会被 WAIT 挡到超时（PLE wait-sync 又要等 launch 返回才放行，直接死锁）。修法是捕捉当场用 <code class="inline">cuGraphUpload</code> 把图上传到设备（仅 Linux 非 HIP 有此入口，缺失时静默跳过），把「实体化」的开销从首次 replay 挪到捕捉期。llama.cpp 走的是另一极：图每次可变、灵活但 CPU 开销大。第 13 章会把这个对照收进自研清单。</div>
   </section>
 
   <div class="chapter-summary">
@@ -289,7 +290,7 @@ res-&gt;<span class="fn">set_inputs</span>(&amp;ubatch);</pre>
 </div>
 
 <footer>
-  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b11672 / FreeToken v0.1.3 · 所有引用代码路径以仓库最新为准
+  深入浅出On-Device推理 · 05 图与调度 · llama.cpp b11709 / FreeToken v0.1.3-60 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
