@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ 8c0f701167</span>
+    <span class="version-badge">openai/codex @ ce0323f2f2</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 04 会话与 Rollout</div>
     <div class="chap-meta">Chapter 04 · Sessions &amp; Rollout</div>
     <h1>会话与 Rollout：Codex 怎么记住、怎么重生</h1>
@@ -95,7 +95,7 @@ sess.get_base_instructions().await    <span class="cmt">// 取基础指令</span
     <span class="kw">pub</span> sender_user_messages: <span class="kw">Option</span>&lt;<span class="kw">Box</span>&lt;SenderUserMessages&gt;&gt;,  <span class="cmt">// 主机在接受该任务消息时捕获的发件方上下文（评审证据）</span>
 }</pre>
     <div class="annotation"><b>原始数据穿信封：</b> <code class="inline">Envelope</code> 模式（信封）是持久化的常见手法：<strong>保持原始 <code class="inline">ResponseItem</code> 不被污染</strong>，把 harness 私有的元数据挂在旁边。这样回放时既能拿到纯净的会话内容，又能读到附带的上下文。注意它实现了 <code class="inline">Deref&lt;Target=ResponseItem&gt;</code>——大多数地方可以当 <code class="inline">ResponseItem</code> 直接用。字段分三组看：Guardian 评审链路占开头的一串（<code class="inline">guardian_sources</code> 记录这条 Guardian 消息送达了哪些完整保留记录，<code class="inline">guardian_review_ids</code> 记录它送达的已完成同步评审，<code class="inline">guardian_retained_omissions</code> 是分节遗漏的交付证明，<code class="inline">retained_source</code> 标记本条就是某份保留证据的替身，几者配合 Guardian 的证据保留/合并机制）；<code class="inline">delivered_assistant_message</code> 与 <code class="inline">mcp_attribution</code> 分别服务多 Agent 消息回执与 MCP 工具归因；其余字段管压缩与回放兼容性。所有可选字段都带 <code class="inline">skip_serializing_if</code>，旧 rollout 不受影响。其中 <code class="inline">SenderUserMessages</code>（<code class="inline">history/src/sender_user_messages.rs:12</code>）是有界的主机渲染发件方证据（receiver_turn_id / receiver_message_id / text 三个字段，text 上限 3600 字节），供 Guardian 委派评审回放与回滚使用。</div>
-    <p>信封里还有一类容易看漏的条目——<strong>心跳消息</strong>。定时自动化任务向线程投递的输入不走普通用户消息的形态，而是带着特殊标记的文本：内容种类被标成 <code class="inline">user.heartbeat</code>（<code class="inline">HEARTBEAT_CONTENT_KIND</code>，history/src/heartbeat.rs:10），正文是一个有界的 XML 信封——<code class="inline">&lt;heartbeat&gt;</code> 包着 <code class="inline">automation_id</code>、<code class="inline">current_time_iso</code> 和 <code class="inline">instructions</code> 三段。写入侧，Session 在持久化用户消息时检查输入来源（<code class="inline">record_user_prompt_and_emit_turn_item</code>，session/mod.rs:5023，改写判定在 :5041）：origin 为心跳就把 content_item_kinds 改写成这个种类；判定来源的依据是 turn trigger 是否为 <code class="inline">automation_heartbeat_scheduled</code>（<code class="inline">UserInputOrigin::from_turn_trigger</code>，heartbeat.rs:24，<code class="inline">User</code>/<code class="inline">Heartbeat</code> 两值枚举）。回读侧 <code class="inline">Heartbeat::from_message</code>（heartbeat.rs:62）再从消息里解析回结构——automation_id 限 128 字节字母数字、timestamp 限 64 字节时间字符、整包算上转义余量不超过 3600 字节，超限或字段陌生就整个按普通消息对待。为什么要单独标记？Guardian 保留上下文与根 handoff 都依赖「最近用户消息」的位置语义，而心跳是机器定时触发的。早期版本（#49057 刚引入 handoff 时）遇到心跳会直接放弃整个 handoff 窗口；#50026 反转了这个策略——现在的 <code class="inline">selected_message_indices</code>（core/src/agent/control/root_handoff.rs:22）<strong>在心跳期间也照常做 handoff 过滤，同时保留已保存的心跳指令和当前 turn 的可信技能</strong>，并把手写用户限制（如「取消部署」）完整带入根上下文（受共享消息条数上限约束），不再让定时任务的痕迹顶掉真实用户的上下文。Guardian 证据归集（<code class="inline">history_user_authorization.rs:60</code>）则一直用 <code class="inline">UserInputOrigin::from_message</code> 区分两种来源。</p>
+    <p>信封里还有一类容易看漏的条目——<strong>心跳消息</strong>。定时自动化任务向线程投递的输入不走普通用户消息的形态，而是带着特殊标记的文本：内容种类被标成 <code class="inline">user.heartbeat</code>（<code class="inline">HEARTBEAT_CONTENT_KIND</code>，history/src/heartbeat.rs:10），正文是一个有界的 XML 信封——<code class="inline">&lt;heartbeat&gt;</code> 包着 <code class="inline">automation_id</code>、<code class="inline">current_time_iso</code> 和 <code class="inline">instructions</code> 三段。写入侧，Session 在持久化用户消息时检查输入来源（<code class="inline">record_user_prompt_and_emit_turn_item</code>，session/mod.rs:5256，改写判定在 :5273）：origin 为心跳就把 content_item_kinds 改写成这个种类；判定来源的依据是 turn trigger 是否为 <code class="inline">automation_heartbeat_scheduled</code>（<code class="inline">UserInputOrigin::from_turn_trigger</code>，heartbeat.rs:24，<code class="inline">User</code>/<code class="inline">Heartbeat</code> 两值枚举）。回读侧 <code class="inline">Heartbeat::from_message</code>（heartbeat.rs:62）再从消息里解析回结构——automation_id 限 128 字节字母数字、timestamp 限 64 字节时间字符、整包算上转义余量不超过 3600 字节，超限或字段陌生就整个按普通消息对待。为什么要单独标记？Guardian 保留上下文与根 handoff 都依赖「最近用户消息」的位置语义，而心跳是机器定时触发的。早期版本（#49057 刚引入 handoff 时）遇到心跳会直接放弃整个 handoff 窗口；#50026 反转了这个策略——现在的 <code class="inline">selected_message_indices</code>（core/src/agent/control/root_handoff.rs:22）<strong>在心跳期间也照常做 handoff 过滤，同时保留已保存的心跳指令和当前 turn 的可信技能</strong>，并把手写用户限制（如「取消部署」）完整带入根上下文（受共享消息条数上限约束），不再让定时任务的痕迹顶掉真实用户的上下文。Guardian 证据归集（<code class="inline">history_user_authorization.rs:60</code>）则一直用 <code class="inline">UserInputOrigin::from_message</code> 区分两种来源。</p>
   </section>
 
   <section class="block">
@@ -248,7 +248,7 @@ recorder.list_threads(...)                      <span class="cmt">// 列出所�
 </div>
 
 <footer>
-  Codex CLI · 04 会话与 Rollout · 源码锚点 openai/codex @ 8c0f701167 · 所有引用代码路径以仓库最新为准
+  Codex CLI · 04 会话与 Rollout · 源码锚点 openai/codex @ ce0323f2f2 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>

@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ 8c0f701167</span>
+    <span class="version-badge">openai/codex @ ce0323f2f2</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 上下文构建</div>
     <div class="chap-meta">Chapter 05 · Context Building</div>
     <h1>上下文构建：模型每一轮到底看到什么</h1>
@@ -57,7 +57,7 @@
   <section class="block">
     <h2><span class="num">5.1</span>一个 Prompt 由什么组成</h2>
     <p>第 3 章看到 <code class="inline">run_sampling_request</code> 每轮调用 <code class="inline">build_prompt</code>。来看看它到底装了什么：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1563 — build_prompt</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1666 — build_prompt</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) fn</span> build_prompt(
     input: Vec&lt;ResponseItem&gt;,              <span class="cmt">// 会话历史（消息/工具调用/结果）</span>
     step_context: &amp;StepContext,
@@ -76,7 +76,7 @@
     }
 }</pre>
     <div class="annotation"><b>一个 Prompt 七块料：</b> 一个 Prompt 有七部分：<strong>① 会话历史 input</strong>（<code class="inline">ResponseItem</code> 列表，含已注入的 fragment）；<strong>② 工具规格</strong>（告诉模型有哪些工具可用）；<strong>③ 并行工具开关</strong>（Codex 默认允许模型一次请求多个工具）；<strong>④ base_instructions</strong>（系统级指令）；<strong>⑤ 输出 schema</strong>（结构化输出约束）；<strong>⑥ output_schema_strict</strong>（Responses API 是否严格校验 output_schema——普通会话开启，guardian/basic 会话关闭）；<strong>⑦ cyber_access_program</strong>（ChatGPT 认证下的 cyber 治理选项）。②④ 两块都吃 <code class="inline">incremental_tools</code> 开关（由 world state 决定，见第 4 章）——增量模式下工具与基础指令都置空，靠 world state 快照另行投递。注意 <code class="inline">input</code> 不只是用户消息——它已经包含了被注入的 developer/user fragment（见 5.3）。</div>
-    <p>这七块料里 base_instructions 的<strong>投递方式</strong>值得单独说一句：#51156 之后，base instructions 不再走 <code class="inline">ResponsesApiRequest.instructions</code> 顶层字段（该字段已从 wire 上移除），而是在发送前把指令文本包装成一条 <strong>developer 角色的 message</strong>，用 <code class="inline">Uuid::new_v5</code> 从指令文本本身算出一个稳定 id，<code class="inline">splice(0..0, prefix)</code> 插到 <code class="inline">input</code> 最前面（client.rs:991-1000）。稳定 id 的好处是缓存友好——同样的指令每次算出同样的 id，prompt 前缀不变。</p>
+    <p>这七块料里 base_instructions 的<strong>投递方式</strong>值得单独说一句：#51156 之后，base instructions 不再走 <code class="inline">ResponsesApiRequest.instructions</code> 顶层字段（该字段已从 wire 上移除），而是在发送前把指令文本包装成一条 <strong>developer 角色的 message</strong>，用 <code class="inline">Uuid::new_v5</code> 从指令文本本身算出一个稳定 id，<code class="inline">splice(0..0, prefix)</code> 插到 <code class="inline">input</code> 最前面（client.rs:996-1005）。稳定 id 的好处是缓存友好——同样的指令每次算出同样的 id，prompt 前缀不变。</p>
   </section>
 
   <section class="block">
@@ -137,29 +137,34 @@
   <section class="block">
     <h2><span class="num">5.3</span>Fragment 的契约：ContextualUserFragment trait</h2>
     <p>每个 fragment 实现同一个 trait，决定它以什么角色、什么内容注入：</p>
-    <div class="code-title">codex-rs/context-fragments/src/fragment.rs:64 — Fragment trait（节选）</div>
+    <div class="code-title">codex-rs/context-fragments/src/fragment.rs:56 — Fragment trait（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">/// 作为消息片段注入的上下文载荷。
 /// /// 实现者拥有 response role，并提供确切的片段正文。</span>
 <span class="kw">pub trait</span> ContextualUserFragment {
+    <span class="kw">fn</span> content_metadata(&amp;self) -&gt; ContentItemMetadata; <span class="cmt">// 出处元数据，默认 harness()</span>
     <span class="kw">fn</span> content_kind(&amp;self) -&gt; ContentItemKind;   <span class="cmt">// 分类标识</span>
     <span class="kw">fn</span> role(&amp;self) -&gt; &amp;<span class="st">'static str</span>;            <span class="cmt">// "developer" | "user" | "system"</span>
-    <span class="kw">fn</span> body(&amp;self) -&gt; String;                   <span class="cmt">// 正文</span>
+    <span class="kw">fn</span> body(&amp;self) -&gt; ContentItem;              <span class="cmt">// 正文（不限于纯文本）</span>
     <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>); <span class="cmt">// 起止标记（识别已注入片段）</span>
-    <span class="kw">fn</span> type_markers(&amp;self) -&gt; Vec&lt;(&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>)&gt;; <span class="cmt">// 按类型打的多组标记</span>
-    <span class="kw">fn</span> matches_text(&amp;self, text: &amp;<span class="kw">str</span>) -&gt; bool;  <span class="cmt">// 判断正文是否含某文本</span>
+    <span class="kw">fn</span> type_markers() -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>); <span class="cmt">// 按类型打的标记</span>
+    <span class="kw">fn</span> matches_text(text: &amp;<span class="kw">str</span>) -&gt; bool;  <span class="cmt">// 判断正文是否含某文本</span>
 }</pre>
-    <div class="code-title">codex-rs/core/src/context/developer_instructions.rs:5 — 一个具体 fragment</div>
+    <div class="code-title">codex-rs/core/src/context/developer_instructions.rs:20 — 一个具体 fragment</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) struct</span> DeveloperInstructions { instructions: String }
 
 <span class="kw">impl</span> ContextualUserFragment <span class="kw">for</span> DeveloperInstructions {
+    <span class="kw">fn</span> content_metadata(&amp;self) -&gt; ContentItemMetadata {
+        ContentItemMetadata::developer_instructions(<span class="cmt">/*from_additional_requirements*/</span> <span class="kw">false</span>)
+    }
     <span class="kw">fn</span> content_kind(&amp;self) -&gt; ContentItemKind {
         ContentItemKind(<span class="st">"generic.developer_instructions"</span>.to_string())
     }
     <span class="kw">fn</span> role(&amp;self) -&gt; &amp;<span class="st">'static str</span> { <span class="st">"developer"</span> }   <span class="cmt">// ← 以 developer 角色注入</span>
-    <span class="kw">fn</span> body(&amp;self) -&gt; String { self.instructions.clone() }
-    <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>) { (<span class="st">""</span>, <span class="st">""</span>) }
+    <span class="kw">fn</span> markers(&amp;self) -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>) { Self::type_markers() }
+    <span class="kw">fn</span> type_markers() -&gt; (&amp;<span class="st">'static str</span>, &amp;<span class="st">'static str</span>) { (<span class="st">""</span>, <span class="st">""</span>) }
+    <span class="kw">fn</span> body(&amp;self) -&gt; ContentItem { input_text(self.instructions.clone()) }
 }</pre>
-    <div class="annotation"><b>身份由 role() 定：</b> <code class="inline">role()</code> 决定片段以什么身份出现——<code class="inline">DeveloperInstructions</code> 用 <code class="inline">"developer"</code>，<code class="inline">UserInstructions</code> 用 <code class="inline">"user"</code>。<strong>markers</strong> 是巧思：注入的片段带起止标记，之后可以识别并 diff——这支撑了「只在变化时重新注入」的增量机制（见 5.5）。<code class="inline">content_kind</code> 给片段分类，方便统计与过滤。</div>
+    <div class="annotation"><b>身份由 role() 定：</b> <code class="inline">role()</code> 决定片段以什么身份出现——<code class="inline">DeveloperInstructions</code> 用 <code class="inline">"developer"</code>，<code class="inline">UserInstructions</code> 用 <code class="inline">"user"</code>。<strong>markers</strong> 是巧思：注入的片段带起止标记，之后可以识别并 diff——这支撑了「只在变化时重新注入」的增量机制（见 5.5）。<code class="inline">content_kind</code> 给片段分类，方便统计与过滤。#53831 之后每个 fragment 还自带 <code class="inline">content_metadata()</code>——声明这段内容是谁产的（<code class="inline">ContentItemProvenance</code>：harness、developer instructions、skills、hooks、工具……），出处由<strong>生产方在注入时给定</strong>而非事后从渲染文本反推，正文也从裸 <code class="inline">String</code> 升级成 <code class="inline">ContentItem</code>（多数片段仍是 <code class="inline">input_text</code>，但已能承载非文本内容）。</div>
     <div class="callout info">
       <b class="tag">角色</b>
       OpenAI Responses API 区分 <code class="inline">system</code> / <code class="inline">developer</code> / <code class="inline">user</code> 三种角色。Codex 把不可协商的规则放 <code class="inline">developer</code>，把项目/用户指令也倾向 <code class="inline">developer</code> 或 <code class="inline">user</code>。<code class="inline">base_instructions</code> 是最高优先级的系统指令。
@@ -265,7 +270,7 @@
 </div>
 
 <footer>
-  Codex CLI · 05 上下文构建 · 源码锚点 openai/codex @ 8c0f701167 · 所有引用代码路径以仓库最新为准
+  Codex CLI · 05 上下文构建 · 源码锚点 openai/codex @ ce0323f2f2 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
