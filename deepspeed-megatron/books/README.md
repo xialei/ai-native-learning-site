@@ -6,8 +6,8 @@
 
 | 仓库 | 本地路径 | 锚点 |
 |---|---|---|
-| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-86-gf0a3be9bb`（version.txt: 0.19.8） |
-| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2735-ge4294782f`（core 包版本 0.20.0） |
+| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-131-g036230e4f`（version.txt: 0.19.8） |
+| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2883-g0900d9281`（core 包版本 0.20.0） |
 
 所有引用代码路径以仓库最新为准——若源码演进导致行号偏移，以文件名 + 函数名定位。
 
@@ -45,6 +45,12 @@
 - **CUDA_DEVICE_MAX_CONNECTIONS=1**（ch3）：TP 通信-计算重叠的正确性前提，一个环境变量决定结果对错。
 
 ## 演化记录
+
+- **2026-10-17 十四次核实**（DeepSpeed 11 commits / Megatron 30 commits，重锚 `v0.19.7-131-g036230e4f` / `core_v0.15.0rc7-2883-g0900d9281`）：
+  - 6 处 pin 漂移修正：ch01 `training.py:3314→3304`（MoE/PGC hunk 上移 -10，`train_step` 摘录正文 byte-identical）；DS `engine.py` 三处 3386→3382 / 3571→3567 / 3446→3442（#8807 延迟 import 平移 -4，backward/step/boundary 三函数内容零改动）；ch08 stage3 step `:2872→:2874`；ch07 epilogue `:1017→:1015`。
+  - 摘录回源全中：ch06 三部曲与 GAS 边界、ch07 IPG epilogue/Muon LRU、ch08 coordinator fetch 链/子组循环/`_allgather_params_coalesced`（partition_parameters.py:2022 未动）、ch09 cpu_adam（amsgrad 抛错仍在）、ch10 CheckpointFunction（:567 未动，仅 `@compiler.disable`→`lazy_disable` 在摘录范围外）、ch11 fusions 目录 17 文件无增删、ch02 `initialize_model_parallel` 签名未动、ch05 TransformerLayer/GPTModel/采样器、ch13 MoELayer 四段与 dispatcher 六钩子、ch12 dist_checkpointing 结构与 async save（`save_checkpoint` 签名未动；删 checkpoint 的 `fork` 移除不触及摘录）。
+  - **预存错误修正（ch13，改名发生在旧锚 c08d89bea 2025-08-17 之前）**：`topk_softmax_with_capacity` 实为 `topk_routing_with_score_function`（!3809 MoE router fusion 重构改名，该函数从 moe_utils.py:316 拆成 `topk_routing_with_score_function` + `compute_routing_scores_for_aux_loss` + `apply_router_token_dropping` 三段）；ch13 摘录与两处散文改为现名，容量截断改述为「token dropping 按 capacity_factor 截断」独立一步；aux loss 挂点 `apply_load_balancing_loss`（历史上不存在）改 `attach_and_log_load_balancing_loss`。教训：伪代码摘录里的函数名也要回源 grep——改名 13 个月后书里还写着旧名。
+  - 两个实质 commit 触及已覆盖面邻接处但不动摇书中断言：DS #8818（BF16 溢出检查尊重 `check_grad_overflow=false` opt-out——ZeRO-1/2 的 norm 溢出判定从无条件改 `dtype != bf16 or check_grad_overflow`；ch07 7.2 的溢出叙述是 fp16 场景不受影响，未展开）、Megatron #7450（MoonEP 虚拟专家负载均衡进 parallel_state/moe_layer/router/token_dispatcher——ch13 的四段流水与六钩子结构不变，新增能力不否定既有叙述，增补候选）。
 
 - **2026-10-09 目标对标补齐**（对照「读完目标/章节主线/特别要求」四条逐项核对，补 ①②③④ 四项缺口；版本锚点不变）：
   - **④ ZeRO 三阶段表**（ch07 7.1）：「一分钟版本」后新增六列表——阶段 × 按 DP 切了什么 × 每卡剩余字节 × 70B/DP=8 数值 × DS 实现入口（类/方法 + 行号）× Megatron 等价物；四个 stage 的类名与方法入口逐一 grep 回源核对（stage_1_and_2.py/stage3.py/distrib_optimizer.py/param_and_grad_buffer.py）。

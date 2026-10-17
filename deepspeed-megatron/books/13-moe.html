@@ -83,10 +83,12 @@
     <span class="kw">def</span> <span class="fn">routing</span>(self, logits):
         scores = softmax(logits)              <span class="cmt"># 全专家概率</span>
         <span class="cmt"># top-k 选择（带/不带 renormalize 两种）</span>
-        probs, routing_map = topk_softmax_with_capacity(
-            logits, topk, ..., capacity_factor, ...)   <span class="cmt"># 容量限制在此</span>
+        probs, routing_map = topk_routing_with_score_function(
+            logits, topk, ..., score_function, ...)   <span class="cmt"># score 函数在此分叉</span>
+        <span class="cmt"># 容量限制是独立一步：token dropping 按 capacity_factor 截断</span>
+        probs, routing_map = apply_router_token_dropping(...)
         <span class="cmt"># aux loss 用「无 topk 的 scores」算——这是与主梯度不同的信号</span>
-        self.apply_load_balancing_loss(scores, ...)   <span class="cmt"># save_to_aux_losses_tracker</span></pre>
+        probs = self.attach_and_log_load_balancing_loss(scores, ...)  <span class="cmt"># save_to_aux_losses_tracker</span></pre>
     <div class="annotation"><b>aux loss 的语义：</b>负载均衡 loss 惩罚「专家间分配不均」——没有它，router 会早期锁死少数专家（富者愈富），其他专家永远得不到训练。注意代码细节：aux 用<strong>未截断的 scores</strong>（即使某 token 因容量限制没被派去那个专家，均衡信号仍然传递）。<code class="inline">capacity_factor</code> 是另一个正交机制：给每个专家设 token 容量上限，超出的 token 丢弃（或走 residual）——它是通信量与训练质量之间的旋钮。</div>
 
     <div class="figure breakout">
@@ -200,7 +202,7 @@ combine（token_combine）：结果 all-to-all 送回原卡，
 
   <section class="block">
     <h2><span class="num">13.5</span>两份实现对照 + 自研启示</h2>
-    <p>token 的四段串完了：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（all-to-all 回程 + unpermute + 加权求和），代价全在中间两跳（图 13.1）。router 那边的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 topk_softmax_with_capacity 处截断；AlltoAll 无求和语义、纯路由，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡则各有各的手段——Megatron 的 aux loss（用未截断 scores），DS 的 noisy gate。两份实现放到一张表里对照：</p>
+    <p>token 的四段串完了：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（all-to-all 回程 + unpermute + 加权求和），代价全在中间两跳（图 13.1）。router 那边的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 apply_router_token_dropping 处截断；AlltoAll 无求和语义、纯路由，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡则各有各的手段——Megatron 的 aux loss（用未截断 scores），DS 的 noisy gate。两份实现放到一张表里对照：</p>
     <table class="tbl">
       <tr><th>维度</th><th>Megatron MoE</th><th>DeepSpeed MoE</th></tr>
       <tr><td>架构定位</td><td>专家是模型内的一等公民（experts 层）</td><td>MoE 是可插拔模块（包一层 MLP）</td></tr>
@@ -216,7 +218,7 @@ combine（token_combine）：结果 all-to-all 送回原卡，
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>这一章走完 token 的四段路：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（回程 + unpermute + 加权求和），代价全在中间两跳。router 的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 topk_softmax_with_capacity 处截断；AlltoAll 纯路由无求和语义，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡各有手段——Megatron 的 aux loss 用未截断 scores，DS 用 noisy gate 加 residual MoE 的另一条路。</p>
+    <p>这一章走完 token 的四段路：route（本卡打分）→ dispatch（permute + all-to-all 去程）→ compute（专家本地 MLP）→ combine（回程 + unpermute + 加权求和），代价全在中间两跳。router 的命名链 logits→scores→probs→routing_map 值得记住，容量因子在 apply_router_token_dropping 处截断；AlltoAll 纯路由无求和语义，不能与 SP 合并，所以 MoE+TP 强制 SP；负载均衡各有手段——Megatron 的 aux loss 用未截断 scores，DS 用 noisy gate 加 residual MoE 的另一条路。</p>
     <p>最后一章把十三章的答案倒回成一条路：六个里程碑走完两库走过的路。<a href="14-build-own-trainer.html">第 14 章：自研训练器</a>。</p>
   </div>
 
@@ -233,7 +235,7 @@ combine（token_combine）：结果 all-to-all 送回原卡，
 </div>
 
 <footer>
-  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-120-g5f266e26d / core_v0.15.0rc7-2853-g9eadd78ec
+  深入浅出 DeepSpeed · Megatron · 13 MoE · 版本锚点 v0.19.7-131-g036230e4f / core_v0.15.0rc7-2883-g0900d9281
 </footer>
 
 </body>
