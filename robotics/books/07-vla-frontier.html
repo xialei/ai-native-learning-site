@@ -178,6 +178,8 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
       <div class="fig-cap">图 7.1：UnifoLM-VLA 的「特征服务器 + 动作引擎」解耦。VLM 整体（含语言塔）可作为冻结底座——但注意这<b>不是默认</b>：shipped 配置里 <code class="inline">freeze_modules: ''</code>（unifolm_vla_train.yaml:68），即默认全部参与训练，冻结要显式指定；DiT 头从零训练。repeated_diffusion_steps 让每个样本贡献多组流匹配监督：代码从 <code class="inline">config.trainer</code> 读，shipped 值 4（yaml 里 <code class="inline">action_model</code> 段还有个同名键写 8，但代码不读它——这处不一致容易看错）。</div>
     </div>
     <div class="annotation"><b>读法：</b>与 π0/SmolVLA 的「VLM 层内互看」相比，这种解耦有得有失——得到的是<strong>模块自由度</strong>（DiT-B 768 宽 12 头 / DiT-L 1536 宽 32 头两档任选，DiTConfig，DiT_ActionHeader.py:130；换 VLM 骨干只需对齐一个 hidden_size）与<strong>训练便宜</strong>（VLM 前向一次缓存特征，DiT 反复迭代不碰它）；失去的是端到端联合微调时的深度耦合。还有两处独特的工程选择：①时间不连续采样，而是 <code class="inline">t×1000</code> 离散成桶号再进正弦编码（:205）——继承自 GR00T N1.5 的动作头血统（文件头注明）；②<strong>future_tokens</strong>——32 个可学习 token 混进序列，给 DiT 一组「任务占位符」，推理时与训练时行为一致。方向约定注意：它的插值是 (1-t)·noise + t·actions，t=1 是动作、t=0 是噪声——与 π0 的记号恰好相反，读代码时别绕晕。</div>
+    <div class="annotation"><b>这个仓库已经停在 2026 年 1 月，后继是谁：</b>Unitree 2026 年 9 月底发布了升级版 <strong>UnifoLM-WLA-1.0</strong>（6B 参数，约 2500 小时真机数据、单模型 64 个任务，源码在 unifolm-wla 仓库，Apache-2.0）。它保留了「VLM + 独立动作头」这条骨架，但两头规格都升了级：VLM 从 Qwen2.5-VL 换成 Qwen3-VL-4B，动作头从单流 DiT 换成 <strong>MMDiT 双流联合 attention</strong>——动作 token 不再隔层 cross-attention 读 VLM 特征，而是与 VLM 文本 token 拼进同一条序列做 joint attention（mmdit.py:245 注明拼接顺序 [action, text]，动作在前以对齐 RoPE 位置）。它登记的框架名是 QwenMMDiT（QwenMMDiT.py:176），文档串直说 "Mirrors QwenGR00T but swaps the action head"（QwenMMDiT.py:4）——血统声明比改名更坦率；微调配置 freeze_modules: "qwen_vl_interface"（mmdit_finetune_frozen_vlm.yaml:66）则是「特征服务器可冻结」同一原则的延续。</div>
+    <div class="annotation"><b>WLA 真正的新东西是「世界模型」，而且要分清它炼在哪一层：</b>官方说法叫「以交互为中心的世界建模」——机器人不只要理解当前画面，还要<strong>预测自己的动作会让场景怎么变</strong>。机制按项目页的说明是：用光流从未来帧里提取「会动的区域」，训练一个 VQ-VAE 把这些动态区域离散成 mask token；然后让 VLM 以当前帧 + 任务描述（或动作）为条件，<strong>直接预测未来动态区域的 mask token</strong>——关注交互对象及其引起的变化，而不是整幅画面。这条「视觉-语言-动作」链路因此多了一段：先在 UnifoLM-ER 系列的具身推理底座上炼出「预测世界怎么变」的能力（空间 QA、2D 轨迹、3D 检测等 5M+ 样本），再加离散动作 token 与未来 mask token 联合对齐得到 ER-Flow，最后 WLA 在它之上接 MMDiT 动作专家。读开源代码时要留意边界：这个开源仓放出的只是动作专家训练部分——世界建模的监督（未来 mask token）是 ER 预训练阶段的事，权重已发布、训练管道没开源。代码里唯一的钩子是训练器的数据标签分发：base_framework.py:155 注明 <code class="inline">compute_loss</code> 目前路由 "vla"/"vlm" 两类，"Subclasses can override this to add more tags (e.g. <code class="inline">'world'</code>)"——世界模型通道在结构里留了位置，等的就是这类数据。另外 WLA 版的 embodiment embedding 是 append-only 契约（DEFAULT_EMBODIMENT_TYPES：unitree/aloha/fractal/franka/bridge/robochallenge×2，MMDiT_ActionHeader.py:89），注释明说顺序即身份、只许追加，否则旧 checkpoint 的 id 全部错位——与 GR00T 按 32 槽位分桶（7.3）是同一问题的两种解法。从 vla 迁到 wla 读代码的成本很低：插值方向、Beta(1.5,1.0) 时间采样、1000 桶离散时间逐项对得上。</div>
   </section>
 
   <section class="block">
@@ -256,6 +258,7 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
       <tr><td>π0</td><td>PaliGemma 3B + Gemma 300M 专家，token 级联合 attention，openpi 官方移植</td></tr>
       <tr><td>ADA-RMS</td><td>π0 结构预留的逐层条件门控（use_adarms），默认关闭</td></tr>
       <tr><td>UnifoLM-VLA</td><td>Qwen2.5-VL 特征 + 独立 DiT 动作头，cross_attention_dim 一点相接</td></tr>
+      <tr><td>UnifoLM-WLA-1.0</td><td>UnifoLM-VLA 的后继（2026-09）：Qwen3-VL 底座 + MMDiT 双流 joint-attention 动作头，冻结 VLM 微调</td></tr>
       <tr><td>future_tokens</td><td>32 个可学习占位 token，让 DiT 序列有「任务槽」</td></tr>
       <tr><td>GR00T N1.7</td><td>NVIDIA 跨本体 VLA：Cosmos-Reason2-2B 骨干 + DiT 头，32 embodiment 分桶，相对 EEF 动作空间</td></tr>
       <tr><td>Prismatic</td><td>CLIP/DINOv2/SigLIP（可双塔融合）+ LLM + 投影层，两阶段预训练范式</td></tr>
@@ -287,7 +290,7 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
 </div>
 
 <footer>
-  深入浅出具身智能 · 07 VLA 前沿 · 基于 lerobot（146d84749）、openpi（215abfb）、unifolm-vla（ff6c39a）、Isaac-GR00T（n1.7-release @ dac54b3）、OpenVLA（c8f03f4）、prismatic-vlms（874c5bb）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 07 VLA 前沿 · 基于 lerobot（146d84749）、openpi（215abfb）、unifolm-vla（ff6c39a）、unifolm-wla（0a1aa87b）、Isaac-GR00T（n1.7-release @ dac54b3）、OpenVLA（c8f03f4）、prismatic-vlms（874c5bb）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>
