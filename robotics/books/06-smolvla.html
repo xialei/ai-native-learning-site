@@ -43,7 +43,7 @@
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>① 总览：VLM 主干 + 动作专家 + 流匹配</h2>
+    <h2><span class="num">6.1</span>总览：VLM 主干 + 动作专家 + 流匹配</h2>
     <p>一个 VLA 要回答的问题是：语言指令进来、机器人动作出去，中间的知识从哪来、动作怎么生成。SmolVLA 的答案是三件套——VLM 主干供理解、动作专家出动作、流匹配当生成器。先看结构。<code class="inline">SmolVLAPolicy</code> 是包在 <code class="inline">VLAFlowMatching</code> 外面的一层皮，后者才是网络本体。源码里自带的架构注释说明了全部结构：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:505 — VLAFlowMatching 结构注释（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">VLAFlowMatching</span>(nn.Module):
@@ -142,7 +142,7 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>② prefix 与 suffix：一次前向，十步去噪</h2>
+    <h2><span class="num">6.2</span>prefix 与 suffix：一次前向，十步去噪</h2>
     <p>知道整体是双塔，接下来该问：十步去噪每步都要跑一次网络，为什么 VLM 主干不会被算十遍？答案在 prefix 与 suffix 的切分。<code class="inline">embed_prefix</code> 把图像、语言、状态编码成一个 token 序列；<code class="inline">embed_suffix</code> 把「噪声动作块 + 时间步」编码成另一个序列。推理时 prefix 只算一次：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:763 — sample_actions：KV cache 复用（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Prefix 只前向一次，缓存 KV</span>
@@ -176,11 +176,11 @@ _, past_key_values = self.vlm_with_expert.forward(
     suffix_out = outputs_embeds[<span class="nu">1</span>][:, -self.config.chunk_size:]
     v_t = self.action_out_proj(suffix_out)
     <span class="kw">return</span> v_t</pre>
-    <div class="annotation"><b>读法：</b>去噪循环的每一步，真正变的是 suffix（当前噪声动作块 x_t 与时间步 t）；prefix（看到的与听到的）完全不变。所以把 prefix 的 KV 缓存起来、每步只前向 suffix——10 步去噪的总成本 ≈ 1 次完整前向 + 10 次小专家前向。<code class="inline">crop(prefix_len)</code> 是个容易忽略的细节：self-attention 会把 suffix 的 KV 追加进缓存，若不裁掉，下一步的注意力会「看到」上一步的噪声动作，污染生成过程。</div>
+    <div class="annotation"><b>省算力的关键在 prefix 不变：</b>去噪循环的每一步，真正变的是 suffix（当前噪声动作块 x_t 与时间步 t）；prefix（看到的与听到的）完全不变。所以把 prefix 的 KV 缓存起来、每步只前向 suffix——10 步去噪的总成本 ≈ 1 次完整前向 + 10 次小专家前向。<code class="inline">crop(prefix_len)</code> 是个容易忽略的细节：self-attention 会把 suffix 的 KV 追加进缓存，若不裁掉，下一步的注意力会「看到」上一步的噪声动作，污染生成过程。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>③ 流匹配：训练一行公式，推理一个欧拉循环</h2>
+    <h2><span class="num">6.3</span>流匹配：训练一行公式，推理一个欧拉循环</h2>
     <p>去噪十步，每一步「噪声怎么变动作」的规则就是流匹配要学的东西。它比 diffusion 更直接：不再学「噪声是什么」，直接学<strong>速度场</strong>。训练前向只有两行核心公式：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:728 — forward：流匹配目标（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> noise <span class="kw">is</span> <span class="kw">None</span>:
@@ -254,11 +254,11 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
       </div>
       <div class="fig-cap">图 6.2：流匹配一句话——「训练时已知两端学方向（MSE），推理时只知道方向走欧拉」。与第 5 章 diffusion 对比：目标从「噪声 ε」换成「速度 u_t」，去噪步数从 100 降到 10。</div>
     </div>
-    <div class="annotation"><b>读法：</b><code class="inline">x_t = t·noise + (1−t)·actions</code> 把「噪声→动作」的路修成直线，任意 t 处的真速度恒为 <code class="inline">noise − actions</code>。模型只要学会「在任意位置指对方向」，推理时就能从纯噪声一路走直线到动作。与 diffusion 的两个实用差异：① 推理步数少一个数量级（10 vs 100），实时机器人控制买得起；② 时间步采样用 Beta 分布（<code class="inline">sample_time_beta</code>，α=1.5 偏向大 t，flow_matching.py:167）——噪声端的插值点更「陌生」，多练。π0、π05、SmolVLA 共用这套 <code class="inline">euler_integrate</code>（flow_matching.py 注释：openpi 衍生策略历史上各带一份拷贝，现已收敛为公共实现），还预留了 RTC 钩子（<code class="inline">rtc_processor</code> 参数，evo1/pi0/pi05/molmoact2 等策略实际接入）；本轮重构还把噪声端约定显式化成 <code class="inline">FlowConvention</code> 枚举——openpi 系 pi0/pi05/smolvla/eo1 是 NOISE_AT_ONE（t=1 噪声），groot/evo1/wall_x 是 NOISE_AT_ZERO（t=0 噪声），两种约定共用同一积分器。</div>
+    <div class="annotation"><b>速度场为什么让路变成直线：</b><code class="inline">x_t = t·noise + (1−t)·actions</code> 之下，任意 t 处的真速度恒为 <code class="inline">noise − actions</code>。模型只要学会「在任意位置指对方向」，推理时就能从纯噪声一路走直线到动作。与 diffusion 的两个实用差异：① 推理步数少一个数量级（10 vs 100），实时机器人控制买得起；② 时间步采样用 Beta 分布（<code class="inline">sample_time_beta</code>，α=1.5 偏向大 t，flow_matching.py:167）——噪声端的插值点更「陌生」，多练。π0、π05、SmolVLA 共用这套 <code class="inline">euler_integrate</code>（flow_matching.py 注释：openpi 衍生策略历史上各带一份拷贝，现已收敛为公共实现），还预留了 RTC 钩子（<code class="inline">rtc_processor</code> 参数，evo1/pi0/pi05/molmoact2 等策略实际接入）；本轮重构还把噪声端约定显式化成 <code class="inline">FlowConvention</code> 枚举——openpi 系 pi0/pi05/smolvla/eo1 是 NOISE_AT_ONE（t=1 噪声），groot/evo1/wall_x 是 NOISE_AT_ZERO（t=0 噪声），两种约定共用同一积分器。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>④ 训练侧：冻结、缺相机补位、processor 链</h2>
+    <h2><span class="num">6.4</span>训练侧：冻结、缺相机补位、processor 链</h2>
     <p>SmolVLA 的微调经济学藏在三个配置项（<code class="inline">configuration_smolvla.py:69-71</code>）：<code class="inline">freeze_vision_encoder=True</code>、<code class="inline">train_expert_only=True</code>——视觉塔与语言塔整体冻结，只训动作专家（约一半参数；专家宽度是 VLM 的 0.75 倍、参数量不与其宽度成正比）。此外 <code class="inline">prepare_images</code> 处理「训练时有多相机、部署时缺相机」的不对称：</p>
     <div class="code-title">src/lerobot/policies/smolvla/modeling_smolvla.py:412 — 缺失相机补全为「空帧 + mask=0」（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Create image features not present in the batch as fully 0 padded images.</span>
@@ -279,12 +279,12 @@ losses = F.mse_loss(u_t, v_t, reduction=<span class="st">"none"</span>)         
     steps.normalize,             <span class="cmt"># 4.5 的 stats.json 在此生效</span>
 ]
 output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
-    <div class="annotation"><b>读法：</b>「空相机补位」是 VLA 泛化性的一个小但关键的工程细节：预训练见过的输入布局是「多个相机位」，部署时相机挂了或配置变了，直接缺 key 会崩；补一张 mask=0 的黑帧，网络把它当「不存在的相机」处理，行为平滑退化。processor 链则再次印证第 5 章的组装点——语言指令也要经过训练时同样的分词（包括结尾换行符这种字节级细节），否则训练与部署的分布不一致，成功率悄悄掉几个点。</div>
+    <div class="annotation"><b>补黑帧的必要性：</b>「空相机补位」是 VLA 泛化性的一个小但关键的工程细节：预训练见过的输入布局是「多个相机位」，部署时相机挂了或配置变了，直接缺 key 会崩；补一张 mask=0 的黑帧，网络把它当「不存在的相机」处理，行为平滑退化。processor 链则再次印证第 5 章的组装点——语言指令也要经过训练时同样的分词（包括结尾换行符这种字节级细节），否则训练与部署的分布不一致，成功率悄悄掉几个点。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.5</span>收尾：小 VLA 的完整标本</h2>
-    <p>6.1 开头的三个问题，答案收拢：双塔是「VLM 塔供理解、专家塔出动作」，专家经 cross-attn 读 VLM 的 KV cache；推理靠 prefix 一次前向 + KV 缓存复用，十步去噪只跑 suffix；流匹配训练一行速度场公式、推理一个欧拉积分循环；单卡微调的经济学靠 freeze_vision_encoder / train_expert_only 两个开关，缺相机时补黑帧 + mask=0 让行为平滑退化。一张表带走：</p>
+    <h2><span class="num">6.5</span>小 VLA 的完整标本</h2>
+    <p>把 SmolVLA 这个标本拆完，骨架是这样：双塔「VLM 塔供理解、专家塔出动作」，专家经 cross-attn 读 VLM 的 KV cache；推理靠 prefix 一次前向 + KV 缓存复用，十步去噪只跑 suffix；流匹配训练一行速度场公式、推理一个欧拉积分循环；单卡微调的经济学靠 freeze_vision_encoder / train_expert_only 两个开关，缺相机时补黑帧 + mask=0 让行为平滑退化。全章部件汇总成一张表：</p>
     <table class="tbl">
       <tr><th>概念</th><th>要点</th><th>源码锚点</th></tr>
       <tr><td>双塔架构</td><td>VLM 塔（SmolVLM2 500M，前 16 层）+ 动作专家塔（宽度 ×0.75）；专家 cross-attn 读 VLM KV cache</td><td>smolvla/modeling_smolvla.py:505; smolvlm_with_expert.py:74,110</td></tr>
@@ -296,7 +296,7 @@ output_steps = [steps.unnormalize, steps.to_cpu, ...]</pre>
       <tr><td>processor</td><td>rename → batch → newline → tokenize → device → normalize 六步</td><td>processor_smolvla.py:65</td></tr>
     </table>
     <div class="callout warn">
-      <b class="tag">下一步</b>
+      <b class="tag">更大底座</b>
       SmolVLA 证明了「小 VLA」可行，但 500M 的世界知识有限。π0 用 3B 的 PaliGemma 主干 + 同样的流匹配把成功率推上新高，UnifoLM-VLA-0 则给出国产开源路线（Qwen2.5 + DiT 动作头），Prismatic 揭示了「视觉骨干怎么选」。这是<a href="07-vla-frontier.html">第 7 章：VLA 前沿</a>。
     </div>
   </section>

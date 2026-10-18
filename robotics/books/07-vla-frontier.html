@@ -43,16 +43,8 @@
   </div>
 
   <section class="block">
-    <h2><span class="num">7.1</span>问题：VLA 的四条路线，分野在哪</h2>
-    <p>第 6 章看完一个 VLA，现在问一圈「别人都怎么做」。四个标本摆在桌面上，要回答四个问题：</p>
-    <ul>
-      <li><strong>① 耦合 or 解耦？</strong>动作专家缝在 VLM 内部（共享 attention）与完全外包给独立 DiT，各牺牲什么、换回什么？</li>
-      <li><strong>② 体量怎么选？</strong>同一个架构骨架，450M 与 3B+300M 差在哪——多出来的参数买到了什么？</li>
-      <li><strong>③ 跨本体是什么意思？</strong>GR00T 说自己「跨本体预训练」，一个模型服务多种机器人，靠什么做到？</li>
-      <li><strong>④ 底座怎么来？</strong>PaliGemma、Qwen2.5-VL、Cosmos-Reason2、SmolVLM2 这些 VLM 是炼出来的——预训练的配方长什么样？</li>
-    </ul>
-    <div class="annotation"><b>四个问题，四个标本：</b>①② 的紧耦合答案 → 7.1 π0（体量顶格）；① 的解耦答案 → 7.2 UnifoLM-VLA、7.3 GR00T N1.7（顺带答 ③）；④ → 7.4 Prismatic。7.5 对比选型，7.6 收尾。</div>
-    <p>先从紧耦合路线的体量上限看起。π0 的移植版（modeling_pi0.py 注明「a direct port of the OpenPI implementation」）结构与 SmolVLA 同构，但两个骨干都换成了 Gemma 系（configuration_pi0.py:33-34）：</p>
+    <h2><span class="num">7.1</span>VLA 的四条路线，分野在哪</h2>
+    <p>第 6 章看完一个 VLA，现在问一圈「别人都怎么做」。四个标本摆在桌面上，对应四个分野：动作专家缝在 VLM 内部共享 attention（紧耦合，π0 走到体量顶格，本节），还是外包给独立 DiT（解耦，7.2 UnifoLM-VLA 与 7.3 GR00T N1.7）；同一个架构骨架下 450M 与 3B+300M 差在哪，多出来的参数买到了什么（π0 一并作答）；GR00T 标榜的「跨本体预训练」靠什么让一个模型服务多种机器人（7.3 顺带回答）；以及 PaliGemma、Qwen2.5-VL、Cosmos-Reason2、SmolVLM2 这些底座 VLM 的预训练配方长什么样（7.4 Prismatic 拆解）。7.5 把四条线排成选型坐标系，7.6 收束。先从紧耦合路线的体量上限看起。π0 的移植版（modeling_pi0.py 注明「a direct port of the OpenPI implementation」）结构与 SmolVLA 同构，但两个骨干都换成了 Gemma 系（configuration_pi0.py:33-34）：</p>
     <div class="code-title">src/lerobot/policies/pi0/modeling_pi0.py:416 — 核心模型组装（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PI0Pytorch</span>(nn.Module):  <span class="cmt"># see openpi `PI0Pytorch`</span>
     <span class="kw">def</span> <span class="fn">__init__</span>(self, config: PI0Config, rtc_processor=<span class="kw">None</span>):
@@ -81,7 +73,7 @@ v_t = self.<span class="fn">_apply_checkpoint</span>(action_out_proj_func, suffi
   </section>
 
   <section class="block">
-    <h2><span class="num">7.2</span>② UnifoLM-VLA：把动作头换成一个 DiT</h2>
+    <h2><span class="num">7.2</span>UnifoLM-VLA：把动作头换成一个 DiT</h2>
     <p>紧耦合不是唯一答案。lerobot 里的 VLA 把动作专家缝在 VLM 内部（共享层/互看 K/V）。UnifoLM-VLA（Unitree 开源，动作头代码源自 NVIDIA Isaac-GR00T、经复旦 Junqiu YU 改配）走另一条路：<strong>VLM 只当特征提取器，动作生成完全外包给一个独立的 DiT</strong>（Diffusion Transformer）：</p>
     <div class="code-title">src/unifolm_vla/model/framework/unifolm_vla.py:19 — 框架组装（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="meta">@FRAMEWORK_REGISTRY.register</span>(<span class="st">"unifolm_vla"</span>)
@@ -177,13 +169,13 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
       </div>
       <div class="fig-cap">图 7.1：UnifoLM-VLA 的「特征服务器 + 动作引擎」解耦。VLM 整体（含语言塔）可作为冻结底座——但注意这<b>不是默认</b>：shipped 配置里 <code class="inline">freeze_modules: ''</code>（unifolm_vla_train.yaml:68），即默认全部参与训练，冻结要显式指定；DiT 头从零训练。repeated_diffusion_steps 让每个样本贡献多组流匹配监督：代码从 <code class="inline">config.trainer</code> 读，shipped 值 4（yaml 里 <code class="inline">action_model</code> 段还有个同名键写 8，但代码不读它——这处不一致容易看错）。</div>
     </div>
-    <div class="annotation"><b>读法：</b>与 π0/SmolVLA 的「VLM 层内互看」相比，这种解耦有得有失——得到的是<strong>模块自由度</strong>（DiT-B 768 宽 12 头 / DiT-L 1536 宽 32 头两档任选，DiTConfig，DiT_ActionHeader.py:130；换 VLM 骨干只需对齐一个 hidden_size）与<strong>训练便宜</strong>（VLM 前向一次缓存特征，DiT 反复迭代不碰它）；失去的是端到端联合微调时的深度耦合。还有两处独特的工程选择：①时间不连续采样，而是 <code class="inline">t×1000</code> 离散成桶号再进正弦编码（:205）——继承自 GR00T N1.5 的动作头血统（文件头注明）；②<strong>future_tokens</strong>——32 个可学习 token 混进序列，给 DiT 一组「任务占位符」，推理时与训练时行为一致。方向约定注意：它的插值是 (1-t)·noise + t·actions，t=1 是动作、t=0 是噪声——与 π0 的记号恰好相反，读代码时别绕晕。</div>
+    <div class="annotation"><b>解耦换来了什么、又付出了什么：</b>与 π0/SmolVLA 的「VLM 层内互看」相比，解耦有得有失——得到的是<strong>模块自由度</strong>（DiT-B 768 宽 12 头 / DiT-L 1536 宽 32 头两档任选，DiTConfig，DiT_ActionHeader.py:130；换 VLM 骨干只需对齐一个 hidden_size）与<strong>训练便宜</strong>（VLM 前向一次缓存特征，DiT 反复迭代不碰它）；失去的是端到端联合微调时的深度耦合。还有两处独特的工程选择：①时间不连续采样，而是 <code class="inline">t×1000</code> 离散成桶号再进正弦编码（:205）——继承自 GR00T N1.5 的动作头血统（文件头注明）；②<strong>future_tokens</strong>——32 个可学习 token 混进序列，给 DiT 一组「任务占位符」，推理时与训练时行为一致。方向约定注意：它的插值是 (1-t)·noise + t·actions，t=1 是动作、t=0 是噪声——与 π0 的记号恰好相反，读代码时别绕晕。</div>
     <div class="annotation"><b>这个仓库已经停在 2026 年 1 月，后继是谁：</b>Unitree 2026 年 9 月底发布了升级版 <strong>UnifoLM-WLA-1.0</strong>（6B 参数，约 2500 小时真机数据、单模型 64 个任务，源码在 unifolm-wla 仓库，Apache-2.0）。它保留了「VLM + 独立动作头」这条骨架，但两头规格都升了级：VLM 从 Qwen2.5-VL 换成 Qwen3-VL-4B，动作头从单流 DiT 换成 <strong>MMDiT 双流联合 attention</strong>——动作 token 不再隔层 cross-attention 读 VLM 特征，而是与 VLM 文本 token 拼进同一条序列做 joint attention（mmdit.py:245 注明拼接顺序 [action, text]，动作在前以对齐 RoPE 位置）。它登记的框架名是 QwenMMDiT（QwenMMDiT.py:176），文档串直说 "Mirrors QwenGR00T but swaps the action head"（QwenMMDiT.py:4）——血统声明比改名更坦率；微调配置 freeze_modules: "qwen_vl_interface"（mmdit_finetune_frozen_vlm.yaml:66）则是「特征服务器可冻结」同一原则的延续。</div>
     <div class="annotation"><b>WLA 真正的新东西是「世界模型」，而且要分清它炼在哪一层：</b>官方说法叫「以交互为中心的世界建模」——机器人不只要理解当前画面，还要<strong>预测自己的动作会让场景怎么变</strong>。机制按项目页的说明是：用光流从未来帧里提取「会动的区域」，训练一个 VQ-VAE 把这些动态区域离散成 mask token；然后让 VLM 以当前帧 + 任务描述（或动作）为条件，<strong>直接预测未来动态区域的 mask token</strong>——关注交互对象及其引起的变化，而不是整幅画面。这条「视觉-语言-动作」链路因此多了一段：先在 UnifoLM-ER 系列的具身推理底座上炼出「预测世界怎么变」的能力（空间 QA、2D 轨迹、3D 检测等 5M+ 样本），再加离散动作 token 与未来 mask token 联合对齐得到 ER-Flow，最后 WLA 在它之上接 MMDiT 动作专家。读开源代码时要留意边界：这个开源仓放出的只是动作专家训练部分——世界建模的监督（未来 mask token）是 ER 预训练阶段的事，权重已发布、训练管道没开源。代码里唯一的钩子是训练器的数据标签分发：base_framework.py:155 注明 <code class="inline">compute_loss</code> 目前路由 "vla"/"vlm" 两类，"Subclasses can override this to add more tags (e.g. <code class="inline">'world'</code>)"——世界模型通道在结构里留了位置，等的就是这类数据。另外 WLA 版的 embodiment embedding 是 append-only 契约（DEFAULT_EMBODIMENT_TYPES：unitree/aloha/fractal/franka/bridge/robochallenge×2，MMDiT_ActionHeader.py:89），注释明说顺序即身份、只许追加，否则旧 checkpoint 的 id 全部错位——与 GR00T 按 32 槽位分桶（7.3）是同一问题的两种解法。从 vla 迁到 wla 读代码的成本很低：插值方向、Beta(1.5,1.0) 时间采样、1000 桶离散时间逐项对得上。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.3</span>③ GR00T N1.7：解耦路线的「原厂完整版」</h2>
+    <h2><span class="num">7.3</span>GR00T N1.7：解耦路线的「原厂完整版」</h2>
     <p>上一节 UnifoLM-VLA 的动作头血统来自 NVIDIA Isaac-GR00T——现在直接读原厂。GR00T N1.7（GA 版）与 UnifoLM-VLA 同属「VLM 特征 + 独立 DiT 头」家族，但它是一台<strong>跨本体预训练的成品机器</strong>，三个差异值得对照着看：</p>
     <div class="code-title">gr00t/model/gr00t_n1d7/gr00t_n1d7.py:38 — 动作头组装（节选，src/Isaac-GR00T/）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">Gr00tN1d7ActionHead</span>(nn.Module):
@@ -200,7 +192,7 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.4</span>④ Prismatic：VLM 本身怎么炼成</h2>
+    <h2><span class="num">7.4</span>Prismatic：VLM 本身怎么炼成</h2>
     <p>前三个标本都把 VLM 当现成件。但「VLM 怎么预训练」值得一节体量的好奇——Prismatic VLMs（Stanford，OpenVLA 的视觉-语言底座）把这个过程做成了可复现的实验矩阵：</p>
     <div class="code-title">prismatic/models/vlms/prismatic.py:38 — 三件套结构（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">PrismaticVLM</span>(VLM):
@@ -251,8 +243,8 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.6</span>收尾：给自研 VLA 的选型坐标系</h2>
-    <p>7.1 的四个问题，答案收拢：① 耦合换的是 token 级联合 attention 的表达力（π0），解耦换的是动作头自由度与训练独立（UnifoLM、GR00T）；② 体量买的是世界知识与泛化，450M 与 3B 差距主要在没见过的场景；③ 跨本体靠统一动作空间（EEF）+ 本体 embedding + 大规模跨机器人预训练；④ 底座靠两阶段预训练——对齐再增强，Prismatic 把配方拆成了实验矩阵。一张表带走：</p>
+    <h2><span class="num">7.6</span>给自研 VLA 的选型坐标系</h2>
+    <p>四个标本看完，分野可以这样归纳：耦合换的是 token 级联合 attention 的表达力（π0），解耦换的是动作头自由度与训练独立（UnifoLM、GR00T）；体量买的是世界知识与泛化，450M 与 3B 差距主要在没见过的场景；跨本体靠统一动作空间（EEF）+ 本体 embedding + 大规模跨机器人预训练；底座靠两阶段预训练——对齐再增强，Prismatic 把配方拆成了实验矩阵。把这些结论排进选型坐标系：</p>
     <table class="tbl">
       <tr><th>概念</th><th>一句话</th></tr>
       <tr><td>π0</td><td>PaliGemma 3B + Gemma 300M 专家，token 级联合 attention，openpi 官方移植</td></tr>
@@ -266,7 +258,7 @@ loss = ((pred_actions - velocity) ** <span class="nu">2</span>).mean()</pre>
       <tr><td>选型法则</td><td>数据少冻结面大；数据多全耦合；做研究选解耦；跨本体用原厂权重起步</td></tr>
     </table>
     <div class="callout warn">
-      <b class="tag">下一步</b>
+      <b class="tag">从真实到虚拟</b>
       数据与模型都已就位，还缺一个「便宜的世界」供机器人大规模练习。Isaac Lab 提供的就是这个世界：GPU 并行仿真、八个 Manager 驱动的环境循环。这是<a href="08-sim-isaaclab.html">第 8 章：Isaac Lab 全景</a>。
     </div>
   </section>
