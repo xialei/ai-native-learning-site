@@ -96,7 +96,7 @@
         <rect class="node acc" x="20" y="240" width="270" height="24" rx="6"></rect>
         <text class="lbl sm" x="155" y="256" text-anchor="middle">SOFollower · KochFollower · LeKiwi …</text>
         <rect class="node acc" x="305" y="240" width="270" height="24" rx="6"></rect>
-        <text class="lbl sm" x="440" y="256" text-anchor="middle">FeetechMotorsBus · DynamixelMotorsBus</text>
+        <text class="lbl sm" x="440" y="256" text-anchor="middle">SerialMotorsBus（rustypot 后端）</text>
         <rect class="node acc" x="595" y="240" width="280" height="24" rx="6"></rect>
         <text class="lbl sm" x="740" y="256" text-anchor="middle">OpenCVCamera · RealSenseCamera · ZMQCamera</text>
 
@@ -176,12 +176,12 @@
   <section class="block">
     <h2><span class="num">2.3</span>③ 一个具体实现：SO-Follower 如何兑现这七个承诺</h2>
     <p>抽象读起来总有点虚，直接看最流行的机型——SO-100/SO-101（<code class="inline">SOFollower</code>）。先看它在 <code class="inline">__init__</code> 里怎么「装配」：</p>
-    <div class="code-title">src/lerobot/robots/so_follower/so_follower.py:68 — 六个关节 + 一条 Feetech 总线</div>
+    <div class="code-title">src/lerobot/robots/so_follower/so_follower.py:64 — 六个关节 + 一条串行总线</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__init__</span>(self, config: SOFollowerRobotConfig):
     <span class="fn">super</span>().__init__(config)
     self.config = config
     norm_mode_body = MotorNormMode.DEGREES <span class="kw">if</span> config.use_degrees <span class="kw">else</span> MotorNormMode.RANGE_M100_100
-    self.bus = FeetechMotorsBus(
+    self.bus = SerialMotorsBus(
         port=self.config.port,
         motors={
             <span class="st">"shoulder_pan"</span>:  Motor(<span class="nu">1</span>, <span class="st">"sts3215"</span>, norm_mode_body),
@@ -194,8 +194,8 @@
         calibration=self.calibration,
     )
     self.cameras = make_cameras_from_configs(config.cameras)</pre>
-    <div class="annotation"><b>一台机械臂的全部硬件知识：</b>6 自由度机械臂浓缩在一张表里：<strong>电机 ID → 电机型号 → 归一化方式</strong>。<code class="inline">MotorNormMode</code>（motors_bus.py:169）决定读数怎么归一：<code class="inline">RANGE_M100_100</code> 把关节行程映射到 [-100, 100]，夹爪用 <code class="inline">RANGE_0_100</code>（0=张开，100=闭合）。策略看到的动作空间就是这组归一化后的数——换机型时只要归一化方式一致，数据集和策略可以复用。</div>
-    <div class="annotation"><b>Feetech 是谁：</b>国产舵机厂商飞特（FEETECH），与韩国 ROBOTIS（Dynamixel 系）并列桌面机械臂的两大舵机主流。SO-100/SO-101 的六个关节全是它的 STS3215 型号，所以上面 6 个电机的 model 字段都是 <code class="inline">"sts3215"</code>。LeRobot 的 <code class="inline">motors/</code> 目录按厂商分包（feetech/、dynamixel/、damiao/、robstride/），各自实现 <code class="inline">MotorsBusBase</code> 接口——本章拿 Feetech 当「具体厂商协议」的代表，2.4 节讲寄存器读写时也以它举例。</div>
+    <div class="annotation"><b>一台机械臂的全部硬件知识：</b>6 自由度机械臂浓缩在一张表里：<strong>电机 ID → 电机型号 → 归一化方式</strong>。<code class="inline">MotorNormMode</code>（motors_bus.py:125）决定读数怎么归一：<code class="inline">RANGE_M100_100</code> 把关节行程映射到 [-100, 100]，夹爪用 <code class="inline">RANGE_0_100</code>（0=张开，100=闭合）。策略看到的动作空间就是这组归一化后的数——换机型时只要归一化方式一致，数据集和策略可以复用。</div>
+    <div class="annotation"><b>Feetech 是谁：</b>国产舵机厂商飞特（FEETECH），与韩国 ROBOTIS（Dynamixel 系）并列桌面机械臂的两大舵机主流。SO-100/SO-101 的六个关节全是它的 STS3215 型号，所以上面 6 个电机的 model 字段都是 <code class="inline">"sts3215"</code>。注意这里的 bus 类不是 <code class="inline">FeetechMotorsBus</code>——串行舵机的总线实现统一在 <code class="inline">SerialMotorsBus</code>（feetech/、dynamixel/ 目录下各留一个弃用别名过渡一个版本），电机型号归哪家由 model 字符串交给 <a href="https://github.com/pollen-robotics/rustypot" class="ext">rustypot</a> 查定义；CAN 总线的 damiao/、robstride/ 仍是各自独立的类。本章拿 SO-101 当「具体机型」的代表，2.4 节讲寄存器读写时也以它的 STS3215 举例。</div>
     <p>然后是观测与动作的两个核心实现——注意它们全部经由 <code class="inline">bus</code>，没有一行 Feetech 协议细节：</p>
     <div class="code-title">src/lerobot/robots/so_follower/so_follower.py — get_observation / send_action（节选）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">get_observation</span>(self) -&gt; RobotObservation:
@@ -225,8 +225,8 @@
 
   <section class="block">
     <h2><span class="num">2.4</span>③（续）MotorsBus：一条串行总线上的「寄存器读写」</h2>
-    <p>舵机机械臂的关节电机不接网卡、不跑 ROS，它们挂在一条串行总线上（Feetech 用 TTL 串口，Dynamixel 同理），每个电机有 ID，协议本质是<strong>读写寄存器</strong>。LeRobot 把这套「查表寻址」抽象在 <code class="inline">MotorsBusBase</code> 里：</p>
-    <div class="code-title">src/lerobot/motors/motors_bus.py:58 — MotorsBusBase 最小接口（摘录）</div>
+    <p>舵机机械臂的关节电机不接网卡、不跑 ROS，它们挂在一条串行总线上（Feetech 用 TTL 串口，Dynamixel 同理），每个电机有 ID，协议本质是<strong>读写寄存器</strong>。LeRobot 把这套「查表寻址」抽象在 <code class="inline">MotorsBusBase</code>（接口）+ <code class="inline">SerialMotorsBus</code>（串行实现）里：</p>
+    <div class="code-title">src/lerobot/motors/motors_bus.py:50 — MotorsBusBase 最小接口（摘录）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">MotorsBusBase</span>(abc.ABC):
     <span class="kw">def</span> <span class="fn">__init__</span>(self, port: <span class="cl">str</span>, motors: <span class="cl">dict</span>[<span class="cl">str</span>, Motor], calibration: ... | <span class="kw">None</span> = <span class="kw">None</span>):
         self.port = port          <span class="cmt"># 串口路径，如 "/dev/ttyACM0"</span>
@@ -247,11 +247,11 @@
     <div class="annotation"><b>两个读写族的区别是总线效率的核心：</b>
       <ul>
         <li><strong><code class="inline">read / write</code></strong>：单电机逐个读写。读 6 个关节要发 6 次请求-响应，串行总线上就是 6 倍延迟。</li>
-        <li><strong><code class="inline">sync_read / sync_write</code></strong>：广播一次指令，所有电机<strong>同时</strong>返回/写入同一个寄存器。FeetechMotorsBus 内部用飞特官方 SDK（<code class="inline">import scservo_sdk as scs</code>）的 <code class="inline">scs.GroupSyncRead</code>（feetech.py:123）实现。30 Hz 控制回路里读 6 关节，sync_read 是能不能跑起来的差别。</li>
-        <li><strong>data_name 是寄存器名</strong>：如 <code class="inline">"Present_Position"</code>、<code class="inline">"Goal_Position"</code>、<code class="inline">"Torque_Enable"</code>。<code class="inline">get_address()</code>（motors_bus.py:140）按电机型号查 <code class="inline">tables.py</code> 里的控制表，把名字翻译成 (地址, 长度)——每种电机芯片的寄存器布局不同，这份差异被压在 tables.py 一个文件里。</li>
+        <li><strong><code class="inline">sync_read / sync_write</code></strong>：广播一次指令，各电机返回/写入同一个寄存器。串行实现统一交给 <a href="https://github.com/pollen-robotics/rustypot" class="ext">rustypot</a> 的 <code class="inline">Bus</code>（motors_bus.py:248 的 <code class="inline">_open_bus</code>）：同一协议、同一寄存器地址的电机打包成一条 Sync Read/Write 指令，没有 Sync Read 指令的舵机（如 Feetech SCS 系）退化为逐个读——文档里明确提醒这种情况下读到的<strong>不是同一瞬间的快照</strong>。30 Hz 控制回路里读 6 关节，sync_read 是能不能跑起来的差别。</li>
+        <li><strong>data_name 是寄存器名</strong>：如 <code class="inline">"Present_Position"</code>、<code class="inline">"Goal_Position"</code>、<code class="inline">"Torque_Enable"</code>（大小写不敏感）。名字到 (地址, 长度) 的翻译由 rustypot 的 ServoDefinition 承担——每种电机芯片的控制表（寄存器布局、分辨率、波特率、运行模式）都在它的定义里，LeRobot 只管归一化、标定与推荐设置（类 docstring 原话，SerialMotorsBus :156）。</li>
       </ul>
     </div>
-    <p>继承结构是 <code class="inline">MotorsBusBase</code>（纯接口）→ <code class="inline">SerialMotorsBus</code>（motors_bus.py:303，串口通用逻辑：端口收发、包超时、重试）→ <code class="inline">FeetechMotorsBus / DynamixelMotorsBus</code>（各自协议细节）。Damiao、Robstride 是 CAN 总线，另走一条实现线。</p>
+    <p>继承结构是 <code class="inline">MotorsBusBase</code>（纯接口）→ <code class="inline">SerialMotorsBus</code>（motors_bus.py:156，串口通用逻辑：rustypot 总线管理、包超时、重试、归一化/标定）。Feetech 与 Dynamixel 的差异不再各写一个子类——<code class="inline">SerialMotorsBus</code> 一类通吃两条产品线，按电机的 model 字符串向 rustypot 查各自的控制表与协议分组；feetech/、dynamixel/ 目录下原来的 <code class="inline">FeetechMotorsBus</code>/<code class="inline">DynamixelMotorsBus</code> 已标弃用（只发 DeprecationWarning 转发到基类，保留一个版本）。Damiao、Robstride 是 CAN 总线，另走一条实现线（仍是 MotorsBusBase 的直接子类）。</p>
     <div class="callout info">
       <b class="tag">延伸</b>
       伺服层级之上才是策略层级。低层控制循环（读当前位置 → 写目标位置）跑在 30-100 Hz；策略推理可能只有 5-10 Hz（VLA 模型更慢）。两者的解耦靠「action chunk + 插值」——这是第 5 章（action chunking 与两种消费模式）和第 11 章（远程推理与队列对齐）的主线。硬件抽象层保证的是：控制循环永远能以固定节拍拿到 <code class="inline">Present_Position</code>、写下去 <code class="inline">Goal_Position</code>。
@@ -260,8 +260,8 @@
 
   <section class="block">
     <h2><span class="num">2.4.1</span>标定：归一化的前提</h2>
-    <p>舵机内部是一个磁编码器：电机转到任意角度，总线上的读数是一个 0-4095 的整数（STS3215 的分辨率，tables.py:190）。问题在于——<strong>电机是装进机械臂之后你才读数的，而装配时电机轴的初始朝向没法保证一致</strong>。同一型号的舵机，装到 A 机器上时电机轴可能正对「水平」，读数 2048；装到 B 机器上时齿轮啮合位置差了一点，同样读到 2048，实际却偏了 30°。两台机器的原始读数之间没有共同坐标系，直接拿去训练或对拷数据全是错的。所以每个电机需要一份 <code class="inline">MotorCalibration</code>——记录「这台机器上，哪个原始读数对应关节零位、行程两端各是多少」，把原始读数换算回统一的归一化坐标：</p>
-    <div class="code-title">src/lerobot/motors/motors_bus.py:176 — MotorCalibration 与 Motor</div>
+    <p>舵机内部是一个磁编码器：电机转到任意角度，总线上的读数是一个 0-4095 的整数（STS3215 的 12 位分辨率，由 rustypot 的 servo 定义提供，<code class="inline">SerialMotorsBus.resolution()</code> 可查，motors_bus.py:268）。问题在于——<strong>电机是装进机械臂之后你才读数的，而装配时电机轴的初始朝向没法保证一致</strong>。同一型号的舵机，装到 A 机器上时电机轴可能正对「水平」，读数 2048；装到 B 机器上时齿轮啮合位置差了一点，同样读到 2048，实际却偏了 30°。两台机器的原始读数之间没有共同坐标系，直接拿去训练或对拷数据全是错的。所以每个电机需要一份 <code class="inline">MotorCalibration</code>——记录「这台机器上，哪个原始读数对应关节零位、行程两端各是多少」，把原始读数换算回统一的归一化坐标：</p>
+    <div class="code-title">src/lerobot/motors/motors_bus.py:125 — MotorNormMode 与 MotorCalibration</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> MotorNormMode(<span class="cl">str</span>, Enum):
     RANGE_0_100 = <span class="st">"range_0_100"</span>        <span class="cmt"># 行程映射到 [0, 100]（夹爪）</span>
     RANGE_M100_100 = <span class="st">"range_m100_100"</span>  <span class="cmt"># 行程映射到 [-100, 100]（关节）</span>
@@ -314,11 +314,11 @@
 
   <section class="block">
     <h2><span class="num">2.6</span>收尾：接口即架构</h2>
-    <p>2.1 的四个问题，答案收拢：① 抽象挡住的是「每台机器一套 SDK」——三个基类把协议、标定、限幅都关进实现里，上层只认接口；② 一台机器人 = 八个接口（观测/动作特征描述 + 连接/标定/配置/读写/断开）；③ 协议差异收敛到 tables.py 的查表与各厂商的 bus 子类，读数坐标靠标定 JSON 统一；④ 相机用 read / async_read / read_latest 三种节拍覆盖离线、单相机主循环、多传感器并发。一张表带走：</p>
+    <p>2.1 的四个问题，答案收拢：① 抽象挡住的是「每台机器一套 SDK」——三个基类把协议、标定、限幅都关进实现里，上层只认接口；② 一台机器人 = 八个接口（观测/动作特征描述 + 连接/标定/配置/读写/断开）；③ 协议差异收敛到 rustypot 的 servo 定义查表与一条串行总线实现，读数坐标靠标定 JSON 统一；④ 相机用 read / async_read / read_latest 三种节拍覆盖离线、单相机主循环、多传感器并发。一张表带走：</p>
     <table class="tbl">
       <tr><th>概念</th><th>lerobot 实现</th><th>你自己做硬件接入时</th></tr>
       <tr><td>整机接口</td><td>Robot ABC：observation_features / connect / get_observation / send_action / disconnect</td><td>先定接口再写实现；新机型 = 新子类 + 配置类，不动上层</td></tr>
-      <tr><td>关节读写</td><td>MotorsBusBase.sync_read / sync_write 广播式总线访问，寄存器名经 tables.py 查表寻址</td><td>控制回路永远用同步组读/组写；协议差异压进一个查表文件</td></tr>
+      <tr><td>关节读写</td><td>MotorsBusBase.sync_read / sync_write 组播式总线访问，寄存器名经 rustypot 的 servo 定义寻址</td><td>控制回路永远用同步组读/组写；协议差异压进一个查表来源</td></tr>
       <tr><td>安全限幅</td><td>max_relative_target → ensure_safe_goal_position 逐步钳位，返回实际发送值</td><td>安全网放离电机最近处；数据落盘用「实际执行值」</td></tr>
       <tr><td>标定</td><td>MotorCalibration（drive_mode/homing_offset/range）以 JSON 持久化，连接时自动加载</td><td>把装配差异折算成统一归一化坐标，是数据可复用的前提</td></tr>
       <tr><td>相机</td><td>Camera ABC 的 read / async_read / read_latest 三种节拍</td><td>多传感器系统里，主循环取 latest、离线脚本才用阻塞读</td></tr>
@@ -333,7 +333,7 @@
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>LeRobot 硬件层的取舍是「<strong>接口窄到不能再窄</strong>」：Robot 只承诺「观测进来、动作出去」，MotorsBus 用查表把协议差异压进一个文件，标定把装配差异折算成统一坐标，Camera 用三种读法对齐多传感器节拍。安全限幅（max_relative_target）放在离电机最近的地方。上层的一切——录制、训练、部署——都建立在这份承诺上。</p>
+    <p>LeRobot 硬件层的取舍是「<strong>接口窄到不能再窄</strong>」：Robot 只承诺「观测进来、动作出去」，MotorsBus 用查表把协议差异压进一个来源，标定把装配差异折算成统一坐标，Camera 用三种读法对齐多传感器节拍。安全限幅（max_relative_target）放在离电机最近的地方。上层的一切——录制、训练、部署——都建立在这份承诺上。</p>
     <p>有了能读能写的机器人，下一章讲怎么让人类「示范」给机器人看 → <a href="03-teleop.html">第 3 章：遥操作与数据采集</a>。</p>
   </div>
 
@@ -350,7 +350,7 @@
 </div>
 
 <footer>
-  深入浅出具身智能 · 02 硬件抽象层 · 基于 huggingface/lerobot（297774fca）· 行号随版本演进可能偏移，以仓库最新代码为准
+  深入浅出具身智能 · 02 硬件抽象层 · 基于 huggingface/lerobot（146d84749）· 行号随版本演进可能偏移，以仓库最新代码为准
 </footer>
 
 </body>
