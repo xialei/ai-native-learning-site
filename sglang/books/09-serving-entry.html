@@ -283,7 +283,7 @@ prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(ren
       模板这一层最近补上了一道安全闸（commit 3e7e652900，#28135）：请求的 <code class="inline">chat_template_kwargs</code> 会原样展开进 <code class="inline">apply_chat_template</code>（<code class="inline">serving_chat.py</code> 的 <code class="inline">extra_template_kwargs.update</code>），而这个函数的签名里本来就有 <code class="inline">chat_template: str | None</code> 参数——kwargs 里塞进同名键就等于替服务端换掉模板本身，客户端得以重写整套渲染规则。现在 <code class="inline">_validate_request</code>（<code class="inline">serving_chat.py</code>）直接拒掉这个键，报错指路 <code class="inline">--trust-request-chat-template</code>；开关定义在 <code class="inline">serving.py</code>，注释写明「Off by default for safety」。另外 <code class="inline">reasoning_effort</code> 走的也是 <code class="inline">chat_template_kwargs</code> 这条路，却不会被误伤——校验只拦名为 <code class="inline">chat_template</code> 的键，其余 kwargs 照常透传。这是「请求体字段流入模板引擎前必须过白名单」的一例，自研适配层里凡是 <code class="inline">**kwargs</code> 直通 Jinja 的地方都值得对照检查。
     </div>
 
-    <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型吐出的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
+    <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型生成的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
     <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — tool call 约束构建（摘录，注释为译注）</div>
     <pre class="code"><span class="cmt"># glm47 先走：整助手回复一条 EBNF 约束，不走逐工具解析</span>
 glm_constraint = self.tool_call_parser == <span class="st">"glm47"</span> <span class="kw">and not</span> <span class="fn">any</span>(
@@ -312,7 +312,7 @@ required_parsed_natively = glm_constraint
             thinking_mode=xgrammar_reasoning,
         )
         required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
-    <div class="annotation"><b>glm47 走单独一条路：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生吐出，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
+    <div class="annotation"><b>glm47 走单独一条路：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生生成，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
   </section>
 
   <section class="block">

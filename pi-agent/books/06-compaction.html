@@ -45,7 +45,7 @@
 
   <section class="block">
     <h2><span class="num">6.1</span>历史太长，丢什么、留什么</h2>
-    <p>Compaction 的定义一句话：<strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。压缩成功后的后续请求里，模型通常只看到「摘要 + 最近细节」，而不是无限增长的完整转写——但压缩关闭、未触发或失败时，请求仍带完整历史。要把这件事做对，得回答四个问题：</p>
+    <p>Compaction 的定义一句话说完：<strong>当上下文快满时，把「较早的历史」交给 LLM 生成一份结构化摘要，用一个 <code class="inline">compaction</code> 条目替换它们，同时保留最近一小段「尾巴」</strong>。压缩成功后的后续请求里，模型通常只看到「摘要 + 最近细节」，而不是无限增长的完整转写——但压缩关闭、未触发或失败时，请求仍带完整历史。要把这件事做对，得回答四个问题：</p>
     <ul>
       <li><strong>何时触发？</strong>token 数怎么数？provider 报过的 usage 在上下文被改写之后还算数吗？</li>
       <li><strong>切割点怎么选？</strong>压掉多少历史、留多少尾巴，切在哪才不把一条对话从中间截断？</li>
@@ -168,12 +168,12 @@
     <div class="code-title">packages/agent/src/harness/compaction/compaction.ts — 设置与触发（v1.0.0 已删）</div>
     <pre class="code"><span class="lang-tag">typescript</span><span class="kw">export interface</span> <span class="cl">CompactionSettings</span> {
   enabled: <span class="cl">boolean</span>;      <span class="cmt">// 是否自动压缩</span>
-  reserveTokens: <span class="cl">number</span>;   <span class="cmt">// 给摘要 prompt 与输出预留多少 token</span>
+  reserveTokens: <span class="cl">number</span>;   <span class="cmt">// 低于窗口多少 token 时开始压缩（旧版兼管摘要输出上限，#11036 起只管触发线）</span>
   keepRecentTokens: <span class="cl">number</span>; <span class="cmt">// 压缩后想保留「最近」多少 token</span>
 }
 <span class="kw">export const</span> <span class="cl">DEFAULT_COMPACTION_SETTINGS</span>: <span class="cl">CompactionSettings</span> = {
   enabled: <span class="kw">true</span>,
-  reserveTokens: <span class="nu">16384</span>,   <span class="cmt">// 预留 ~16K</span>
+  reserveTokens: <span class="nu">16384</span>,   <span class="cmt">// 提前 ~16K 开始压缩</span>
   keepRecentTokens: <span class="nu">20000</span>, <span class="cmt">// 保留最近 ~20K</span>
 };
 
@@ -182,7 +182,7 @@
   <span class="kw">if</span> (!settings.enabled) <span class="kw">return false</span>;
   <span class="kw">return</span> contextTokens &gt; contextWindow - settings.reserveTokens;
 }</pre>
-    <div class="annotation">思路是「别等到窗口满才动，留出 <code class="inline">reserveTokens</code> 给这次摘要本身」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。<code class="inline">reserveTokens</code> 还影响摘要输出上限（按模型最大输出 token 封顶），不只是触发线。</div>
+    <div class="annotation">思路是「别等到窗口满才动，提前留出缓冲」。<code class="inline">keepRecentTokens</code> 决定压缩后模型还能看到多少「新鲜细节」。这两个数是压缩体验的关键旋钮——太小会损失细节，太大压缩不彻底。曾经 <code class="inline">reserveTokens</code> 还兼管摘要输出上限（按 0.8× 封顶），#11036（v1.3.0 后）把这条砍掉了：摘要请求不再设 maxTokens，直接用模型自身的输出上限——摘要请求远小于整个上下文（keepRecentTokens 的尾巴不发送、工具结果被截断、工具定义与系统提示不在场），把它的输出强行按「能塞进预留空间」算，在推理共享输出额度的端点上会把额度吃光，报「generation hit the token cap」。如今 <code class="inline">reserveTokens</code> 只管触发线——provider 层本就会按「实际请求大小 + 模型输出上限」自动收口。</div>
     <p>生产侧（coding-agent 的 <code class="inline">settings-manager.ts</code>）在这两个旋钮之上又加了一层解析：<code class="inline">compaction.modelOverrides</code> 允许按 <code class="inline">"provider/modelId"</code> 精确覆盖 <code class="inline">reserveTokens</code>/<code class="inline">keepRecentTokens</code>。动机很实际——一个 1M 窗口的模型与一个 32K 窗口的模型，合身的预留预算差了一个量级，全局一份默认值必然顾此失彼。解析顺序是<strong>模型覆盖 → 普通设置 → 内置默认</strong>，两个字段各自独立回退；<code class="inline">AgentSession</code> 在每次触发检查、手动 <code class="inline">/compact</code>、溢出恢复时都按<strong>当前模型</strong>调 <code class="inline">getCompactionSettings(model)</code> 拿生效值，换模型后下次检查就用新预算（进行中的那次压缩仍用开工时捕获的设置）。</p>
   </section>
 
@@ -430,12 +430,12 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
     </ul>
     <div class="callout warn">
       <b class="tag">要点</b>
-      <strong>token 预算是两笔账</strong>：reserveTokens（给这次摘要留空间）+ keepRecentTokens（保留多少细节）。<strong>切割要尊重对话边界</strong>，别从工具结果中间切。<strong>增量更新旧摘要</strong>，别每次全量重写（省 token 且更连贯）。<strong>摘要里带上文件清单等"元上下文"</strong>，比纯文本可控得多。
+      <strong>token 预算是两笔账</strong>：reserveTokens（触发线提前量）+ keepRecentTokens（保留多少细节）。<strong>切割要尊重对话边界</strong>，别从工具结果中间切。<strong>增量更新旧摘要</strong>，别每次全量重写（省 token 且更连贯）。<strong>摘要里带上文件清单等"元上下文"</strong>，比纯文本可控得多。
     </div>
   </section>
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>把这四问放回第 5 章的立场上看，压缩其实是「投影层的一次批量改写」：不是删历史，而是在 append-only 树上追加一条 compaction 条目，让模型面前的视图从「全量」换成「摘要 + 尾巴」。正因为切点选在投影上而不是原始转写上，context_edit 改过的上下文才算得对；正因为原始历史还在盘上，摘要生成失败才敢整单作废重来——溢出恢复只给一次机会，赌注押得住的前提是事实层无损。两笔预算账（reserveTokens / keepRecentTokens）贯穿全章，前者给摘要留空间，后者决定细节留多少。</p>
+    <p>把这四问放回第 5 章的立场上看，压缩其实是「投影层的一次批量改写」：不是删历史，而是在 append-only 树上追加一条 compaction 条目，让模型面前的视图从「全量」换成「摘要 + 尾巴」。正因为切点选在投影上而不是原始转写上，context_edit 改过的上下文才算得对；正因为原始历史还在盘上，摘要生成失败才敢整单作废重来——溢出恢复只给一次机会，赌注押得住的前提是事实层无损。两笔预算账（reserveTokens / keepRecentTokens）贯穿全章，前者决定何时动手，后者决定细节留多少。</p>
     <p>压缩何时被调度、崩了怎么续 → <a href="07-harness.html">第 7 章 · Harness 运行时骨架</a>。</p>
   </div>
 
@@ -452,7 +452,7 @@ summary += <span class="fn">formatFileOperations</span>(readFiles, modifiedFiles
 </div>
 
 <footer>
-  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v1.2.0-57-g5ab7fe74c · 所有引用代码路径以仓库最新为准
+  Pi Agent Harness · 06 上下文压缩 Compaction · 版本 v1.3.0-16-g8efd314fa · 所有引用代码路径以仓库最新为准
 </footer>
 
 <script>

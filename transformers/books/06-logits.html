@@ -39,13 +39,13 @@
     <h1>选词:logit 向量到 token 之间发生什么</h1>
     <div class="lede">
       <p>第 5 章的循环里,「选词」一拍只有几行:过处理器链、argmax 或 multinomial。但模型给出的只是一个 15 万维的 logit 向量——「它觉得哪个词都行」和「它非说这个词不可」之间,隔着一整条流水线:温度把它变软变硬,top-p 把长尾砍掉,重复惩罚按住复读的嘴,不能说的词直接按到 -inf。这条流水线也是第 0 章问题三「库内表达机制」的主体:模型学到的偏好在此变成行为约束。</p>
-      <p>这一章拆 logits_process.py(3252 行,40 个处理器类)的两条链,再看候选解码(candidate_generator.py,1770 行):小模型/文本复用/MTP 七种候选生成器,怎么让一次前向验出多个 token。</p>
+      <p>这一章拆 logits_process.py(3252 行,35 个处理器类)的两条链,再看候选解码(candidate_generator.py,1770 行):小模型/文本复用/MTP 八种候选生成器,怎么让一次前向验出多个 token。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① 处理器 = 对词表 logit 的纯函数变换,链式叠加:「塑形」(温度/截断)与「约束」(禁词/强制)两类正交(6.1);② 采样参数不是玄学:温度 × 截断族各有明确作用面,装配顺序有讲究(min_p 必须在温度后,水印必须最后)(6.2);③ 候选解码把「一次前向产一个 token」改成「产 k+1 个」:小模型先猜、大模型一次验全对前缀,赌的是「猜错只浪费小模型算力,猜对白赚大模型吞吐」(6.3);④ 接受准则有两条路:greedy 直接比 token,采样走论文 Algorithm 1 的分布修正——保证统计上等价于大模型自己采样(6.4)。
+    先交代四问各自的答案::① 处理器 = 对词表 logit 的纯函数变换,链式叠加:「塑形」(温度/截断)与「约束」(禁词/强制)两类正交(6.1);② 采样参数不是玄学:温度 × 截断族各有明确作用面,装配顺序有讲究(min_p 必须在温度后,水印必须最后)(6.2);③ 候选解码把「一次前向产一个 token」改成「产 k+1 个」:小模型先猜、大模型一次验全对前缀,赌的是「猜错只浪费小模型的算力,猜对就多拿大模型的吞吐」(6.3);④ 接受准则有两条路:greedy 直接比 token,采样走论文 Algorithm 1 的分布修正——保证统计上等价于大模型自己采样(6.4)。
   </div>
 
   <section class="block">
@@ -77,7 +77,7 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
 
   <section class="block">
     <h2><span class="num">6.2</span>四个代表性处理器,读懂一族</h2>
-    <p>40 个类不必逐个讲,四个代表看懂,其余照方抓药:</p>
+    <p>35 个类不必逐个讲,四个代表看懂,其余照方抓药:</p>
     <div class="code-title">logits_process.py:238 — TemperatureLogitsWarper(核心一行)</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, input_ids, scores):
     <span class="kw">return</span> scores / self.temperature</pre>
@@ -127,7 +127,7 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
   <section class="block">
     <h2><span class="num">6.3</span>候选解码:一次前向验 k+1 个 token</h2>
     <p>主循环每步一次大模型前向、产一个 token。候选解码改这个赌注:让便宜的「候选生成器」先猜 k 个 token,大模型把「已确认前缀 + k 个候选」一次前向,每个位置都能与候选对账——全对就一步收 k+1 个 token,错了从错处截断。代价是多算了 k 个位置的 KV,但一次前向的批处理效率远高于 k 次串行, GPU 越空闲越划算。</p>
-    <p>候选从哪来?candidate_generator.py 有七种,分发逻辑在 _get_candidate_generator(generation/utils.py:1287):</p>
+    <p>候选从哪来?candidate_generator.py 有八个类,分发逻辑在 _get_candidate_generator(generation/utils.py:1287):</p>
     <table class="tbl">
       <tr><th>候选生成器(pin)</th><th>猜法</th><th>适用</th></tr>
       <tr><td>AssistedCandidateGenerator(:77)</td><td>小模型自回归草拟</td><td>经典 assisted / speculative</td></tr>
@@ -136,9 +136,10 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
       <tr><td>PromptLookupCandidateGenerator(:1017)</td><td>在 prompt 里找 n-gram 复读当候选</td><td>摘要/改写等「输出近似 prompt」场景</td></tr>
       <tr><td>EarlyExitCandidateGenerator(:1157)</td><td>用主模型浅层早退头当草稿</td><td>自推测</td></tr>
       <tr><td>MTPCandidateGenerator(:1372)</td><td>主模型附带的 MTP 头(如 GLM/deepseek 式多 token 预测层)</td><td>模型自带投机头</td></tr>
+    <tr><td>SinglePositionMultiTokenCandidateGenerator(:1213)</td><td>MTP 变体:固定 position_ids 从单位置连草 k 个,主模型 KV 共享给草稿模型</td><td>Gemma 4 式共享 KV 架构</td></tr>
       <tr><td>DFlashTokenCandidateGenerator(:1505)</td><td>DFlash 式并行草拟</td><td>专用草稿模型</td></tr>
     </table>
-    <div class="annotation"><b>分发优先级是「特例在前」:</b>assistant_early_exit → prompt_lookup → use_mtp → Gemma 专属共享 KV → dflash → 异词表 → 默认小模型。七种候选器共享同一个接口:get_candidates(input_ids) → (candidate_ids, candidate_logits) 与 update_candidate_strategy(反馈调参)。接口统一是这套代码能扩到七种的原因——第 9 章会看到工具调用也用同样的「接口统一,实现各自」模式。</div>
+    <div class="annotation"><b>分发优先级是「特例在前」:</b>assistant_early_exit → prompt_lookup → use_mtp → Gemma 专属共享 KV → dflash → 异词表 → 默认小模型。八种候选器共享同一个接口:get_candidates(input_ids) → (candidate_ids, candidate_logits) 与 update_candidate_strategy(反馈调参)。接口统一是这套代码能扩到八种的原因——第 9 章会看到工具调用也用同样的「接口统一,实现各自」模式。</div>
 
     <h3>自适应草稿长度:一个简单的启发式</h3>
     <div class="code-title">candidate_generator.py:223 — update_candidate_strategy(摘录,注释为译注)</div>
@@ -152,8 +153,8 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
 
   <section class="block">
     <h2><span class="num">6.4</span>验证与接受:两条准则</h2>
-    <p>候选生成后,大模型一次前向验全段(_assisted_decoding,:3901,核心在 :4050 附近):</p>
-    <div class="code-title">generation/utils.py:4070 附近 — 接受准则两分支(骨架,注释为译注)</div>
+    <p>候选生成后,大模型一次前向验全段(_assisted_decoding,:3901,核心在 :4081 起):</p>
+    <div class="code-title">generation/utils.py:4081 — 接受准则两分支(骨架,注释为译注)</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Case 1: 采样模式 —— 走投机采样论文的 Algorithm 1</span>
 <span class="kw">if</span> do_sample <span class="kw">and</span> candidate_logits <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
     valid_tokens, n_matches = _speculative_sampling(
@@ -165,8 +166,8 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
     candidate_new_tokens = candidate_input_ids[:, cur_len:]
     n_matches = ((~(candidate_new_tokens == selected_tokens[:, :-<span class="nu">1</span>])).cumsum(dim=-<span class="nu">1</span>) &lt; <span class="nu">1</span>).sum()
     valid_tokens = selected_tokens[:, : n_matches + <span class="nu">1</span>]   <span class="cmt"># 全部匹配 + 错位后的「红利 token」</span></pre>
-    <div class="annotation"><b>「红利 token」是投机解码的小甜头:</b>验证前向本来就要算到候选段后一位(candidate_length + 1 个位置的 logits),所以即使 k 个候选全对,还能免费拿下一个 token——一步 k+1 个。greedy 的接受准则是「逐位比对,错即截断」;采样的准则(Algorithm 1)不是比对,而是概率修正:若小模型给某 token 的概率低于大模型,按 (p−q)/p 的概率拒绝并从修正分布重采——接受序列的分布与大模型直接采样在统计上严格一致。这是投机解码「不损失质量」的数学保证,代码里 _speculative_sampling 函数实现。</div>
-    <div class="annotation"><b>MTP 是模型自带的「内建小模型」:</b>MTPCandidateGenerator 从主模型里拉出 MtpModel(模型权重里附带的额外预测层),主模型末层隐状态直接喂给 MTP 头产候选,不用第二个模型。缓存侧配套的 MtpCache(第 4 章类清单里出现过)负责保存 MTP 层自己的状态。对用户就是 use_mtp=True 一个开关——「投机」从「要养两个模型」进化到「模型出厂自带」,这是 v5 把它做成一等公民的原因。</div>
+    <div class="annotation"><b>「红利 token」是投机解码的小甜头:</b>验证前向本来就要算到候选段后一位(candidate_length + 1 个位置的 logits),所以即使 k 个候选全对,还能免费拿下一个 token——一步 k+1 个。greedy 的接受准则是「逐位比对,错即截断」;采样的准则(Algorithm 1)不是比对,而是概率修正:草稿概率 q 低于大模型概率 p 的 token 直接保留;q 高于 p 时按 1 − p/q 的概率拒绝,并从修正分布 clamp(p−q) 重采——接受序列的分布与大模型直接采样在统计上严格一致。这是投机解码「不损失质量」的数学保证,代码里 _speculative_sampling 函数实现。</div>
+    <div class="annotation"><b>MTP 是模型自带的「内建小模型」:</b>MTPCandidateGenerator 从主模型里拉出 MtpModel(模型权重里附带的额外预测层),主模型末层隐状态直接喂给 MTP 头产候选,不用第二个模型。缓存侧配套的 MtpCache(cache_utils.py:2137,DynamicCache 的子类)负责保存 MTP 层自己的状态。对用户就是 use_mtp=True 一个开关——「投机」从「要养两个模型」进化到「模型出厂自带」,这是 v5 把它做成一等公民的原因。</div>
   </section>
 
   <div class="figure breakout">
@@ -221,7 +222,7 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>logit 到 token 之间是两条链:硬约束处理器(永远启用,禁/强制/防复读)与塑形 warper(采样时启用,温度+截断族),装配顺序有约定——min-p 在温度后、水印在所有处理之后、LogitNormalization 垫底。40 个处理器分五组(塑形/防复读/硬约束/引导/水印),全部是「logit 的纯函数」;截断族都是 unfold/sort + masked_fill(-inf) 的张量手法。候选解码用「草稿便宜、验证并行」换吞吐:七种候选生成器共享 get_candidates/update_candidate_strategy 接口,自适应调草稿长度与置信门槛;greedy 验证逐位比对,采样验证走投机采样 Algorithm 1 的分布修正,统计上严格等价于大模型采样;MTP 把草稿模型变成主模型自带的预测头。这章的机制是问题三「库内表达机制」的主体:约束在此表达,能力从训练来(第 11 章)。</p>
+    <p>logit 到 token 之间是两条链:硬约束处理器(永远启用,禁/强制/防复读)与塑形 warper(采样时启用,温度+截断族),装配顺序有约定——min-p 在温度后、水印在所有处理之后、LogitNormalization 垫底。35 个处理器分六组(塑形/防复读/硬约束/引导/水印),全部是「logit 的纯函数」;截断族都是 unfold/sort + masked_fill(-inf) 的张量手法。候选解码用「草稿便宜、验证并行」换吞吐:八种候选生成器共享 get_candidates/update_candidate_strategy 接口,自适应调草稿长度与置信门槛;greedy 验证逐位比对,采样验证走投机采样 Algorithm 1 的分布修正,统计上严格等价于大模型采样;MTP 把草稿模型变成主模型自带的预测头。这章的机制是问题三「库内表达机制」的主体:约束在此表达,能力从训练来(第 11 章)。</p>
     <p>单机 generate 讲完了。并发怎么破?把「一个循环一个 batch」改成「调度器管一池请求」。<a href="07-serving.html">第 7 章:并发</a>。</p>
   </div>
 

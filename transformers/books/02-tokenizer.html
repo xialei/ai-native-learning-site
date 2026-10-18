@@ -45,7 +45,7 @@
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① token 的边界由词表 + 合并规则决定,不是空格——BPE 把高频字节对合并成单元,词表是训练语料的统计产物(2.2);② 中文慢在 UTF-8 一字三字节,常见汉字在词表里是单 token,生僻字要退回字节(2.3);③ v5 删掉慢分词器,只留 tokenizers 库后端 + 一层 Python 纯实现(2.4);④ token 不是模型「理解」的最小单位,是工程折中——词表大小、分词质量、解码效率在互相拉扯(2.6)。
+    开头那四个问题,逐个作答::① token 的边界由词表 + 合并规则决定,不是空格——BPE 把高频字节对合并成单元,词表是训练语料的统计产物(2.2);② 中文慢在 UTF-8 一字三字节,常见汉字在词表里是单 token,生僻字要退回字节(2.3);③ v5 删掉慢分词器,只留 tokenizers 库后端 + 一层 Python 纯实现(2.4);④ token 不是模型「理解」的最小单位,是工程折中——词表大小、分词质量、解码效率在互相拉扯(2.6)。
   </div>
 
   <section class="block">
@@ -113,14 +113,14 @@
         self._special_tokens_map = <span class="cl">dict</span>.fromkeys(self.SPECIAL_TOKENS_ATTRIBUTES)
         self._extra_special_tokens = []  <span class="cmt"># 模型专属:图像 token、工具 token 这类</span></pre>
     <div class="annotation"><b>为什么要分两组:</b>命名槽位是协议级的(所有模型共用这几个名字);extra 是模型自留地——视觉模型要 &lt;image&gt; 占位符,工具调用模型要有包住函数调用的标记。第 8、9 章会看到,chat template 的本质就是「把对话渲染成控制符序列」,而这些控制符必须是词表里的真 token,模型才能在训练时学会「看到它意味着什么」。这正是问题二(工具调用)在模型侧的第一块基石:工具调用的语法,是靠特殊 token 和普通文本一起拼出来的。</div>
-    <p>还有一个安全细节值得提前知道:v5 新增了 <code class="inline">sanitize_control_tokens</code> 参数(apply_chat_template 的签名里,tokenization_utils_base.py:3012)。用户输入里如果混着 <code class="inline">&lt;/s&gt;</code> 这样的字面量,默认会被编码成普通文本而不是控制 token——防止用户伪造「对话结束」或「工具调用」标记。提示注入的一个攻击面,就是从分词这一层堵的。</p>
+    <p>还有一个安全细节值得提前知道:v5 新增了 <code class="inline">sanitize_control_tokens</code> 参数(apply_chat_template 的签名里,tokenization_utils_base.py:3012)。用户输入里如果混着 <code class="inline">&lt;/s&gt;</code> 这样的字面量,默认(不传参数)会照常编码成控制 token——这正是提示注入的攻击面:用户可以伪造「对话结束」或「工具调用」标记。把 <code class="inline">sanitize_control_tokens=True</code> 打开后,用户文本里的字面量才被降级成普通文本,只有聊天模板自己写下的控制 token 保留身份——防注入是从分词这一层堵的,但要显式开关。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">2.4</span>v5 的断代:慢分词器退场</h2>
     <p>v4 时代的分词器是双轨的:每个模型一份 <code class="inline">tokenization_&lt;model&gt;.py</code>(纯 Python,慢)和一份 <code class="inline">tokenization_&lt;model&gt;_fast.py</code>(Rust 的 tokenizers 库,快)。两份代码实现同样的行为,但总会有行为不一致的角落——这是长期积累的技术债。</p>
     <p>v5 的迁移指南(MIGRATION_GUIDE_V5.md)写得很直白:慢分词器文件整体移除,原 <code class="inline">_fast</code> 后缀的文件改名顶替;sentencepiece 等其他后端以「轻量适配层」的方式保留在加载失败时的回退路径里。配套的 API 精简:encode_plus → <code class="inline">__call__</code>、batch_decode → <code class="inline">decode</code>、prepare_seq2seq_batch → <code class="inline">__call__(text_target=...)</code>。</p>
-    <p>纯 Python 侧没有全删——tokenization_python.py 里的 PythonBackend(400 行)保留,但定位变了:它是「没有 Rust 环境时的兜底」,以及在 doctest 和单元测试里跑得起来的一份参考实现。那份文件里的 Trie(45 行起)值得一看:最长匹配优先的 special token 扫描器,是「文本里混进控制符怎么办」这个问题的原始答案。</p>
+    <p>纯 Python 侧没有全删——tokenization_python.py 里的 PythonBackend(:400 起)保留,但定位变了:它是「没有 Rust 环境时的兜底」,以及在 doctest 和单元测试里跑得起来的一份参考实现。那份文件里的 Trie(45 行起)值得一看:最长匹配优先的 special token 扫描器,是「文本里混进控制符怎么办」这个问题的原始答案。</p>
     <div class="annotation"><b>为什么值得记住这次删减:</b>分词器是全库「双轨并存」时间最长的组件,双轨的动机(渐进迁移)和代价(行为漂移)都写在了 git 历史里。v5 用「一个 Rust 后端 + 一层声明」收敛它,和第 1 章的 modular 机制是同一个思路——<strong>把「每模型一份重复实现」换成「一份机制 + 每模型一份声明」。</strong>这也是全书反复出现的模式。</div>
   </section>
 
@@ -190,13 +190,13 @@
 
     <div class="callout info">
       <b class="tag">要点</b>
-      分词器是「互联网 → 模型」的关税关卡:所有内容在这里被计价(token 数)、被整形(控制符)、被卡住或放行(特殊 token、字节回退)。第 3 章开始,模型拿到这些 ID 之后发生的事——权重怎么「记住」互联网——才正式开场。
+      「互联网 → 模型」之间的所有内容都要过一遍分词器:在这里被计价(token 数)、被整形(控制符)、被卡住或放行(特殊 token、字节回退)。第 3 章开始,模型拿到这些 ID 之后发生的事——权重怎么「记住」互联网——才正式开场。
     </div>
   </section>
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>token 边界由词表和合并规则决定,是训练语料的统计产物,不是语义单位;字节级 BPE 用 256 字节打底加字节回退,保证任何文本可表示,代价是序列长度(中文尤其明显);特殊 token 是控制符的物理载体,v5 把命名槽位与模型专属 token 分开管理,sanitize_control_tokens 从分词层堵提示注入;v5 删掉双轨分词器,收敛成「一个 Rust 后端 + 每模型一层声明」,与 modular 机制同一个思路。</p>
+    <p>token 边界由词表和合并规则决定,是训练语料的统计产物,不是语义单位;字节级 BPE 用 256 字节打底加字节回退,保证任何文本可表示,代价是序列长度(中文尤其明显);特殊 token 是控制符的物理载体,v5 把命名槽位与模型专属 token 分开管理,sanitize_control_tokens 提供了从分词层堵提示注入的开关(默认关);v5 删掉双轨分词器,收敛成「一个 Rust 后端 + 每模型一层声明」,与 modular 机制同一个思路。</p>
     <p>文本已变成 ID 序列。下一章看它流进的第一个部件:注意力层,以及权重为什么能「记住」互联网。<a href="03-memory.html">第 3 章:记忆</a>。</p>
   </div>
 

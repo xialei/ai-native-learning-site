@@ -38,18 +38,18 @@
     <div class="chap-meta">Chapter 08 · Chat Template</div>
     <h1>对话模板:把聊天记录变成模型能读的序列</h1>
     <div class="lede">
-      <p>模型只会读 token 序列,而对话是「谁在什么时刻说了什么」的结构化数据。把后者变成前者,每个模型各有各的方言:Llama 用 [INST]...[/INST],Qwen 用 &lt;|im_start|&gt;user...,Gemma 用 &lt;start_of_turn&gt;。错一个控制符,模型就「看不懂」你说话——能力再强也输出乱码。把方言收拢成配置的,是 chat template:一段 Jinja 模板,随分词器发布,apply_chat_template 一调,对话列表变序列。</p>
+      <p>模型只会读 token 序列,而对话是「谁在什么时刻说了什么」的结构化数据。把后者变成前者,每个模型各有各的模板约定:Llama 用 [INST]...[/INST],Qwen 用 &lt;|im_start|&gt;user...,Gemma 用 &lt;start_of_turn&gt;。错一个控制符,模型就「看不懂」你说话——能力再强也输出乱码。把各家模板收拢成一份配置的,是 chat template:一段 Jinja 模板,随分词器发布,apply_chat_template 一调,对话列表变序列。</p>
       <p>这一章拆 chat_template_utils.py(740 行)的渲染链,看 v5 新增的 control token 消毒(用户伪造控制符怎么办)和工具 schema 自动转换;再看库内新出现的另一半:模型「答完之后」的解析(response_parsing)——这段代码把第 9 章工具调用的「解析」半边提前亮出来。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① 模板是随分词器发布的 Jinja 字符串,渲染输入 = messages + tools + documents + add_generation_prompt,输出 = 模型可读的文本(8.1);② 用户输入里的控制符是注入面:v5 用私有区标记把「用户写的控制符」编码成纯文本,只有模板自己写的才算真控制符(8.2);③ add_generation_prompt 是「该模型接话了」的开关——它渲染出 assistant 头,让模型从正确位置续写(8.3);④ 模型输出是文本,工具调用要靠 response_template 定义的结构化格式解析回来——渲染与解析是一对镜像(8.4)。
+    四个问题的回答按顺序是::① 模板是随分词器发布的 Jinja 字符串,渲染输入 = messages + tools + documents + add_generation_prompt,输出 = 模型可读的文本(8.1);② 用户输入里的控制符是注入面:v5 用私有区标记把「用户写的控制符」编码成纯文本,只有模板自己写的才算真控制符(8.2);③ add_generation_prompt 是「该模型接话了」的开关——它渲染出 assistant 头,让模型从正确位置续写(8.3);④ 模型输出是文本,工具调用要靠 response_template 定义的结构化格式解析回来——渲染与解析是一对镜像(8.4)。
   </div>
 
   <section class="block">
-    <h2><span class="num">8.1</span>模板:随分词器发布的方言配置</h2>
+    <h2><span class="num">8.1</span>模板:随分词器发布的各家约定</h2>
     <p>chat template 本体是一段 Jinja2 模板字符串,存在 tokenizer_config.json 里。一个典型的 Llama 式模板长这样(示意,非逐字):</p>
     <div class="code-title">Jinja 模板长什么样(示意)</div>
     <pre class="code"><span class="lang-tag">jinja</span>{%- <span class="kw">for</span> message <span class="kw">in</span> messages -%}
@@ -127,8 +127,8 @@ message = tokenizer.parse_response(
     tools=tools,             <span class="cmt"># 传了就按工具的 JSON Schema 做类型转换</span>
 )
 <span class="cmt"># "7" → 7(integer 参数) / "7" → "7"(string 参数)</span></pre>
-    <div class="annotation"><b>为什么必须传 prefix:</b>ResponseParser 的 docstring 讲得直白——「chat templates often pre-write part of the assistant message (e.g. an opening &lt;think&gt; tag)」(8.3 节的预填)。解析器拿完整对话,用 start_anchor(如 &lt;start_of_turn&gt;model)截到最近一条 assistant 消息才开始匹配(response_templates.py 的 truncate_past_last_anchor)。前缀里已关闭的区域还会作为 initial_events 吐出来,前端渲染器可以把预填部分也画出来。<strong>渲染与解析是同一份模板的两面:</strong>模板声明输出格式 → 模型照格式生成 → 解析器按同一格式收回来。response_template 与 chat_template 一起随分词器发布,推理循环(第 5 章)里的 stop_strings、这里的事件流解析,是工具调用可靠性的两道工程保障。</div>
-    <div class="annotation"><b>流式设计:三段事件:</b>ResponseParser.feed(chunk) 逐块喂入模型输出,吐出 region_open / region_chunk / region_close 事件——前端不用等全文,「思考区」「工具调用区」「正文区」各开各的流。工具参数在 region_close 时按 JSON Schema 做类型收敛(_coerce:integer/number/boolean/object/array 各有转换逻辑,NaN/inf 拒收)。这与第 9 章工具调用「停止条件 + 解析」的分工严丝合缝:库内管格式与解析,执行与循环在库外。</div>
+    <div class="annotation"><b>为什么必须传 prefix:</b>ResponseParser 的 docstring 讲得直白——「chat templates often pre-write part of the assistant message (e.g. an opening &lt;think&gt; tag)」(8.3 节的预填)。解析器拿完整对话,用 start_anchor(如 &lt;start_of_turn&gt;model)截到最近一条 assistant 消息才开始匹配(response_templates.py 的 truncate_past_last_anchor)。前缀里已关闭的区域还会作为 initial_events 一并发出,前端渲染器可以把预填部分也画出来。<strong>渲染与解析是同一份模板的两面:</strong>模板声明输出格式 → 模型照格式生成 → 解析器按同一格式收回来。response_template 与 chat_template 一起随分词器发布,推理循环(第 5 章)里的 stop_strings、这里的事件流解析,是工具调用可靠性的两道工程保障。</div>
+    <div class="annotation"><b>流式设计:三段事件:</b>ResponseParser.feed(chunk) 逐块接收模型输出,发出 region_open / region_chunk / region_close 事件——前端不用等全文,「思考区」「工具调用区」「正文区」各开各的流。工具参数在 region_close 时按 JSON Schema 做类型收敛(_coerce:integer/number/boolean/object/array 各有转换逻辑,NaN/inf 拒收)。这与第 9 章工具调用「停止条件 + 解析」的分工正好衔接:库内管格式与解析,执行与循环在库外。</div>
   </section>
 
   <div class="figure breakout">
@@ -183,7 +183,7 @@ message = tokenizer.parse_response(
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>chat template 是随分词器发布的 Jinja 方言配置,render_jinja_template 把 messages/tools/documents 渲染成 token 序列;tools 传函数即可,get_json_schema 从类型提示 + docstring 自动生成 schema。用户输入中的控制符是注入面:v5 的防线是「用户内容打私有区标记,按纯文本编码;模板自写的才是真控制符」,并防标记本身被伪造。add_generation_prompt/continue_final_message 两个开关分别管「该谁接话」与「从哪续写」,预填让模板预先写好 assistant 消息开头——这也是解析侧必须拿 prefix 的原因。v5 的 chat_parsing 子包补上了输出侧:response_template 声明输出格式,ResponseParser 流式吐事件,工具参数按 JSON Schema 类型收敛。渲染与解析是同一份格式的两面,第 9 章把它们接进完整的工具调用链。</p>
+    <p>chat template 是随分词器发布的 Jinja 模板配置,render_jinja_template 把 messages/tools/documents 渲染成 token 序列;tools 传函数即可,get_json_schema 从类型提示 + docstring 自动生成 schema。用户输入中的控制符是注入面:v5 的防线是「用户内容打私有区标记,按纯文本编码;模板自写的才是真控制符」,并防标记本身被伪造。add_generation_prompt/continue_final_message 两个开关分别管「该谁接话」与「从哪续写」,预填让模板预先写好 assistant 消息开头——这也是解析侧必须拿 prefix 的原因。v5 的 chat_parsing 子包补上了输出侧:response_template 声明输出格式,ResponseParser 流式吐事件,工具参数按 JSON Schema 类型收敛。渲染与解析是同一份格式的两面,第 9 章把它们接进完整的工具调用链。</p>
     <p>格式有了,解析有了,还差「模型怎么决定调工具、工具怎么执行」——那是第 9 章的事,也是问题二的正面回答。<a href="09-tool-use.html">第 9 章:工具调用</a>。</p>
   </div>
 

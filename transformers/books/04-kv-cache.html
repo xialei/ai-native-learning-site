@@ -45,7 +45,7 @@
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① 不缓存则每生成一个 token 都要重算全部历史的 K/V——缓存把「每步 O(N) 次前向」变成「每步一次前向增量」(4.1);② 显存公式 = 2(K/V) × 层数 × 头数 × 头维 × 上下文长 × batch × 字节数,7B 模型 8k 上下文单请求约 2 GB(4.2);③ 同一个注意力接口下有动态/静态/滑窗/量化/线性五族缓存层,按模型 config 自动配(4.3);④ 长窗口不是把缓存撑大,而是换记忆结构——滑窗丢远处、线性注意力压成固定状态、RoPE 缩放撑长检索距离(4.5)。
+    把四问的答案先放在这里::① 不缓存则每生成一个 token 都要重算全部历史的 K/V——缓存把「每步 O(N) 次前向」变成「每步一次前向增量」(4.1);② 显存公式 = 2(K/V) × 层数 × 头数 × 头维 × 上下文长 × batch × 字节数,7B 模型 8k 上下文单请求 GQA 下约 1 GB、无 GQA 4 GB(4.2);③ 同一个注意力接口下有动态/静态/滑窗/量化/线性五族缓存层,按模型 config 自动配(4.3);④ 长窗口不是把缓存撑大,而是换记忆结构——滑窗丢远处、线性注意力压成固定状态、RoPE 缩放撑长检索距离(4.5)。
   </div>
 
   <section class="block">
@@ -64,7 +64,7 @@
     <h2><span class="num">4.2</span>显存账:一个公式和一笔 2 GB 的账</h2>
     <p>KV Cache 的显存占用可以一行公式写死:</p>
     <table class="tbl">
-      <tr><th>项</th><th>含义</th><th>典型值(7B, Llama 2 式)</th></tr>
+      <tr><th>项</th><th>含义</th><th>典型值(7B,GQA 8 KV 头,Llama 3 式)</th></tr>
       <tr><td>2</td><td>K 和 V 各一份</td><td>—</td></tr>
       <tr><td>num_layers</td><td>每层独立一份缓存</td><td>32</td></tr>
       <tr><td>num_kv_heads × head_dim</td><td>每层每 token 的 K/V 尺寸(GQA 压过)</td><td>8 × 128 = 1024</td></tr>
@@ -134,8 +134,8 @@
 
   <section class="block">
     <h2><span class="num">4.4</span>缓存怎么被选中:生成入口的协商</h2>
-    <p>调用 <code class="inline">model.generate()</code> 时缓存从哪来?v5 的规则在 generation/utils.py:2222 的 _prepare_cache_for_generation,逻辑是四条「快速通道」:</p>
-    <div class="code-title">generation/utils.py:2249 — 缓存选择逻辑(骨架,注释为译注)</div>
+    <p>调用 <code class="inline">model.generate()</code> 时缓存从哪来?v5 的规则在 generation/utils.py:2222 的 _prepare_cache_for_generation,逻辑是三条「快速通道」加一条兜底:</p>
+    <div class="code-title">generation/utils.py:2222 — 缓存选择逻辑(骨架,注释为译注)</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">_prepare_cache_for_generation</span>(self, generation_config, model_kwargs, generation_mode,
                                    batch_size, max_cache_length):
     user_defined_cache = model_kwargs.get(cache_name)
@@ -144,7 +144,7 @@
     <span class="kw">if</span> <span class="kw">not</span> self._supports_default_dynamic_cache(): <span class="kw">return</span>  <span class="cmt"># ③ 特殊架构(mamba 等)自理</span>
     <span class="cmt"># ④ 否则按 cache_implementation 建:静态族 / quantized / 默认 DynamicCache</span>
     ...</pre>
-    <div class="annotation"><b>v5 的一个重要变化藏在这里:</b>迁移指南写明,generate 不传缓存时,默认缓存类由<strong>模型自己决定</strong>(PR #41505),不再一律 DynamicCache。模型的 config.layer_types 逐层声明注意力类型,cache_utils.py:1726 的 get_layer_types_and_kwargs 把它翻译成每层的缓存类——「混合注意力」模型(qwen3_next:线性注意力层 + 少量全注意力层)会得到 LinearAttentionAndFullAttentionLayer 这类混合缓存:线性层只存固定递归状态,全注意力层才存 KV。缓存结构 = 注意力结构的镜像,这张对应关系在 4.4 的表里已经列了一半。</div>
+    <div class="annotation"><b>v5 的一个重要变化藏在这里:</b>迁移指南写明,generate 不传缓存时,默认缓存类由<strong>模型自己决定</strong>(PR #41505),不再一律 DynamicCache。模型的 config.layer_types 逐层声明注意力类型,cache_utils.py:1726 的 get_layer_types_and_kwargs 把它翻译成每层的缓存类——「混合注意力」模型(qwen3_next:线性注意力层 + 少量全注意力层)会得到 LinearAttentionAndFullAttentionLayer 这类混合缓存:线性层只存固定递归状态,全注意力层才存 KV。缓存结构 = 注意力结构的镜像,这张对应关系在 4.3 的表里已经列了一半。</div>
     <p>对 beam search 的支持也落在缓存上:CacheLayerMixin.reorder_cache(cache_utils.py:96)按 beam 重排 batch 维度(index_select 挑出留下来的 beam)——beam 展开时缓存跟着复制,beam 收缩时缓存跟着重排。缓存是「对话状态」的物理载体,所以任何改变「有几条对话、各是什么前缀」的解码策略,最后都要在缓存上动刀(第 6 章展开)。</p>
   </section>
 
@@ -197,7 +197,7 @@
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>KV Cache 存在的理由是因果注意力的「历史 K/V 不变」性质,它把生成从 O(N²) 次前向压成 N 次增量前向;显存账的公式(2 × 层数 × KV 维 × 长度 × batch × 字节)决定了 7B 模型 8k 上下文单请求 1~2 GB,GQA 是第一道减法;cache_utils 的双层结构里,五族层类对应五种注意力结构,缓存由 config.layer_types 自动配置——v5 起默认缓存类由模型决定;长上下文有三条路:RoPE 缩放(五种方案)、滑窗(显存有顶、远处遗忘)、线性注意力(固定状态、检索换压缩)。缓存还是解码策略的操作对象:beam search 的重排、淘汰都落在 reorder_cache 上。</p>
+    <p>KV Cache 存在的理由是因果注意力的「历史 K/V 不变」性质,它把生成从 O(N²) 次前向压成 N 次增量前向;显存账的公式(2 × 层数 × KV 维 × 长度 × batch × 字节)决定了 7B 模型 8k 上下文单请求 1 GB(GQA)/ 4 GB(无 GQA),GQA 是第一道减法;cache_utils 的双层结构里,五族层类对应五种注意力结构,缓存由 config.layer_types 自动配置——v5 起默认缓存类由模型决定;长上下文有三条路:RoPE 缩放(五种方案)、滑窗(显存有顶、远处遗忘)、线性注意力(固定状态、检索换压缩)。缓存还是解码策略的操作对象:beam search 的重排、淘汰都落在 reorder_cache 上。</p>
     <p>缓存备好之后,一步生成到底怎么跑完、怎么停?下一章拆 generate 的主循环。<a href="05-generation.html">第 5 章:生成循环</a>。</p>
   </div>
 

@@ -39,13 +39,13 @@
     <h1>量化与装载:权重的变换</h1>
     <div class="lede">
       <p>前 11 章讲的是「模型已经就位之后」的事——注意力怎么算、token 怎么出、工具怎么调。这一章讲「就位之前」:一份 15 GB 的 bf16 权重怎么变成 4 GB 出头跑进你的显卡;一份 llama.cpp 的 GGUF 文件怎么进 transformers;一个第三方命名五花八门的 checkpoint 怎么被改写成本库的键名。第 1 章埋的三个钩子——26 个 quantizer 后端、from_pretrained 总入口、并行计划怎么进装载——在这里一起收口。</p>
-      <p>这一章先拆 26 个后端共用的一套协议(HfQuantizer 的钩子族),再走一遍 from_pretrained 从 config 到可用模型的装配线,然后是 bitsandbytes 4-bit 的完整旅程、装载器本体的「键改名 + 张量变换」两段式,最后是 GGUF 这条最特别的路径——权重以压缩块形态常住内存,前向时才解开。</p>
+      <p>这一章先拆 26 个后端共用的一套协议(HfQuantizer 的钩子族),再走一遍 from_pretrained 从 config 到可用模型的装配线,然后是 bitsandbytes 4-bit 的一次完整量化、装载器本体的「键改名 + 张量变换」两段式,最后是 GGUF 这条最特别的路径——权重以压缩块形态常住内存,前向时才解开。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① 「量化」不是模型能力,是权重的变换:26 个后端各一个 quantizer 文件,实现同一组 HfQuantizer 钩子(validate_environment / update_device_map / preprocess_model / postprocess_model),from_pretrained 在固定点位调用它们(12.1);② from_pretrained 是一条装配线:meta 设备建空壳 → 量化器/精度计划/设备映射完成协商 → 权重以「最终形态」流入(12.2);③ 4-bit 的旅程是「换层 + 在线量化」(12.3),GGUF 的旅程是「保块 + 前向按批大小选 GEMV 或分块解压」(12.4)——两种账法,显存充裕与紧张的机器各有胜场;④ 键名对不上的 checkpoint 靠 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回原格式;词表对不上不自动重塑,靠 LOAD REPORT 报错(12.3b、12.5、12.6)。
+    四个问题的答案串起来是::① 「量化」不是模型能力,是权重的变换:26 个后端各一个 quantizer 文件,实现同一组 HfQuantizer 钩子(validate_environment / update_device_map / preprocess_model / postprocess_model),from_pretrained 在固定点位调用它们(12.1);② from_pretrained 是一条装配线:meta 设备建空壳 → 量化器/精度计划/设备映射完成协商 → 权重以「最终形态」流入(12.2);③ 4-bit 走「换层 + 在线量化」(12.3),GGUF 走「保块 + 前向按批大小选 GEMV 或分块解压」(12.4)——两种账法,显存充裕与紧张的机器各有胜场;④ 键名对不上的 checkpoint 靠 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回原格式;词表对不上不自动重塑,靠 LOAD REPORT 报错(12.3b、12.5、12.6)。
   </div>
 
   <section class="block">
@@ -99,14 +99,14 @@
   </section>
 
   <section class="block">
-    <h2><span class="num">12.3</span>bnb 4-bit:一次量化的完整旅程</h2>
+    <h2><span class="num">12.3</span>bnb 4-bit:一次量化的完整流程</h2>
     <p>拿最常见的配方走一遍:</p>
     <div class="code-title">用户视角的三行(与 MIGRATION_GUIDE_V5.md:493 的范例一致)</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">from</span> transformers <span class="kw">import</span> AutoModelForCausalLM, BitsAndBytesConfig
 
 quantization_config = BitsAndBytesConfig(load_in_4bit=<span class="kw">True</span>)   <span class="cmt"># v5:只能走 quantization_config</span>
 model = AutoModelForCausalLM.from_pretrained(<span class="st">"meta-llama/Llama-3.2-3B"</span>, device_map=<span class="st">"auto"</span>, quantization_config=quantization_config)</pre>
-    <p>v5 把裸的 load_in_4bit/load_in_8bit 参数从 from_pretrained 里删了(MIGRATION_GUIDE_V5.md:483),统一收敛到 BitsAndBytesConfig(utils/quantization_config.py:390)——一个类同时管 4/8-bit,靠 load_in_4bit/load_in_8bit 两个布尔区分;AutoHfQuantizer.from_config 在派发时给 bnb 做特判:bnb 只有一个 quant_method,按哪个布尔是真拼成 bitsandbytes_4bit / bitsandbytes_8bit 两个不同的键(quantizers/auto.py:211-219)。配置进模型后的旅程分四站:</p>
+    <p>v5 把裸的 load_in_4bit/load_in_8bit 参数从 from_pretrained 里删了(MIGRATION_GUIDE_V5.md:483),统一收敛到 BitsAndBytesConfig(utils/quantization_config.py:390)——一个类同时管 4/8-bit,靠 load_in_4bit/load_in_8bit 两个布尔区分;AutoHfQuantizer.from_config 在派发时给 bnb 做特判:bnb 只有一个 quant_method,按哪个布尔是真拼成 bitsandbytes_4bit / bitsandbytes_8bit 两个不同的键(quantizers/auto.py:211-219)。配置进模型后要走四步:</p>
     <table class="tbl">
       <tr><th>站</th><th>位置(pin)</th><th>发生什么</th></tr>
       <tr><td>① 协商</td><td>get_hf_quantizer(quantizers/auto.py:338)</td><td>checkpoint 自带 quantization_config(预量化)→ 与用户传参合并;都没有则全程旁路</td></tr>
@@ -267,7 +267,7 @@ WeightConverter(
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>「量化与装载」是同一个系统的两个名字:v5 把 from_pretrained 重写成一条装配线——meta 设备建空壳,量化器/精度计划/设备映射/kernel 替换完成协商与结构改造,权重以「最终形态」流入。26 个量化后端实现同一组 HfQuantizer 钩子(validate/update/preprocess/postprocess);bnb 4-bit 的旅程是「换层 + 在线量化」,GGUF 的旅程是「保块 + 前向按批大小选 GEMV 或分块解压」,打包与否由「沿途变换是否碰字节」决定,不猜。装载器本体是 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回 checkpoint 原格式;缺键、形状不符、转换失败统一进 LOAD REPORT,词表重塑不自动做、留给 resize_token_embeddings。精度计划(_keep_in_fp32_modules 两级)与设备映射预算(param_element_size)是同一本模块尺寸账的两个读法。kernel 化(290 处装饰器、28 条映射)把「换更快的计算」接进同一套「声明→协商→回退」协议,且装上就卸不下——它是结构,不是开关。下一章收口:把全书拆过的部件拼成一张「自研路线图」。</p>
+    <p>「量化与装载」是同一个系统的两个名字:v5 把 from_pretrained 重写成一条装配线——meta 设备建空壳,量化器/精度计划/设备映射/kernel 替换完成协商与结构改造,权重以「最终形态」流入。26 个量化后端实现同一组 HfQuantizer 钩子(validate/update/preprocess/postprocess);bnb 4-bit 走的是「换层 + 在线量化」,GGUF 走的是「保块 + 前向按批大小选 GEMV 或分块解压」,打包与否由「沿途变换是否碰字节」决定,不猜。装载器本体是 741 条改名 + 72 条张量变换的声明式映射表,每个算子带逆操作,保存时倒放回 checkpoint 原格式;缺键、形状不符、转换失败统一进 LOAD REPORT,词表重塑不自动做、留给 resize_token_embeddings。精度计划(_keep_in_fp32_modules 两级)与设备映射预算(param_element_size)是同一本模块尺寸账的两个读法。kernel 化(290 处装饰器、28 条映射)把「换更快的计算」接进同一套「声明→协商→回退」协议,且装上就卸不下——它是结构,不是开关。下一章收口:把全书拆过的部件拼成一张「自研路线图」。</p>
     <p>部件都拆过了,怎么拼一套自己的系统?<a href="13-build-own.html">第 13 章:自研路线</a>。</p>
   </div>
 

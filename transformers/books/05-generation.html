@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>05 · 生成循环:一次 generate 的完整旅程 — 深入浅出 Transformers</title>
+<title>05 · 生成循环:一次 generate 从头走到尾 — 深入浅出 Transformers</title>
 <link rel="stylesheet" href="assets/transformers-learn.css">
 </head>
 <body>
@@ -36,25 +36,25 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 05 生成循环</div>
     <div class="chap-meta">Chapter 05 · Generation Loop</div>
-    <h1>生成循环:一次 generate 的完整旅程</h1>
+    <h1>生成循环:一次 generate 从头走到尾</h1>
     <div class="lede">
-      <p>第 3 章的前向把 logit 向量吐出来,第 4 章的缓存让增量解码成为可能。但「一个 token 一个 token 循环生成、条件满足才停」这件事本身,是谁在驱动?答案是一个你可能天天在调、但很少打开的函数:generation/utils.py 的 generate()——4434 行文件里最长的入口方法,从校验参数到分发解码策略,串起整库推理侧的所有子系统。</p>
+      <p>第 3 章的前向输出 logit 向量,第 4 章的缓存让增量解码成为可能。但「一个 token 一个 token 循环生成、条件满足才停」这件事本身,是谁在驱动?答案是一个你可能天天在调、但很少打开的函数:generation/utils.py 的 generate()——4434 行文件里最长的入口方法,从校验参数到分发解码策略,串起整库推理侧的所有子系统。</p>
       <p>这一章拆它的九步流程(:2569 起),再看唯一留在库内的解码主循环 _sample(:3104)——其余解码策略或被并入、或已移出库外改为按需从 Hub 拉取——最后看两个特殊机制:chunked prefill 与 MPS 设备上的「晚一步停」。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问的答案依次是:① 生成循环是「前向 + 取 logit + 选词 + 追加判停」的重复,缓存让它每步只前向一个新位置(5.1/5.2);② 对话回合之间的粘合是 kwargs 演进(_update_model_kwargs_for_generation)与缓存续写——上一步的输出就是下一步的输入(5.2/5.6);③ 策略入口收敛成 GenerationMode 枚举 + 一张映射表,greedy 并入 sample,四种长尾策略改为 Hub 插件按需拉取(5.3);④ 判停本身有同步代价,MPS 设备用「晚一步停 + 回滚」把每步的设备同步挤掉(5.5)。
+    四个问题的答案,一条条对上::① 生成循环是「前向 + 取 logit + 选词 + 追加判停」的重复,缓存让它每步只前向一个新位置(5.1/5.2);② 对话回合之间的粘合是 kwargs 演进(_update_model_kwargs_for_generation)与缓存续写——上一步的输出就是下一步的输入(5.2/5.6);③ 策略入口收敛成 GenerationMode 枚举 + 一张映射表,greedy 并入 sample,四种长尾策略改为 Hub 插件按需拉取(5.3);④ 判停本身有同步代价,MPS 设备用「晚一步停 + 回滚」把每步的设备同步挤掉(5.5)。
   </div>
 
   <section class="block">
     <h2><span class="num">5.1</span>入口:九步准备,一次分发</h2>
-    <p>generate() 的文档字符串就有 150 行,但骨架是源码注释里编好号的九步。压到最干:</p>
+    <p>generate() 的文档字符串有 93 行,但骨架是源码注释里编好号的九步。压到最干:</p>
     <div class="code-title">generation/utils.py:2569 — generate() 骨架(注释为译注)</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">generate</span>(self, inputs=<span class="kw">None</span>, generation_config=<span class="kw">None</span>, ..., custom_generate=<span class="kw">None</span>, **kwargs):
 
-    <span class="cmt"># 0.a. custom_generate:从 Hub 加载一个「换心脏」的 generate 实现</span>
+    <span class="cmt"># 0.a. custom_generate:从 Hub 加载一个替换 generate 本体的实现</span>
     <span class="cmt"># 0.b. cache_implementation=="paged" → 转发到连续批处理 generate_batch(第 7 章)</span>
 
     <span class="cmt"># 1. 校验 kwargs,解析 GenerationConfig,判定 generation_mode</span>
@@ -118,7 +118,7 @@
     <div class="annotation"><b>del outputs 那行注释值得读:</b>「This is needed to properly delete outputs.logits ... Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration」——循环体不留 outputs 引用,显存才能在长生成里保持平稳。大模型工程里的显存 bug 往往不是「没释放」,而是「有个变量悄悄引用着」。这 20 行是全库性能最敏感的代码,每一步都在跟张量生命周期搏斗。</div>
 
     <h3>kwargs 演进:上一步的输出如何变成下一步的输入</h3>
-    <p>循环里最不起眼但最要紧的是 _update_model_kwargs_for_generation(:1231):attention_mask 追加一列 1、position_ids 用缓存长度接续、encoder-decoder 模型的 decoder_input_ids 换成新 token——上一步的全部痕迹经它滚进下一步。第 3 章 3.1 节骨架 ③ 的 past_seen_tokens 也是在这里从缓存账本更新。对话「记得之前说过什么」的工程事实,一半在缓存,一半在这行 kwargs 演进。</p>
+    <p>循环里最不起眼但最要紧的是 _update_model_kwargs_for_generation(:1231):attention_mask 追加一列 1、token_type_ids 复制末列、position_ids 取「上位置值 + num_new_tokens」接续(按缓存长度折算位置是模型 forward 里的事)——上一步的全部痕迹经它滚进下一步。decoder 模型的 decoder_input_ids 不经它:新 token 由循环体里一行 torch.cat 追加。第 3 章 3.1 节骨架 ③ 的 past_seen_tokens 则在模型 forward 里从缓存账本读出(modeling_llama.py:376)。对话「记得之前说过什么」的工程事实,一半在缓存,一半在这行 kwargs 演进。</p>
   </section>
 
   <section class="block">
@@ -199,7 +199,7 @@
     <p>generate 默认只返回张量;return_dict_in_generate=True 时返回 GenerateDecoderOnlyOutput(:184),把 sequences/scores/logits/attentions/hidden_states/past_key_values 打包。其中 past_key_values 字段最实用:一个回合结束后把缓存拿出来,下一回合把新 prompt 追加进去传入,就能「接着聊」而不重算历史——第 4 章 4.4 节「默认缓存类由模型决定」的机制在这里接上了:模型侧用 config.layer_types 选缓存类,用户侧 return_dict_in_generate 拿到缓存,下一回合原样传回。</p>
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t51 d51">
-        <title id="t51">一次 generate 调用的完整旅程</title>
+        <title id="t51">一次 generate 调用的完整路径</title>
         <desc id="d51">从 inputs 到输出序列:九步准备横排在上方,下方是六拍解码循环,右侧是判停与流式出口。</desc>
         <defs>
           <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
