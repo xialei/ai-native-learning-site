@@ -6,8 +6,8 @@
 
 | 仓库 | 本地路径 | 锚点 |
 |---|---|---|
-| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-131-g036230e4f`（version.txt: 0.19.8） |
-| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2883-g0900d9281`（core 包版本 0.20.0） |
+| DeepSpeed | `/Users/lei.xia/workspace/github/DeepSpeed` | `v0.19.7-137-g0eb3a8bcc`（version.txt: 0.19.8） |
+| Megatron-LM | `/Users/lei.xia/workspace/github/Megatron-LM` | `core_v0.15.0rc7-2905-gebab48fc4`（core 包版本 0.20.0） |
 
 所有引用代码路径以仓库最新为准——若源码演进导致行号偏移，以文件名 + 函数名定位。
 
@@ -46,6 +46,11 @@
 
 ## 演化记录
 
+- **2026-10-20 十五次核实**（DeepSpeed 6 commits / Megatron 22 commits，重锚 `v0.19.7-137-g0eb3a8bcc` / `core_v0.15.0rc7-2905-gebab48fc4`）：
+  - 3 处 pin 漂移修正：ch01 `training.py:3304→3283`（#8149 TrainingConfig/ValidationConfig 迁移，training.py 307 行改动、train_step 内部逻辑零变化，仅 `cfg = get_run_config()` 一行插在函数开头）；DS stage3 step `:2874→:2873`（#8815 在文件更上方净删一行）、epilogue `:1015→:1016`（同 commit 在 epilogue 前净增一行）——两函数摘录正文 byte-identical。
+  - 摘录回源全中：两库全部摘录源文件逐一 diff——DS `engine.py`/`parameter_offload.py`/`partitioned_param_coordinator.py`/`cpu_adam.py`/`activation_checkpointing` byte-identical，`stage3.py`/`stage_1_and_2.py` 仅 `#8815` 把手写的 `group is not None and world_size > 1` 守卫换成 `pg_utils.is_parallel(group)` 谓词（新增 `deepspeed/comm/pg_utils.py`，`None` 语义分离：comm.py 里 world group、pg_utils 里「该并行维不存在」——不触及任何摘录）；Megatron `schedules.py`/`parallel_state.py`/`recompute.py`/`mappings.py`/`moe_layer.py`/`token_dispatcher.py`/`moe_utils.py`/`param_and_grad_buffer.py`/`gpt_model.py`/`module.py`/`utils.py` byte-identical。
+  - Megatron #8149（TrainingConfig 容器化第二波）触及 ch01/ch12 邻接处但不动摇断言：`train_step` 的 `forward_backward_func` 调用改传 `cfg.train.micro_batch_size`（摘录本就写 `args.seq_length, ...` 简化形，语义不变）；`check_checkpoint_args` 的 `_compare` 优先读 run_config 节、回落旧 args（ch12 「args 随 checkpoint 走」的机制描述仍准，宽残差五超参校验 `_WIDE_RESIDUAL_ARG_DEFAULTS` 仍在）；`save_checkpoint` 新增 `on_saved` 回调参数（async finalize 与同步 barrier 后统一调用）——书未断言签名。#8197（TrainState checkpoint 删 `do_train/do_valid/do_test` 三标志，改为加载后由 dataloader 重新推导）未触及书中任何断言（书未列 TrainState 的 state_dict 字段清单）。
+  - 增补候选（未写，待批）：Megatron #8142（fused embedding wgrad——`EmbeddingWithGradAccumulationFusion`，embedding backward 直接把词梯度累进 `main_grad` 并可只触碰出现过的 token 行，`fused_embedding_wgrad.py` 266 行，ch03 梯度融合的词表侧对称物）、#7775（full-iteration cuda graph 下 optimizer 梯度转换复用整图存储 `FullIterationGradCopy`）、#7606（GLU checkpoint 布局转换 `glu_checkpointing.py`）；DS #8732（Hybrid Engine 连续 rollout 的 CUDA Graph 解码回放）、#8815（`pg_utils.is_parallel` 并行组谓词）。
 - **2026-10-17 十四次核实**（DeepSpeed 11 commits / Megatron 30 commits，重锚 `v0.19.7-131-g036230e4f` / `core_v0.15.0rc7-2883-g0900d9281`）：
   - 6 处 pin 漂移修正：ch01 `training.py:3314→3304`（MoE/PGC hunk 上移 -10，`train_step` 摘录正文 byte-identical）；DS `engine.py` 三处 3386→3382 / 3571→3567 / 3446→3442（#8807 延迟 import 平移 -4，backward/step/boundary 三函数内容零改动）；ch08 stage3 step `:2872→:2874`；ch07 epilogue `:1017→:1015`。
   - 摘录回源全中：ch06 三部曲与 GAS 边界、ch07 IPG epilogue/Muon LRU、ch08 coordinator fetch 链/子组循环/`_allgather_params_coalesced`（partition_parameters.py:2022 未动）、ch09 cpu_adam（amsgrad 抛错仍在）、ch10 CheckpointFunction（:567 未动，仅 `@compiler.disable`→`lazy_disable` 在摘录范围外）、ch11 fusions 目录 17 文件无增删、ch02 `initialize_model_parallel` 签名未动、ch05 TransformerLayer/GPTModel/采样器、ch13 MoELayer 四段与 dispatcher 六钩子、ch12 dist_checkpointing 结构与 async save（`save_checkpoint` 签名未动；删 checkpoint 的 `fork` 移除不触及摘录）。
