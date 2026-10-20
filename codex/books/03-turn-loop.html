@@ -33,7 +33,7 @@
 
 <div class="wrap">
   <div class="page-header">
-    <span class="version-badge">openai/codex @ ce0323f2f2</span>
+    <span class="version-badge">openai/codex @ 18795fc125</span>
     <div class="breadcrumb"><a href="index.html">首页</a> / 03 Turn 循环</div>
     <div class="chap-meta">Chapter 03 · The Turn Loop</div>
     <h1>Turn 循环：一个 prompt 在 Codex 里到底怎么跑</h1>
@@ -81,13 +81,13 @@
 
         <rect class="node core" x="30" y="144" width="880" height="44" rx="8"></rect>
         <text class="lbl" x="470" y="164" text-anchor="middle">③ run_turn：前置压缩 → 捕获 step context → 记录输入 → 进入 loop {}</text>
-        <text class="lbl sm" x="470" y="180" text-anchor="middle">session/turn.rs:454 —— ★ Agent 主循环（工具 → 再采样）</text>
+        <text class="lbl sm" x="470" y="180" text-anchor="middle">session/turn.rs:459 —— ★ Agent 主循环（工具 → 再采样）</text>
 
         <line class="edge" x1="470" y1="188" x2="470" y2="204" marker-end="url(#arrow)"></line>
 
         <rect class="node" x="30" y="206" width="880" height="44" rx="8"></rect>
         <text class="lbl" x="470" y="226" text-anchor="middle">④ run_sampling_request：流式采样 + 工具执行（内部 loop 仅重试流式错误）</text>
-        <text class="lbl sm" x="470" y="242" text-anchor="middle">session/turn.rs:1707 —— build_prompt → 调 LLM → 执行工具 → 返回 needs_follow_up</text>
+        <text class="lbl sm" x="470" y="242" text-anchor="middle">session/turn.rs:1714 —— build_prompt → 调 LLM → 执行工具 → 返回 needs_follow_up</text>
 
         <line class="edge" x1="470" y1="250" x2="470" y2="266" marker-end="url(#arrow)"></line>
 
@@ -106,7 +106,7 @@
   <section class="block">
     <h2><span class="num">3.2</span>run_turn：turn 的前置准备</h2>
     <p><code class="inline">run_turn</code> 是 turn 的入口，它负责「采样前」的所有准备：前置压缩、捕获 step context、记录用户输入、构建技能/插件注入。真正采样在它调用的 <code class="inline">run_sampling_request</code> 里。</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:166 — run_turn 签名与前置压缩（节选）</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:173 — run_turn 签名与前置压缩（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub(crate) async fn</span> run_turn(
     sess: Arc&lt;Session&gt;,
     turn_context: Arc&lt;TurnContext&gt;,
@@ -146,7 +146,7 @@
   <section class="block">
     <h2><span class="num">3.3</span>两个 loop：run_turn 的「再采样」与 run_sampling_request 的「重试」</h2>
     <p>要厘清「Agent 循环」，必须区分两个 <code class="inline">loop {}</code>：<strong>run_turn 的 loop 驱动「工具 → 再采样」</strong>——每完成一轮采样，若模型请求了工具（<code class="inline">needs_follow_up</code>），执行完工具、把结果回填历史后再进下一轮采样；而 <strong>run_sampling_request 内部的 loop 只负责流式重试</strong>——它遇到可重试的流式错误才继续，一旦采样成功就立即返回。<code class="inline">run_turn</code> 的循环才是通常所说的「Agent 循环」：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:454 — run_turn 的采样循环（节选）</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:459 — run_turn 的采样循环（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// ★ Agent 循环：工具 → 再采样</span>
     <span class="cmt">// 1. 取走队列里 pending 的 steering 输入（首轮通常为空）</span>
     <span class="kw">let</span> pending_input = <span class="kw">if</span> can_drain_pending_input {
@@ -186,7 +186,7 @@
     <div class="annotation"><b>循环体里没有工具：</b> 一轮 <code class="inline">run_turn</code> loop = 一次「采样 + 工具执行」。<strong>工具执行发生在 <code class="inline">run_sampling_request</code> 内部</strong>（不是这里）——它流式产出 ResponseItem、执行工具并把结果回填进 session 历史，所以每轮 loop 顶部重新克隆历史时，上一轮的工具结果自然可见，构建 prompt 不需要这里操心。</div>
     <div class="annotation"><b>源码注记：</b> 循环退出条件是 <code class="inline">!needs_follow_up</code>，其中 <code class="inline">needs_follow_up = model_needs_follow_up || has_pending_input</code>（<code class="inline">try_run_sampling_request</code> 返回值展开）——除工具调用外，输入队列里还有待处理输入也会驱动循环继续。</div>
     <p>那 <code class="inline">run_sampling_request</code> 自己的 <code class="inline">loop {}</code> 干什么？它只做<strong>流式重试</strong>：</p>
-    <div class="code-title">codex-rs/core/src/session/turn.rs:1707 — run_sampling_request 的重试循环（节选）</div>
+    <div class="code-title">codex-rs/core/src/session/turn.rs:1714 — run_sampling_request 的重试循环（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {                                            <span class="cmt">// 仅流式重试，非工具→再采样</span>
     <span class="cmt">// 取历史（首轮用传入的 input，之后从 session 克隆）并构建 prompt</span>
     <span class="kw">let</span> prompt_input = <span class="kw">if let</span> Some(input) = initial_input.take() {
@@ -215,9 +215,9 @@
 }</pre>
     <div class="annotation"><b>重试只管流：</b> <code class="inline">run_sampling_request</code> 的 <code class="inline">loop</code> 只在<strong>可重试的流式错误</strong>时继续——采样一成功就 <code class="inline">return Ok</code>，把控制权交回 <code class="inline">run_turn</code>。<strong>重试逻辑</strong>集中在 <code class="inline">handle_response_stream_error</code>（responses_retry.rs）里：流式出错时交给它判定——可重试且预算未耗尽就继续 loop；重试预算耗尽时，还会先尝试把传输从 WebSocket 降级到 HTTPS 再重试一次（重试计数清零）；终端错误或降级后仍超限，就把错误上抛。别把这个循环和 <code class="inline">run_turn</code> 的「工具→再采样」循环搞混。</div>
 
-    <p>重试循环里还埋着一条实验性的<strong>抢占通道</strong>。<code class="inline">StepContext</code> 捕获时会按功能开关创建一个可选的取消令牌：<code class="inline">preempt: turn_context.config.features.enabled(Feature::InstantInterrupt).then(CancellationToken::new)</code>（session/mod.rs:4027-4031）。<code class="inline">InstantInterrupt</code> 目前是 <code class="inline">UnderDevelopment</code>、但已默认开启（#51812 把默认值翻了过来；features/src/lib.rs:1220）。开关打开时，<code class="inline">run_sampling_request</code> 开头就调用 <code class="inline">sess.input_queue.watch_user_input(...)</code>（turn.rs:1718-1721），把「用户又发新消息」变成对 <code class="inline">preempt</code> 的取消信号；后续每一处慢等待——重试等待、流式等待——都用 <code class="inline">.or_cancel(&amp;preempt).or_cancel(&amp;cancellation_token)</code>（turn.rs:1819-1821）挂在两个令牌上。被抢占的采样不清历史、不重试，而是返回 <code class="inline">needs_follow_up: true</code>（turn.rs:1825-1833），让 <code class="inline">run_turn</code> 的循环顶部取走新输入、带着新消息重新采样——这就是「打字时立刻打断模型」的实现底座。流式产出侧也有对应处理：流错误且连接可复用时，新建一个 <code class="inline">preempt</code> 令牌并 <code class="inline">continue</code>（turn.rs:2749），保证下一轮等待挂在新鲜令牌上。配套的还有恢复场景的 <code class="inline">prewarm_with_history</code>（codex_thread.rs:279）——空闲线程恢复时用当前历史提前预热一次连接，下一个 turn 若 prompt 仍是该历史的前缀就直接复用预备好的响应。</p>
+    <p>重试循环里还埋着一条实验性的<strong>抢占通道</strong>。<code class="inline">StepContext</code> 捕获时会按功能开关创建一个可选的取消令牌：<code class="inline">preempt: turn_context.config.features.enabled(Feature::InstantInterrupt).then(CancellationToken::new)</code>（session/mod.rs:4068-4072）。<code class="inline">InstantInterrupt</code> 目前是 <code class="inline">UnderDevelopment</code>、但已默认开启（#51812 把默认值翻了过来；features/src/lib.rs:1232）。开关打开时，<code class="inline">run_sampling_request</code> 开头就调用 <code class="inline">sess.input_queue.watch_user_input(...)</code>（turn.rs:1725-1728），把「用户又发新消息」变成对 <code class="inline">preempt</code> 的取消信号；后续每一处慢等待——重试等待、流式等待——都用 <code class="inline">.or_cancel(&amp;preempt).or_cancel(&amp;cancellation_token)</code>（turn.rs:1826-1828）挂在两个令牌上。被抢占的采样不清历史、不重试，而是返回 <code class="inline">needs_follow_up: true</code>（turn.rs:1832-1840），让 <code class="inline">run_turn</code> 的循环顶部取走新输入、带着新消息重新采样——这就是「打字时立刻打断模型」的实现底座。流式产出侧也有对应处理：流错误且连接可复用时，新建一个 <code class="inline">preempt</code> 令牌并 <code class="inline">continue</code>（turn.rs:2807），保证下一轮等待挂在新鲜令牌上。配套的还有恢复场景的 <code class="inline">prewarm_with_history</code>（codex_thread.rs:279）——空闲线程恢复时用当前历史提前预热一次连接，下一个 turn 若 prompt 仍是该历史的前缀就直接复用预备好的响应。</p>
 
-    <p>重试等待时长也有讲究。早期版本纯按本地退避公式计算延迟；现在（#47641）错误对象会携带服务端的 <code class="inline">Retry-After</code> 建议（<code class="inline">CodexErr::retry_after()</code>，protocol/src/error.rs:449），重试时刻由它直接决定（responses_retry.rs:162 的 <code class="inline">retry_at</code> 计算：<code class="inline">let retry_at = retry_after.map(RetryAfter::deadline).unwrap_or(now + delay);</code>）——<strong>服务端给了建议就替换本地退避，没给才回落到本地公式</strong>（<code class="inline">retry_delay</code> 的实现是 <code class="inline">server_retry_delay().unwrap_or_else(|| backoff(retry_count))</code>，error.rs:410）。这在限流场景下避免了「本地算出 2 秒、服务端却说 30 秒」导致的无效重连风暴。两条补充规则：WebSocket→HTTPS 传输回退时不能绕过服务端建议，回退前的等待也要睡到 <code class="inline">retry_after.deadline()</code>（responses_retry.rs:127-128，#49441）；流式 <code class="inline">response.failed</code> 事件里嵌的 <code class="inline">Retry-After</code> 头现在也会被解析出来，优先于限流消息里的建议（#50418）。协议层还贴心地区分了两个口径——<code class="inline">server_retry_delay()</code> 返回剩余延迟（过期建议保留为 0 而不回退本地值），<code class="inline">retry_after()</code> 返回原始截止时刻，供把错误继续上抛的调用方使用。</p>
+    <p>重试等待时长也有讲究。早期版本纯按本地退避公式计算延迟；现在（#47641）错误对象会携带服务端的 <code class="inline">Retry-After</code> 建议（<code class="inline">CodexErr::retry_after()</code>，protocol/src/error.rs:463），重试时刻由它直接决定（responses_retry.rs:162 的 <code class="inline">retry_at</code> 计算：<code class="inline">let retry_at = retry_after.map(RetryAfter::deadline).unwrap_or(now + delay);</code>）——<strong>服务端给了建议就替换本地退避，没给才回落到本地公式</strong>（<code class="inline">retry_delay</code> 的实现是 <code class="inline">server_retry_delay().unwrap_or_else(|| backoff(retry_count))</code>，error.rs:455）。这在限流场景下避免了「本地算出 2 秒、服务端却说 30 秒」导致的无效重连风暴。两条补充规则：WebSocket→HTTPS 传输回退时不能绕过服务端建议，回退前的等待也要睡到 <code class="inline">retry_after.deadline()</code>（responses_retry.rs:127-128，#49441）；流式 <code class="inline">response.failed</code> 事件里嵌的 <code class="inline">Retry-After</code> 头现在也会被解析出来，优先于限流消息里的建议（#50418）。协议层还贴心地区分了两个口径——<code class="inline">server_retry_delay()</code> 返回剩余延迟（过期建议保留为 0 而不回退本地值），<code class="inline">retry_after()</code> 返回原始截止时刻，供把错误继续上抛的调用方使用。</p>
     <div class="callout warn">
       <b class="tag">关键</b>
       注意 <code class="inline">ContextWindowExceeded</code> 会直接返回错误而非重试——它先 <code class="inline">set_total_tokens_full</code> 标记窗口已满，再上抛。上抛后该 turn 走通用错误分支：发出 turn 错误事件并 <code class="inline">break</code> 结束当前 turn（让用户继续），<strong>并不在同一个 turn 内自动压缩重试</strong>。真正的压缩防线上移到了采样之前——<code class="inline">run_pre_sampling_compact</code>（见第 6 章）在构建 prompt 前就检查预算；而采样成功后若 token 仍触顶（<code class="inline">should_roll_over</code>），会在 mid-turn 触发一次 <code class="inline">run_auto_compact</code> 为下一轮腾空间。即「压缩」主要跑在成功路径上，而非作为超窗错误的兜底重试。（例外：Guardian 审查预算耗尽后触发的超窗，会先压缩一次再继续采样。）此外，turn 正常收尾（无工具调用）时若达到 post-turn 压缩阈值（<code class="inline">model_post_turn_compact_threshold_percent &gt; 0</code>，未配置即关闭；且未启用 TokenBudget 预算模式），还会在 break 前跑一次 <code class="inline">CompactionPhase::PostTurn</code> 阶段的自动压缩，为下一轮腾窗口（见第 6 章）。
@@ -304,7 +304,7 @@
   <section class="block">
     <h2><span class="num">3.6</span>中断与恢复</h2>
     <p>用户可以发 <code class="inline">Op::Interrupt</code> 中断当前 turn。中断不是杀死进程，而是触发 <code class="inline">CancellationToken</code>，让循环在合适的安全点退出：</p>
-    <div class="code-title">codex-rs/protocol/src/protocol.rs:1937 — AgentStatus 状态</div>
+    <div class="code-title">codex-rs/protocol/src/protocol.rs:1939 — AgentStatus 状态</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub enum</span> AgentStatus {
     PendingInit,                 <span class="cmt">// 等待初始化</span>
     Running,                     <span class="cmt">// 正在跑</span>
@@ -335,7 +335,7 @@
 }</pre>
     <div class="annotation"><b>没有状态字段：</b> 状态完全由事件驱动推导——<code class="inline">TurnStarted</code> → Running，<code class="inline">TurnComplete</code> → Completed（无错误时）/ Errored（携带终端错误时，<code class="inline">ev.error</code>），<code class="inline">TurnAborted</code> 按原因分到 Interrupted 或 Errored。<strong>中断后的 turn 是可恢复的</strong>：线程空闲时前端可发 <code class="inline">Op::RecoverTurn</code>（走 <code class="inline">recover_turn_if_idle</code>），复用已记录的 <code class="inline">turn_id</code> 重新采样，不产生新的用户输入。这是「崩溃可恢复」的基础（配合第 4 章的 rollout 持久化）。</div>
 
-    <p>恢复还有一个容易被忽略的体验细节——<strong>预热</strong>。恢复一个空闲线程（或进程启动）时，网络连接是冷的：TLS 握手、WebSocket 建连、鉴权引导都要走一遍，用户要干等。Codex 把这套预热做成了独立模块 <code class="inline">session/startup_prewarm.rs</code>：会话建立时（session.rs:1957）与空闲线程恢复时（<code class="inline">codex_thread.rs:270</code> 的 <code class="inline">prewarm()</code>）调度一个后台任务，提前建好 <code class="inline">ModelClientSession</code> 的 WebSocket 连接；下一个普通 turn 通过 <code class="inline">consume_startup_prewarm_for_regular_turn</code>（startup_prewarm.rs:289）消费它——注释原话「One scheduled task owns the prepared client session until the next regular turn consumes it」。同一通道也用于<strong>修复</strong>：预热任务完成时会复查 socket 是否还活着，关了就重建。这条「连接冷启动」的优化与 3.2 的 turn 级 prewarm 呼应：turn 级解决「同一 turn 内多次采样复用连接」，启动级解决「第一句话之前的等待」。</p>
+    <p>恢复还有一个容易被忽略的体验细节——<strong>预热</strong>。恢复一个空闲线程（或进程启动）时，网络连接是冷的：TLS 握手、WebSocket 建连、鉴权引导都要走一遍，用户要干等。Codex 把这套预热做成了独立模块 <code class="inline">session/startup_prewarm.rs</code>：会话建立时（session.rs:1963）与空闲线程恢复时（<code class="inline">codex_thread.rs:270</code> 的 <code class="inline">prewarm()</code>）调度一个后台任务，提前建好 <code class="inline">ModelClientSession</code> 的 WebSocket 连接；下一个普通 turn 通过 <code class="inline">consume_startup_prewarm_for_regular_turn</code>（startup_prewarm.rs:289）消费它——注释原话「One scheduled task owns the prepared client session until the next regular turn consumes it」。同一通道也用于<strong>修复</strong>：预热任务完成时会复查 socket 是否还活着，关了就重建。这条「连接冷启动」的优化与 3.2 的 turn 级 prewarm 呼应：turn 级解决「同一 turn 内多次采样复用连接」，启动级解决「第一句话之前的等待」。</p>
   </section>
 
   <section class="block">
@@ -373,8 +373,8 @@
     <span class="cmt">/// Keeps a V2 recipient resident until this submission is handled or dropped.</span>
     <span class="kw">pub</span> residency_guard: Option&lt;OwnedRwLockReadGuard&lt;()&gt;&gt;,
 }</pre>
-    <div class="annotation"><b>提交是带谱系的：</b> 每条 Submission 带 W3C trace（跨异步边界传播追踪上下文）、<code class="inline">parent_turn_id</code>/<code class="inline">root_turn_id</code>（turn 祖先链，Debug 诊断用——字段上有 <code class="inline">#[expect(dead_code)]</code>，说明当前只在日志里露面）、以及 V2 多 Agent 的驻留锁 guard（保证收件 Agent 在处理前不被回收）。通道另一头是 <code class="inline">submission_loop</code>（handlers.rs:440），内核真正的「消息泵」：</div>
-    <div class="code-title">codex-rs/core/src/session/handlers.rs:440 — submission_loop：select! biased 三路监听（节选）</div>
+    <div class="annotation"><b>提交是带谱系的：</b> 每条 Submission 带 W3C trace（跨异步边界传播追踪上下文）、<code class="inline">parent_turn_id</code>/<code class="inline">root_turn_id</code>（turn 祖先链，Debug 诊断用——字段上有 <code class="inline">#[expect(dead_code)]</code>，说明当前只在日志里露面）、以及 V2 多 Agent 的驻留锁 guard（保证收件 Agent 在处理前不被回收）。通道另一头是 <code class="inline">submission_loop</code>（handlers.rs:444），内核真正的「消息泵」：</div>
+    <div class="code-title">codex-rs/core/src/session/handlers.rs:444 — submission_loop：select! biased 三路监听（节选）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">loop</span> {
     <span class="kw">let</span> sub = tokio::select! {
         biased;
@@ -399,7 +399,7 @@
     };
     <span class="cmt">// 按 op 分发：Op::Interrupt → interrupt(&amp;sess)、Op::TurnInput → turn_input::handle、...</span>
 }</pre>
-    <div class="annotation"><b>biased 决定优先级：</b> <code class="inline">tokio::select!</code> 加 <code class="inline">biased;</code> 表示按分支顺序轮询而非随机——<strong>shutdown 永远优先于新提交</strong>，关停请求不会被积压的提交「饿死」。三个分支各司其职：取消令牌触发会话收尾；<code class="inline">rx_sub.recv()</code> 出错（发送端全 drop）是会话循环的<strong>正常退出路径</strong>；邮箱分支只处理 Agent 间通信的到达信号，<code class="inline">continue</code> 回到顶部重新 select。Op 的真正分发在 select 之后的 match（handlers.rs:492 起）——<code class="inline">Op::Interrupt</code> 调 <code class="inline">interrupt()</code>、<code class="inline">Op::TurnInput</code> 进 <code class="inline">turn_input::handle</code>（:570）——第 3.5 节的 steering、第 3.6 节的中断都是在这里被分发的。</div>
+    <div class="annotation"><b>biased 决定优先级：</b> <code class="inline">tokio::select!</code> 加 <code class="inline">biased;</code> 表示按分支顺序轮询而非随机——<strong>shutdown 永远优先于新提交</strong>，关停请求不会被积压的提交「饿死」。三个分支各司其职：取消令牌触发会话收尾；<code class="inline">rx_sub.recv()</code> 出错（发送端全 drop）是会话循环的<strong>正常退出路径</strong>；邮箱分支只处理 Agent 间通信的到达信号，<code class="inline">continue</code> 回到顶部重新 select。Op 的真正分发在 select 之后的 match（handlers.rs:499 起）——<code class="inline">Op::Interrupt</code> 调 <code class="inline">interrupt()</code>、<code class="inline">Op::TurnInput</code> 进 <code class="inline">turn_input::handle</code>（:567）——第 3.5 节的 steering、第 3.6 节的中断都是在这里被分发的。</div>
 
     <p>任务侧，所有在跑的工作都抽象成 <code class="inline">SessionTask</code>。这个 trait 只有三个必答问题：你是什么（kind）、tracing 里叫什么（span_name）、怎么跑（run）：</p>
     <div class="code-title">codex-rs/core/src/tasks/mod.rs:181 — SessionTask trait（节选）</div>
@@ -426,7 +426,7 @@
     <span class="cmt">/// Gives the task a chance to perform cleanup after an abort.（默认 no-op）</span>
     <span class="kw">fn</span> abort(...) { async {} }
 }</pre>
-    <div class="annotation"><b>返回值与种类：</b> <code class="inline">SessionTaskResult = CodexResult&lt;Option&lt;String&gt;&gt;</code>（tasks/mod.rs:76）——Some 是最终 agent 消息（<code class="inline">on_task_finished</code> 会发给客户端）。任务种类是三值枚举 <code class="inline">TaskKind { Regular, Review, Compact }</code>（state/turn.rs:70）：Regular 是普通对话 turn，Review 是代码审查，Compact 是压缩（第 6 章）。kind 的一个实际用途在 steering：非 Regular 任务不可插话（<code class="inline">steer_input</code> 里 match 到 Review/Compact 就返回 <code class="inline">ActiveTurnNotSteerable</code>，session/turn_input.rs:829-840）——第 3.5 节的「并非所有 turn 都可 steer」落地在任务类型上。具体的任务就是实现这个 trait 的薄壳，如 <code class="inline">RegularTask</code>（tasks/regular.rs:23）：<code class="inline">kind() → TaskKind::Regular</code>、<code class="inline">span_name() = "session_task.turn"</code>、<code class="inline">run()</code> 里就是第 3.2 节拆过的 <code class="inline">run_turn</code>。</div>
+    <div class="annotation"><b>返回值与种类：</b> <code class="inline">SessionTaskResult = CodexResult&lt;Option&lt;String&gt;&gt;</code>（tasks/mod.rs:76）——Some 是最终 agent 消息（<code class="inline">on_task_finished</code> 会发给客户端）。任务种类是三值枚举 <code class="inline">TaskKind { Regular, Review, Compact }</code>（state/turn.rs:70）：Regular 是普通对话 turn，Review 是代码审查，Compact 是压缩（第 6 章）。kind 的一个实际用途在 steering：非 Regular 任务不可插话（<code class="inline">steer_input</code> 里 match 到 Review/Compact 就返回 <code class="inline">ActiveTurnNotSteerable</code>，session/turn_input.rs:845-857）——第 3.5 节的「并非所有 turn 都可 steer」落地在任务类型上。具体的任务就是实现这个 trait 的薄壳，如 <code class="inline">RegularTask</code>（tasks/regular.rs:23）：<code class="inline">kind() → TaskKind::Regular</code>、<code class="inline">span_name() = "session_task.turn"</code>、<code class="inline">run()</code> 里就是第 3.2 节拆过的 <code class="inline">run_turn</code>。</div>
 
     <p>跑起来的任务被包在 <code class="inline">RunningTask</code> 里，这是取消机制的实体：</p>
     <div class="code-title">codex-rs/core/src/state/turn.rs:70 — TaskKind 与 RunningTask</div>
@@ -468,7 +468,7 @@
     ...
 };
 turn.task = Some(running_task);</pre>
-    <div class="annotation"><b>先杀后启 + 令牌级联：</b> <code class="inline">spawn_task</code> 的第一步永远是 <code class="inline">abort_all_tasks(TurnAbortReason::Replaced)</code>——<strong>一个会话同时只有一个活动任务，新任务来了旧任务让路</strong>，而不是排队。这也是第 3.5 节 <code class="inline">ContinueIfIdle</code> 返回 <code class="inline">Superseded</code> 的原因：<code class="inline">start_if_idle</code> 先检查上一个 turn id，发现不符就走拒绝路径，而不是挤掉正在跑的任务。取消则靠令牌树：<code class="inline">start_task</code> 里 <code class="inline">cancellation_token.child_token()</code> 生子令牌传给任务（:346），run_sampling_request 再往下派孙令牌（第 3.3 节的采样循环）——<strong>父令牌一取消，整棵子树齐灭</strong>；而任务自身结束只影响自己的子树。任务完成时的收尾也统一：spawn 侧的 task_future 末尾检查「未被取消」才调 <code class="inline">on_task_finished</code>（:417），随后 <code class="inline">done.notify_waiters()</code>（:420）唤醒所有等 <code class="inline">RunningTask.done</code> 的调用方（比如等 turn 结束再做事的测试或 host）。被 abort 的任务另有 <code class="inline">SessionTask::abort()</code> 清理钩子（默认 no-op），由 <code class="inline">abort_all_tasks</code>（:564）统一触发——注释强调「Let interrupted tasks observe cancellation before dropping pending approvals」，先给任务一个观察取消的机会，再清审批等挂起状态，避免 in-flight 审批被误判成模型可见的拒绝。</div>
+    <div class="annotation"><b>先杀后启 + 令牌级联：</b> <code class="inline">spawn_task</code> 的第一步永远是 <code class="inline">abort_all_tasks(TurnAbortReason::Replaced)</code>——<strong>一个会话同时只有一个活动任务，新任务来了旧任务让路</strong>，而不是排队。这也是第 3.5 节 <code class="inline">ContinueIfIdle</code> 返回 <code class="inline">Superseded</code> 的原因：<code class="inline">start_if_idle</code> 先检查上一个 turn id，发现不符就走拒绝路径，而不是挤掉正在跑的任务。取消则靠令牌树：<code class="inline">start_task</code> 里 <code class="inline">cancellation_token.child_token()</code> 生子令牌传给任务（:365），run_sampling_request 再往下派孙令牌（第 3.3 节的采样循环）——<strong>父令牌一取消，整棵子树齐灭</strong>；而任务自身结束只影响自己的子树。任务完成时的收尾也统一：spawn 侧的 task_future 末尾检查「未被取消」才调 <code class="inline">on_task_finished</code>（:417），随后 <code class="inline">done.notify_waiters()</code>（:420）唤醒所有等 <code class="inline">RunningTask.done</code> 的调用方（比如等 turn 结束再做事的测试或 host）。被 abort 的任务另有 <code class="inline">SessionTask::abort()</code> 清理钩子（默认 no-op），由 <code class="inline">abort_all_tasks</code>（:563）统一触发——注释强调「Let interrupted tasks observe cancellation before dropping pending approvals」，先给任务一个观察取消的机会，再清审批等挂起状态，避免 in-flight 审批被误判成模型可见的拒绝。</div>
     <div class="callout info">
       <b class="tag">分层</b>
       把这几块拼起来，内核的并发分工是：<strong>SessionIo</strong> 是队列端点（提交通道 + 事件通道 + 状态 watch + 终止 future），<strong>submission_loop</strong> 是单线程消息泵（biased select：停机 &gt; 提交 &gt; 邮箱），<strong>SessionTask/RunningTask</strong> 是任务抽象（kind 分类 + AbortOnDropHandle 托底 + CancellationToken 级联）。通道用 async_channel（兼容 async-std/tokio 双生态）、通知用 tokio 原语（watch/Notify/oneshot）、取消用 tokio_util 的 CancellationToken——每类原语只用一处，不混。
@@ -500,7 +500,7 @@ turn.task = Some(running_task);</pre>
 </div>
 
 <footer>
-  Codex CLI · 03 Turn 循环 · 源码锚点 openai/codex @ ce0323f2f2 · 所有引用代码路径以仓库最新为准
+  Codex CLI · 03 Turn 循环 · 源码锚点 openai/codex @ 18795fc125 · 所有引用代码路径以仓库最新为准
 </footer>
 
 </body>
