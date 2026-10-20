@@ -57,8 +57,8 @@ python3 -m http.server
 
 - 消息/循环：`packages/agent/src/`（`types.ts`、`agent.ts`、`agent-loop.ts`；v1.0.0 后 pi-agent-core 只剩 Agent + 循环 + proxy + 类型）
 - ~~旧 experimental harness~~：`packages/agent/src/harness/`（契约 `agent-harness.ts`、runtime/、session/、compaction/）——**v1.0.0 整体删除**，各章保留其机制讲解并标注「已删」
-- durable 后继：`packages/durable/`（`@earendil-works/pi-durable`，`src/harness/` 的 Harness.open / scheduler / registry，规格在 `docs/spec.md`；SQLite 后端在 `storage/sqlite/node`）
-- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`（durable 的消费方在 `packages/coding-agent/src/experimental/session-worker.ts`）
+- durable 后继：`packages/durable/`（`@earendil-works/pi-durable`，`src/harness/` 的 Harness.open / scheduler / registry，规格在 `docs/spec.md`；SQLite 后端在 `storage/sqlite/node`，底层驱动已下沉到 `packages/chord/src/sqlite/`）
+- 生产 harness：`packages/coding-agent/src/core/agent-session.ts`、`agent-session-runtime.ts`（durable 的消费方是 experimental 的 `packages/env/`；v1.2.0 已删除原消费方 `packages/coding-agent/src/experimental/session-worker.ts`）
 - 工具：`packages/coding-agent/src/core/tools/`；暴露面（exposure/prepareLoadout）在 `core/extensions/types.ts`
 - 能力外置：`packages/codemode/`（QuickJS 沙箱）、`packages/mcp/`（MCP 客户端）；内置扩展注册在 `packages/coding-agent/src/extensions/index.ts`（`builtin:<name>`）
 - AI 层：`packages/ai/src/`（`types.ts`、`api/*.ts`）
@@ -66,5 +66,5 @@ python3 -m http.server
 ## 备注
 
 - 内容基于当前仓库源码整理。代码引用不标行号，随版本演化可能略有出入，以源码为准。
-- 当前审核版本：`v1.1.0-22-gea448f454`（2026-10-11 再核实：自 v1.0.4-6-g0cf65d2bf 起 69 commits，含 v1.1.0 正式版；ch07 修 Harness.open close-catch 摘录 + Conversation.context 增 {at}、§7.8 补 durable 嵌套调用/structuredOutputSchema/callers 与调度器索引瘦身 cb4375493/ea448f454；ch10 分类器三值改四值（+openai-decisions / classifier-shared.ts 搬家）+ 摘录 input 字段改 ModelInputModality + 10.2 补 #9880 配置 schema 化演化痕迹（compat-schema.ts / model-schema.ts 拆分）；ch08 agent_settled 补 aborted（#10607）；ch11 11.2 补 +name/-name 工具修饰符、11.4 增补 OSC 7501 程序状态；ch06 chars/4 复核不受 pi-ai 估算 3.5 变更影响）。
+- 当前审核版本：`v1.3.0-42-g73f8de80b`（2026-10-20 再核实：自 v1.3.0-16-g8efd314fa 起 26 commits；ch07 §7.8 增补 durable 三条线——sleeping 任务/sleepUntil+now/setTimer/onWake 时钟链路、崩溃循环守卫 restartLimit+parked、onReport 带类型化 ReportInfo 九种 + afterFailedRun/checkpointWhen 必填；ch01 包表补 chord//sqlite 与 telemetry-sqlite 下沉、pi-telemetry 能力扩容（propagation/links/metrics/TelemetryStore/renderTrace）；ch10 §10.3.1 补 Copilot 裸 HTTP 413 溢出收编、§10.3/10.4 补 AI_TELEMETRY_SCHEMA 遥测观察器与 telemetryContext→telemetry 改名；ch09 powershell 工具补三级查找 + existsSync→accessSync（nodejs/node#36790）；ch11 11.4 程序状态条补终端能力探测（Rex OSC 8/真彩、图片关、内层先判）；全部既有摘录与 pin 逐一对源复核零漂移）。
 - 配色沿用 Pi 的 teal / indigo 品牌色调（`assets/pi-learn.css`），结构上借鉴了此前自建的 vLLM 学习站模板。
