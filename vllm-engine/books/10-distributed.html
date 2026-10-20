@@ -286,7 +286,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
     </table>
     <p>选型暗含一条分界线：什么时候才需要专门的 all2all kernel？层配置里的判据（fused_moe/config.py:1035）是 <code class="inline">use_all2all_kernels = use_ep and (dp_size &gt; 1 or pcp_size &gt; 1 or 序列并行)</code>——纯 TP 内的 EP（单机、无 DP）各卡 batch 相同，all-gather 就够；一旦上了 DP（各卡 batch 不同）或跨机，token 分布参差，就值得上 DeepEP 这种「精确按需投递」的 kernel。另外还有一层与显存预算的联动：开了 EP 后加载权重时，每个 rank 只读自己那份专家权重（<code class="inline">enable_ep_weight_filter</code>，config/parallel.py:199），DeepSeek/Mixtral 这类逐专家存盘的模型能省一大截磁盘 IO。</p>
     <div class="annotation"><b>EPLB 是这套机制上的补丁：</b>均匀切专家的前提是「token 均匀路由」，而真实负载永远偏斜——热门专家所在卡排队，冷门卡闲着。<code class="inline">enable_eplb</code>（expert parallelism load balancing）就是为此准备的：runner 每步收尾时调 <code class="inline">eplb_step</code>（gpu_model_runner.py:3182），累计各专家的命中率，热度高到阈值就复制出「冗余专家」（<code class="inline">num_redundant_experts</code>）挪到冷卡，再重排 expert_map。配合 <code class="inline">expert_placement_strategy</code> 的两种初始摆法（连续段 vs 隔行），这是 MoE 大模型上线后真正要调的东西。EPLB 组本身也是一个通信组（<code class="inline">get_eplb_group</code>，parallel_state.py:1671），用于重排时的权重同步。</div>
-    <div class="annotation"><b>TP 切 KV 有一个特殊档位——只复制、不切分：</b>TP 的本意是均摊显存，但对某些模型，KV cache 的头数太少，硬切到 N 张卡上每张剩不下几个头，通信换来的显存节省不划算。vLLM 给 KV cache 规格加了两个对应字段（kv_cache_interface.py:517 的 <code class="inline">max_tp_shards</code>）：这份 cache 在 TP 维度上最多切成几份，超过这个份数的 TP rank 不再拿「四分之一份」，而是整份复制。实际切几份、复制几份在启动时统一算出：<code class="inline">kv_cache_groups_tp_replicas</code>（core/kv_cache_planning.py:1241）对每组 KV 规格算 <code class="inline">tp_size // max_tp_shards</code>，再对全组取 gcd，得到 <code class="inline">kv_tp_replicas</code>（#57652）——「相邻的几个 TP rank 持有完全相同的 KV」。取 gcd 是因为一个 KV 组里有多层、多个 spec 时，复制数必须对所有层都成立。这个数随后写进 <code class="inline">KVCacheConfig.kv_tp_replicas</code>（kv_cache_interface.py:1502），供 KV 卸载等下游按「真身 + 副本」理解布局。初读容易误以为这是新加的并行维度——它不增加进程数、不引入新通信组，只是 TP 显存账本上的一个标注：这几张卡的 KV 是彼此的镜像。</div>
+    <div class="annotation"><b>TP 切 KV 有一个特殊档位——只复制、不切分：</b>TP 的本意是均摊显存，但对某些模型，KV cache 的头数太少，硬切到 N 张卡上每张剩不下几个头，通信换来的显存节省不划算。vLLM 给 KV cache 规格加了两个对应字段（kv_cache_interface.py:539 的 <code class="inline">max_tp_shards</code>）：这份 cache 在 TP 维度上最多切成几份，超过这个份数的 TP rank 不再拿「四分之一份」，而是整份复制。实际切几份、复制几份在启动时统一算出：<code class="inline">kv_cache_groups_tp_replicas</code>（core/kv_cache_planning.py:1241）对每组 KV 规格算 <code class="inline">tp_size // max_tp_shards</code>，再对全组取 gcd，得到 <code class="inline">kv_tp_replicas</code>（#57652）——「相邻的几个 TP rank 持有完全相同的 KV」。取 gcd 是因为一个 KV 组里有多层、多个 spec 时，复制数必须对所有层都成立。这个数随后写进 <code class="inline">KVCacheConfig.kv_tp_replicas</code>（kv_cache_interface.py:1538），供 KV 卸载等下游按「真身 + 副本」理解布局。初读容易误以为这是新加的并行维度——它不增加进程数、不引入新通信组，只是 TP 显存账本上的一个标注：这几张卡的 KV 是彼此的镜像。</div>
     <h3>all-reduce 的实现栈：从 torch 到 custom kernel</h3>
     <p>TP 的账算完，还剩一个问题：同样叫 all-reduce，vLLM 内部有几条路？答案在 <code class="inline">cuda_communicator.py</code> 的 <code class="inline">all_reduce</code>（:362）里，是一条按条件逐级下落的链：</p>
     <table class="tbl">
@@ -360,7 +360,7 @@ result = <span class="fn">run_method</span>(self.driver_worker, method, args, kw
 </div>
 
 <footer>
-  深入浅出vLLM · 10 分布式 · 版本 proto-v0.6.0-237-g4e964b2623c (4e964b2623)
+  深入浅出vLLM · 10 分布式 · 版本 proto-v0.6.0-378-g3897f95cf17 (3897f95cf1)
 </footer>
 
 </body>

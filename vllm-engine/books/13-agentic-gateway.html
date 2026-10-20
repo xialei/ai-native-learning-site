@@ -45,7 +45,7 @@
 
   <div class="callout info">
     <b class="tag">代码来源</b>
-    本章所有 Rust 片段摘自 <strong>vllm-project/agentic-api</strong>（<code class="inline">v0.9.0-29-g634899a</code>，Apache-2.0），核心库在 <code class="inline">crates/agentic-server-core/</code>（对外叫 <code class="inline">agentic_core</code>）。它不是 vLLM 的 fork，而是一个<strong>独立进程</strong>：vLLM 用 <code class="inline">vllm serve</code> 原样启动，网关把请求翻译成 vLLM 自己的 OpenAI 兼容 Responses API 再转发。片段有删节，行内中文注释是本书补写的说明——源码里的注释是英文。
+    本章所有 Rust 片段摘自 <strong>vllm-project/agentic-api</strong>（<code class="inline">v0.9.0-37-g81c4e91</code>，Apache-2.0），核心库在 <code class="inline">crates/agentic-server-core/</code>（对外叫 <code class="inline">agentic_core</code>）。它不是 vLLM 的 fork，而是一个<strong>独立进程</strong>：vLLM 用 <code class="inline">vllm serve</code> 原样启动，网关把请求翻译成 vLLM 自己的 OpenAI 兼容 Responses API 再转发。片段有删节，行内中文注释是本书补写的说明——源码里的注释是英文。
   </div>
 
   <section class="block">
@@ -197,9 +197,10 @@
 
     <span class="kw">let mut</span> items = <span class="cl">InOutItem::into_input_items</span>(history);  <span class="cmt">// 行 → 领域类型</span>
     items.<span class="fn">extend</span>(<span class="cl">Vec</span>::<span class="fn">from</span>(&ctx.original_request.input));    <span class="cmt">// 追加本轮新输入</span>
-    <span class="kw">if let</span> <span class="cl">Some</span>(pending) = <span class="fn">pending_calls</span>(&amp;items)?.into_iter().next() {
-        <span class="cmt">// 上一轮有个 function_call 还没等到 function_call_output？</span>
+    <span class="kw">if let</span> <span class="cl">Some</span>(pending) = <span class="fn">first_unanswered_sync_call</span>(&amp;items)? {
+        <span class="cmt">// 上一轮有个同步 function_call 还没等到 function_call_output？</span>
         <span class="cmt">// 拒绝整个请求，而不是带着悬空调用去推理。</span>
+        <span class="cmt">// 挂起的 async 调用不算数——它们本来就允许输出后到。</span>
         <span class="kw">return</span> <span class="cl">Err</span>(<span class="cl">ExecutorError::Tool</span>(<span class="cl">ToolError::MissingOutput</span> {
             call_id: pending.call_id,
         }));
@@ -209,7 +210,7 @@
     ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(items);
     ...
 }</pre>
-    <div class="annotation"><b>三个细节：</b>(1) 拼完历史立刻做 <strong>pending calls 校验</strong>——每个 call_id 必须唯一、每个 call 必须有且仅有一个 output，有悬空就拒绝请求（4xx），绝不把残缺的调用记录喂给模型；(2) <code class="inline">previous_response_id</code> 被清空——vLLM 收到的永远是<strong>自包含全量输入</strong>，它不需要知道「续聊」的存在；(3) 工具声明可以从上条 response 的元数据里<strong>继承</strong>（<code class="inline">resolve_tools</code>），续聊不必每次重发 tools。</div>
+    <div class="annotation"><b>三个细节：</b>(1) 拼完历史立刻做 <strong>pending calls 校验</strong>——每个 call_id 必须唯一、同步调用必须有且仅有一个 output，有悬空就拒绝请求（4xx），绝不把残缺的调用记录喂给模型；<strong>异步调用除外</strong>——声明了 <code class="inline">async: true</code> 的工具允许「调用先发、输出后到」（还接受多次追加输出），挂着的异步调用不拦截请求（<code class="inline">first_unanswered_sync_call</code>，pending_calls.rs）；(2) <code class="inline">previous_response_id</code> 被清空——vLLM 收到的永远是<strong>自包含全量输入</strong>，它不需要知道「续聊」的存在；(3) 工具声明可以从上条 response 的元数据里<strong>继承</strong>（<code class="inline">resolve_tools</code>），续聊不必每次重发 tools。</div>
     <p>那数据库里到底存了什么？看建表 SQL，整个存储只有三张表，核心是一张 items 流水表：</p>
     <div class="code-title">crates/agentic-server-core/migrations/0001_initial.sql（摘录）</div>
     <pre class="code"><span class="lang-tag">sql</span><span class="kw">CREATE TABLE IF NOT EXISTS</span> conversations (
@@ -305,25 +306,39 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
         <span class="kw">return</span> <span class="cl">Ok</span>((payload, ...));
     }
 }</pre>
-    <p>而「怎么决定下一步」的函数非常短，值得整段读——它就是循环的<strong>状态机</strong>（引擎循环重构后从 engine.rs 搬到了 <code class="inline">engine/agent_turn.rs</code>，<code class="inline">LoopDecision</code> 也改名 <code class="inline">RoundDecision</code>，还多了一个 <code class="inline">UpstreamTerminal</code> 出口——上游返回 failed/incomplete 时保留状态直接收尾，不再开启下一轮）：</p>
-    <div class="code-title">crates/agentic-server-core/src/executor/engine/agent_turn.rs — classify_round（全文；注释为译注）</div>
-    <pre class="code"><span class="lang-tag">rust</span><span class="kw">fn</span> <span class="fn">classify_round</span>(
-    has_client_owned_calls: <span class="cl">bool</span>,
+    <p>而「怎么决定下一步」的函数非常短，值得整段读——它就是循环的<strong>状态机</strong>（引擎循环重构后从 engine.rs 搬到了 <code class="inline">engine/agent_turn.rs</code>，<code class="inline">LoopDecision</code> 也改名 <code class="inline">RoundDecision</code>，多了一个 <code class="inline">UpstreamTerminal</code> 出口——上游返回 failed/incomplete 时保留状态直接收尾，不再开启下一轮；后来又拆出了独立的 <code class="inline">round_policy.rs</code>，因为异步客户端工具加入后，四个出口的判定不再是一个函数能顺手写完的事）：</p>
+    <div class="code-title">crates/agentic-server-core/src/executor/engine/agent_turn/round_policy.rs — classify_round（全文；注释为译注）</div>
+    <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// 本轮输出的客户端调用分两类：同步（要停掉响应等客户端回传）与异步（模型继续干活）</span>
+<span class="kw">pub(super) struct</span> <span class="cl">ClientCalls</span> { <span class="kw">pub</span>(super) <span class="cl">synchronous</span>: <span class="cl">bool</span>, <span class="kw">pub</span>(super) <span class="cl">asynchronous</span>: <span class="cl">bool</span> }
+
+<span class="cmt">// 连续「仅靠异步调用续命」的轮数上限：超过就收工，不烧完整 10 轮预算</span>
+<span class="kw">const</span> <span class="cl">MAX_CONSECUTIVE_ASYNC_CONTINUATIONS</span>: <span class="cl">usize</span> = <span class="nu">2</span>;
+
+<span class="kw">pub(super) fn</span> <span class="fn">classify_round</span>(
+    client_calls: <span class="cl">ClientCalls</span>,
     gateway_results: &amp;[<span class="cl">GatewayCallResult</span>],
     round: <span class="cl">usize</span>,
     max_rounds: <span class="cl">usize</span>,
+    continuations: &amp;<span class="kw">mut</span> <span class="cl">AsyncContinuations</span>,
 ) -&gt; <span class="cl">RoundDecision</span> {
-    <span class="kw">if</span> has_client_owned_calls {
-        <span class="cl">RoundDecision::RequiresClientAction</span>   <span class="cmt">// 客户端工具：交还调用方</span>
-    } <span class="kw">else if</span> gateway_results.is_empty() {
-        <span class="cl">RoundDecision::Done</span>                   <span class="cmt">// 模型不再要工具：收工</span>
-    } <span class="kw">else if</span> round + <span class="nu">1</span> &gt;= max_rounds {
-        <span class="cl">RoundDecision::Incomplete</span>(...)        <span class="cmt">// 10 轮用完：返回 status=incomplete</span>
+    <span class="kw">let</span> last_round = round + <span class="nu">1</span> &gt;= max_rounds;
+    <span class="kw">let</span> previous = <span class="cl">std</span>::<span class="cl">mem</span>::<span class="fn">take</span>(&amp;<span class="kw">mut</span> continuations.<span class="nu">0</span>);
+    <span class="kw">if</span> client_calls.<span class="cl">synchronous</span> {
+        <span class="cl">RoundDecision::RequiresClientAction</span>   <span class="cmt">// 同步客户端工具：交还调用方</span>
+    } <span class="kw">else if</span> !gateway_results.<span class="fn">is_empty</span>() {
+        <span class="kw">if</span> last_round {
+            <span class="cl">RoundDecision::Incomplete</span>(...)    <span class="cmt">// 10 轮用完：返回 status=incomplete</span>
+        } <span class="kw">else</span> {
+            <span class="cl">RoundDecision::Continue</span>           <span class="cmt">// 网关工具已执行：结果喂回再推理</span>
+        }
+    } <span class="kw">else if</span> client_calls.<span class="cl">asynchronous</span> &amp;&amp; !last_round
+        &amp;&amp; previous &lt; <span class="cl">MAX_CONSECUTIVE_ASYNC_CONTINUATIONS</span> {
+        <span class="cl">RoundDecision::Continue</span>               <span class="cmt">// 挂着的异步调用：让模型继续</span>
     } <span class="kw">else</span> {
-        <span class="cl">RoundDecision::Continue</span>
+        <span class="cl">RoundDecision::Done</span>                   <span class="cmt">// 没有可继续的工作：收工</span>
     }
 }</pre>
-    <div class="annotation"><b>看懂这个状态机：</b>四个出口的<strong>优先级</strong>就是语义：客户端工具最优先（哪怕本轮同时有网关工具，网关的也先执行、记档，但响应仍交还客户端——这样客户端下一轮带着完整上下文回来）；「模型这轮没要工具」才意味着完成；10 轮上限不报错，而是把已积累的输出以 <code class="inline">status: &quot;incomplete&quot;</code> 交还，且最后一轮的调用/结果照常落库，保证续聊时<strong>没有悬空的 function_call</strong>。把「错误」「部分成功」「预算耗尽」都表达成正常的状态而非异常，长循环服务应当这样设计。</div>
+    <div class="annotation"><b>看懂这个状态机：</b>出口的<strong>优先级</strong>就是语义。同步客户端工具最优先（哪怕本轮同时有网关工具，网关的也先执行、记档，但响应仍交还客户端——这样客户端下一轮带着完整上下文回来）；网关工具已执行则继续循环，10 轮上限不报错，而是把已积累的输出以 <code class="inline">status: &quot;incomplete&quot;</code> 交还，且最后一轮的调用/结果照常落库，保证续聊时<strong>没有悬空的 function_call</strong>。最新的变化是第三条分支：<strong>异步客户端工具</strong>（声明 <code class="inline">async: true</code> 的 function/custom）发出后不阻塞响应——模型像 OpenAI 那样带着挂起的调用继续推理，输出后到；但「仅靠异步续命」最多连续 2 轮（<code class="inline">AsyncContinuations</code> 计数器，插进任何非异步轮就清零），防止模型反复开工不收口烧穿轮数预算。到达上限或最后一轮时出口是 <code class="inline">Done</code> 而非报错——挂起的异步调用本来就是公开形态，「没有工作留在未记录状态」。把「错误」「部分成功」「预算耗尽」都表达成正常的状态而非异常，长循环服务应当这样设计。</div>
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
         <defs>
@@ -365,24 +380,25 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
     <span class="cl">Gateway</span>(<span class="cl">Option</span>&lt;<span class="cl">GatewayBinding</span>&gt;),
 }</pre>
     <p>三种命运对应三个归属：<strong>Client</strong>——调用原样交还客户端执行（function、custom、Codex 命名空间）；<strong>Gateway(Some)</strong>——网关绑定执行器自己跑（web_search、MCP 发现的工具）；<strong>Gateway(None)</strong>——原则上归网关、但 handler 尚未实现（如 FileSearch / CodeInterpreter），调度器派活时命中 <code class="inline">GatewayExecutionPlan::MissingHandler</code>（规划期 gateway.rs，执行期 run_one 入口再兜一层），生成一条「has no registered handler」的错误输出喂回模型，请求照常继续而不是 500。</p>
-    <p>每个请求开始时，网关把客户端声明的所有工具「过一遍注册流程」，建出一张 <strong>模型可见名 → 条目</strong> 的请求级注册表：</p>
+    <p>每个请求开始时，网关把客户端声明的所有工具「过一遍注册流程」，建出一张 <strong>模型可见名 → 条目</strong> 的请求级注册表。入参是 <code class="inline">ToolDeclaration</code>（declaration.rs）——工具层自己的内部类型，各 API 形状的 wire 声明（如 Responses 的 <code class="inline">ResponsesTool</code>）先转成它再注册：</p>
     <div class="code-title">crates/agentic-server-core/src/tool/registry.rs — build_with_handlers（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub async fn</span> <span class="fn">build_with_handlers</span>(
-    tools: &amp;<span class="kw">mut</span> [<span class="cl">ResponsesTool</span>],
+    tools: &amp;<span class="kw">mut</span> [<span class="cl">ToolDeclaration</span>],
     executors: &amp;<span class="kw">mut</span> <span class="cl">GatewayExecutors</span>,
 ) -&gt; <span class="cl">Result</span>&lt;<span class="kw">Self</span>, <span class="cl">ToolError</span>&gt; {
     <span class="kw">let mut</span> entries = <span class="cl">HashMap::with_capacity</span>(tools.len());
     <span class="kw">for</span> (index, tool) <span class="kw">in</span> resolved_tools.iter().<span class="fn">enumerate</span>() {
         <span class="kw">match</span> tool {
-            <span class="cl">ResponsesTool::Function</span>(p) =&gt; { <span class="cmt">/* 客户端自有：Client */</span> }
-            <span class="cl">ResponsesTool::Mcp</span>(p) =&gt; {
-                <span class="cmt">// 现场连 MCP server，tools/list 发现该 server 的工具</span>
+            <span class="cl">ToolDeclaration::Function</span>(p) =&gt; { <span class="cmt">/* 客户端自有：Client */</span> }
+            <span class="cl">ToolDeclaration::Mcp</span>(p) =&gt; {
+                <span class="cmt">// 现场连 MCP server，tools/list 发现该 server 的工具；</span>
+                <span class="cmt">// 失败不炸请求，记成一条 failed McpListTools 元数据继续走</span>
                 <span class="kw">let</span> tool_set = executors.<span class="fn">mcp_server_tools</span>(p).<span class="kw">await</span>?;
                 <span class="kw">for</span> discovered <span class="kw">in</span> handlers {
                     <span class="fn">insert_discovered_mcp_entry</span>(...);   <span class="cmt">// 归网关</span>
                 }
             }
-            <span class="cl">ResponsesTool::WebSearch</span>(p) =&gt; {
+            <span class="cl">ToolDeclaration::WebSearch</span>(p) =&gt; {
                 <span class="fn">insert_web_search_entry</span>(..., executors.<span class="fn">web_search_handler</span>());
             }
             ...
@@ -504,7 +520,7 @@ id=resp_2 conversation_id=conv_1 previous_response_id=resp_1
     <span class="kw">true</span>
 }</pre>
     <div class="annotation"><b>它只做三件事：</b>① 全流 <code class="inline">sequence_number</code> 单调递增（跨轮连续）；② 后面轮次的 <code class="inline">output_index</code> 整体平移（<code class="inline">output_offset</code>），让第 2 轮的输出接在第 1 轮后面而不是顶掉它；③ <code class="inline">response.created/in_progress</code> 去重，每个 response 只发一次。其余帧原样透传。名字里虽然有 accumulator，但它<strong>不攒数据</strong>——攒数据的是另一头的 <code class="inline">ResponseAccumulator</code>（把流拼回完整 JSON 用）。</div>
-    <p>更麻烦的是<strong>工具事件</strong>：vLLM 不管工具归谁，一律吐 <code class="inline">function_call</code> 事件。但公开 API 里 web_search/MCP 调用应该是 <code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> 形状，而且要等真实执行完才能给结果。这件事在 59 个文件的翻译层重构后被拆成「一个调度器 + 一族翻译器」（<code class="inline">executor/translate/</code>）：调度器只管路由和缓冲，每种工具各自持有翻译状态：</p>
+    <p>更麻烦的是<strong>工具事件</strong>：vLLM 不管工具归谁，一律吐 <code class="inline">function_call</code> 事件。但公开 API 里 web_search/MCP 调用应该是 <code class="inline">web_search_call</code> / <code class="inline">mcp_call</code> 形状，而且要等真实执行完才能给结果。这件事在 74 个文件的 AgentPipeline 重构后被拆成「一个调度器 + 一族翻译器」（<code class="inline">executor/translate/</code>）：调度器只管路由和缓冲，每种工具各自持有翻译状态：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/translate/dispatcher.rs + mod.rs（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="cmt">// 每个活跃调用二选一：客户端工具挂着翻译器（原样/改写透传），</span>
 <span class="cmt">// 网关工具直接标记 Gateway——它的公开生命周期事件由执行完事后合成</span>
@@ -619,17 +635,29 @@ vLLM ──SSE──▶ 网关                          <span class="cmt">（第
         .<span class="fn">is_some_and</span>(|config| config.enabled);
     <span class="kw">let</span> prefix = <span class="kw">if</span> multi_agent { <span class="fn">resolved_prefix_len</span>(&amp;items)? } <span class="kw">else</span> { items.<span class="fn">len</span>() };
     <span class="kw">if</span> !items[..prefix].<span class="fn">iter</span>().<span class="fn">any</span>(item_has_meaningful_context) { <span class="kw">return Ok</span>(<span class="cl">None</span>); }
+
+    <span class="cmt">// CompactionCarryOver 先算两份清单：摘要替代不了「输出还没到」的异步调用，</span>
+    // 它们留在模型输入里（open_calls）；本轮自己新写的 items 存储层还要重存一份
+    <span class="kw">let</span> (open_calls, carried) = {
+        <span class="kw">let</span> carry = <span class="cl">CompactionCarryOver</span>::<span class="fn">new</span>(compacted_items, &ctx.new_input_items, suffix);
+        (carry.<span class="fn">open_calls</span>().cloned().collect::&lt;<span class="cl">Vec</span>&lt;_&gt;&gt;(), carry.<span class="fn">stored</span>())
+    };
     <span class="kw">let</span> input = <span class="cl">ResponsesInput::Items</span>(items[..prefix].<span class="fn">to_vec</span>());
     <span class="kw">let</span> (<span class="kw">mut</span> compacted, usage, _) = <span class="fn">compact_items_with_trigger</span>(&amp;ctx.enriched_request, input, ...,
         exec_ctx, auth, <span class="cl">CompactionTrigger::ContextManagement</span>).<span class="kw">await</span>?;  <span class="cmt">// 摘要也是一次推理
 </span>    <span class="kw">if</span> multi_agent {  <span class="cmt">// 前缀里的 MCP 目录原样保留，接在摘要之后</span>
         compacted.<span class="fn">extend</span>(items[..prefix].<span class="fn">iter</span>().filter(|item| <span class="fn">matches!</span>(item, <span class="cl">InputItem::McpListTools</span>(_))).cloned());
-        compacted.<span class="fn">extend_from_slice</span>(&amp;items[prefix..]);
     }
-    ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(compacted.clone());
-    ctx.new_input_items = compacted;
+    <span class="cmt">// 两条产物分道：模型输入 = 摘要 + 挂着的异步调用 + 后缀；落库 = 重放的自身 items + 后缀</span>
+    <span class="kw">let mut</span> model_input = compacted.<span class="fn">clone</span>();
+    model_input.<span class="fn">extend</span>(open_calls);
+    model_input.<span class="fn">extend_from_slice</span>(suffix);
+    <span class="kw">let mut</span> stored = carried.<span class="fn">insert_into</span>(compacted);
+    stored.<span class="fn">extend_from_slice</span>(suffix);
+    ctx.enriched_request.input = <span class="cl">ResponsesInput::Items</span>(model_input);
+    ctx.new_input_items = stored;
     <span class="cmt">// multi_agent 场景里 prefix 之后是本轮的 MultiAgentCall/Output 展开项，</span>
-    <span class="cmt">// 摘要只收编前缀；上面的 extend 分支保证它们不被摘要吃掉。</span>
+    <span class="cmt">// 摘要只收编前缀；suffix 整段原样保留，不被摘要吃掉。</span>
     <span class="kw">if let</span> <span class="cl">Some</span>(continuation) = &amp;<span class="kw">mut</span> ctx.continuation {
         continuation.<span class="fn">mark_history_replaced</span>();   <span class="cmt">// 历史被摘要替换：作废续租基线
 </span>    }
@@ -638,13 +666,14 @@ vLLM ──SSE──▶ 网关                          <span class="cmt">（第
     <p>压缩的执行本身也是<strong>一次普通的推理调用</strong>——用一段固定的 CHECKPOINT 提示词让模型自己总结：</p>
     <div class="code-title">crates/agentic-server-core/src/executor/compaction.rs — 压缩提示词（原文）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">const</span> <span class="cl">COMPACTION_PROMPT</span>: &amp;<span class="cl">str</span> = <span class="st">"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a concise handoff summary that preserves current progress, decisions, constraints, unresolved work, and critical references for the next model. Return only the summary."</span>;</pre>
-    <p>压完之后，「历史可见性」有两条边界，值得分开看（<code class="inline">types/io/input.rs</code>）：</p>
+    <p>压完之后，「历史可见性」有两条边界，值得分开看（<code class="inline">types/io/input.rs</code>，窗口计算本体在 <code class="inline">types/io/input/window.rs</code>）：</p>
     <div class="code-title">crates/agentic-server-core/src/types/io/input.rs — model_input：模型可见性边界（摘录）</div>
     <pre class="code"><span class="lang-tag">rust</span><span class="kw">pub fn</span> <span class="fn">model_input</span>(&amp;<span class="kw">self</span>) -&gt; <span class="cl">Cow</span>&lt;<span class="cl">'_</span>, <span class="kw">Self</span>&gt; {
-    <span class="cmt">// 裁剪窗口在 model_items()（input.rs:431）里算好：</span>
+    <span class="cmt">// 裁剪窗口在 model_items()（input.rs:414，核心在 window.rs:111）里算好：</span>
     <span class="cmt">// ① 剥掉编排用的内部项（mcp_list_tools / compaction_trigger）——模型永远看不到</span>
     <span class="cmt">// ② 若有压缩检查点：检查点之前的旧上下文被摘要取代；</span>
     <span class="cmt">//    检查点本身转成一条 assistant 消息（内容即摘要文本）</span>
+    <span class="cmt">// ③ 检查点之前仍挂着的异步调用保留在窗口里——模型不能收到没有调用的输出</span>
     <span class="kw">let</span> model_items = <span class="kw">self</span>.<span class="fn">model_items</span>()
         .map(|item| <span class="kw">match</span> item {
             <span class="cl">InputItem::Compaction</span>(compaction) =&gt; <span class="cl">InputItem::Message</span>(...),  <span class="cmt">// → assistant 摘要</span>
@@ -709,7 +738,7 @@ curl http://localhost:9000/v1/responses -H <span class="st">"Content-Type: appli
 </div>
 
 <footer>
-  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.9.0-29-g634899a · vLLM 侧版本 proto-v0.6.0-237-g4e964b2623c (4e964b2623)
+  深入浅出vLLM · 13 实战·Agentic 网关 · 网关代码版本 v0.9.0-37-g81c4e91 · vLLM 侧版本 proto-v0.6.0-378-g3897f95cf17 (3897f95cf1)
 </footer>
 
 </body>
