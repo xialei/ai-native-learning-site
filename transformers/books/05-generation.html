@@ -38,7 +38,7 @@
     <div class="chap-meta">Chapter 05 · Generation Loop</div>
     <h1>生成循环:一次 generate 从头走到尾</h1>
     <div class="lede">
-      <p>第 3 章的前向输出 logit 向量,第 4 章的缓存让增量解码成为可能。但「一个 token 一个 token 循环生成、条件满足才停」这件事本身,是谁在驱动?答案是一个你可能天天在调、但很少打开的函数:generation/utils.py 的 generate()——4434 行文件里最长的入口方法,从校验参数到分发解码策略,串起整库推理侧的所有子系统。</p>
+      <p>第 3 章的前向输出 logit 向量,第 4 章的缓存让增量解码成为可能。但「一个 token 一个 token 循环生成、条件满足才停」这件事本身,是谁在驱动?答案是一个你可能天天在调、但很少打开的函数:generation/utils.py 的 generate()——4437 行文件里最长的入口方法,从校验参数到分发解码策略,串起整库推理侧的所有子系统。</p>
       <p>这一章拆它的九步流程(:2569 起),再看唯一留在库内的解码主循环 _sample(:3104)——其余解码策略或被并入、或已移出库外改为按需从 Hub 拉取——最后看两个特殊机制:chunked prefill 与 MPS 设备上的「晚一步停」。</p>
     </div>
   </div>
@@ -166,16 +166,19 @@
 
     <span class="cmt"># 分支二:prompt 切块逐块喂,缓存逐块长(超长 prompt / 显存吃紧)</span>
     <span class="kw">else</span>:
+        <span class="kw">if</span> cache <span class="kw">is</span> <span class="kw">None</span>:
+            <span class="kw">raise</span> <span class="cl">ValueError</span>("Cannot use prefill chunking without a cache")
         getattr(torch, "_dynamo").config.cache_size_limit = <span class="nu">64</span>  <span class="cmt"># flex 编译图会变多,提前放宽上限</span>
-        input_chunks = torch.split(input_ids, chunk_size, dim=-<span class="nu">1</span>)
+        <span class="cmt"># 接着已有缓存续写时,input_ids 可能含旧 token,只切出新的那段</span>
+        input_chunks = torch.split(input_ids[:, -next_sequence_length:], chunk_size, dim=-<span class="nu">1</span>)
         attention_mask = model_kwargs.pop("attention_mask", <span class="kw">None</span>)
-        past_length = <span class="nu">0</span>
+        past_length = cache.get_seq_length()   <span class="cmt"># 不再固定从 0 起算</span>
         <span class="kw">for</span> input_chunk <span class="kw">in</span> input_chunks:
             current_length = past_length + input_chunk.shape[-<span class="nu">1</span>]
             model_kwargs["attention_mask"] = attention_mask[:, :current_length]
             ...  <span class="cmt"># 前向一块,缓存追加一块</span></pre>
     <div class="annotation"><b>为什么需要 chunked prefill:</b>100 万 token 的 prompt,一次前向意味着一个 [1, 1000000, hidden] 的激活张量直接打爆显存。切块后峰值显存 = 单块激活 + 缓存,代价是 flex_attention 的编译图数量翻倍——所以循环前先把 dynamo 缓存上限从默认 8 提到 64,注释里说免得撞上「非常难读懂的报错」。服务端引擎(vLLM/SGLang)把「prefill 与 decode 分时复用」做成了独立的调度问题,Transformers 这里的 chunked prefill 是单机版的前置形态,第 7 章会再遇到这个术语。</div>
-    <p>另一个细节在 _prefill 开头:从已有缓存续写(接着上次对话)时,输入可能是「完整序列」或「只有新 token」两种,分支依据是 attention_mask 长度与 input_ids 长度的比较——续写不是重算,而是切片后只前向新的一段。</p>
+    <p>另一个细节在 _prefill 开头:从已有缓存续写(接着上次对话)时,输入可能是「完整序列」或「只有新 token」两种,分支依据是 attention_mask 长度与 input_ids 长度的比较——续写不是重算,而是切片后只前向新的一段。这件事在一次修复(#49662)里才在分块路径上补齐:此前分支二固定 <code class="inline">past_length = 0</code> 且按整段 input_ids 切块,续写时分块 prefill 会与已有缓存错位;现在两条分支共用同一个 next_sequence_length,分块路径也从 cache.get_seq_length() 起算,并明确要求传进来的必须是一个缓存对象。</p>
   </section>
 
   <section class="block">
@@ -281,7 +284,7 @@
 </div>
 
 <footer>
-  深入浅出 Transformers · 05 生成循环 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+  深入浅出 Transformers · 05 生成循环 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
 </footer>
 
 </body>

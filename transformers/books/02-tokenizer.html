@@ -39,7 +39,7 @@
     <h1>分词:互联网的文字,先变成一串整数</h1>
     <div class="lede">
       <p>模型的世界里没有字,只有整数。你输入的一句话在进入第一层网络之前,要被切成 token、查表变成 ID 序列;模型输出的一串 ID,也要查表拼回文字。这一步看着像字符串处理,实际上决定了三件大事:一段话花多少算力(中文和英文的 token 效率差几倍)、模型「没见过」的东西怎么处理(字节回退)、以及第八、九章要讲的——工具调用和控制符,全靠 token 表里的特殊符号撑起来。</p>
-      <p>这一章讲三件事:token 从哪来(词表和算法)、v5 把分词器动成什么样(双后端重构)、一条文本编码成张量的完整路径。锚定 tokenization_utils_base.py(3764 行)和 tokenizers 库的接缝层。</p>
+      <p>这一章讲三件事:token 从哪来(词表和算法)、v5 把分词器动成什么样(双后端重构)、一条文本编码成张量的完整路径。锚定 tokenization_utils_base.py(3782 行)和 tokenizers 库的接缝层。</p>
     </div>
   </div>
 
@@ -113,7 +113,8 @@
         self._special_tokens_map = <span class="cl">dict</span>.fromkeys(self.SPECIAL_TOKENS_ATTRIBUTES)
         self._extra_special_tokens = []  <span class="cmt"># 模型专属:图像 token、工具 token 这类</span></pre>
     <div class="annotation"><b>为什么要分两组:</b>命名槽位是协议级的(所有模型共用这几个名字);extra 是模型自留地——视觉模型要 &lt;image&gt; 占位符,工具调用模型要有包住函数调用的标记。第 8、9 章会看到,chat template 的本质就是「把对话渲染成控制符序列」,而这些控制符必须是词表里的真 token,模型才能在训练时学会「看到它意味着什么」。这正是问题二(工具调用)在模型侧的第一块基石:工具调用的语法,是靠特殊 token 和普通文本一起拼出来的。</div>
-    <p>还有一个安全细节值得提前知道:v5 新增了 <code class="inline">sanitize_control_tokens</code> 参数(apply_chat_template 的签名里,tokenization_utils_base.py:3012)。用户输入里如果混着 <code class="inline">&lt;/s&gt;</code> 这样的字面量,默认(不传参数)会照常编码成控制 token——这正是提示注入的攻击面:用户可以伪造「对话结束」或「工具调用」标记。把 <code class="inline">sanitize_control_tokens=True</code> 打开后,用户文本里的字面量才被降级成普通文本,只有聊天模板自己写下的控制 token 保留身份——防注入是从分词这一层堵的,但要显式开关。</p>
+    <p>自己往词表里加 token(add_tokens,tokenization_utils_base.py:1218)时有个坑值得提前踩掉:fast tokenizer 若用 Metaspace 预分词器且 prepend_scheme="always"(NLLB 这类),加入 ["abcd"] 之后,"abcdgym" 会被切成 ["abcd", "▁gym"],解码回来变成 "abcd gym"——多加的空格不是解码器的问题,是预分词在新增 token 边界上又补了一个词首标记。加进去的 token 可能出现在词中间时,把 prepend_scheme 改成 "first",只有输入开头才补。</p>
+<p>还有一个安全细节值得提前知道:v5 新增了 <code class="inline">sanitize_control_tokens</code> 参数(apply_chat_template 的签名里,tokenization_utils_base.py:3030)。用户输入里如果混着 <code class="inline">&lt;/s&gt;</code> 这样的字面量,默认(不传参数)会照常编码成控制 token——这正是提示注入的攻击面:用户可以伪造「对话结束」或「工具调用」标记。把 <code class="inline">sanitize_control_tokens=True</code> 打开后,用户文本里的字面量才被降级成普通文本,只有聊天模板自己写下的控制 token 保留身份——防注入是从分词这一层堵的,但要显式开关。</p>
   </section>
 
   <section class="block">
@@ -121,6 +122,7 @@
     <p>v4 时代的分词器是双轨的:每个模型一份 <code class="inline">tokenization_&lt;model&gt;.py</code>(纯 Python,慢)和一份 <code class="inline">tokenization_&lt;model&gt;_fast.py</code>(Rust 的 tokenizers 库,快)。两份代码实现同样的行为,但总会有行为不一致的角落——这是长期积累的技术债。</p>
     <p>v5 的迁移指南(MIGRATION_GUIDE_V5.md)写得很直白:慢分词器文件整体移除,原 <code class="inline">_fast</code> 后缀的文件改名顶替;sentencepiece 等其他后端以「轻量适配层」的方式保留在加载失败时的回退路径里。配套的 API 精简:encode_plus → <code class="inline">__call__</code>、batch_decode → <code class="inline">decode</code>、prepare_seq2seq_batch → <code class="inline">__call__(text_target=...)</code>。</p>
     <p>纯 Python 侧没有全删——tokenization_python.py 里的 PythonBackend(:400 起)保留,但定位变了:它是「没有 Rust 环境时的兜底」,以及在 doctest 和单元测试里跑得起来的一份参考实现。那份文件里的 Trie(45 行起)值得一看:最长匹配优先的 special token 扫描器,是「文本里混进控制符怎么办」这个问题的原始答案。</p>
+    <p>加载路径上还有一处值得记的取舍。tokenizer.json 在磁盘上是完整序列化的后端,朴素做法是加载时 TokenizerFast.from_file 一份、把它当 tokenizer_object 传进 __init__;问题是这样传会触发一次整后端的 deepcopy。现在的做法(convert_to_native_format,tokenization_utils_tokenizers.py:104)只把文件路径塞进 local_kwargs,让 __init__ 自己加载——同一份文件只解析一次,AutoTokenizer.from_pretrained 因此快了 2 到 2.9 倍(#49667)。省掉的不是解析,是解析后的那次复制。</p>
     <div class="annotation"><b>为什么值得记住这次删减:</b>分词器是全库「双轨并存」时间最长的组件,双轨的动机(渐进迁移)和代价(行为漂移)都写在了 git 历史里。v5 用「一个 Rust 后端 + 一层声明」收敛它,和第 1 章的 modular 机制是同一个思路——<strong>把「每模型一份重复实现」换成「一份机制 + 每模型一份声明」。</strong>这也是全书反复出现的模式。</div>
   </section>
 
@@ -139,7 +141,7 @@
 
         <rect class="node acc" x="20" y="40" width="150" height="60" rx="8"></rect>
         <text class="lbl" x="95" y="65" text-anchor="middle">tokenizer(text)</text>
-        <text class="lbl sm" x="95" y="84" text-anchor="middle">base.py:2432</text>
+        <text class="lbl sm" x="95" y="84" text-anchor="middle">base.py:2450</text>
 
         <rect class="node" x="210" y="40" width="170" height="60" rx="8"></rect>
         <text class="lbl" x="295" y="59" text-anchor="middle">截断/填充策略</text>
@@ -147,7 +149,7 @@
 
         <rect class="node core" x="420" y="40" width="190" height="60" rx="8"></rect>
         <text class="lbl" x="515" y="59" text-anchor="middle">TokenizersBackend</text>
-        <text class="lbl sm" x="515" y="78" text-anchor="middle">tokenization_utils_tokenizers.py:970</text>
+        <text class="lbl sm" x="515" y="78" text-anchor="middle">tokenization_utils_tokenizers.py:971</text>
 
         <rect class="node" x="630" y="40" width="130" height="60" rx="8"></rect>
         <text class="lbl" x="695" y="65" text-anchor="middle">Rust 编码</text>
@@ -162,7 +164,7 @@
         <line class="edge" x1="590" y1="70" x2="628" y2="70"></line>
         <line class="edge" x1="760" y1="70" x2="788" y2="70"></line>
 
-        <text class="lbl sm" x="20" y="150">encode(base.py:2255)是单序列薄封装:策略解析 → _encode_plus → 取回 input_ids。</text>
+        <text class="lbl sm" x="20" y="150">encode(base.py:2273)是单序列薄封装:策略解析 → _encode_plus → 取回 input_ids。</text>
         <text class="lbl sm" x="20" y="175">返回值不只是 ID 列表:attention_mask(哪些位置是真 token)、可选的 offset_mapping(字符↔token 映射)一起打包。</text>
         <text class="lbl sm" x="20" y="200">v5:apply_chat_template 默认也返回 BatchEncoding(此前裸 input_ids)——对话渲染与普通编码在返回类型上统一了(08 章接)。</text>
       </svg>
@@ -213,7 +215,7 @@
 </div>
 
 <footer>
-  深入浅出 Transformers · 02 分词 · 版本 trunk d4804f9d76 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+  深入浅出 Transformers · 02 分词 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
 </footer>
 
 </body>
