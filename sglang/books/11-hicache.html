@@ -121,7 +121,7 @@
     </div>
 
     <div class="annotation"><b>关键映射（按目录）：</b>
-      <code class="inline">python/sglang/srt/mem_cache/unified_radix_cache.py</code> → UnifiedRadixCache（树 + 各层状态机，3830 行）；
+      <code class="inline">python/sglang/srt/mem_cache/unified_radix_cache.py</code> → UnifiedRadixCache（树 + 各层状态机，3900 多行）；
       <code class="inline">python/sglang/srt/mem_cache/unified_cache/</code> → 树核心与组件（unified_tree_core.py、components/base.py）；
       <code class="inline">python/sglang/srt/managers/cache_controller.py</code> → HiCacheController（L1↔L2/L3 传输）；
       <code class="inline">python/sglang/srt/mem_cache/pool_host/</code> → host KV 池（L2 的物理内存）；
@@ -316,14 +316,43 @@
             <span class="cmt"># Cache mode reserves the requested span up front; buffer mode</span>
             <span class="cmt"># grants occupancy later at hit-alloc time, sized to the hit.</span>
             self.cache_controller.prefetch_tokens_occupied += <span class="fn">len</span>(prefetch_key)</pre>
-    <div class="annotation"><b>三个门槛：</b> 存储未启用（或没有 controller）直接不预取；潜在命中长度低于 <code class="inline">prefetch_threshold</code>（默认 256 token）不预取；L2 里被在途预取占用的 token 数超过容量上限（<code class="inline">prefetch_rate_limited</code>）则取消。比起被删的旧实现，统一版在前面多了两道闸：同请求的在途预取直接短路（<code class="inline">get_prefetch_submission</code> / <code class="inline">ongoing_prefetch</code>），预取锚点的命名空间（extra_key / cache_salt）要与请求一致，否则 assert 拒绝——存储页按命名空间隔离后，拿错命名空间的锚点会把页写错账。发起后请求挂在 <code class="inline">ongoing_prefetch</code> 里——预取是异步的，调度器不等它，下一轮收割时再对账。<br><br><b>这里有一处容易看漏的次序：预取阶段<em>不</em>分配 host 槽位。</b><code class="inline">prefetch_from_storage</code> 只登记「要取哪些 token」（<code class="inline">PoolTransfer(host_indices=None)</code>），KV staging 的 <code class="inline">alloc</code> 延后到命中时才做——源码注释 "Size the component's staging now; it is allocated at hit time, next to the KV staging, so the query holds no host memory"（<code class="inline">unified_radix_cache.py</code> 附近）。原因是预取是乐观的：三级存储里可能只有一部分真的存在，提前按 <code class="inline">prefetch_length</code> 全额占位会浪费 host 池；等 L3 命中数确定后，<code class="inline">_drain_and_alloc_storage_hit()</code>（<code class="inline">unified_radix_cache.py</code>）按实际命中长度分配，只付真正拿到的那部分。等不了那么久也有退出机制：<code class="inline">hicache_storage_prefetch_policy</code> 支持 <code class="inline">best_effort</code>（随时可放弃）、<code class="inline">wait_complete</code>（死等）、<code class="inline">timeout</code>（按传输量线性放宽的超时）：</div>
-    <div class="code-title">python/sglang/srt/mem_cache/unified_radix_cache.py — 线性超时函数（摘录，注释为译注）</div>
-    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">_prefetch_timeout_check_linear_func</span>(self, operation: <span class="cl">PrefetchOperation</span>) -&gt; <span class="cl">bool</span>:
-        <span class="kw">return</span> (
-            time.<span class="fn">monotonic</span>() - operation.start_time
-            &gt; self.prefetch_timeout_base
-            + <span class="fn">len</span>(operation.hash_value) * self.prefetch_timeout_per_page
-        )</pre>
+    <div class="annotation"><b>三个门槛：</b> 存储未启用（或没有 controller）直接不预取；潜在命中长度低于 <code class="inline">prefetch_threshold</code>（默认 256 token）不预取；L2 里被在途预取占用的 token 数超过容量上限（<code class="inline">prefetch_rate_limited</code>）则取消。比起被删的旧实现，统一版在前面多了两道闸：同请求的在途预取直接短路（<code class="inline">get_prefetch_submission</code> / <code class="inline">ongoing_prefetch</code>），预取锚点的命名空间（extra_key / cache_salt）要与请求一致，否则 assert 拒绝——存储页按命名空间隔离后，拿错命名空间的锚点会把页写错账。发起后请求挂在 <code class="inline">ongoing_prefetch</code> 里——预取是异步的，调度器不等它，下一轮收割时再对账。<br><br><b>这里有一处容易看漏的次序：预取阶段<em>不</em>分配 host 槽位。</b><code class="inline">prefetch_from_storage</code> 只登记「要取哪些 token」（<code class="inline">PoolTransfer(host_indices=None)</code>），KV staging 的 <code class="inline">alloc</code> 延后到命中时才做——源码注释 "Size the component's staging now; it is allocated at hit time, next to the KV staging, so the query holds no host memory"（<code class="inline">unified_radix_cache.py</code> 附近）。原因是预取是乐观的：三级存储里可能只有一部分真的存在，提前按 <code class="inline">prefetch_length</code> 全额占位会浪费 host 池；等 L3 命中数确定后，<code class="inline">_drain_and_alloc_storage_hit()</code>（<code class="inline">unified_radix_cache.py</code>）按实际命中长度分配，只付真正拿到的那部分。等不了那么久也有退出机制：<code class="inline">hicache_storage_prefetch_policy</code> 支持 <code class="inline">best_effort</code>（随时可放弃）、<code class="inline">wait_complete</code>（死等）、<code class="inline">timeout</code>（按传输量线性放宽的超时）。超时这条现在不是每次现算一个比较式，而是先记一份「这次预取的预算」，后面所有判断都读它：</div>
+    <div class="code-title">python/sglang/srt/mem_cache/unified_radix_cache.py — 预取超时的预算与判决（摘录，注释为译注）</div>
+    <pre class="code"><span class="lang-tag">python</span>    <span class="kw">def</span> <span class="fn">_start_storage_prefetch_wait</span>(self, operation: <span class="cl">PrefetchOperation</span>) -&gt; <span class="kw">None</span>:
+        <span class="kw">if</span> (
+            self.prefetch_stop_policy == <span class="st">"timeout"</span>
+            <span class="kw">and</span> operation.handle <span class="kw">not in</span> self._storage_prefetch_wait
+        ):
+            <span class="cmt"># 预算从第一次被卡住的准入轮询开始；重取沿用同一份预算</span>
+            pages = operation.stats_requested_tokens // self.page_size
+            wait = <span class="cl">_StoragePrefetchWait</span>(
+                timeout_s=self.prefetch_timeout_base
+                + pages * self.prefetch_timeout_per_page,
+            )
+            wait.timer.<span class="fn">observe</span>(ready=<span class="kw">False</span>)
+            self._storage_prefetch_wait[operation.handle] = wait
+
+    <span class="kw">def</span> <span class="fn">_prefetch_deadline_expired</span>(self, operation: <span class="cl">PrefetchOperation</span>) -&gt; <span class="cl">bool</span>:
+        <span class="kw">if</span> operation.host_indices <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> (
+            operation.completed_tokens &gt;= <span class="fn">len</span>(operation.hash_value) * self.page_size
+        ):
+            <span class="cmt"># KV 已落地：此时掐掉还在读的 sidecar 什么也省不下</span>
+            <span class="kw">return</span> <span class="kw">False</span>
+        wait = self._storage_prefetch_wait.<span class="fn">get</span>(operation.handle)
+        <span class="kw">return</span> wait <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> (
+            wait.expired
+            <span class="kw">or</span> (wait.timer.running <span class="kw">and</span> wait.timer.<span class="fn">elapsed</span>() &gt; wait.timeout_s)
+        )
+
+    <span class="kw">def</span> <span class="fn">_mark_prefetch_deadline_expired</span>(self, operation: <span class="cl">PrefetchOperation</span>) -&gt; <span class="kw">None</span>:
+        operation.deadline_expired = <span class="kw">True</span>
+        self.storage_prefetch_retries.<span class="fn">cancel</span>(operation.handle.rid)
+        <span class="cmt"># 只有各 rank 一致的判决才能压住重试——包括那些还没走到自己那轮</span>
+        <span class="cmt"># 条件式准入轮询的 peer</span>
+        self._storage_prefetch_wait.<span class="fn">setdefault</span>(
+            operation.handle, <span class="cl">_StoragePrefetchWait</span>()
+        ).expired = <span class="kw">True</span></pre>
+    <div class="annotation"><b>为什么从「算一次」变成「记一份」：</b>旧写法是一个纯函数，拿 <code class="inline">operation.start_time</code> 和当前时刻做比较。<br><br>问题是这个判断会在多个 rank、多次轮询上重复发生，而每次重取（refetch）都会刷新计时起点——于是「同一个预取究竟还有多少预算」取决于谁在第几次问。现在预算在第一次被卡住的准入轮询时算一次（<code class="inline">base + pages × per_page</code>，页数取 <code class="inline">stats_requested_tokens // page_size</code>），存进 <code class="inline">_storage_prefetch_wait</code>，重取不再重置；判决读这份记录。<br><br>另外多了一条短路：KV 已经全部落地时直接判「没过期」——这时候超时指针掐掉的是还在读的 sidecar，省不下传输，只会让这次命中变成半成品。这也解释了 <code class="inline">_mark_prefetch_deadline_expired</code> 为什么要专门写一个 <code class="inline">expired</code> 标记而不是只靠时间算：<code class="inline">_can_terminate_prefetch</code> 是 <code class="inline">@rank_consensus(same_results=True)</code> 包着的，一个 rank 已经判过期、别的 rank 还没轮到自己的条件式轮询时，只能靠这个共享标记对齐结论。</div>
 
     <p><strong>回写（L1→L2→L3）</strong>由 <code class="inline">--hicache-write-policy</code> 控制，三种策略：</p>
     <table class="tbl">
@@ -429,21 +458,28 @@
 <span class="cmt"># 字节工件存储（TensorCast 会话）</span>
 <span class="cl">StorageBackendFactory</span>.<span class="fn">register_backend</span>(
     <span class="st">"tensorcast"</span>, <span class="st">"sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store"</span>, <span class="st">"TensorcastStore"</span>
+)
+<span class="cmt"># 对象存储（SeaweedFS 集群）</span>
+<span class="cl">StorageBackendFactory</span>.<span class="fn">register_backend</span>(
+    <span class="st">"seaweedfs"</span>, <span class="st">"sglang.srt.mem_cache.storage.seaweedfs.seaweedfs_store"</span>, <span class="st">"SeaweedFSStore"</span>
 )</pre>
-    <div class="annotation"><b>一共注册 <strong>12</strong> 个后端：</b> 所有后端实现同一个抽象基类 <code class="inline">HiCacheStorage</code>（<code class="inline">hicache_storage.py</code>），核心就三个方法：<code class="inline">batch_exists</code>（哪些页在）、<code class="inline">batch_get</code>（按页哈希取回）、<code class="inline">batch_set</code>（按页哈希写入）。最简单的 <code class="inline">HiCacheFile</code> 就是本地目录 + LRU 驱逐；mooncake / hf3fs / nixl / aibrix 接的是分布式 KV 存储或高速文件系统。<code class="inline">sim</code> 是模拟后端（测试用），<code class="inline">simm</code> 与 <code class="inline">mori</code> 是较新的两家：SiMM 是存储侧的内存管理方案，<code class="inline">UMBP</code> 走的是 AMD 的 mori 传输栈；<code class="inline">npu_memcache</code> 是华为 NPU 侧的 memcache 存储；最新注册的 <code class="inline">tensorcast</code> 接 TensorCast 的字节工件会话——它不持有 host 池，把 KV 页适配成字节工件后交给外部会话管理（<code class="inline">tensorcast_store.py</code>，构造只吃 storage_config）。</div>
+    <div class="annotation"><b>一共注册 <strong>13</strong> 个后端：</b> 所有后端实现同一个抽象基类 <code class="inline">HiCacheStorage</code>（<code class="inline">hicache_storage.py</code>），核心就三个方法：<code class="inline">batch_exists</code>（哪些页在）、<code class="inline">batch_get</code>（按页哈希取回）、<code class="inline">batch_set</code>（按页哈希写入）。最简单的 <code class="inline">HiCacheFile</code> 就是本地目录 + LRU 驱逐；mooncake / hf3fs / nixl / aibrix 接的是分布式 KV 存储或高速文件系统。<code class="inline">sim</code> 是模拟后端（测试用），<code class="inline">simm</code> 与 <code class="inline">mori</code> 是较新的两家：SiMM 是存储侧的内存管理方案，<code class="inline">UMBP</code> 走的是 AMD 的 mori 传输栈；<code class="inline">npu_memcache</code> 是华为 NPU 侧的 memcache 存储；<code class="inline">tensorcast</code> 接 TensorCast 的字节工件会话——它不持有 host 池，把 KV 页适配成字节工件后交给外部会话管理（<code class="inline">tensorcast_store.py</code>，构造只吃 storage_config）；<code class="inline">seaweedfs</code> 挂在 SeaweedFS 集群上，走的是「分布式对象存储当 KV 后端」这条最朴素的路线。</div>
     <p>共享语义是这一节最需要记住的事实（设计文档原文要点）：L1、L2 都是<strong>实例私有</strong>——同一台机器上跑两个 SGLang 进程，它们的 L2 各是各的，互不共享；只有 L3 按后端配置决定共享范围。所以「同机多实例去重」必须走 L3，L2 再大也只帮本实例。</p>
     <p>多 rank 一致性由两件事保证。其一，L3 的键是<strong>逐页哈希</strong>（内容寻址），两棵树算出同样的页序列就指向同样的键，天然去重；其二，TP 组内预取前要先对存储命中页数做一次 all-reduce 取最小值（<code class="inline">prefetch_thread_func</code> 里的 <code class="inline">ReduceOp.MIN</code>）——各 rank 命中数不一致时按最少者对齐，保证所有 rank 拉回同一长度。文件后端还按 rank 拆键，避免多 rank 写同一个文件：</p>
     <div class="code-title">python/sglang/srt/mem_cache/hicache_storage.py — HiCacheFile 的按 rank 分键（摘录，注释保留原文）</div>
-    <pre class="code"><span class="lang-tag">python</span>        self.config_suffix = <span class="st">f"_{model_name}"</span>
-        <span class="kw">if</span> <span class="kw">not</span> is_mla_model:
-            self.config_suffix += <span class="st">f"_{tp_rank}_{tp_size}"</span>
-        <span class="kw">if</span> enable_pp:
-            self.config_suffix += <span class="st">f"_{pp_size}_{pp_rank}"</span>
+    <pre class="code"><span class="lang-tag">python</span>        enable_pp = pp_size &gt; <span class="nu">1</span>
+        shard_suffix = <span class="st">f"_{pp_size}_{pp_rank}"</span> <span class="kw">if</span> enable_pp <span class="kw">else</span> <span class="st">""</span>
         <span class="cmt"># Under NSA context parallel each CP rank holds a disjoint slice of every</span>
         <span class="cmt"># page, so give each rank its own file key to avoid a cross-rank write race.</span>
         <span class="kw">if</span> attn_cp_size &gt; <span class="nu">1</span>:
-            self.config_suffix += <span class="st">f"_cp{attn_cp_rank}_{attn_cp_size}"</span></pre>
-    <div class="annotation"><b>键里没写的维度就共享不了：</b> 非 MLA 模型下每个 TP rank 持有不同的 KV 分片，所以键里必须带 <code class="inline">tp_rank/tp_size</code>；CP（context parallel）下每个 rank 持有每页的一个不相交切片，注释说明了为什么必须再按 CP rank 拆键——否则多 rank 写同一文件就是写冲突。共享是有条件的：键设计里没覆盖的并行维度，L3 就共享不了。</div>
+            shard_suffix += <span class="st">f"_cp{attn_cp_rank}_{attn_cp_size}"</span>
+        <span class="cmt"># MLA KV is replicated across TP ranks and shares one file per page;</span>
+        <span class="cmt"># TP-sharded state is keyed by tp_config_suffix instead.</span>
+        self.tp_config_suffix = <span class="st">f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"</span>
+        self.config_suffix = (
+            <span class="st">f"_{model_name}{shard_suffix}"</span> <span class="kw">if</span> is_mla_model <span class="kw">else</span> self.tp_config_suffix
+        )</pre>
+    <div class="annotation"><b>键里没写的维度就共享不了：</b> 非 MLA 模型下每个 TP rank 持有不同的 KV 分片，所以键里必须带 <code class="inline">tp_rank/tp_size</code>；CP（context parallel）下每个 rank 持有每页的一个不相交切片，注释说明了为什么必须再按 CP rank 拆键——否则多 rank 写同一文件就是写冲突。共享是有条件的：键设计里没覆盖的并行维度，L3 就共享不了。<br><br><b>MLA 让「一个后缀」变成了「两个后缀」：</b>原来的写法是往一个 <code class="inline">config_suffix</code> 上依次 <code class="inline">+=</code>，MLA 与非 MLA 的差别体现在「加不加 TP 那一段」。现在拆成两条：<code class="inline">tp_config_suffix</code> 永远带 <code class="inline">tp_rank/tp_size</code>，用来给真正按 TP 分片的状态做键；<code class="inline">config_suffix</code> 在 MLA 模型上退化成「只带模型名 + PP/CP 后缀」——因为 MLA 的 KV 在 TP rank 之间是复制的，同一页所有 rank 写的内容一模一样，按 TP 拆键只会把同一份数据存 N 份。所以那句「MLA 按 TP 复制、一页共用一个文件」不是优化，是正确性之外的另一半：分片状态用 <code class="inline">tp_config_suffix</code> 避开写冲突，复制的 KV 用 <code class="inline">config_suffix</code> 共享一份文件。</div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       这张注册表之外最近多了一条不走它的通路（commit cf5df82680，#38652）：开 <code class="inline">--enable-lmcache</code> 时，建树逻辑在 <code class="inline">registry.py</code> 直接返回 <code class="inline">LMCacheUnifiedRadixCache</code>——<code class="inline">UnifiedRadixCache</code> 的子类（<code class="inline">lmcache_unified_radix_cache.py</code>，docstring 自述「device-direct LMCache MP KV/state I/O」），而且优先级排在 unified_cache_external_linker（<code class="inline">registry.py</code>）<strong>之前</strong>，<code class="inline">kv_cache_hook.py</code> 明确两者互斥——同样是「L3 接外部存储」，链接器是挂在树外的旁路，LMCache 则整棵树被替换成自带连接器的版本（按 FULL / SWA / MAMBA 组件选择 tree_components，<code class="inline">registry.py</code>）。它对树协议只动了两个方法，两个都值得记。<code class="inline">is_backuped</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）无条件返回 True，注释一句话讲透：「LMCache rebuilds lookup keys from tokens, so any L1 node is valid」——调度器的存储预取锚点检查（<code class="inline">scheduler.py</code>）原来要求「锚点节点已备份到 host」，否则连哈希都懒得算（必然 miss）；LMCache 按 token 重建查找键，跟树内备份状态无关，任何 L1 节点都配当锚点。<code class="inline">match_prefix</code>（<code class="inline">lmcache_unified_radix_cache.py</code>）则把「外部存储的命中」伪装成 L2 命中：LMCache 查到了、GPU 槽位还没就位时，先借 MatchResult 的 host 字段报告命中（<code class="inline">host_hit_length=external_hit</code>、SWA/Mamba 各自的 host 字段），调度器按「L2 回载」的既有路径发配额、拉数据；H2D 载入已提交时改为从已载槽位表里切出后缀，把命中长度直接累加进 <code class="inline">device_prefix_len</code>（并发下被树内插入抢走的私有槽位还要记 <code class="inline">skip</code> 排除）。命中语义统一从「数据在哪个池子里」回到「数据在不在、怎么拿到」——第 11.2 节的三种节点状态是树内视角，这里相当于给 MatchResult 加了一层「外部也算数」的解释。
@@ -477,7 +513,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 11 HiCache · 版本 gateway-v0.3.1-11712-g553836c164 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

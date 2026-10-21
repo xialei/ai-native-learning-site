@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>07 · 并发:从一个循环到一池请求 — 深入浅出 Transformers</title>
+<title>07 · 并发：从一个循环到一池请求 — 深入浅出 Transformers</title>
 <link rel="stylesheet" href="assets/transformers-learn.css">
 </head>
 <body>
@@ -36,23 +36,23 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 07 并发</div>
     <div class="chap-meta">Chapter 07 · Continuous Batching</div>
-    <h1>并发:从一个循环到一池请求</h1>
+    <h1>并发：从一个循环到一池请求</h1>
     <div class="lede">
-      <p>第 5 章的 generate 是「一个循环服务一个 batch」:batch 里最长的序列决定节奏,先结束的请求陪跑到最后,padding 白白烧算力。服务场景下这是致命的——100 个对话陆续到达、长短不一、陆续结束,静态 batch 的利用率会跌到地板上。vLLM/SGLang 用「连续批处理 + 分页 KV」解决这个问题;v5 的答案是把这套东西直接搬进库:generation/continuous_batching/ 子包,5792 行,调度器、分页缓存、CUDA 图、CPU 卸载一应俱全。</p>
-      <p>这一章拆它的四个部件:PagedAttentionCache 的三级内存结构、调度器的准入与饥饿处理、ModelRunner 的双路径执行、异步 API 的双缓冲。也回答一个问题:库内实现与服务引擎还有什么差距——这正是第 0 章问题二/三「库内/库外」边界在服务侧的划法。</p>
+      <p>第 5 章的 generate 是「一个循环服务一个 batch」：batch 里最长的序列决定节奏，先结束的请求陪跑到最后，padding 白白烧算力。服务场景下这是致命的——100 个对话陆续到达、长短不一、陆续结束，静态 batch 的利用率会跌到地板上。vLLM/SGLang 用「连续批处理 + 分页 KV」解决这个问题；v5 的答案是把这套东西直接搬进库：generation/continuous_batching/ 子包，5792 行，调度器、分页缓存、CUDA 图、CPU 卸载一应俱全。</p>
+      <p>这一章拆它的四个部件：PagedAttentionCache 的三级内存结构、调度器的准入与饥饿处理、ModelRunner 的双路径执行、异步 API 的双缓冲。也回答一个问题：库内实现与服务引擎还有什么差距——这正是第 0 章问题二/三「库内/库外」边界在服务侧的划法。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    四问各自收在哪一节::① 连续批处理把「batch」从输入单位改成输出单位——每步重新组批,先完成的请求立刻退场,新请求随时插队(7.1);② 分页缓存把 KV 显存切成 page/block/sector 三级池,按需分配、前缀共享、进程退出才释放(7.2);③ 调度器用 token 预算 + 缓存预算做准入,显存紧张时宁可饿着新请求也不让进行中的请求崩溃(7.3);④ 执行层分 varlen(prefill 混合)与 decode 快路径两条编译路线,CUDA 图靠 padding 把动态形状钉死(7.4)。
+    四问各自收在哪一节：① 连续批处理把「batch」从输入单位改成输出单位——每步重新组批，先完成的请求立刻退场，新请求随时插队(7.1)；② 分页缓存把 KV 显存切成 page/block/sector 三级池，按需分配、前缀共享、进程退出才释放(7.2)；③ 调度器用 token 预算 + 缓存预算做准入，显存紧张时宁可饿着新请求也不让进行中的请求崩溃(7.3)；④ 执行层分 varlen（prefill 混合）与 decode 快路径两条编译路线，CUDA 图靠 padding 把动态形状钉死(7.4)。
   </div>
 
   <section class="block">
-    <h2><span class="num">7.1</span>为什么静态 batch 不行,以及 generate_batch</h2>
-    <p>静态批处理的浪费有三处:① batch 内所有序列绑在一起生成到 max_new_tokens,短请求陪跑;② 新请求必须等当前 batch 全部结束;③ prefill(长)与 decode(单 token)混在一个 batch 里,算力被不均匀地占用。连续批处理(counterfactually named "iteration-level batching")的解法:调度器每步重新决定「这一步前向哪些请求、各前向几个 token」,完成即退场、到达即插入。</p>
-    <p>v5 的入口是 generate_batch(continuous_api.py:1368),签名已经说明用法变化:</p>
-    <div class="code-title">continuous_batching/continuous_api.py:1368 — generate_batch 签名(注释为译注)</div>
+    <h2><span class="num">7.1</span>为什么静态 batch 不行，以及 generate_batch</h2>
+    <p>静态批处理的浪费有三处：① batch 内所有序列绑在一起生成到 max_new_tokens，短请求陪跑；② 新请求必须等当前 batch 全部结束；③ prefill（长）与 decode（单 token）混在一个 batch 里，算力被不均匀地占用。连续批处理（counterfactually named "iteration-level batching"）的解法：调度器每步重新决定「这一步前向哪些请求、各前向几个 token」，完成即退场、到达即插入。</p>
+    <p>v5 的入口是 generate_batch(continuous_api.py:1368)，签名已经说明用法变化：</p>
+    <div class="code-title">continuous_batching/continuous_api.py:1368 — generate_batch 签名（注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">generate_batch</span>(
     self,
     inputs: list[list[int]],                        <span class="cmt"># 一堆 prompt(不再是单张量)</span>
@@ -63,14 +63,14 @@
     warmup: bool = True,                           <span class="cmt"># 预热:先把 CUDA 图捕获好</span>
     **kwargs,
 ) -&gt; dict[str, GenerationOutput]:  <span class="cmt"># 请求 ID → 各自的输出</span></pre>
-    <p>返回值从「一个张量」变成「请求 ID → GenerationOutput 的字典」——请求是第一公民了。每个 GenerationOutput(requests.py:94)带自己的 prompt_ids/generated_tokens/logprobs/status/created_time/lifespan:延迟统计直接内建。第 5 章 generate 里那个「检测到 paged 就转发过来」的分流,终点就是这里。</p>
-    <div class="annotation"><b>与 generate 的三点不同:</b>① 输入是 list[list[int]](token 序列的列表),每条 prompt 一个请求;② 没有 stopping_criteria/num_beams——并发路径不支持束搜索(stopping 由 GenerationConfig 的 max_new_tokens/EOS 处理);③ persistent_manager=True 时管理器存活,可以继续收请求——这是把「一次性批量」升级成「常驻服务」的钩子。真正的服务化(HTTP、鉴权、多模型)仍在库外,这是库与 vLLM/SGLang 的边界。</div>
+    <p>返回值从「一个张量」变成「请求 ID → GenerationOutput 的字典」——请求是第一公民了。每个 GenerationOutput(requests.py:94)带自己的 prompt_ids/generated_tokens/logprobs/status/created_time/lifespan：延迟统计直接内建。第 5 章 generate 里那个「检测到 paged 就转发过来」的分流，终点就是这里。</p>
+    <div class="annotation"><b>与 generate 的三点不同：</b>① 输入是 list[list[int]]（token 序列的列表），每条 prompt 一个请求；② 没有 stopping_criteria/num_beams——并发路径不支持束搜索（stopping 由 GenerationConfig 的 max_new_tokens/EOS 处理）；③ persistent_manager=True 时管理器存活，可以继续收请求——这是把「一次性批量」升级成「常驻服务」的钩子。真正的服务化（HTTP、鉴权、多模型）仍在库外，这是库与 vLLM/SGLang 的边界。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.2</span>分页缓存:page/block/sector 三级结构</h2>
-    <p>第 4 章的 DynamicCache 是「一个请求一条链」;并发的显存管理要求把缓存变成公共池。PagedAttentionCache(cache.py:70)的 docstring 用一段 ASCII 图讲清了三级结构:</p>
-    <div class="code-title">continuous_batching/cache.py:70 — 三级内存结构(docstring 摘译)</div>
+    <h2><span class="num">7.2</span>分页缓存：page/block/sector 三级结构</h2>
+    <p>第 4 章的 DynamicCache 是「一个请求一条链」；并发的显存管理要求把缓存变成公共池。PagedAttentionCache(cache.py:70)的 docstring 用一段 ASCII 图讲清了三级结构：</p>
+    <div class="code-title">continuous_batching/cache.py:70 — 三级内存结构（docstring 摘译）</div>
     <pre class="code"><span class="lang-tag">text</span>物理上:一整块扁平张量(flat tensor)
 虚拟上,按从小到大的单位分配:
   - 层级单位:page(每层每 page_size 个 token 的 KV)
@@ -85,23 +85,23 @@
         [ ---------------------- SECTOR ---------------------- ]
   full:   [ FULL BLOCK 0 | FULL BLOCK 1 | FULL BLOCK 2 ]  (layer 1)
   slide:  [ SLIDING BLOCK 0                        ]      (layers 0,2,3)</pre>
-    <div class="annotation"><b>sector 是这份设计的关键一步:</b>第 4 章 4.4 节的混合模型(滑窗层 + 全注意力层)在并发池里遇到新问题——两类层每 token 需要的显存不同,若按同一块大小分配,滑窗层会浪费 3 倍。解法是把物理张量切成「所有分配器都能整除的公共单元」,每个分配器只向 PagedAttentionCache 要 sector,块管理下放。这与 vLLM 的 paged attention(块大小固定、全注意力为主)对比:Transformers 的方案额外消化了「混合注意力」这个 v5 生态里的新常态。块共享(allow_block_sharing 默认开)则让公共前缀的 block 引用计数共享——同一系统提示词的 100 个请求只存一份前缀 KV。</div>
-    <p>分配量多少?ContinuousBatchingConfig(configuration_utils.py:1683)给出自动推断规则:</p>
+    <div class="annotation"><b>sector 是这份设计的关键一步：</b>第 4 章 4.4 节的混合模型（滑窗层 + 全注意力层）在并发池里遇到新问题——两类层每 token 需要的显存不同，若按同一块大小分配，滑窗层会浪费 3 倍。解法是把物理张量切成「所有分配器都能整除的公共单元」，每个分配器只向 PagedAttentionCache 要 sector，块管理下放。这与 vLLM 的 paged attention（块大小固定、全注意力为主）对比：Transformers 的方案额外消化了「混合注意力」这个 v5 生态里的新常态。块共享（allow_block_sharing 默认开）则让公共前缀的 block 引用计数共享——同一系统提示词的 100 个请求只存一份前缀 KV。</div>
+    <p>分配量多少？ContinuousBatchingConfig(configuration_utils.py:1683)给出自动推断规则：</p>
     <table class="tbl">
       <tr><th>参数</th><th>默认</th><th>说明</th></tr>
       <tr><td>page_size</td><td>256 token</td><td>全注意力页的 token 粒度</td></tr>
       <tr><td>num_blocks</td><td>按显存推</td><td>KV 池总块数</td></tr>
-      <tr><td>max_memory_percent</td><td>0.9 / 0.8 / 0.6</td><td>无处理器 0.9;有 logit 处理器 0.8(留词表大临时张量);MPS 设备 0.6(RAM/VRAM 同体,防 swap)</td></tr>
+      <tr><td>max_memory_percent</td><td>0.9 / 0.8 / 0.6</td><td>无处理器 0.9；有 logit 处理器 0.8（留词表大临时张量）；MPS 设备 0.6（RAM/VRAM 同体，防 swap）</td></tr>
       <tr><td>allow_block_sharing</td><td>True</td><td>前缀缓存共享</td></tr>
-      <tr><td>max_blocks_per_request</td><td>自动</td><td>解码快路径的块表宽度;置 0 关闭快路径</td></tr>
+      <tr><td>max_blocks_per_request</td><td>自动</td><td>解码快路径的块表宽度；置 0 关闭快路径</td></tr>
     </table>
-    <div class="annotation"><b>max_memory_percent 分了三档:</b>它把「缓存能吃多少显存」从拍脑袋变成按设备与功能自动推断的逻辑——有 logit 处理器时留 20% 余量,因为某些处理器要生成 [batch, 词表] 大小的临时张量;MPS 设备留 40%,因为统一内存架构下「显存挤爆」等于把整个系统拖进 swap。资源预算跟着执行环境走,这个思路在第 11 章 Trainer 的显存预算里会再见到。</div>
+    <div class="annotation"><b>max_memory_percent 分了三档：</b>它把「缓存能吃多少显存」从拍脑袋变成按设备与功能自动推断的逻辑——有 logit 处理器时留 20% 余量，因为某些处理器要生成 [batch， 词表] 大小的临时张量；MPS 设备留 40%，因为统一内存架构下「显存挤爆」等于把整个系统拖进 swap。资源预算跟着执行环境走，这个思路在第 11 章 Trainer 的显存预算里会再见到。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.3</span>调度器:准入、优先级与饥饿</h2>
-    <p>scheduler.py 只有 408 行,是整个子系统里最短的核心文件。抽象基类 Scheduler(:22)持有三个队列(active/waiting/to_cancel)和两个预算;两个实现:FIFOScheduler(:307,默认,解码优先)与 PrefillFirstScheduler(:356,补完切割中的 prefill 优先)。每步的调度循环:</p>
-    <div class="code-title">continuous_batching/scheduler.py:225 附近 — 准入检查(骨架,注释为译注)</div>
+    <h2><span class="num">7.3</span>调度器：准入、优先级与饥饿</h2>
+    <p>scheduler.py 只有 408 行，是整个子系统里最短的核心文件。抽象基类 Scheduler(:22)持有三个队列(active/waiting/to_cancel)和两个预算；两个实现：FIFOScheduler（:307，默认，解码优先）与 PrefillFirstScheduler（:356，补完切割中的 prefill 优先）。每步的调度循环：</p>
+    <div class="code-title">continuous_batching/scheduler.py:225 附近 — 准入检查（骨架，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">for</span> state <span class="kw">in</span> candidates:
     request_len = min(len(request_tokens), token_budget)      <span class="cmt"># token 预算内截断</span>
 
@@ -122,26 +122,26 @@
     token_budget -= request_len
     cache_budget -= read_cache_needed
     request_budget -= <span class="nu">1</span></pre>
-    <div class="annotation"><b>「饥饿」标记是准入机制的自我保护:</b>缓存分配失败时,已在进行的请求不会踢掉,而是记进 starved_requests,等空间释放再补——「宁可晚,不可崩」。safety_margin(默认 FIFO 15%)是另一道保险:空闲块低于 15% 就不再接新 prefill,防止「接了一半发现装不下」的碎片化。这两个机制合起来回答「显存不够怎么办」:先饿新请求,再饿进行中的请求,永不 OOM 崩溃。与服务引擎(本站 sglang、vLLM 两本书有完整的抢占/换出对比)相比,这里少了「换出已运行请求」的激进手段,多了「保守准入」的简单性。</div>
-    <p>请求状态机极简(requests.py:83):PENDING → PREFILLING → DECODING → FINISHED/FAILED。调度器的所有决策都基于这五个状态 + 两个预算,不到 400 行的文件就能完整表达——状态机简单,是这套代码能被读懂的关键。</p>
+    <div class="annotation"><b>「饥饿」标记是准入机制的自我保护：</b>缓存分配失败时，已在进行的请求不会踢掉，而是记进 starved_requests，等空间释放再补——「宁可晚，不可崩」。safety_margin（默认 FIFO 15%）是另一道保险：空闲块低于 15% 就不再接新 prefill，防止「接了一半发现装不下」的碎片化。这两个机制合起来回答「显存不够怎么办」：先饿新请求，再饿进行中的请求，永不 OOM 崩溃。与服务引擎（本站 sglang、vLLM 两本书有完整的抢占/换出对比）相比，这里少了「换出已运行请求」的激进手段，多了「保守准入」的简单性。</div>
+    <p>请求状态机极简(requests.py:83)：PENDING → PREFILLING → DECODING → FINISHED/FAILED。调度器的所有决策都基于这五个状态 + 两个预算，不到 400 行的文件就能完整表达——状态机简单，是这套代码能被读懂的关键。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">7.4</span>执行:双路径与 CUDA 图</h2>
-    <p>ModelRunner(model_runner.py:52)的 docstring 定位清楚:「anything running on the device should happen from this class」——设备侧的一切从这里走。它维护两条编译路径:</p>
+    <h2><span class="num">7.4</span>执行：双路径与 CUDA 图</h2>
+    <p>ModelRunner(model_runner.py:52)的 docstring 定位清楚：「anything running on the device should happen from this class」——设备侧的一切从这里走。它维护两条编译路径：</p>
     <table class="tbl">
       <tr><th>路径</th><th>场景</th><th>形状特点</th><th>编译策略</th></tr>
-      <tr><td>varlen</td><td>prefill + 混合批(每请求 token 数不一)</td><td>Q/KV 都动态</td><td>torch.compile dynamic=True 更优</td></tr>
-      <tr><td>decode 快路径</td><td>全是单 token 请求</td><td>Q=1 固定,KV 按块表读</td><td>静态形状,适合 CUDA 图</td></tr>
+      <tr><td>varlen</td><td>prefill + 混合批（每请求 token 数不一）</td><td>Q/KV 都动态</td><td>torch.compile dynamic=True 更优</td></tr>
+      <tr><td>decode 快路径</td><td>全是单 token 请求</td><td>Q=1 固定，KV 按块表读</td><td>静态形状，适合 CUDA 图</td></tr>
     </table>
-    <div class="annotation"><b>CUDA 图与连续批处理天然相克,解法是 padding:</b>连续批处理每步的 Q 长度(本步要算几个 token)和 KV 长度(缓存多长)都在变,而 CUDA 图要求形状固定。解法是按 q_padding_interval_size/kv_padding_interval_size 的粒度补齐到档位(文件头注释:64 token 的 Q 档,对 max_batch_tokens=256 产生约 4 张图),用块表(flash_attn_with_kvcache)让补零位置不参与计算。编译路径与第 4 章 StaticLayer 的 mark_static_address 是同一个原理的并发版——「把动态问题变成静态问题,才好吃编译红利」。async double-buffering(use_async_batching)更进一步:两套 host-device IO 对轮替,CPU 准备下一批时 GPU 在算上一批,代价是静态输入张量与 CUDA 图的显存翻倍——「GPU 够大就是好交易」(docstring 原话)。</div>
-    <p>logit 处理器在并发路径里有专用版(cb_logits_processors.py 的 ContinuousBatchingLogitsProcessorList):处理器要声明 supports_continuous_batching=True 才放行(第 6 章 6.2 节)——并发路径不支持「逐请求任意改分布」的老接口,只有声明兼容的处理器才能进。</p>
+    <div class="annotation"><b>CUDA 图与连续批处理天然相克，解法是 padding：</b>连续批处理每步的 Q 长度（本步要算几个 token）和 KV 长度（缓存多长）都在变，而 CUDA 图要求形状固定。解法是按 q_padding_interval_size/kv_padding_interval_size 的粒度补齐到档位（文件头注释：64 token 的 Q 档，对 max_batch_tokens=256 产生约 4 张图），用块表(flash_attn_with_kvcache)让补零位置不参与计算。编译路径与第 4 章 StaticLayer 的 mark_static_address 是同一个原理的并发版——「把动态问题变成静态问题，才好吃编译红利」。async double-buffering(use_async_batching)更进一步：两套 host-device IO 对轮替，CPU 准备下一批时 GPU 在算上一批，代价是静态输入张量与 CUDA 图的显存翻倍——「GPU 够大就是好交易」（docstring 原话）。</div>
+    <p>logit 处理器在并发路径里有专用版（cb_logits_processors.py 的 ContinuousBatchingLogitsProcessorList）：处理器要声明 supports_continuous_batching=True 才放行（第 6 章 6.2 节）——并发路径不支持「逐请求任意改分布」的老接口，只有声明兼容的处理器才能进。</p>
   </section>
 
   <section class="block">
     <h2><span class="num">7.5</span>CPU 卸载与分布式</h2>
-    <p>显存池满了怎么办?offloading_manager.py(393 行)实现了 CPU swap:初始化时一次性分配一个 pinned 的 CPU 张量,镜像 GPU 缓存的几何结构(同样的 sector/block 布局)。冷请求的缓存块搬去 CPU,激活时再搬回;搬运按「连续 runs」批量切,散块合并成少数 slice copy。这是第 4 章 4.3 节 Cache offloading(层间换入换出)的并发版——那次是「GPU 显存里只留一两层」,这次是「GPU 池里只留热请求」。</p>
-    <p>分布式(distributed.py)封装了张量并行的 collectives:多卡时调度决策在 rank 0 做齐、广播执行。与 vLLM/SGLang 的多卡调度相比,这套实现明确写着自己支持的是「单节点多卡」——多机推理不在库内目标里。</p>
+    <p>显存池满了怎么办？offloading_manager.py（393 行）实现了 CPU swap：初始化时一次性分配一个 pinned 的 CPU 张量，镜像 GPU 缓存的几何结构（同样的 sector/block 布局）。冷请求的缓存块搬去 CPU，激活时再搬回；搬运按「连续 runs」批量切，散块合并成少数 slice copy。这是第 4 章 4.3 节 Cache offloading（层间换入换出）的并发版——那次是「GPU 显存里只留一两层」，这次是「GPU 池里只留热请求」。</p>
+    <p>分布式(distributed.py)封装了张量并行的 collectives：多卡时调度决策在 rank 0 做齐、广播执行。与 vLLM/SGLang 的多卡调度相比，这套实现明确写着自己支持的是「单节点多卡」——多机推理不在库内目标里。</p>
     <div class="figure breakout">
       <svg class="svg-box" viewBox="0 0 940 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t71 d71">
         <title id="t71">连续批处理一步的完整流程</title>
@@ -184,14 +184,14 @@
         <text class="lbl sm" x="35" y="168" text-anchor="start">连续:A 完成立刻退出,C 在 A 的空位进入   │        ▼</text>
         <text class="lbl sm" x="35" y="186" text-anchor="start">                                   └─ 每步重新组批,无 padding 浪费</text>
       </svg>
-      <div class="fig-cap">图 7.1:连续批处理的一步。调度器按两个预算准入,分页缓存按块供显存,完成即退、到达即入。</div>
+      <div class="fig-cap">图 7.1：连续批处理的一步。调度器按两个预算准入，分页缓存按块供显存，完成即退、到达即入。</div>
     </div>
   </section>
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>continuous_batching 子包把服务引擎的核心搬进库:generate_batch 以请求为第一公民(输入 list[list[int]],输出请求字典,GenerationOutput 自带延迟统计);PagedAttentionCache 用 page/block/sector 三级结构把 KV 显存变成公共池,混合注意力按 LCM 切 sector,前缀块按引用计数共享;调度器(FIFO 默认/PreFillFirst 备选)按 token 预算 + 缓存预算准入,分配失败标记饥饿而非抢占,safety_margin 防碎片;ModelRunner 分 varlen 与 decode 快路径,CUDA 图靠 padding 档位把动态形状固定化,异步 API 用双缓冲 IO 消 CPU 开销。与 vLLM/SGLang 的差距:无抢占换出、单节点多卡、不支持束搜索——库内保正确性与易用,极致吞吐仍在服务引擎。第 0 章「库内/库外」边界在服务侧的具体画法,就是这条线。</p>
-    <p>单条请求的生成讲完了,并发也有了。接下来回到「人机对话」本身:对话轮次怎么组织成模型能懂的格式?<a href="08-chat-template.html">第 8 章:对话模板</a>。</p>
+    <p>continuous_batching 子包把服务引擎的核心搬进库：generate_batch 以请求为第一公民（输入 list[list[int]]，输出请求字典，GenerationOutput 自带延迟统计）；PagedAttentionCache 用 page/block/sector 三级结构把 KV 显存变成公共池，混合注意力按 LCM 切 sector，前缀块按引用计数共享；调度器（FIFO 默认/PreFillFirst 备选）按 token 预算 + 缓存预算准入，分配失败标记饥饿而非抢占，safety_margin 防碎片；ModelRunner 分 varlen 与 decode 快路径，CUDA 图靠 padding 档位把动态形状固定化，异步 API 用双缓冲 IO 消 CPU 开销。与 vLLM/SGLang 的差距：无抢占换出、单节点多卡、不支持束搜索——库内保正确性与易用，极致吞吐仍在服务引擎。第 0 章「库内/库外」边界在服务侧的具体画法，就是这条线。</p>
+    <p>单条请求的生成讲完了，并发也有了。接下来回到「人机对话」本身：对话轮次怎么组织成模型能懂的格式？<a href="08-chat-template.html">第 8 章：对话模板</a>。</p>
   </div>
 
   <nav class="pagenav">
@@ -207,7 +207,7 @@
 </div>
 
 <footer>
-  深入浅出 Transformers · 07 并发 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+  深入浅出 Transformers · 07 并发 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

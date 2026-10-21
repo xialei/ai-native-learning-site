@@ -220,24 +220,28 @@ max_new_tokens = <span class="nu">8</span> <span class="kw">if</span> model_info
 
     <div class="callout info">
       <b class="tag">演进痕迹</b>
-      权重更新这条路最近长出了「会话」语义（commit f4d9d2e670，#40777）。此前的三条 /update_weights_* 是一次性 RPC，发一条做一件事；#40777 加了 <code class="inline">/begin_weight_update</code> 和 <code class="inline">/end_weight_update</code>（<code class="inline">http_server.py</code>、:1415，都是 ADMIN_OPTIONAL）把更新包进一个开关区间，动机是 RL 训练循环里反复推权重——而这些服务里大量模型做了<strong>原地量化打包</strong>（weight pack）：参数在显存里已经不是加载时的形状，新权重根本塞不进去。所以 begin 干的事是「恢复出厂形状」：调 <code class="inline">DefaultModelLoader.restore_weights_before_loading</code>，docstring 一句话讲清目的——"Undo in-place quant packing so fresh weights can be loaded"（<code class="inline">loader.py</code>）。<br><br>会话有三条规矩。其一，<code class="inline">update_weights_from_tensor / from_distributed</code> 在会话外直接拒绝——scheduler 侧 <code class="inline"><code class="inline">.py</code>、<code class="inline">:219.py</code></code> 的错误信息就是字面意思："must run between begin_weight_update() and end_weight_update()"；from_disk 不受此限，它本来就按「完整加载」的流程走。其二，end 时只在<strong>整个会话期间没跑过任何加载</strong>才补 <code class="inline">post_load_weights</code>（<code class="inline">run_post_load = not session.loaded_weights</code>，<code class="inline">weight_updater.py</code>）——P2P/RDMA 走自组网直拷，加载路径自己收尾；跑过 tensor/distributed 加载的会话，加载器已经做过后处理，再跑一次会把打包做两遍。其三，end 收尾的 runner 集合取自 begin 时记下的 selector，而不是 end 请求里重新给的那份——<code class="inline">_WeightUpdateSession</code> 就两个字段（<code class="inline">weight_updater.py</code>，注释原话 "recorded at begin so end finalizes the same runners"）。<br><br>selector 是这次改动引入的新旋钮：<code class="inline">Literal["target","draft","all"]</code>（<code class="inline">io_struct.py</code>），默认 all。实现不是 if-else，而是每个 worker 暴露 <code class="inline">weight_update_runners()</code> 返回 <code class="inline">(role, runner)</code> 列表：目标侧 tp_worker 返回 <code class="inline">[("target", …)]</code>（<code class="inline">tp_worker.py</code>），投机侧 BaseSpecWorker 返回 <code class="inline">[("draft", r) for r in draft_runners]</code>——NGRAM / UNO 这类无草稿模型的返回空表；多层 EAGLE 则按层给 <code class="inline">("draft_step_0", …), ("draft_step_1", …)</code>。_select_runners 把两边的表拼接起来，权重更新第一次能精确落到草稿模型上——RL 训 EAGLE 草稿头时不用再重启引擎。begin/end 各自以 <code class="inline">torch.distributed.barrier(group=self.tp_cpu_group)</code> 收尾，保证 TP 组对「会话开着/关着」的判断同步。
+      权重更新这条路最近长出了「会话」语义（commit f4d9d2e670，#40777）。此前的三条 /update_weights_* 是一次性 RPC，发一条做一件事；#40777 加了 <code class="inline">/begin_weight_update</code> 和 <code class="inline">/end_weight_update</code>（<code class="inline">http_server.py</code>、:1433，都是 ADMIN_OPTIONAL）把更新包进一个开关区间，动机是 RL 训练循环里反复推权重——而这些服务里大量模型做了<strong>原地量化打包</strong>（weight pack）：参数在显存里已经不是加载时的形状，新权重根本塞不进去。所以 begin 干的事是「恢复出厂形状」：调 <code class="inline">DefaultModelLoader.restore_weights_before_loading</code>，docstring 写得很直白——"Undo in-place quant packing so fresh weights can be loaded"（<code class="inline">loader.py</code>）。<br><br>会话有三条规矩。其一，<code class="inline">update_weights_from_tensor / from_distributed</code> 在会话外直接拒绝——scheduler 侧 <code class="inline">weight_updater.py</code>、<code class="inline">:195</code>／<code class="inline">:237</code> 的错误信息就是字面意思："must run between begin_weight_update() and end_weight_update()"；from_disk 不受此限，它本来就按「完整加载」的流程走。其二，end 时只在<strong>整个会话期间没跑过任何加载</strong>才补 <code class="inline">post_load_weights</code>（<code class="inline">run_post_load = not session.loaded_weights</code>，<code class="inline">weight_updater.py</code>）——P2P/RDMA 走自组网直拷，加载路径自己收尾；跑过 tensor/distributed 加载的会话，加载器已经做过后处理，再跑一次会把打包做两遍。其三，end 收尾的 runner 集合取自 begin 时记下的 selector，而不是 end 请求里重新给的那份——<code class="inline">_WeightUpdateSession</code> 就两个字段（<code class="inline">weight_updater.py</code>，注释原话 "recorded at begin so end finalizes the same runners"）。<br><br>selector 是这次改动引入的新旋钮：<code class="inline">Literal["target","draft","all"]</code>（<code class="inline">io_struct.py</code>），默认 all。实现不是 if-else，而是每个 worker 暴露 <code class="inline">weight_update_runners()</code> 返回 <code class="inline">(role, runner)</code> 列表：目标侧 tp_worker 返回 <code class="inline">[("target", …)]</code>（<code class="inline">tp_worker.py</code>），投机侧 BaseSpecWorker 返回 <code class="inline">[("draft", r) for r in draft_runners]</code>——NGRAM / UNO 这类无草稿模型的返回空表；多层 EAGLE 则按层给 <code class="inline">("draft_step_0", …), ("draft_step_1", …)</code>。_select_runners 把两边的表拼接起来，权重更新第一次能精确落到草稿模型上——RL 训 EAGLE 草稿头时不用再重启引擎。begin/end 各自以 <code class="inline">torch.distributed.barrier(group=self.tp_cpu_group)</code> 收尾，保证 TP 组对「会话开着/关着」的判断同步。
     </div>
     <div class="callout info">
       <b class="tag">演进痕迹</b>
       路由表里评分类那一行最近热闹了两轮。其一，新增 <code class="inline">/v1/systemone</code>（<code class="inline">http_server.py</code>，commit 16d1c93b3d #41208）——System One 兼容的决策 API，与 <code class="inline">/v1/decisions</code> 共用 <code class="inline">OpenAIServingDecisions</code> 的渲染、标签校验与打分（<code class="inline">serving.py</code> 的子类说明写得很直白："Answers System One questions with the rendering, label checks, and scoring of /v1/decisions"）；唯一特化在错误格式：全局 422→400 的改写器单独给它留了口子，保留 System One API 文档规定的 422 detail list（<code class="inline">http_server.py</code> 的注释）。兼容层的「兼容」二字再次显形——不只兼容请求格式，连<strong>错误码语义</strong>都要兼容。其二，打分本身多了一种 setwise 读出（#38965/#41188）：请求带 <code class="inline">score_extraction_token</code>（<code class="inline">protocol.py</code>）后，读出点从「序列最后一个 token」变成「query+item 拼接里每次出现该 token 的位置」，返回嵌套形状 <code class="inline">[num_items][Nᵢ × num_labels]</code>——一次前向给一组候选各自打分（SeqCls 在该 token 处池化，CausalLM 读标签 logprob），嵌套深度本身用来区分 pointwise/setwise 两种返回形状（protocol.py 的 ScoringResponse 注释）。用途是 rerank/评审类负载：逐 item 独立打分对「候选项互相关」是盲的，setwise 让同批候选在同一个上下文里被比出来。
     </div>
 
-    <p>还有一个正在发生的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出：</p>
+    <p>还有一个正在发生的演进：HTTP 层本身正在被 Rust 重写。<code class="inline">SGLANG_RUST_SERVER=1</code> 时，Python 主进程不再跑 FastAPI 和 TokenizerManager——api-server、tokenizer、detokenizer 全部由 sgl-model-gateway 的 Rust 侧承担，Python 这边只等 Scheduler 退出。注意主进程连 warmup 都不做：那是每个 Rust listener 自己的事，它在自己 warmup 成功之前一直把 <code class="inline">/health</code> 压成 503。于是这个分支里只剩一个 <code class="inline">launch_callback</code> 和一句阻塞等待，而平时熟悉的「The server is fired up and ready to roll!」日志属于 else 分支——它在 <code class="inline">_setup_and_run_http_server</code> 里：</p>
     <div class="code-title">python/sglang/srt/entrypoints/http_server.py — launch_server 的双分支（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">if</span> envs.SGLANG_RUST_SERVER.<span class="fn">get</span>():
     <span class="cmt"># Rust 侧同时承担 api-server、tokenizer、detokenizer，</span>
     <span class="cmt"># 主进程不再有 Python HTTP server / tokenizer manager</span>
-    <span class="kw">if not</span> get_serving().skip_server_warmup:
-        _execute_server_warmup(server_args)
-    logger.info(<span class="st">"The server is fired up and ready to roll!"</span>)
+    <span class="cmt"># 每个 Rust listener 自己跑启动 warmup，并在成功前把 /health 压在 503，</span>
+    <span class="cmt"># 所以主进程这边不 warmup</span>
+    <span class="kw">if</span> launch_callback <span class="kw">is not</span> <span class="kw">None</span>:
+        <span class="fn">launch_callback</span>()
     scheduler_init_result.<span class="fn">block_until_scheduler_exits</span>()
 <span class="kw">else</span>:
-    _setup_and_run_http_server(server_args, tokenizer_manager, ...)</pre>
+    _setup_and_run_http_server(
+        server_args, tokenizer_manager, template_manager, port_args,
+        scheduler_init_result.scheduler_infos, subprocess_watchdog, ...
+    )</pre>
   </section>
 
   <section class="block">
@@ -285,13 +289,18 @@ prompt_ids = self.tokenizer_manager.tokenizer.<span class="fn">encode</span>(ren
 
     <p>第二件重活是 tool call。适配层要把请求里的 tools 翻译成模型能输出的格式约束，并在输出流里把模型生成的特殊 token 解析回结构化 tool_calls——SGLang 为约 40 种模型的对话格式各写了一个 detector：</p>
     <div class="code-title">python/sglang/srt/entrypoints/openai/serving_chat.py — tool call 约束构建（摘录，注释为译注）</div>
-    <pre class="code"><span class="cmt"># glm47 先走：整助手回复一条 EBNF 约束，不走逐工具解析</span>
-glm_constraint = self.tool_call_parser == <span class="st">"glm47"</span> <span class="kw">and not</span> <span class="fn">any</span>(
-    tool.function.strict <span class="kw">for</span> tool <span class="kw">in</span> effective_tools
+    <pre class="code"><span class="cmt"># 语法一旦走到终止态就会结束生成，与 ignore_eos 无关，
+# 所以只有请求真的允许调用工具时才装它</span>
+effective_tools = self.<span class="fn">_effective_tools</span>(request)
+glm_constraint = (
+    self.tool_call_parser == <span class="st">"glm47"</span>
+    <span class="kw">and</span> <span class="fn">bool</span>(effective_tools)
+    <span class="kw">and</span> request.tool_choice != <span class="st">"none"</span>
+    <span class="kw">and not</span> <span class="fn">any</span>(tool.function.strict <span class="kw">for</span> tool <span class="kw">in</span> effective_tools)
 )
 <span class="kw">if</span> glm_constraint:
     enable_thinking = (request.chat_template_kwargs <span class="kw">or</span> {}).<span class="fn">get</span>(<span class="st">"enable_thinking"</span>)
-    parser = <span class="cl">FunctionCallParser</span>(request.tools <span class="kw">or</span> [], self.tool_call_parser)
+    parser = <span class="cl">FunctionCallParser</span>(effective_tools, self.tool_call_parser)
     tool_call_constraint = parser.<span class="fn">get_structure_constraint</span>(
         request.tool_choice,
         parallel_tool_calls=request.parallel_tool_calls,
@@ -312,7 +321,7 @@ required_parsed_natively = glm_constraint
             thinking_mode=xgrammar_reasoning,
         )
         required_parsed_natively = parser.detector.<span class="fn">parses_required_natively</span>()</pre>
-    <div class="annotation"><b>glm47 走单独一条路：</b> 入口现在分两路：<code class="inline">glm47</code>（且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生生成，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。</div>
+    <div class="annotation"><b>glm47 走单独一条路：</b> 入口现在分两路：<code class="inline">glm47</code>（有可用工具、<code class="inline">tool_choice</code> 不是 <code class="inline">"none"</code>、且没有 tool 声明 strict）先在前面单独构建一条全助手回复的 EBNF 约束，后面的通用分支用 <code class="inline">not glm_constraint</code> 跳过；其余模型仍走通用路径。<code class="inline">required_parsed_natively</code> 的初值就是 <code class="inline">glm_constraint</code>——glm47 的调用格式必须由模型原生生成，不能靠采样掩码兜底。tool_call_constraint 会一路传到采样层变成结构化输出约束（第 8 章），让模型在生成时就被限制在合法的调用格式内；流式响应阶段再用 detector 从输出 token 里解析出 function name / arguments 的增量。推理内容（reasoning）的分离也是同样套路，靠 reasoning_parser 的前后缀检测。<br><br><b>门上那两条不是在挑工具：</b>约束文法一朝走到终止态，生成立刻结束，这条压过 <code class="inline">ignore_eos</code>。所以「请求没带工具」和「<code class="inline">tool_choice="none"</code>」这两种情形下再去装一条工具调用文法，结果是回复被一个空文法提前切断——不是「没工具可调所以算了」，而是「不该装就别装」。<code class="inline">effective_tools</code> 由 <code class="inline">_effective_tools(request)</code> 统一算出，两条分支都吃它而不是各自去摸 <code class="inline">request.tools</code>，工具集合与约束文法才不会各说各的。</div>
   </section>
 
   <section class="block">
@@ -449,23 +458,27 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 
   <section class="block">
     <h2><span class="num">9.7</span>配置体系：ServerArgs 与 runtime_context</h2>
-    <p>SGLang 的启动参数有 200 多个，全部收在 <code class="inline">ServerArgs</code> 一个 msgspec Struct 里。它的字段声明方式有个特点：CLI flag 直接从字段名推导，帮助文本写在类型注解里：</p>
+    <p>SGLang 的启动参数有 500 多个（<code class="inline">arg_groups/fields/</code> 下 535 处 <code class="inline">A[...]</code> 声明），全部按命名空间收在 <code class="inline">ServerArgs</code> 一个 msgspec Struct 里。它的字段声明方式有个特点：CLI flag 直接从字段名推导，帮助文本写在类型注解里：</p>
     <div class="code-title">python/sglang/srt/server_args.py — ServerArgs 的字段注解约定（摘录，docstring 译文）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">ServerArgs</span>:
     <span class="st">"""
-    1. **Use the ``A[T, ...]`` annotation.** ``A`` is an alias for
-       ``typing.Annotated``. The primary CLI flag is auto-derived from the
-       field name (``tp_size`` → ``--tp-size``):
+    Raw server configuration, sealed when resolution starts.
 
-           # Bare string — simplest form (just help text):
-           host: A[str, "The host of the HTTP server."] = "127.0.0.1"
-           trust_remote_code: A[bool, "Whether to allow custom models."] = False
+    Add fields to the matching namespace in ``arg_groups/fields/`` using
+    ``A[T, help]`` or ``A[T, Arg(...)]``; see ``arg_utils.Arg`` for CLI metadata.
+    """</span>
 
-           # Arg(...) — when you need choices, aliases, type_parser, etc.:
-           load_format: A[str, Arg(help="...", choices=CHOICES)] = "auto"
-           model_path: A[str, Arg(help="...", aliases=["--model"])]
-    """</span></pre>
-    <div class="annotation"><b>一处声明，三份产出：</b> 字段定义、CLI 注册、帮助文档三份信息合并成一处声明，加参数只改一个文件。这个文件本身也是配置演进的记录：代码里专门列出了哪些参数「必须手动注册」（废弃 flag 重定向、动态 choices），并按注释块分区（# Model and tokenizer、# LoRA……），新参数必须归入对应分区。</div>
+<span class="cmt"># arg_groups/fields/serving.py — 一个命名空间长这样</span>
+<span class="kw">class</span> <span class="cl">Serving</span>(msgspec.<span class="cl">Struct</span>):
+    _NS_PATH = <span class="st">"serving"</span>
+    enable_response_store: A[bool, <span class="st">"Enable in-memory Responses storage ..."</span>] = <span class="kw">False</span>
+    tokenizer_path: A[Optional[str], <span class="st">"The path of the tokenizer."</span>] = <span class="kw">None</span>
+    tokenizer_mode: A[
+        str,
+        <span class="cl">Arg</span>(help=<span class="st">"Tokenizer mode. 'auto' will use the fast tokenizer ..."</span>,
+            choices=[<span class="st">"auto"</span>, <span class="st">"slow"</span>]),
+    ] = <span class="st">"auto"</span></pre>
+    <div class="annotation"><b>一处声明，三份产出：</b> 字段定义、CLI 注册、帮助文档三份信息合并成一处声明，加参数只改一处。<code class="inline">A</code> 是 <code class="inline">typing.Annotated</code> 的别名，主 flag 由字段名推导（<code class="inline">tp_size</code> → <code class="inline">--tp-size</code>）；需要 choices、别名、<code class="inline">type_parser</code> 时把第二个位置从裸字符串换成 <code class="inline">Arg(...)</code>。<br><br>字段搬进了 <code class="inline">arg_groups/fields/</code> 下的 12 个模块、21 个命名空间类（<code class="inline">model</code> / <code class="inline">serving</code> / <code class="inline">parallel</code> / <code class="inline">memory</code> / <code class="inline">schedule</code> / <code class="inline">spec</code> / <code class="inline">disagg</code> / <code class="inline">lora</code> / <code class="inline">mm</code> / <code class="inline">device</code> / <code class="inline">observability</code>，以及一个文件拆成十个类的 <code class="inline">exec_</code>：<code class="inline">ExecKernel</code>、<code class="inline">ExecMoe</code>、<code class="inline">ExecGraph</code>、<code class="inline">ExecComm</code>、<code class="inline">ExecMamba</code>、<code class="inline">ExecOverlap</code>、<code class="inline">ExecOffload</code>、<code class="inline">ExecDllm</code>、<code class="inline">ExecDeterministic</code>、<code class="inline">ExecFeatures</code>，每个类带一个 <code class="inline">_NS_PATH</code>），<code class="inline">ServerArgs</code> 本身只剩 docstring 和一批方法——组装、解析、校验都在 <code class="inline">arg_groups/</code> 里。原来「按注释块分区」的约定因此升格成了结构：新参数直接加到对应命名空间，不再靠人守格式。<code class="inline">POSITIONAL_FIELD_ORDER</code>（<code class="inline">arg_groups/field_order.py</code>）保留这些字段拼装回 <code class="inline">ServerArgs</code> 时的位置参数顺序。</div>
 
     <p>配置的<strong>读取</strong>端不在 ServerArgs 上，而是发布到一组进程级全局对象。Scheduler、ModelRunner、Sampler 里的代码到处在调 <code class="inline">get_schedule().page_size</code>、<code class="inline">get_memory().disable_radix_cache</code> 这类语句：</p>
     <div class="code-title">python/sglang/srt/runtime_context.py — 配置命名空间的访问器（摘录，注释为译注）</div>
@@ -522,7 +535,7 @@ context_before_publish = <span class="fn">snapshot_context</span>()
 </div>
 
 <footer>
-  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 09 服务入口 · 版本 gateway-v0.3.1-11712-g553836c164 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

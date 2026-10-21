@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>06 · 选词:logit 向量到 token 之间发生什么 — 深入浅出 Transformers</title>
+<title>06 · 选词：logit 向量到 token 之间发生什么 — 深入浅出 Transformers</title>
 <link rel="stylesheet" href="assets/transformers-learn.css">
 </head>
 <body>
@@ -36,22 +36,22 @@
   <div class="page-header">
     <div class="breadcrumb"><a href="index.html">首页</a> / 06 选词</div>
     <div class="chap-meta">Chapter 06 · Token Selection</div>
-    <h1>选词:logit 向量到 token 之间发生什么</h1>
+    <h1>选词：logit 向量到 token 之间发生什么</h1>
     <div class="lede">
-      <p>第 5 章的循环里,「选词」一拍只有几行:过处理器链、argmax 或 multinomial。但模型给出的只是一个 15 万维的 logit 向量——「它觉得哪个词都行」和「它非说这个词不可」之间,隔着一整条流水线:温度把它变软变硬,top-p 把长尾砍掉,重复惩罚按住复读的嘴,不能说的词直接按到 -inf。这条流水线也是第 0 章问题三「库内表达机制」的主体:模型学到的偏好在此变成行为约束。</p>
-      <p>这一章拆 logits_process.py(3252 行,35 个处理器类)的两条链,再看候选解码(candidate_generator.py,1770 行):小模型/文本复用/MTP 八种候选生成器,怎么让一次前向验出多个 token。</p>
+      <p>第 5 章的循环里，「选词」一拍只有几行：过处理器链、argmax 或 multinomial。但模型给出的只是一个 15 万维的 logit 向量——「它觉得哪个词都行」和「它非说这个词不可」之间，隔着一整条流水线：温度把它变软变硬，top-p 把长尾砍掉，重复惩罚按住复读的嘴，不能说的词直接按到 -inf。这条流水线也是第 0 章问题三「库内表达机制」的主体：模型学到的偏好在此变成行为约束。</p>
+      <p>这一章拆 logits_process.py（3252 行，35 个处理器类）的两条链，再看候选解码（candidate_generator.py，1770 行）：小模型/文本复用/MTP 八种候选生成器，怎么让一次前向验出多个 token。</p>
     </div>
   </div>
 
   <div class="callout info">
     <b class="tag">答案地图</b>
-    先交代四问各自的答案::① 处理器 = 对词表 logit 的纯函数变换,链式叠加:「塑形」(温度/截断)与「约束」(禁词/强制)两类正交(6.1);② 采样参数不是玄学:温度 × 截断族各有明确作用面,装配顺序有讲究(min_p 必须在温度后,水印必须最后)(6.2);③ 候选解码把「一次前向产一个 token」改成「产 k+1 个」:小模型先猜、大模型一次验全对前缀,赌的是「猜错只浪费小模型的算力,猜对就多拿大模型的吞吐」(6.3);④ 接受准则有两条路:greedy 直接比 token,采样走论文 Algorithm 1 的分布修正——保证统计上等价于大模型自己采样(6.4)。
+    先交代四问各自的答案：① 处理器 = 对词表 logit 的纯函数变换，链式叠加：「塑形」（温度/截断）与「约束」（禁词/强制）两类正交(6.1)；② 采样参数不是玄学：温度 × 截断族各有明确作用面，装配顺序有讲究（min_p 必须在温度后，水印必须最后）(6.2)；③ 候选解码把「一次前向产一个 token」改成「产 k+1 个」：小模型先猜、大模型一次验全对前缀，赌的是「猜错只浪费小模型的算力，猜对就多拿大模型的吞吐」(6.3)；④ 接受准则有两条路：greedy 直接比 token，采样走论文 Algorithm 1 的分布修正——保证统计上等价于大模型自己采样(6.4)。
   </div>
 
   <section class="block">
-    <h2><span class="num">6.1</span>两条链:处理器与 warper</h2>
-    <p>_get_logits_processor(:1410)装配的列表其实是两批。第一批是<strong>处理器(processor)</strong>:无条件启用,处理「硬约束」——长度(最小长度内禁 EOS)、禁词(bad_words_ids)、n-gram 禁复(repetition)、强制 token(forced_bos/eos)。第二批是<strong>塑形器(warper)</strong>,do_sample=True 才启用,处理「分布形态」——温度、top-k、top-p、min-p、typical、epsilon/eta。装配顺序是写死的(代码注释:「TODO: find a strategy to specify the order of the processors」):</p>
-    <div class="code-title">generation/utils.py:1410 — 装配顺序(骨架,注释为译注)</div>
+    <h2><span class="num">6.1</span>两条链：处理器与 warper</h2>
+    <p>_get_logits_processor(:1410)装配的列表其实是两批。第一批是<strong>处理器(processor)</strong>：无条件启用，处理「硬约束」——长度（最小长度内禁 EOS）、禁词(bad_words_ids)、n-gram 禁复(repetition)、强制 token(forced_bos/eos)。第二批是<strong>塑形器(warper)</strong>，do_sample=True 才启用，处理「分布形态」——温度、top-k、top-p、min-p、typical、epsilon/eta。装配顺序是写死的（代码注释：「TODO： find a strategy to specify the order of the processors」）：</p>
+    <div class="code-title">generation/utils.py:1410 — 装配顺序（骨架，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 第一批:硬约束,永远装</span>
 processors.append(UnbatchedClassifierFreeGuidanceLogitsProcessor(...))  <span class="cmt"># guidance_scale</span>
 processors.append(RepetitionPenaltyLogitsProcessor(penalty=...))         <span class="cmt"># 重复惩罚</span>
@@ -71,17 +71,17 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
 <span class="kw">if</span> generation_config.watermarking_config <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>: ...
 <span class="kw">if</span> generation_config.renormalize_logits <span class="kw">is</span> <span class="kw">True</span>:
     processors.append(LogitNormalization())</pre>
-    <div class="annotation"><b>顺序为什么重要:</b>处理器链是串行的,前一个的输出是后一个的输入。min-p 的阈值要按「最高概率 token 的概率」缩放,若在温度前执行,温度还没把分布拉尖,阈值就失真——所以代码注释明确 min_p「Applied after temperature scaling」。水印是「在概率里埋签名」,若后面的处理器改动分布,签名就废了——所以水印固定垫在 warper 之后。LogitNormalization 垫底保证链尾归一。这类顺序约定文档里不显眼,但读装配代码都能对出来。</div>
-    <p>基类接口极简:一个 <code class="inline">__call__(input_ids, scores) → scores</code>。input_ids 是已生成序列(某些处理器要查历史),scores 是当前 logit。处理器只改 logit,不碰模型——这是「表达机制」与「能力」的分界线:库能把模型不许说的词摁死,但模型「想说」什么,在权重里(第 11 章训练侧再回来看)。</p>
+    <div class="annotation"><b>顺序为什么重要：</b>处理器链是串行的，前一个的输出是后一个的输入。min-p 的阈值要按「最高概率 token 的概率」缩放，若在温度前执行，温度还没把分布拉尖，阈值就失真——所以代码注释明确 min_p「Applied after temperature scaling」。水印是「在概率里埋签名」，若后面的处理器改动分布，签名就废了——所以水印固定垫在 warper 之后。LogitNormalization 垫底保证链尾归一。这类顺序约定文档里不显眼，但读装配代码都能对出来。</div>
+    <p>基类接口极简：一个 <code class="inline">__call__(input_ids, scores) → scores</code>。input_ids 是已生成序列（某些处理器要查历史），scores 是当前 logit。处理器只改 logit，不碰模型——这是「表达机制」与「能力」的分界线：库能把模型不许说的词摁死，但模型「想说」什么，在权重里（第 11 章训练侧再回来看）。</p>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.2</span>四个代表性处理器,读懂一族</h2>
-    <p>35 个类不必逐个讲,四个代表看懂,其余照方抓药:</p>
-    <div class="code-title">logits_process.py:238 — TemperatureLogitsWarper(核心一行)</div>
+    <h2><span class="num">6.2</span>四个代表性处理器，读懂一族</h2>
+    <p>35 个类不必逐个讲，四个代表看懂，其余照方抓药：</p>
+    <div class="code-title">logits_process.py:238 — TemperatureLogitsWarper（核心一行）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, input_ids, scores):
     <span class="kw">return</span> scores / self.temperature</pre>
-    <div class="code-title">logits_process.py:489 — TopPLogitsWarper(核心五行)</div>
+    <div class="code-title">logits_process.py:489 — TopPLogitsWarper（核心五行）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, input_ids, scores):
     sorted_logits, sorted_indices = torch.sort(scores, descending=False)
     cumulative_probs = sorted_logits.softmax(dim=-<span class="nu">1</span>).cumsum(dim=-<span class="nu">1</span>)
@@ -90,16 +90,16 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
     sorted_indices_to_remove[..., -self.min_tokens_to_keep :] = <span class="nu">0</span>  <span class="cmt"># 至少留 min_tokens_to_keep 个</span>
     indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
     <span class="kw">return</span> scores.masked_fill(indices_to_remove, self.filter_value)  <span class="cmt"># -inf</span></pre>
-    <div class="annotation"><b>top-p 从小端 sort 是个巧思:</b>从概率小的方向累积,累积量刚超过阈值时切一刀,被切的全是长尾;从大端做就要回头修正边界。所有截断族(top-k/top-p/min-p/typical/epsilon/eta)都返回同样的 masked_fill 模式——被过滤的 token 置 -inf,softmax 后概率为 0。它们之间是「与」关系:链上每个都有自己的判据,交集留下来。</div>
-    <div class="code-title">logits_process.py:720 — MinPLogitsWarper(核心五行)</div>
+    <div class="annotation"><b>top-p 从小端 sort 是个巧思：</b>从概率小的方向累积，累积量刚超过阈值时切一刀，被切的全是长尾；从大端做就要回头修正边界。所有截断族(top-k/top-p/min-p/typical/epsilon/eta)都返回同样的 masked_fill 模式——被过滤的 token 置 -inf，softmax 后概率为 0。它们之间是「与」关系：链上每个都有自己的判据，交集留下来。</div>
+    <div class="code-title">logits_process.py:720 — MinPLogitsWarper（核心五行）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, input_ids, scores):
     probs = torch.softmax(scores, dim=-<span class="nu">1</span>)
     top_probs = probs.amax(dim=-<span class="nu">1</span>, keepdim=<span class="kw">True</span>)        <span class="cmt"># 最高概率 token</span>
     scaled_min_p = self.min_p * top_probs              <span class="cmt"># 阈值跟着置信度浮动</span>
     tokens_to_remove = probs &lt; scaled_min_p
     ...  <span class="cmt"># 保底 min_tokens_to_keep,再 masked_fill</span></pre>
-    <div class="annotation"><b>min-p 与 top-p 的哲学差异:</b>top-p 的阈值是固定的概率质量(90% 的总概率),分布越尖留的 token 越少;min-p 的阈值是「最高 token 概率的 min_p 倍」,模型自信时卡得紧、犹豫时放得宽。源码 docstring 给的经验值:min_p 在 0.01-0.2,等价于 top_p 的 0.99-0.8——「用相反方向的 top_p 值」。这是截断族里唯一「自适应分布形状」的。</div>
-    <div class="code-title">logits_process.py:1089 — NoRepeatNGramLogitsProcessor(核心八行,注释为译注)</div>
+    <div class="annotation"><b>min-p 与 top-p 的哲学差异：</b>top-p 的阈值是固定的概率质量（90% 的总概率），分布越尖留的 token 越少；min-p 的阈值是「最高 token 概率的 min_p 倍」，模型自信时卡得紧、犹豫时放得宽。源码 docstring 给的经验值：min_p 在 0.01-0.2，等价于 top_p 的 0.99-0.8——「用相反方向的 top_p 值」。这是截断族里唯一「自适应分布形状」的。</div>
+    <div class="code-title">logits_process.py:1089 — NoRepeatNGramLogitsProcessor（核心八行，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">__call__</span>(self, input_ids, scores):
     <span class="cmt"># 只需拿「最后 n-1 个 token」当前缀,和历史里所有 n-gram 窗口比</span>
     prefix = input_ids[:, cur_len + <span class="nu">1</span> - self.ngram_size :]
@@ -109,52 +109,52 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
     banned_mask = scores.new_zeros((scores.shape[<span class="nu">0</span>], vocab_size + <span class="nu">1</span>), dtype=torch.bool)
     banned_mask.scatter_(1, torch.where(matches, windows[..., -<span class="nu">1</span>].clamp(max=vocab_size), vocab_size), <span class="kw">True</span>)
     <span class="kw">return</span> scores.masked_fill(banned_mask[:, :vocab_size], -float("inf"))</pre>
-    <div class="annotation"><b>注释里那句「不能禁自己的后继」值得读:</b>前缀窗口本身也是匹配窗口,但它禁的「后一个 token」还没生成——把它指向词表外的备用列,与其他窗口的禁令互不干扰。把「查重复」写成一次 unfold + 广播比较 + scatter,是这份代码张量化的典型手法(第 5 章 StopStringCriteria 同款思路:预计算 + 查表)。</div>
+    <div class="annotation"><b>注释里那句「不能禁自己的后继」值得读：</b>前缀窗口本身也是匹配窗口，但它禁的「后一个 token」还没生成——把它指向词表外的备用列，与其他窗口的禁令互不干扰。把「查重复」写成一次 unfold + 广播比较 + scatter，是这份代码张量化的典型手法（第 5 章 StopStringCriteria 同款思路：预计算 + 查表）。</div>
 
-    <p>处理器族全景(按用途分组):</p>
+    <p>处理器族全景（按用途分组）：</p>
     <table class="tbl">
       <tr><th>组</th><th>代表(pin)</th><th>作用</th></tr>
-      <tr><td>塑形</td><td>Temperature(:238) / TopK(:558) / TopP(:489) / TopH(:614) / MinP(:720) / Typical(:796) / Epsilon(:884) / Eta(:953)</td><td>调分布形态,采样专用</td></tr>
+      <tr><td>塑形</td><td>Temperature(:238) / TopK(:558) / TopP(:489) / TopH(:614) / MinP(:720) / Typical(:796) / Epsilon(:884) / Eta(:953)</td><td>调分布形态，采样专用</td></tr>
       <tr><td>防复读</td><td>RepetitionPenalty(:306) / NoRepeatNGram(:1089) / Encoder 系(:427/1160)</td><td>惩罚或禁止已出现 token</td></tr>
       <tr><td>硬约束</td><td>MinLength(:101) / MinNewTokensLength(:164) / NoBadWords(:1413) / SuppressTokens(:1891) / ForcedBOS(:1577) / ForcedEOS(:1622)</td><td>禁或强制特定 token</td></tr>
       <tr><td>引导</td><td>PrefixConstrained(:1502) / SequenceBias(:1229) / ClassifierFreeGuidance(:2145/2254)</td><td>按前缀约束、按偏好偏置</td></tr>
       <tr><td>水印</td><td>WatermarkLogitsProcessor(:2419) / SynthIDTextWatermarkLogitsProcessor(:2592)</td><td>在分布里埋可检测签名</td></tr>
       <tr><td>模型专属</td><td>Whisper 时间戳(:1931) / Bark(:2372) / Dia 系(:3034-3172)</td><td>特定模型的结构性需求</td></tr>
     </table>
-    <div class="annotation"><b>两个工程细节:</b>① 每个处理器类有 <code class="inline">supports_continuous_batching</code> 类属性(如 TemperatureLogitsWarper 上为 True),第 7 章连续批处理只放行声明了支持的处理器——「能不能进并发路径」是处理器要声明的能力,与模型 _supports_* 的声明模式同构。② 水印处理器有 Watermark 绿色版与 SynthIDText(谷歌方案)两套,都在核心库——生成内容的「验伪」需求已经进入主流路径。</div>
+    <div class="annotation"><b>两个工程细节：</b>① 每个处理器类有 <code class="inline">supports_continuous_batching</code> 类属性（如 TemperatureLogitsWarper 上为 True），第 7 章连续批处理只放行声明了支持的处理器——「能不能进并发路径」是处理器要声明的能力，与模型 _supports_* 的声明模式同构。② 水印处理器有 Watermark 绿色版与 SynthIDText（谷歌方案）两套，都在核心库——生成内容的「验伪」需求已经进入主流路径。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.3</span>候选解码:一次前向验 k+1 个 token</h2>
-    <p>主循环每步一次大模型前向、产一个 token。候选解码改这个赌注:让便宜的「候选生成器」先猜 k 个 token,大模型把「已确认前缀 + k 个候选」一次前向,每个位置都能与候选对账——全对就一步收 k+1 个 token,错了从错处截断。代价是多算了 k 个位置的 KV,但一次前向的批处理效率远高于 k 次串行, GPU 越空闲越划算。</p>
-    <p>候选从哪来?candidate_generator.py 有八个类,分发逻辑在 _get_candidate_generator(generation/utils.py:1287):</p>
+    <h2><span class="num">6.3</span>候选解码：一次前向验 k+1 个 token</h2>
+    <p>主循环每步一次大模型前向、产一个 token。候选解码改这个赌注：让便宜的「候选生成器」先猜 k 个 token，大模型把「已确认前缀 + k 个候选」一次前向，每个位置都能与候选对账——全对就一步收 k+1 个 token，错了从错处截断。代价是多算了 k 个位置的 KV，但一次前向的批处理效率远高于 k 次串行， GPU 越空闲越划算。</p>
+    <p>候选从哪来？candidate_generator.py 有八个类，分发逻辑在 _get_candidate_generator(generation/utils.py:1287)：</p>
     <table class="tbl">
       <tr><th>候选生成器(pin)</th><th>猜法</th><th>适用</th></tr>
       <tr><td>AssistedCandidateGenerator(:77)</td><td>小模型自回归草拟</td><td>经典 assisted / speculative</td></tr>
       <tr><td>AssistedCandidateGeneratorDifferentTokenizers(:340)</td><td>草拟 + 词表翻译</td><td>助手与目标分词器不同</td></tr>
-      <tr><td>UniversalSpeculativeDecodingGenerator(:898)</td><td>上者 + 采样版</td><td>同上,do_sample=True</td></tr>
+      <tr><td>UniversalSpeculativeDecodingGenerator(:898)</td><td>上者 + 采样版</td><td>同上，do_sample=True</td></tr>
       <tr><td>PromptLookupCandidateGenerator(:1017)</td><td>在 prompt 里找 n-gram 复读当候选</td><td>摘要/改写等「输出近似 prompt」场景</td></tr>
       <tr><td>EarlyExitCandidateGenerator(:1157)</td><td>用主模型浅层早退头当草稿</td><td>自推测</td></tr>
-      <tr><td>MTPCandidateGenerator(:1372)</td><td>主模型附带的 MTP 头(如 GLM/deepseek 式多 token 预测层)</td><td>模型自带投机头</td></tr>
-    <tr><td>SinglePositionMultiTokenCandidateGenerator(:1213)</td><td>MTP 变体:固定 position_ids 从单位置连草 k 个,主模型 KV 共享给草稿模型</td><td>Gemma 4 式共享 KV 架构</td></tr>
+      <tr><td>MTPCandidateGenerator(:1372)</td><td>主模型附带的 MTP 头（如 GLM/deepseek 式多 token 预测层）</td><td>模型自带投机头</td></tr>
+    <tr><td>SinglePositionMultiTokenCandidateGenerator(:1213)</td><td>MTP 变体：固定 position_ids 从单位置连草 k 个，主模型 KV 共享给草稿模型</td><td>Gemma 4 式共享 KV 架构</td></tr>
       <tr><td>DFlashTokenCandidateGenerator(:1505)</td><td>DFlash 式并行草拟</td><td>专用草稿模型</td></tr>
     </table>
-    <div class="annotation"><b>分发优先级是「特例在前」:</b>assistant_early_exit → prompt_lookup → use_mtp → Gemma 专属共享 KV → dflash → 异词表 → 默认小模型。八种候选器共享同一个接口:get_candidates(input_ids) → (candidate_ids, candidate_logits) 与 update_candidate_strategy(反馈调参)。接口统一是这套代码能扩到八种的原因——第 9 章会看到工具调用也用同样的「接口统一,实现各自」模式。</div>
+    <div class="annotation"><b>分发优先级是「特例在前」：</b>assistant_early_exit → prompt_lookup → use_mtp → Gemma 专属共享 KV → dflash → 异词表 → 默认小模型。八种候选器共享同一个接口：get_candidates(input_ids) → （candidate_ids， candidate_logits） 与 update_candidate_strategy（反馈调参）。接口统一是这套代码能扩到八种的原因——第 9 章会看到工具调用也用同样的「接口统一，实现各自」模式。</div>
 
-    <h3>自适应草稿长度:一个简单的启发式</h3>
-    <div class="code-title">candidate_generator.py:223 — update_candidate_strategy(摘录,注释为译注)</div>
+    <h3>自适应草稿长度：一个简单的启发式</h3>
+    <div class="code-title">candidate_generator.py:223 — update_candidate_strategy（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># 上轮草稿全对 → 下轮多猜 2 个;有错 → 少猜 1 个,最低 1</span>
 <span class="kw">if</span> num_matches == len(scores[<span class="nu">0</span>]) - <span class="nu">1</span>:
     self.num_assistant_tokens += <span class="nu">2</span>
 <span class="kw">else</span>:
     self.num_assistant_tokens = max(<span class="nu">1</span>, self.num_assistant_tokens - <span class="nu">1</span>)</pre>
-    <div class="annotation"><b>草稿长度是自适应的:</b>小模型猜得准就多猜(收益大),猜不准就收缩(省草拟成本)。还有一个更精细的自适应:用 sklearn 拟合「草稿置信度 → 命中率」的 ROC 曲线,按误报 25%/漏报 75% 的代价模型动态调 assistant_confidence_threshold——置信度门槛高,浪费草稿;门槛低,白跑验证。整个机制是为「草稿便宜、验证贵」的赌注服务的。</div>
+    <div class="annotation"><b>草稿长度是自适应的：</b>小模型猜得准就多猜（收益大），猜不准就收缩（省草拟成本）。还有一个更精细的自适应：用 sklearn 拟合「草稿置信度 → 命中率」的 ROC 曲线，按误报 25%/漏报 75% 的代价模型动态调 assistant_confidence_threshold——置信度门槛高，浪费草稿；门槛低，白跑验证。整个机制是为「草稿便宜、验证贵」的赌注服务的。</div>
   </section>
 
   <section class="block">
-    <h2><span class="num">6.4</span>验证与接受:两条准则</h2>
-    <p>候选生成后,大模型一次前向验全段(_assisted_decoding,:3901,核心在 :4081 起):</p>
-    <div class="code-title">generation/utils.py:4081 — 接受准则两分支(骨架,注释为译注)</div>
+    <h2><span class="num">6.4</span>验证与接受：两条准则</h2>
+    <p>候选生成后，大模型一次前向验全段（_assisted_decoding，:3901，核心在 :4081 起）：</p>
+    <div class="code-title">generation/utils.py:4081 — 接受准则两分支（骨架，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="cmt"># Case 1: 采样模式 —— 走投机采样论文的 Algorithm 1</span>
 <span class="kw">if</span> do_sample <span class="kw">and</span> candidate_logits <span class="kw">is</span> <span class="kw">not</span> <span class="kw">None</span>:
     valid_tokens, n_matches = _speculative_sampling(
@@ -166,8 +166,8 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
     candidate_new_tokens = candidate_input_ids[:, cur_len:]
     n_matches = ((~(candidate_new_tokens == selected_tokens[:, :-<span class="nu">1</span>])).cumsum(dim=-<span class="nu">1</span>) &lt; <span class="nu">1</span>).sum()
     valid_tokens = selected_tokens[:, : n_matches + <span class="nu">1</span>]   <span class="cmt"># 全部匹配 + 错位后的「红利 token」</span></pre>
-    <div class="annotation"><b>「红利 token」是投机解码的小甜头:</b>验证前向本来就要算到候选段后一位(candidate_length + 1 个位置的 logits),所以即使 k 个候选全对,还能免费拿下一个 token——一步 k+1 个。greedy 的接受准则是「逐位比对,错即截断」;采样的准则(Algorithm 1)不是比对,而是概率修正:草稿概率 q 低于大模型概率 p 的 token 直接保留;q 高于 p 时按 1 − p/q 的概率拒绝,并从修正分布 clamp(p−q) 重采——接受序列的分布与大模型直接采样在统计上严格一致。这是投机解码「不损失质量」的数学保证,代码里 _speculative_sampling 函数实现。</div>
-    <div class="annotation"><b>MTP 是模型自带的「内建小模型」:</b>MTPCandidateGenerator 从主模型里拉出 MtpModel(模型权重里附带的额外预测层),主模型末层隐状态直接喂给 MTP 头产候选,不用第二个模型。缓存侧配套的 MtpCache(cache_utils.py:2137,DynamicCache 的子类)负责保存 MTP 层自己的状态。对用户就是 use_mtp=True 一个开关——「投机」从「要养两个模型」进化到「模型出厂自带」,这是 v5 把它做成一等公民的原因。</div>
+    <div class="annotation"><b>「红利 token」是投机解码的小甜头：</b>验证前向本来就要算到候选段后一位（candidate_length + 1 个位置的 logits），所以即使 k 个候选全对，还能免费拿下一个 token——一步 k+1 个。greedy 的接受准则是「逐位比对，错即截断」；采样的准则（Algorithm 1）不是比对，而是概率修正：草稿概率 q 低于大模型概率 p 的 token 直接保留；q 高于 p 时按 1 − p/q 的概率拒绝，并从修正分布 clamp(p−q) 重采——接受序列的分布与大模型直接采样在统计上严格一致。这是投机解码「不损失质量」的数学保证，代码里 _speculative_sampling 函数实现。</div>
+    <div class="annotation"><b>MTP 是模型自带的「内建小模型」：</b>MTPCandidateGenerator 从主模型里拉出 MtpModel（模型权重里附带的额外预测层），主模型末层隐状态直接喂给 MTP 头产候选，不用第二个模型。缓存侧配套的 MtpCache（cache_utils.py:2137，DynamicCache 的子类）负责保存 MTP 层自己的状态。对用户就是 use_mtp=True 一个开关——「投机」从「要养两个模型」进化到「模型出厂自带」，这是 v5 把它做成一等公民的原因。</div>
   </section>
 
   <div class="figure breakout">
@@ -217,13 +217,13 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
       <line x1="340" y1="180" x2="470" y2="180" class="edge"></line>
       <line x1="670" y1="180" x2="730" y2="180" class="edge"></line>
     </svg>
-    <div class="fig-cap">图 6.1:上——每个 token 都要过的处理器链;下——候选解码把「一步一 token」改成「一步 k+1」,草稿便宜、验证一次到位。</div>
+    <div class="fig-cap">图 6.1：上——每个 token 都要过的处理器链；下——候选解码把「一步一 token」改成「一步 k+1」，草稿便宜、验证一次到位。</div>
   </div>
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>logit 到 token 之间是两条链:硬约束处理器(永远启用,禁/强制/防复读)与塑形 warper(采样时启用,温度+截断族),装配顺序有约定——min-p 在温度后、水印在所有处理之后、LogitNormalization 垫底。35 个处理器分六组(塑形/防复读/硬约束/引导/水印),全部是「logit 的纯函数」;截断族都是 unfold/sort + masked_fill(-inf) 的张量手法。候选解码用「草稿便宜、验证并行」换吞吐:八种候选生成器共享 get_candidates/update_candidate_strategy 接口,自适应调草稿长度与置信门槛;greedy 验证逐位比对,采样验证走投机采样 Algorithm 1 的分布修正,统计上严格等价于大模型采样;MTP 把草稿模型变成主模型自带的预测头。这章的机制是问题三「库内表达机制」的主体:约束在此表达,能力从训练来(第 11 章)。</p>
-    <p>单机 generate 讲完了。并发怎么破?把「一个循环一个 batch」改成「调度器管一池请求」。<a href="07-serving.html">第 7 章:并发</a>。</p>
+    <p>logit 到 token 之间是两条链：硬约束处理器（永远启用，禁/强制/防复读）与塑形 warper（采样时启用，温度+截断族），装配顺序有约定——min-p 在温度后、水印在所有处理之后、LogitNormalization 垫底。35 个处理器分六组（塑形/防复读/硬约束/引导/水印），全部是「logit 的纯函数」；截断族都是 unfold/sort + masked_fill(-inf) 的张量手法。候选解码用「草稿便宜、验证并行」换吞吐：八种候选生成器共享 get_candidates/update_candidate_strategy 接口，自适应调草稿长度与置信门槛；greedy 验证逐位比对，采样验证走投机采样 Algorithm 1 的分布修正，统计上严格等价于大模型采样；MTP 把草稿模型变成主模型自带的预测头。这章的机制是问题三「库内表达机制」的主体：约束在此表达，能力从训练来（第 11 章）。</p>
+    <p>单机 generate 讲完了。并发怎么破？把「一个循环一个 batch」改成「调度器管一池请求」。<a href="07-serving.html">第 7 章：并发</a>。</p>
   </div>
 
   <nav class="pagenav">
@@ -239,7 +239,7 @@ processors = self._merge_criteria_processor_list(processors, logits_processor)  
 </div>
 
 <footer>
-  深入浅出 Transformers · 06 选词 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准;行号随版本演进可能偏移,仅供参考
+  深入浅出 Transformers · 06 选词 · 版本 trunk 823a6ea6d8 (5.21.0.dev0) · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

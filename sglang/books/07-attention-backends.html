@@ -45,7 +45,7 @@
   <section class="block">
     <h2><span class="num">7.1</span>一分钟版本</h2>
     <p>注意力后端（attention backend）= 分页注意力在某一类硬件/kernel 家族上的具体实现。它要回答的问题都一样：给定 <code class="inline">q/k/v</code>、KV 池的槽位索引（<code class="inline">req_to_token</code>）、每个请求的序列长度，怎么把这一步的 attention 算出来，并把新的 K/V 写进池子。</p>
-    <p>SGLang 在 <code class="inline">attention_registry.py</code> 里注册了 <strong>25</strong> 个后端工厂。启动时按 <code class="inline">--attention-backend</code>（或不指定，按硬件与模型自动挑）解析出<strong>两个</strong>名字——prefill 和 decode 各一个——分别实例化，必要时组合成混合后端。之后模型代码的每一层都不再碰 kernel 选择：每层只有一个 <code class="inline">RadixAttention</code> 模块，它的 <code class="inline">forward</code> 把调用转给当前装配好的后端。</p>
+    <p>SGLang 在 <code class="inline">attention_registry.py</code> 里用 <code class="inline">@register_attention_backend</code> 注册了 <strong>24</strong> 个后端工厂（<code class="inline">--attention-backend</code> 的候选名单另在 <code class="inline">arg_groups/choices.py</code> 的 <code class="inline">ATTENTION_BACKEND_CHOICES</code> 里，去重后 25 个，多出来的是只走 CLI 的别名）。启动时按 <code class="inline">--attention-backend</code>（或不指定，按硬件与模型自动挑）解析出<strong>两个</strong>名字——prefill 和 decode 各一个——分别实例化，必要时组合成混合后端。之后模型代码的每一层都不再碰 kernel 选择：每层只有一个 <code class="inline">RadixAttention</code> 模块，它的 <code class="inline">forward</code> 把调用转给当前装配好的后端。</p>
     <ul>
       <li><strong>MHA 路线</strong>（标准多头）：flashinfer、fa3/fa4、triton、trtllm_mha……K/V 是两个独立张量。</li>
       <li><strong>MLA 路线</strong>（DeepSeek 潜空间注意力）：flashmla、trtllm_mla、cutedsl_mla、tokenspeed_mla……KV 压缩成一个 latent 向量加 rope 部分，kernel 形状完全不同。</li>
@@ -234,7 +234,7 @@
       <b class="tag">困惑点</b>
       模型代码里每层 attention 都是 <code class="inline">RadixAttention</code>，但这个类和第 3 章的基数树缓存<strong>没有关系</strong>。它只是 QKV 到后端 kernel 的转发层——「Radix」是项目早期论文里注意力实现与前缀缓存绑定的历史遗留；如今这一层对缓存一无所知，纯粹是把张量交给后端。真正的前缀逻辑在 <code class="inline">mem_cache/radix_cache.py</code>。
     </div>
-    <p>这个类存的都是 kernel 需要的每层常量，forward 里做三件事：reshape、判断是否走编译路径、转发：</p>
+    <p>这个类存的都是 kernel 需要的每层常量，forward 里做三件事：reshape、判断要不要在图内走 eager 区、转发：</p>
     <div class="code-title">python/sglang/srt/layers/radix_attention.py — 字段与 forward 分派（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">RadixAttention</span>(nn.<span class="cl">Module</span>):
     <span class="kw">def</span> <span class="fn">__init__</span>(self, num_heads, head_dim, scaling, num_kv_heads, layer_id,
@@ -252,22 +252,30 @@
                 key_value_num_tokens: Optional[<span class="cl">int</span>] = <span class="kw">None</span>, **kwargs):
         <span class="kw">if</span> k <span class="kw">is not</span> <span class="kw">None</span>:
             <span class="cmt"># 跨层共享 KV 时 k 可能是 None；带 k_rope 的模型 k 是压缩过的</span>
+            k = k.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_k_head_num,
+                       self.v_head_dim <span class="kw">if</span> <span class="st">"k_rope"</span> <span class="kw">in</span> kwargs <span class="kw">else</span> self.qk_head_dim)
             <span class="kw">if</span> <span class="st">"k_rope"</span> <span class="kw">not in</span> kwargs:
-                k = k.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_k_head_num, self.qk_head_dim)
                 v = v.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_v_head_num, self.v_head_dim)
-            <span class="kw">else</span>:
-                k = k.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_k_head_num, self.v_head_dim)
 
-        context = <span class="fn">get_tc_piecewise_forward_context</span>()
-        <span class="kw">if</span> (forward_batch.forward_mode.<span class="fn">is_extend</span>()
-                <span class="kw">and</span> context <span class="kw">is not</span> <span class="kw">None</span> ...):
-            <span class="cmt"># prefill 分段 CUDA Graph：走 torch.compile 融合算子</span>
+        breakable_cg = <span class="fn">is_in_breakable_cuda_graph</span>()
+        full_cg = <span class="fn">is_in_full_prefill_graph</span>()
+        use_eager_attention = (
+            self.use_prefill_attention_wrapper
+            <span class="kw">and</span> <span class="fn">is_in_prefill_graph_scope</span>()
+            <span class="kw">and</span> forward_batch.forward_mode.<span class="fn">is_extend</span>()
+            <span class="kw">and</span> (breakable_cg <span class="kw">or</span> full_cg)
+        )
+        <span class="kw">if</span> use_eager_attention:
+            <span class="cmt"># 图内 eager 区：只算真实 token 行，补齐行留给下一段图</span>
             ...
-        <span class="kw">else</span>:
-            <span class="cmt"># 常规路径：转给当前装配的后端</span>
-            <span class="kw">return</span> <span class="fn">get_attn_backend</span>().<span class="fn">forward</span>(
-                q, k, v, self, forward_batch, save_kv_cache, **kwargs)</pre>
-    <div class="annotation"><b>后端引用从 context 里来：</b> <code class="inline">get_attn_backend()</code> 从 forward context 里取当前实例——ModelRunner 在每次前向外围把后端挂进 context，模型代码因此完全不用持有后端引用。<code class="inline">layer_id</code> 是后端与 KV 池对上的关键：后端用它去 <code class="inline">k_buffer[layer_id]</code> 读写（第 5 章）。<code class="inline">layer.scaling / logit_cap / sliding_window_size</code> 这些常量也经 <code class="inline">layer</code> 参数透传给 kernel。<br><br>上面那个 <code class="inline">k_rope</code> 分支是目前唯一一处「按 kwargs 决定 reshape 形状」的地方：带 k_rope 的模型（部分 MLA/混合结构）会把 rope 部分从 k 里拆出去，此时 k 剩下的宽度是 <code class="inline">v_head_dim</code> 而不是 <code class="inline">qk_head_dim</code>。这种「靠约定参数名换行为」的写法读起来突然，但它避开了在每层 forward 里传一个显式标志位。<code class="inline">key_value_num_tokens</code> 则是新加的可选形参，给需要显式知道 KV token 数的后端（如跨层共享、异构 batch）留的口子。</div>
+            <span class="kw">return</span> <span class="fn">_eager_attention</span>(...)
+        real_num_tokens = <span class="fn">padded_extend_real_tokens</span>(q, forward_batch)
+        <span class="kw">if</span> real_num_tokens <span class="kw">is not</span> <span class="kw">None</span>:
+            <span class="kw">return</span> <span class="fn">_attention_on_real_rows</span>(...)
+        <span class="cmt"># 常规路径：转给当前装配的后端</span>
+        <span class="kw">return</span> <span class="fn">get_attn_backend</span>().<span class="fn">forward</span>(
+            q, k, v, self, forward_batch, save_kv_cache, **kwargs)</pre>
+    <div class="annotation"><b>后端引用从 context 里来：</b> <code class="inline">get_attn_backend()</code> 从 forward context 里取当前实例——ModelRunner 在每次前向外围把后端挂进 context，模型代码因此完全不用持有后端引用。<code class="inline">layer_id</code> 是后端与 KV 池对上的关键：后端用它去 <code class="inline">k_buffer[layer_id]</code> 读写（第 5 章）。<code class="inline">layer.scaling / logit_cap / sliding_window_size</code> 这些常量也经 <code class="inline">layer</code> 参数透传给 kernel。<br><br>上面那个 <code class="inline">k_rope</code> 分支是目前唯一一处「按 kwargs 决定 reshape 形状」的地方：带 k_rope 的模型（部分 MLA/混合结构）会把 rope 部分从 k 里拆出去，此时 k 剩下的宽度是 <code class="inline">v_head_dim</code> 而不是 <code class="inline">qk_head_dim</code>。这种「靠约定参数名换行为」的写法读起来突然，但它避开了在每层 forward 里传一个显式标志位。<code class="inline">key_value_num_tokens</code> 则是新加的可选形参，给需要显式知道 KV token 数的后端（如跨层共享、异构 batch）留的口子。<br><br><b>图内 eager 区的判据从「编译上下文」换成了三个布尔探针：</b>旧版本这里问的是 <code class="inline">get_tc_piecewise_forward_context()</code> 有没有返回一个上下文对象，非空就走编译路径。现在判据改成三个互不依赖的探针组合：<code class="inline">is_in_prefill_graph_scope()</code>（在一次 prefill 图捕获/重放的作用域内）、<code class="inline">is_in_breakable_cuda_graph()</code> 与 <code class="inline">is_in_full_prefill_graph()</code>（当前在可中断图还是完整 prefill 图里），再加上本层构造时的 <code class="inline">use_prefill_attention_wrapper</code> 开关。命中之后走的是 <code class="inline">_eager_attention</code>——它只对真实 token 行调后端，补齐出来的 padding 行整段跳过，输出再按 <code class="inline">global_num_token_non_padded_cpu</code> 零化或拷回。所以这条路径不是「绕过后端」，而是「在图里按真实行数调后端」：<code class="inline">padded_extend_real_tokens</code> 与 <code class="inline">_attention_on_real_rows</code> 处理的是图外的同一种情形。这一整套辅助函数本文件不再自带，搬去了 <code class="inline">layers/attention/graph_utils.py</code>；<code class="inline">radix_attention.py</code> 因此从 800 多行缩到 230 行，只剩分发。<br><br>顺带一句：<code class="inline">tc_piecewise</code> 这个名字没有整体消失——<code class="inline">is_in_tc_piecewise_cuda_graph()</code> 仍由 <code class="inline">flashinfer_mla_backend.py</code>、<code class="inline">dsa_backend.py</code>、<code class="inline">trtllm_mla_backend.py</code> 等后端自己 import，用来判断「在图里必须走 paged 分支」。变的是模型层的这一跳：它不再认识 piecewise 这个概念。</div>
   </section>
 
   <section class="block">
@@ -421,7 +429,7 @@
 
   <div class="chapter-summary">
     <h2>本章小结</h2>
-    <p>注意力后端是分页注意力在具体硬件/kernel 家族上的实现，attention_registry.py 用一个 dict + 装饰器注册了 25 个工厂；启动时解析出 prefill/decode 两个名字分别实例化，必要时组合成混合后端，之后模型代码每层只有一个 RadixAttention，forward 把调用转给装配好的后端——kernel 选择不写在模型里。后端契约是三个初始化钩子（图外/图内拆两步）加 forward_extend/forward_decode 两个 forward；MHA 与 MLA 两条路线共用同一注册表，工厂函数检查 use_mla_backend 不匹配即报错。</p>
+    <p>注意力后端是分页注意力在具体硬件/kernel 家族上的实现，attention_registry.py 用一个 dict + 装饰器注册了 24 个工厂；启动时解析出 prefill/decode 两个名字分别实例化，必要时组合成混合后端，之后模型代码每层只有一个 RadixAttention，forward 把调用转给装配好的后端——kernel 选择不写在模型里。后端契约是三个初始化钩子（图外/图内拆两步）加 forward_extend/forward_decode 两个 forward；MHA 与 MLA 两条路线共用同一注册表，工厂函数检查 use_mla_backend 不匹配即报错。</p>
     <p>下一章 → <a href="08-sampling.html">第 8 章 · 采样与结构化输出：logits 之后发生了什么</a>。</p>
   </div>
 
@@ -438,7 +446,7 @@
 </div>
 
 <footer>
-  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 07 注意力后端 · 版本 gateway-v0.3.1-11712-g553836c164 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

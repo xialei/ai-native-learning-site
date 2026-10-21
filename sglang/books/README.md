@@ -37,7 +37,7 @@ open sglang/books/index.html
 ## 技术说明
 
 - **纯静态**：每个 `.html` 自带导航与内联 SVG，仅引用一个共享 CSS。
-- **基于 SGLang SRT**（`sgl-project/sglang`，`python/sglang/srt`）编写，代码对应版本 `gateway-v0.3.1-11393-ge87e32b311`（HEAD `e87e32b311`）。
+- **基于 SGLang SRT**（`sgl-project/sglang`，`python/sglang/srt`）编写，代码对应版本 `gateway-v0.3.1-11712-g553836c164`（HEAD `553836c164`）。
 - 站点内代码片段均摘自真实代码并标注文件路径；仓库持续演进，若某处函数/路径对不上，以仓库最新代码为准。
 
 ## 维护指南

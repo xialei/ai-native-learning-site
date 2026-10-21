@@ -353,10 +353,17 @@ max_new = <span class="fn">min</span>(
 )
 cand_extend_input_len = <span class="fn">len</span>(req.full_untruncated_fill_ids) - req.prefix_len
 total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
+mamba_gap_reserve = self.<span class="fn">_mamba_gap_budget_for_req</span>(req, include_host_hit=<span class="kw">True</span>)
+total_tokens += mamba_gap_reserve
 ...
-<span class="kw">if</span> total_tokens &gt;= self.rem_total_tokens:
-    <span class="kw">return</span> <span class="cl">AddReqResult</span>.NO_TOKEN</pre>
-    <div class="annotation"><b>命中越多，准入越便宜：</b> 前缀命中直接降低准入成本：命中越多，<code class="inline">cand_extend_input_len</code> 越小，同一个预算能塞进更多请求。这也是第 4 章 cache-aware 排序策略（优先挑命中长的请求）的动机——同样的显存，先做命中多的，吞吐更高。</div>
+request_slot_reserve = self.<span class="fn">_request_slot_reserve_for_req</span>(req)
+total_tokens += request_slot_reserve
+
+<span class="kw">with</span> self.<span class="fn">_lock_node</span>(req.last_node):
+    admission = self.<span class="fn">_select_prefill_admission</span>(req, total_tokens=total_tokens, ...)
+    <span class="kw">if</span> <span class="fn">isinstance</span>(admission, <span class="cl">AddReqResult</span>):
+        <span class="kw">return</span> admission</pre>
+    <div class="annotation"><b>命中越多，准入越便宜：</b> 前缀命中直接降低准入成本：命中越多，<code class="inline">cand_extend_input_len</code> 越小，同一个预算能塞进更多请求。这也是第 4 章 cache-aware 排序策略（优先挑命中长的请求）的动机——同样的显存，先做命中多的，吞吐更高。<br><br><b>「够不够」不在这段里判：</b>这里只把账算齐——输入、输出预算、每请求页余量，再加上两笔较新的预留：<code class="inline">mamba_gap_reserve</code>（共享 mamba 池里新状态与既有状态之间的间隙开销）和 <code class="inline">request_slot_reserve</code>（请求槽与 load-back 状态槽）。判够不够的动作收在 <code class="inline">_select_prefill_admission</code> 里，连 <code class="inline">total_tokens &gt;= self.rem_total_tokens</code> 这个比较本身都搬去了 <code class="inline">mem_cache/prefill_budget.py</code> 的 <code class="inline">check_prefill()</code>——所以摘录末尾看不到任何 <code class="inline">return NO_TOKEN</code>，只看到一层 <code class="inline">isinstance(admission, AddReqResult)</code> 的透传。第 4 章讲那本账时会给完整的判据。</div>
 
     <p>第二个减法在组 batch 阶段。<code class="inline">prepare_for_extend</code>（<code class="inline">schedule_batch.py</code>）只把后缀喂给模型：</p>
     <div class="code-title">python/sglang/srt/managers/schedule_batch.py — prepare_for_extend（摘录，注释为译注）</div>
@@ -384,7 +391,7 @@ total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
     <p>对应到树这边的 <code class="inline">RadixCache.checkpoint()</code>（<code class="inline">radix_cache.py</code>）：把已算好的段 insert 进树、立刻重新 match 一次、沿新终点节点的路径取出槽位下标，写进请求在 <code class="inline">req_to_token</code> 池里的那一行（从 <code class="inline">cache_protected_len</code> 起覆盖到新长度），然后换锁——锁现在是一个 <code class="inline">TreeLock</code> 对象挂在 <code class="inline">req.lock</code> 上，换锁就是 <code class="inline">self.unlock(req.lock)</code> → <code class="inline">req.lock = self.lock(new_last_node)</code>（内部还是 <code class="inline">dec_lock_ref</code>/<code class="inline">inc_lock_ref</code>，只是把节点和归还参数打了个包）。这么做的好处是：如果同一前缀的另一个请求此刻到达，它能命中已完成的那几块，而不是等整个 prefill 结束。</p>
     <div class="callout info">
       <b class="tag">困惑点</b>
-      <code class="inline">req.kv.cache_protected_len</code> 是页对齐与树记账接缝处的关键计数，checkpoint 里新写的注释把它讲透了：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在<strong>请求的 req_to_token 行里</strong>但不在树上；checkpoint 后 <code class="inline">cache_protected_len = len(new_indices)</code> 标出「树已经接管的前缀长度」。请求结束时 <code class="inline">release_kv_cache()</code> 只释放 <code class="inline">(cache_protected_len, owned_kv_len)</code> 这一段——受保护的部分是树的，不是这个请求的（"The protected prefix is not this req's to free."），半页在下一个 checkpoint 或收尾时统一处理。这套字段都挂在 <code class="inline">req.kv</code>（<code class="inline">KVCacheState</code>）下：除了 <code class="inline">cache_protected_len</code>，还有上面提到的 <code class="inline">cache_inserted_len</code>（insert 过多少，用于命中去重计数）。先有按 token 的树，后有按页的池，接缝处的字段都挂在请求状态上对齐两套粒度。
+      <code class="inline">req.kv.cache_protected_len</code> 是页对齐与树记账接缝处的关键计数，checkpoint 里新写的注释把它讲透了：page_size&gt;1 时，insert 只把整页部分放进树，末尾的半页留在<strong>请求的 req_to_token 行里</strong>但不在树上；checkpoint 后 <code class="inline">cache_protected_len = len(new_indices)</code> 标出「树已经接管的前缀长度」。请求结束时 <code class="inline">release_kv_cache()</code> 只释放 <code class="inline">(cache_protected_len, owned_kv_len)</code> 这一段——受保护的部分是树的，不是这个请求的（"The protected prefix is not this req's to free."），半页在下一个 checkpoint 或收尾时统一处理。这套字段都挂在 <code class="inline">req.kv</code>（<code class="inline">ReqKvInfo</code>，<code class="inline">schedule_batch.py</code>）下：除了 <code class="inline">cache_protected_len</code>，还有上面提到的 <code class="inline">cache_inserted_len</code>（insert 过多少，用于命中去重计数）。先有按 token 的树，后有按页的池，接缝处的字段都挂在请求状态上对齐两套粒度。
     </div>
   </section>
 
@@ -396,7 +403,6 @@ total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
     </div>
     <div class="code-title">python/sglang/srt/layers/radix_attention.py — RadixAttention.forward（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">class</span> <span class="cl">RadixAttention</span>(nn.<span class="cl">Module</span>):
-    <span class="st">"""The attention layer implementation."""</span>
 
     <span class="kw">def</span> <span class="fn">__init__</span>(self, num_heads, head_dim, scaling, num_kv_heads,
                  layer_id, logit_cap=<span class="nu">0.0</span>, v_head_dim=-<span class="nu">1</span>, ...):
@@ -412,9 +418,14 @@ total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
         <span class="kw">if</span> k <span class="kw">is not</span> <span class="kw">None</span>:
             <span class="cmt"># 跨层共享 KV 时 k 可为 None</span>
             <span class="kw">assert</span> v <span class="kw">is not</span> <span class="kw">None</span>
-            k = k.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_k_head_num, self.qk_head_dim)
-            v = v.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_v_head_num, self.v_head_dim)
-        ...  <span class="cmt"># 转发到注意力后端（第 7 章）</span></pre>
+            k = k.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_k_head_num,
+                       self.v_head_dim <span class="kw">if</span> <span class="st">"k_rope"</span> <span class="kw">in</span> kwargs <span class="kw">else</span> self.qk_head_dim)
+            <span class="kw">if</span> <span class="st">"k_rope"</span> <span class="kw">not in</span> kwargs:
+                v = v.<span class="fn">view</span>(-<span class="nu">1</span>, self.tp_v_head_num, self.v_head_dim)
+        ...
+        <span class="kw">return</span> <span class="fn">get_attn_backend</span>().<span class="fn">forward</span>(
+            q, k, v, self, forward_batch, save_kv_cache, **kwargs
+        )</pre>
     <div class="annotation"><b>类里找不到树：</b> 类里找不到任何树结构或缓存逻辑——只有头的数量、缩放系数、logit 上限这些「一次注意力的参数」。真正写 KV 的动作发生在后端里（如 <code class="inline">flashinfer_backend.py</code> 的 <code class="inline">self.token_to_kv_pool.set_kv_buffer(...)</code>），写到哪里由 <code class="inline">forward_batch.out_cache_loc</code> 决定，而那个下标正是调度器从树和分配器那里算出来的。
     <br><br>最后把两种前缀索引放在一起看。分页本身两边一致（固定大小的块/页、引用计数、共享），分道的是「怎么发现这段 KV 已经算过」：
     <table class="tbl" style="margin-top:10px">
@@ -456,7 +467,7 @@ total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
 </div>
 
 <footer>
-  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 03 前缀缓存 · 版本 gateway-v0.3.1-11712-g553836c164 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

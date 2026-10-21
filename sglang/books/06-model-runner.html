@@ -311,13 +311,13 @@ Backend selection comes from cuda_graph_config.decode:
                       segmented capture (no torch.compile).
   - "tc_piecewise"     — not implemented for decode; logs a one-shot warning
                       and falls back to "full".</pre>
-    <div class="annotation"><b>同一个语义、三种捕获策略：</b> 默认 full：每个捕获形状一张完整 <code class="inline">torch.cuda.CUDAGraph</code>。breakable 是实验性的分段捕获（图内允许断点、不依赖 torch.compile）。tc_piecewise 只用于 prefill，decode 请求它会警告并退回 full。full 最快但形状最死，breakable 换灵活性，仍在验证中。</div>
+    <div class="annotation"><b>同一个语义、三种捕获策略：</b> 默认 full：每个捕获形状一张完整 <code class="inline">torch.cuda.CUDAGraph</code>。breakable 是实验性的分段捕获（图内允许断点、不依赖 torch.compile）。tc_piecewise 只用于 prefill，decode 请求它会警告并退回 full。full 最快但形状最死，breakable 换灵活性，仍在验证中。<br><br><b>图外那层上下文归 runner 管：</b>不管是捕获、warmup 还是回放，外面都套了一层 <code class="inline">self.model_context()</code>（<code class="inline">base_runner.py</code>）。它做的是「把当前模型的布局覆盖上去」——<code class="inline">get_model().override(shared_experts=self.model_runner.model.shared_experts_config)</code>，让这段代码里所有按全局模型配置读取的地方看到的是本 runner 这份模型。捕获侧它包住了整个 <code class="inline">_capture()</code>，<code class="inline">capture()</code> 现在只剩「进上下文 + 调 <code class="inline">_capture</code>」两行，真正的捕获流程（warmup、autotune、逐形状捕获）搬进了后者。回放侧就是下面这段 <code class="inline">execute</code>：<code class="inline">model_context()</code>、<code class="inline">timer_ctx</code>、<code class="inline">backend.replay_session()</code> 三个上下文一起进——分别管模型布局、CUDA event 计时、后端自己的一次性重放会话状态。multi-step 与投机解码把 target/draft 两套 runner 塞进同一个进程之后，第一层才有了必须存在的理由。</div>
 
     <p>回放前必须把真实数据拷进捕获时定下的静态 buffer——这就是 padding 的物理实现：</p>
     <div class="code-title">python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py — execute 与 load_batch（摘录，注释为译注）</div>
     <pre class="code"><span class="lang-tag">python</span><span class="kw">def</span> <span class="fn">execute</span>(self, forward_batch, pp_proxy_tensors=<span class="kw">None</span>):
     ...
-    <span class="kw">with</span> timer_ctx, self.backend.<span class="fn">replay_session</span>():
+    <span class="kw">with</span> self.<span class="fn">model_context</span>(), timer_ctx, self.backend.<span class="fn">replay_session</span>():
         self.<span class="fn">load_batch</span>(forward_batch, pp_proxy_tensors)   <span class="cmt"># 真实数据 → 静态 buffer</span>
         ...
         output = self.backend.<span class="fn">replay</span>(self._replay_graph_key, forward_batch)
@@ -423,7 +423,7 @@ Backend selection comes from cuda_graph_config.decode:
 </div>
 
 <footer>
-  深入浅出SGLang · 06 Model Runner · 版本 gateway-v0.3.1-11393-ge87e32b311 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
+  深入浅出SGLang · 06 Model Runner · 版本 gateway-v0.3.1-11712-g553836c164 · 所有引用代码路径以仓库最新为准；行号随版本演进可能偏移，仅供参考
 </footer>
 
 </body>

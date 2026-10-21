@@ -8,14 +8,20 @@
 
 一套围绕 AI Native 技术的中文源码精读站点。每个子项目对应一个开源仓库,以"成书"形式(每章一个 HTML,配架构图与逐行解释)深入拆解其源码实现与设计取舍。目前包含:
 
-- **AI Native Context Engine** —— 企业级 Context Engine 设计稿(自研),覆盖对象模型、知识构建、混合检索、图扩展、上下文排序与压缩、运行时、缓存、可观测性、多 Agent 协作(16 章)。
-- **Pi Agent Harness** —— 拆解 TypeScript Agent 运行时 [pi](https://github.com/earendil-works/pi):Agent 循环、会话存储、上下文投影、压缩 Compaction、Harness 骨架、工具层、AI 多供应商抽象、安全边界与本地集成,并对照 LangGraph(15 章)。
+- **AI Native Context Engine** —— 企业级 Context Engine 设计稿(自研),覆盖对象模型、知识构建、混合检索、图扩展、上下文排序与压缩、运行时、缓存、可观测性、多 Agent 协作(15 章)。
+- **Pi Agent Harness** —— 拆解 TypeScript Agent 运行时 [pi](https://github.com/earendil-works/pi):Agent 循环、会话存储、上下文投影、压缩 Compaction、Harness 骨架、工具层、AI 多供应商抽象、安全边界与本地集成,并对照 LangGraph(14 章)。
 - **Claude Code** —— 拆解 Anthropic 终端 agentic 编码工具 [claude-code](https://github.com/anthropics/claude-code):基于官方仓库的插件 / Hooks / Settings / SDK 实例 + 官方文档,讲透 Agentic 循环、上下文构建、权限模型、Hooks 生命周期、插件与 Skills、MCP 外接工具(14 章)。
 - **Codex CLI** —— 拆解 OpenAI 用 Rust 写的编码 Agent [codex](https://github.com/openai/codex):从 Cargo workspace 分层到 Turn 循环、会话与 Rollout、上下文工程、压缩、工具系统、审批与沙箱,最后给出自研 Agent Runtime 路线图(13 章)。
 - **DeepSeek Harness** —— 拆解 TypeScript Agent 运行时 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)(`dsh`):一切皆插件(cordis)、append-only 会话日志、Agent 循环、持久化与冷恢复、工具调度、LLM 适配层、Prompt 组装与 Scope、沙箱与审批、五条能力缝、Compaction、多 Agent 编排,最后给出自制 Harness 路线图(13 章)。
 - **深入浅出具身智能** —— 拆解具身智能全栈：HuggingFace [lerobot](https://github.com/huggingface/lerobot)（真机/数据/模仿策略）、NVIDIA [IsaacLab](https://github.com/isaac-sim/IsaacLab)（仿真/RL）、[prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) 与 unifolm-vla（VLA 模型）——硬件抽象、数据集、ACT/Diffusion/SmolVLA/π0、并行仿真与 RL 训练、Sim2Real 部署,附六里程碑实战路线(13 章)。
 - **深入浅出 DeepSpeed · Megatron** —— 双书结构拆解大模型训练栈：[Megatron-LM](https://github.com/NVIDIA/Megatron-LM) 的计算侧并行（TP/PP/CP/EP、1F1B 调度、selective 重算、可重分片 checkpoint）与 [DeepSpeed](https://github.com/deepspeedai/DeepSpeed) 的显存侧优化（ZeRO 1/2/3、offload/DeepNVMe、CPU Adam）,以"算不过来 vs 存不下"的分工论贯穿,附六里程碑自研训练器路线(14 章)。
 - **深入浅出 PyTorch** —— 拆解 [pytorch/pytorch](https://github.com/pytorch/pytorch) 本体实现：从 `torch/__init__.py` 的导入前厅到 c10/ATen/torch-csrc 三层,经 TensorImpl 与 StorageImpl 分离、Dispatcher 路由、自动求导图与反向引擎、Module/优化器/DataLoader 应用层,再到 Dynamo→Inductor 编译栈、缓存分配器与 CUDA Graphs、DeviceMesh/DTensor/FSDP2 分布式与 DCP/pipelining/torchrun 工程件,收口于扩展档位表与自研里程碑(14 章)。
+- **深入浅出 LangGraph** —— 拆解 [langchain-ai/langgraph](https://github.com/langchain-ai/langgraph):StateGraph 与 Channel、Reducer 的状态合并规则、条件边与 Send 并行分发、interrupt 与 Checkpointer 的持久化、ReAct / 多 Agent 等常见模式,收口于自建方案与选型对照(12 章)。
+- **深入浅出 vLLM** —— 拆解 [vllm-project/vllm](https://github.com/vllm-project/vllm) 推理引擎:PagedAttention 与块表、调度器与连续批处理、显存与 KV 管理、采样、分布式执行、模型权重加载与多模态演进,并为自研推理引擎给出路线图(14 章)。
+- **深入浅出 SGLang** —— 拆解 [sgl-project/sglang](https://github.com/sgl-project/sglang) 运行时(SRT):RadixCache 前缀复用、调度与 overlap 事件循环、注意力后端、HiCache 分层缓存、PD 分离与投机解码(13 章)。
+- **深入浅出 On-Device 推理** —— 双引擎对照拆解 **llama.cpp** 与 **FreeToken**(消费级 GPU 的 MoE 专用引擎):GGUF 加载、解码循环、KV Cache、图调度、多设备切分、采样与投机解码、混合专家卸载,并为自研 on-device 引擎给出路线图(13 章)。
+- **深入浅出 Transformers** —— 拆解 [huggingface/transformers](https://github.com/huggingface/transformers) v5 主干,围绕三个问题展开:模型怎么"记住"互联网、怎么接上工具调用、解决问题的能力从哪来——分词、注意力与 FFN 记忆机制、KV Cache、生成循环、chat template、训练与量化,每章把答案落在具体文件与行号上(14 章)。
+- **Token 工厂** —— 自创的系统工程抽象(非某个开源项目):把一组 GPU 当作工厂来管,讲有效产能、单机生产、集群编排、Kubernetes 与可观测性、成本与计费,以及时间切片与错峰调度(18 章,含概述与尾声)。
 
 ## 适合谁读
 
@@ -43,6 +49,8 @@
 | [`robotics/`](robotics/) | [huggingface/lerobot](https://github.com/huggingface/lerobot) · [isaac-sim/IsaacLab](https://github.com/isaac-sim/IsaacLab) · [TRI-ML/prismatic-vlms](https://github.com/TRI-ML/prismatic-vlms) · unifolm-vla | [`../robotics`](../robotics) |
 | [`deepspeed-megatron/`](deepspeed-megatron/) | [NVIDIA/Megatron-LM](https://github.com/NVIDIA/Megatron-LM) · [deepspeedai/DeepSpeed](https://github.com/deepspeedai/DeepSpeed) | [`../Megatron-LM`](../Megatron-LM) · [`../DeepSpeed`](../DeepSpeed) |
 | [`pytorch/`](pytorch/) | [pytorch/pytorch](https://github.com/pytorch/pytorch) | [`../pytorch`](../pytorch) |
+| [`transformers/`](transformers/) | [huggingface/transformers](https://github.com/huggingface/transformers) | [`../transformers`](../transformers) |
+| [`token-factory/`](token-factory/) | Token 工厂(自创系统工程抽象,非开源项目) | — |
 
 ## 阅读方式
 
